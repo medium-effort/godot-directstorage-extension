@@ -37,6 +37,10 @@ public:
 	bool is_initialized() const;
 	String get_active_backend_name() const;
 
+	bool is_current_drive_supported() const;
+	bool is_path_supported(const String &p_path) const;
+	Dictionary get_drive_info(const String &p_path = "res://") const;
+
 	bool initialize_ds();
 	void shutdown_ds();
 

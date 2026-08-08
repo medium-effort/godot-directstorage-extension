@@ -18,6 +18,7 @@ private:
 	IDStorageQueue1 *memory_queue = nullptr;
 	HANDLE batch_event = nullptr;
 	Vector<Ref<DSRequest>> in_flight_requests;
+	Vector<IDStorageFile *> open_files;
 #endif
 
 public:
@@ -33,6 +34,8 @@ public:
 	bool enqueue_request(Ref<DSRequest> p_request) override;
 	void submit_batch() override;
 	void cancel_requests_with_tag(uint64_t p_tag) override;
+
+	static Dictionary get_drive_info_for_path(const String &p_path);
 };
 
 } // namespace godot

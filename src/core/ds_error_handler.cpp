@@ -80,7 +80,7 @@ VOID NTAPI DSErrorHandler::error_callback(PVOID pData, BOOLEAN bTimeout) {
 				NULL);
 
 		String err_msg = String("DirectStorage Async Error (HRESULT 0x") +
-				String::num_int64(failureRecord.HResult, 16) + "): " +
+				String::num_uint64(static_cast<uint32_t>(failureRecord.HResult), 16) + "): " +
 				String(windowsErrorBuffer);
 
 		if (failureRecord.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST) {

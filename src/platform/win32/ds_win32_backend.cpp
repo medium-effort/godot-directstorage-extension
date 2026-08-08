@@ -7,9 +7,159 @@
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
+#ifdef _WIN32
+#include <winioctl.h>
+#endif
+
 #include <string>
 
 namespace godot {
+
+#ifndef FSCTL_GET_BYPASSIO_STATE
+#define FSCTL_GET_BYPASSIO_STATE CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 238, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+struct DS_BYPASSIO_OUTPUT {
+	uint32_t State;
+	uint32_t Reason;
+	uint32_t VolumeDriverState;
+	uint32_t StorageDriverState;
+};
+
+Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
+	Dictionary res;
+	res["drive"] = "";
+	res["bus_type"] = "Unknown";
+	res["file_system"] = "Unknown";
+	res["bypassio_state"] = "Unsupported";
+	res["directstorage_supported"] = false;
+	res["reason"] = "";
+
+#ifdef _WIN32
+	String global_path = p_path;
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (ps && (p_path.begins_with("res://") || p_path.begins_with("user://"))) {
+		global_path = ps->globalize_path(p_path);
+	}
+	if (global_path.is_empty()) {
+		global_path = "C:\\";
+	}
+
+	// Format drive root cleanly as "X:\"
+	String drive_root = global_path.substr(0, 2) + "\\";
+	if (drive_root.length() < 3 || drive_root[1] != ':') {
+		drive_root = "C:\\";
+	}
+	res["drive"] = drive_root;
+
+	// 3. Query FileSystem Name
+	wchar_t fs_name[MAX_PATH] = {0};
+	wchar_t vol_name[MAX_PATH] = {0};
+	std::wstring w_drive_root(reinterpret_cast<const wchar_t *>(drive_root.utf16().get_data()));
+	if (GetVolumeInformationW(w_drive_root.c_str(), vol_name, MAX_PATH, nullptr, nullptr, nullptr, fs_name, MAX_PATH)) {
+		res["file_system"] = String(reinterpret_cast<const char16_t *>(fs_name));
+	}
+
+	// 4. Query Storage BusType & BypassIO State
+	String volume_device = "\\\\.\\" + drive_root.substr(0, 2);
+	std::wstring w_volume_device(reinterpret_cast<const wchar_t *>(volume_device.utf16().get_data()));
+
+	HANDLE hDevice = CreateFileW(
+			w_volume_device.c_str(),
+			0,
+			FILE_SHARE_READ | FILE_SHARE_WRITE,
+			nullptr,
+			OPEN_EXISTING,
+			0,
+			nullptr);
+
+	if (hDevice != INVALID_HANDLE_VALUE) {
+		STORAGE_PROPERTY_QUERY query = {};
+		query.PropertyId = StorageDeviceProperty;
+		query.QueryType = PropertyStandardQuery;
+
+		STORAGE_DEVICE_DESCRIPTOR dev_desc = {};
+		DWORD bytes_returned = 0;
+
+		if (DeviceIoControl(
+					hDevice,
+					IOCTL_STORAGE_QUERY_PROPERTY,
+					&query,
+					sizeof(query),
+					&dev_desc,
+					sizeof(dev_desc),
+					&bytes_returned,
+					nullptr)) {
+
+			switch (dev_desc.BusType) {
+				case BusTypeNvme:
+					res["bus_type"] = "NVMe";
+					break;
+				case BusTypeSata:
+					res["bus_type"] = "SATA";
+					break;
+				case BusTypeUsb:
+					res["bus_type"] = "USB";
+					break;
+				case BusTypeSd:
+					res["bus_type"] = "SD";
+					break;
+				case BusTypeMmc:
+					res["bus_type"] = "MMC";
+					break;
+				case BusTypeVirtual:
+					res["bus_type"] = "Virtual";
+					break;
+				default:
+					res["bus_type"] = "BusType_" + String::num_int64(dev_desc.BusType);
+					break;
+			}
+		}
+
+		// Query Windows Kernel BypassIO state
+		DS_BYPASSIO_OUTPUT bypassio_out = {};
+		DWORD bypassio_bytes = 0;
+		if (DeviceIoControl(
+					hDevice,
+					FSCTL_GET_BYPASSIO_STATE,
+					nullptr,
+					0,
+					&bypassio_out,
+					sizeof(bypassio_out),
+					&bypassio_bytes,
+					nullptr)) {
+			if (bypassio_out.State == 0) {
+				res["bypassio_state"] = "Enabled";
+			} else if (bypassio_out.State == 1) {
+				res["bypassio_state"] = "Disabled";
+			} else {
+				res["bypassio_state"] = "Unsupported";
+			}
+		}
+
+		CloseHandle(hDevice);
+	}
+
+	bool is_nvme = (res["bus_type"] == "NVMe");
+	bool is_ntfs = (res["file_system"] == "NTFS");
+
+	if (!is_nvme) {
+		res["directstorage_supported"] = false;
+		res["reason"] = "Drive is non-NVMe (BusType: " + String(res["bus_type"]) + "). DirectStorage requires NVMe for hardware acceleration.";
+	} else if (!is_ntfs) {
+		res["directstorage_supported"] = false;
+		res["reason"] = "File system is " + String(res["file_system"]) + ". DirectStorage requires NTFS.";
+	} else {
+		res["directstorage_supported"] = true;
+		res["reason"] = "Hardware NVMe drive and NTFS file system support DirectStorage hardware acceleration.";
+	}
+
+#else
+	res["reason"] = "Platform is non-Windows.";
+#endif
+
+	return res;
+}
 
 bool Win32Backend::is_available() const {
 #ifdef _WIN32
@@ -33,7 +183,21 @@ bool Win32Backend::initialize() {
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (ps) {
 		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
-		SetDllDirectoryW(reinterpret_cast<LPCWSTR>(bin_dir.utf16().get_data()));
+		String dstoragecore_path = bin_dir + "/dstoragecore.dll";
+		String dstorage_path = bin_dir + "/dstorage.dll";
+
+		std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(bin_dir.utf16().get_data()));
+		std::wstring w_core_path(reinterpret_cast<const wchar_t *>(dstoragecore_path.utf16().get_data()));
+		std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
+
+		SetDllDirectoryW(w_bin_dir.c_str());
+		LoadLibraryW(w_core_path.c_str());
+		LoadLibraryW(w_ds_path.c_str());
+	}
+
+	Dictionary drive_info = get_drive_info_for_path("res://");
+	if (!drive_info["directstorage_supported"]) {
+		UtilityFunctions::push_warning("[DirectStorage] Warning: Current drive " + String(drive_info["drive"]) + " is unsupported (" + String(drive_info["reason"]) + ").");
 	}
 
 	uint32_t staging_mb = ctx->get_staging_buffer_size_mb();
@@ -45,12 +209,11 @@ bool Win32Backend::initialize() {
 	config.DisableGpuDecompression = disable_gpu;
 	config.DisableGpuDecompressionMetacommand = disable_gpu;
 
-	String step_name = "DStorageSetConfiguration";
-	HRESULT hr = DStorageSetConfiguration(&config);
-	if (SUCCEEDED(hr)) {
-		step_name = "DStorageGetFactory";
-		hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
-	}
+	// DStorageSetConfiguration is optional. Ignore non-fatal configuration errors.
+	DStorageSetConfiguration(&config);
+
+	String step_name = "DStorageGetFactory";
+	HRESULT hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
 
 	if (SUCCEEDED(hr) && factory) {
 		factory->SetDebugFlags(DSTORAGE_DEBUG_NONE);
@@ -110,6 +273,13 @@ void Win32Backend::shutdown() {
 		batch_event = nullptr;
 	}
 
+	for (int i = 0; i < open_files.size(); i++) {
+		if (open_files[i]) {
+			open_files[i]->Close();
+			open_files[i]->Release();
+		}
+	}
+	open_files.clear();
 	in_flight_requests.clear();
 #endif
 }
@@ -125,6 +295,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	}
 
 	String path = p_request->get_file_path();
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (ps && (path.begins_with("res://") || path.begins_with("user://"))) {
+		path = ps->globalize_path(path);
+	}
 	std::wstring wpath = path.utf8().get_data() ? std::wstring(path.wide_string().get_data()) : L"";
 
 	IDStorageFile *file = nullptr;
@@ -157,8 +331,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	request.CancellationTag = p_request->get_cancellation_tag();
 
 	memory_queue->EnqueueRequest(&request);
-	file->Close();
-	file->Release();
+	open_files.push_back(file);
 
 	p_request->set_status(DSRequest::STATUS_SUBMITTED);
 	in_flight_requests.push_back(p_request);
@@ -215,6 +388,13 @@ void Win32Backend::submit_batch() {
 		}
 	}
 
+	for (int i = 0; i < open_files.size(); i++) {
+		if (open_files[i]) {
+			open_files[i]->Close();
+			open_files[i]->Release();
+		}
+	}
+	open_files.clear();
 	in_flight_requests.clear();
 #endif
 }

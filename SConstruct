@@ -22,6 +22,7 @@ if env["platform"] == "windows":
     env.Append(LIBPATH=["thirdparty/directstorage/lib/x64"])
     env.Append(LIBS=["dstorage.lib"])
     if "msvc" in env["TOOLS"]:
+        env.Append(LINKFLAGS=["/DELAYLOAD:dstorage.dll", "delayimp.lib"])
         # Replace /std:c++17 with /std:c++20 to eliminate MSVC warning D9025
         env["CXXFLAGS"] = [flag if flag != "/std:c++17" else "/std:c++20" for flag in env.get("CXXFLAGS", [])]
         if "/std:c++20" not in env["CXXFLAGS"]:
@@ -62,14 +63,64 @@ if env["platform"] == "windows":
     installed_dlls = env.Install(output_dir, ds_dlls)
     targets.append(installed_dlls)
 
-# Post-build action: generate build status manifest artifact (recording SUCCESS or FAILED)
+# Post-build action: generate build status manifest artifact and incremental project sync
 import json
 import datetime
 import subprocess
 import atexit
+import shutil
 import SCons.Script
 
+if sys.platform == "win32":
+    import winreg
+
 BUILD_START_TIME = datetime.datetime.now().astimezone()
+
+TARGET_MACHINE_GUID = "4e2b44a0-d5af-4b59-aa22-7a24d8187a63"
+
+def get_machine_guid():
+    if sys.platform == "win32":
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+                guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+                return guid
+        except Exception:
+            pass
+    return None
+
+def sync_changed_files(src_dir, dst_dir):
+    copied_count = 0
+    for root, dirs, files in os.walk(src_dir):
+        # Exclude .godot cache folder from post-build sync
+        dirs[:] = [d for d in dirs if d != ".godot"]
+
+        rel_path = os.path.relpath(root, src_dir)
+        target_root = os.path.join(dst_dir, rel_path) if rel_path != "." else dst_dir
+        os.makedirs(target_root, exist_ok=True)
+
+        for f in files:
+            src_file = os.path.join(root, f)
+            dst_file = os.path.join(target_root, f)
+
+            should_copy = False
+            if not os.path.exists(dst_file):
+                should_copy = True
+            else:
+                try:
+                    src_stat = os.stat(src_file)
+                    dst_stat = os.stat(dst_file)
+                    if src_stat.st_mtime > dst_stat.st_mtime + 0.1 or src_stat.st_size != dst_stat.st_size:
+                        should_copy = True
+                except Exception:
+                    should_copy = True
+
+            if should_copy:
+                try:
+                    shutil.copy2(src_file, dst_file)
+                    copied_count += 1
+                except Exception:
+                    pass
+    return copied_count
 
 def write_build_manifest():
     build_finish_time = datetime.datetime.now().astimezone()
@@ -95,6 +146,27 @@ def write_build_manifest():
 
     status = "FAILED" if failures else "SUCCESS"
 
+    target_sync_dir = r"D:\directstorage-test"
+    sync_info = {
+        "target_path": target_sync_dir,
+        "synced": False,
+        "copied_files_count": 0
+    }
+
+    if status == "SUCCESS" and os.path.exists("D:\\") and get_machine_guid() == TARGET_MACHINE_GUID:
+        try:
+            os.makedirs(target_sync_dir, exist_ok=True)
+            copied = sync_changed_files(os.path.abspath("project"), target_sync_dir)
+            sync_info["synced"] = True
+            sync_info["copied_files_count"] = copied
+            if copied > 0:
+                print(f"[SCons] Post-build sync: Copied/Updated {copied} file(s) -> {target_sync_dir}")
+            else:
+                print(f"[SCons] Post-build sync: Target {target_sync_dir} is up to date.")
+        except Exception as e:
+            sync_info["error"] = str(e)
+            print(f"[SCons] Post-build sync error: {e}")
+
     manifest_data = {
         "status": status,
         "timestamps": {
@@ -110,7 +182,8 @@ def write_build_manifest():
             "message": commit_msg,
             "date": commit_date,
             "dirty": is_dirty
-        }
+        },
+        "post_build_sync": sync_info
     }
     if failures:
         manifest_data["failures_count"] = len(failures)
@@ -120,6 +193,12 @@ def write_build_manifest():
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest_data, f, indent=2)
         print(f"[SCons] Updated build manifest ({status}): {manifest_path}")
+
+        # Copy the final updated manifest JSON directly to sync target directory
+        if sync_info["synced"]:
+            dst_manifest = os.path.join(target_sync_dir, os.path.relpath(manifest_path, os.path.abspath("project")))
+            os.makedirs(os.path.dirname(dst_manifest), exist_ok=True)
+            shutil.copy2(manifest_path, dst_manifest)
     except Exception as e:
         print(f"[SCons] Failed to write build manifest: {e}")
 

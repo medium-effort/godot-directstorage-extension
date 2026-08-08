@@ -4,6 +4,7 @@
 #include "../platform/fallback/ds_fallback_backend.h"
 #include "../platform/win32/ds_win32_backend.h"
 
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
@@ -64,6 +65,37 @@ String DSContext::get_active_backend_name() const {
 		return active_backend->get_name();
 	}
 	return "None";
+}
+
+bool DSContext::is_current_drive_supported() const {
+	OS *os = OS::get_singleton();
+	String path = "res://";
+	if (os) {
+		String exec_path = os->get_executable_path();
+		if (!exec_path.is_empty()) {
+			path = exec_path;
+		}
+	}
+	return is_path_supported(path);
+}
+
+bool DSContext::is_path_supported(const String &p_path) const {
+	Dictionary info = get_drive_info(p_path);
+	return info.get("directstorage_supported", false);
+}
+
+Dictionary DSContext::get_drive_info(const String &p_path) const {
+#ifdef _WIN32
+	return Win32Backend::get_drive_info_for_path(p_path);
+#else
+	Dictionary res;
+	res["drive"] = "";
+	res["bus_type"] = "Non-Windows";
+	res["file_system"] = "Unknown";
+	res["directstorage_supported"] = false;
+	res["reason"] = "DirectStorage hardware acceleration is only supported on Windows.";
+	return res;
+#endif
 }
 
 bool DSContext::initialize_ds() {
@@ -182,6 +214,9 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_d3d12_backend"), &DSContext::is_d3d12_backend);
 	ClassDB::bind_method(D_METHOD("is_initialized"), &DSContext::is_initialized);
 	ClassDB::bind_method(D_METHOD("get_active_backend_name"), &DSContext::get_active_backend_name);
+	ClassDB::bind_method(D_METHOD("is_current_drive_supported"), &DSContext::is_current_drive_supported);
+	ClassDB::bind_method(D_METHOD("is_path_supported", "path"), &DSContext::is_path_supported);
+	ClassDB::bind_method(D_METHOD("get_drive_info", "path"), &DSContext::get_drive_info, DEFVAL("res://"));
 	ClassDB::bind_method(D_METHOD("initialize_ds"), &DSContext::initialize_ds);
 	ClassDB::bind_method(D_METHOD("shutdown_ds"), &DSContext::shutdown_ds);
 

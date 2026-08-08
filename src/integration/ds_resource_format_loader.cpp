@@ -80,6 +80,10 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		}
 	}
 
+	if (!FileAccess::file_exists(p_path)) {
+		return Variant();
+	}
+
 	String ext = p_path.get_extension().to_lower();
 
 	if (ext == "dstex") {
@@ -87,7 +91,6 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		dstex.instantiate();
 		Dictionary header = dstex->read_header(p_path);
 		if (header.is_empty()) {
-			UtilityFunctions::push_error("DSResourceFormatLoader: Failed to read .dstex header: ", p_path);
 			return Variant();
 		}
 
