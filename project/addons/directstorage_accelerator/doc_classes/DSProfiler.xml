@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSProfiler" inherits="Object" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Performance profiling and NVMe transfer throughput monitor for DirectStorage.
+	</brief_description>
+	<description>
+		[DSProfiler] tracks read workload durations and bytes transferred. It registers the custom monitor [code]"directstorage/throughput_mbps"[/code] in Godot's [Performance] monitor, allowing real-time MB/s throughput inspection in Godot Editor debugger graphs.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_last_bytes" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the total bytes read in the last profiled workload.
+			</description>
+		</method>
+		<method name="get_last_duration_us" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the microsecond duration of the last profiled workload.
+			</description>
+		</method>
+		<method name="get_last_throughput_mbps" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the calculated transfer throughput in megabytes per second (MB/s).
+			</description>
+		</method>
+		<method name="record_workload">
+			<return type="void" />
+			<param index="0" name="bytes" type="int" />
+			<param index="1" name="duration_us" type="int" />
+			<description>
+				Records a completed read workload with the total [param bytes] and elapsed duration [param duration_us].
+			</description>
+		</method>
+		<method name="register_performance_monitors">
+			<return type="void" />
+			<description>
+				Registers custom Performance monitors with Godot Engine's debugger system.
+			</description>
+		</method>
+	</methods>
+</class>

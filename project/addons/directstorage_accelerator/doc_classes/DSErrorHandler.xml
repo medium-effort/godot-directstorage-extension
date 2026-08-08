@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSErrorHandler" inherits="Object" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Asynchronous error bridge for DirectStorage kernel events.
+	</brief_description>
+	<description>
+		[DSErrorHandler] registers a Windows Threadpool wait on DirectStorage error events. When a background I/O error occurs, it retrieves [code]DSTORAGE_ERROR_RECORD[/code] diagnostics and routes error messages to Godot's Output panel via [method push_error].
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="clear_error">
+			<return type="void" />
+			<description>
+				Clears the last recorded error state.
+			</description>
+		</method>
+		<method name="get_last_error" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the string description of the last asynchronous DirectStorage failure.
+			</description>
+		</method>
+		<method name="has_error" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if an asynchronous error has been flagged.
+			</description>
+		</method>
+		<method name="report_error">
+			<return type="void" />
+			<param index="0" name="msg" type="String" />
+			<description>
+				Manually flags and reports an error message to the error handler.
+			</description>
+		</method>
+	</methods>
+</class>

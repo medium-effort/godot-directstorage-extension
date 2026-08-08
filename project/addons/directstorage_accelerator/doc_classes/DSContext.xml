@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSContext" inherits="Object" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Core singleton manager for DirectStorage hardware acceleration and fallback backends in Godot.
+	</brief_description>
+	<description>
+		[DSContext] manages the lifecycle of the Microsoft DirectStorage factory, memory queues, staging buffers, and cross-platform I/O fallback backends. It provides batch request submission and cancellation for NVMe streaming pipelines.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="cancel_requests_with_tag">
+			<return type="void" />
+			<param index="0" name="tag" type="int" />
+			<description>
+				Cancels all enqueued read requests whose cancellation tag matches [param tag].
+			</description>
+		</method>
+		<method name="enqueue_request">
+			<return type="bool" />
+			<param index="0" name="request" type="DSRequest" />
+			<description>
+				Enqueues a [DSRequest] object into the active DirectStorage/fallback I/O queue. Returns [code]true[/code] if enqueued successfully.
+			</description>
+		</method>
+		<method name="flush_batch">
+			<return type="void" />
+			<description>
+				Flushes and submits all enqueued requests in the queue to the DirectStorage runtime or fallback worker threadpool.
+			</description>
+		</method>
+		<method name="get_active_backend_name" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the name of the active I/O backend ([code]"Win32DirectStorage"[/code] or [code]"SoftwareFallback"[/code]).
+			</description>
+		</method>
+		<method name="initialize_ds">
+			<return type="bool" />
+			<description>
+				Initializes DirectStorage hardware queues and staging buffers. Returns [code]true[/code] if initialized successfully.
+			</description>
+		</method>
+		<method name="is_d3d12_backend" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if Godot is running with the Direct3D 12 rendering driver.
+			</description>
+		</method>
+		<method name="is_initialized" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if [DSContext] has been initialized.
+			</description>
+		</method>
+		<method name="is_supported" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if the current OS platform supports DirectStorage.
+			</description>
+		</method>
+		<method name="shutdown_ds">
+			<return type="void" />
+			<description>
+				Shuts down DirectStorage queues, releases COM interfaces, and cleans up active backend resources.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="disable_gpu_decompression" type="bool" setter="set_disable_gpu_decompression" getter="get_disable_gpu_decompression" default="false">
+			If [code]true[/code], forces DirectStorage runtime to perform CPU decompression instead of GPU decompression shaders.
+		</member>
+		<member name="queue_capacity" type="int" setter="set_queue_capacity" getter="get_queue_capacity" default="128">
+			The maximum request capacity for the DirectStorage queue.
+		</member>
+		<member name="staging_buffer_size_mb" type="int" setter="set_staging_buffer_size_mb" getter="get_staging_buffer_size_mb" default="32">
+			The size in megabytes of each staging buffer allocated by DirectStorage.
+		</member>
+	</members>
+</class>

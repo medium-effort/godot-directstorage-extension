@@ -1,0 +1,14 @@
+[configuration]
+entry_symbol = "directstorage_accelerator_init"
+compatibility_minimum = "4.1"
+reloadable = true
+
+[libraries]
+windows.debug.x86_64 = "bin/directstorage_accelerator.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "bin/directstorage_accelerator.windows.template_release.x86_64.dll"
+windows.debug.x86_64.dev = "bin/directstorage_accelerator.windows.template_debug.dev.x86_64.dll"
+
+[dependencies]
+windows.debug.x86_64 = {"bin/dstorage.dll": "", "bin/dstoragecore.dll": ""}
+windows.release.x86_64 = {"bin/dstorage.dll": "", "bin/dstoragecore.dll": ""}
+windows.debug.x86_64.dev = {"bin/dstorage.dll": "", "bin/dstoragecore.dll": ""}

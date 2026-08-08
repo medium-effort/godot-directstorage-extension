@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSRequest" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Encapsulates a single DirectStorage read request.
+	</brief_description>
+	<description>
+		[DSRequest] contains the source file path, byte offset, read size, cancellation tag, compression format, destination memory buffer, and execution status for an async DirectStorage or fallback read operation.
+	</description>
+	<tutorials>
+	</tutorials>
+	<members>
+		<member name="cancellation_tag" type="int" setter="set_cancellation_tag" getter="get_cancellation_tag" default="0">
+			An arbitrary [int] tag assigned to this request used for batch cancellation via [method DSContext.cancel_requests_with_tag].
+		</member>
+		<member name="compression_format" type="int" setter="set_compression_format" getter="get_compression_format" enum="DSRequest.CompressionFormat" default="0">
+			The compression format of the source data ([code]COMPRESSION_NONE[/code] or [code]COMPRESSION_GDEFLATE[/code]).
+		</member>
+		<member name="destination_buffer" type="PackedByteArray" setter="set_destination_buffer" getter="get_destination_buffer" default="PackedByteArray()">
+			The destination memory buffer where decompressed or raw uncompressed bytes are written.
+		</member>
+		<member name="error_message" type="String" setter="set_error_message" getter="get_error_message" default="&quot;&quot;">
+			Error diagnostic string set if the request failed.
+		</member>
+		<member name="file_path" type="String" setter="set_file_path" getter="get_file_path" default="&quot;&quot;">
+			The file path on disk to read from.
+		</member>
+		<member name="offset" type="int" setter="set_offset" getter="get_offset" default="0">
+			The byte offset in the file to start reading from.
+		</member>
+		<member name="size" type="int" setter="set_size" getter="get_size" default="0">
+			The number of bytes to read from the file.
+		</member>
+		<member name="status" type="int" setter="set_status" getter="get_status" enum="DSRequest.Status" default="0">
+			The current status of this request ([code]STATUS_PENDING[/code], [code]STATUS_SUBMITTED[/code], [code]STATUS_COMPLETED[/code], or [code]STATUS_FAILED[/code]).
+		</member>
+	</members>
+	<constants>
+		<constant name="STATUS_PENDING" value="0" enum="Status">
+			Request is created but has not been enqueued.
+		</constant>
+		<constant name="STATUS_SUBMITTED" value="1" enum="Status">
+			Request has been enqueued in the DirectStorage/fallback queue.
+		</constant>
+		<constant name="STATUS_COMPLETED" value="2" enum="Status">
+			Request read and decompression has completed successfully.
+		</constant>
+		<constant name="STATUS_FAILED" value="3" enum="Status">
+			Request failed during I/O read or decompression.
+		</constant>
+		<constant name="COMPRESSION_NONE" value="0" enum="CompressionFormat">
+			Data is uncompressed raw binary.
+		</constant>
+		<constant name="COMPRESSION_GDEFLATE" value="1" enum="CompressionFormat">
+			Data is compressed with GPUOpen/NVIDIA GDeflate tile format.
+		</constant>
+	</constants>
+</class>
