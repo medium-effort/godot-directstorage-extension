@@ -1,4 +1,6 @@
 #include "register_types.h"
+#include "compression/gdeflate_compressor.h"
+#include "compression/gdeflate_decompressor.h"
 #include "core/ds_context.h"
 #include "core/ds_error_handler.h"
 #include "core/ds_profiler.h"
@@ -24,6 +26,8 @@ void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_lev
 	ClassDB::register_class<DSRequest>();
 	ClassDB::register_class<DSErrorHandler>();
 	ClassDB::register_class<DSProfiler>();
+	ClassDB::register_class<GDeflateCompressor>();
+	ClassDB::register_class<GDeflateDecompressor>();
 
 	ds_context_singleton = memnew(DSContext);
 	ds_error_handler_singleton = memnew(DSErrorHandler);
