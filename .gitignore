@@ -1,0 +1,16 @@
+/DirectStorage
+/DirectStorageSample
+/mcp_tools
+
+# ==============================================================================
+# Local Tooling & Agent Metadata
+# ==============================================================================
+.codegraph/
+/codegraph.json
+/.crewmate
+/.opencode
+/opencode.json
+/opencode.jsonc
+/wavexecute_tasks
+/.agents/
+/.projectmem/
