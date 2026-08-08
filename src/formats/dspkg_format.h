@@ -2,7 +2,7 @@
 #define DSPKG_FORMAT_H
 
 #include <godot_cpp/classes/file_access.hpp>
-#include <godot_cpp/classes/ref_counted.hpp>
+#include <godot_cpp/classes/resource.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/templates/hash_map.hpp>
 #include <godot_cpp/variant/array.hpp>
@@ -37,8 +37,8 @@ struct DSPkgEntry {
 	uint32_t mip_count = 0;
 };
 
-class DSPkg : public RefCounted {
-	GDCLASS(DSPkg, RefCounted);
+class DSPkg : public Resource {
+	GDCLASS(DSPkg, Resource);
 
 private:
 	// Builder state

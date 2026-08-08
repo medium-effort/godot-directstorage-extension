@@ -50,6 +50,7 @@ public:
 	Dictionary get_file_info(const String &p_path);
 
 	static int godot_format_to_rd_format(int p_image_format);
+	static int rd_format_to_godot_format(int p_rd_format);
 };
 
 } // namespace godot

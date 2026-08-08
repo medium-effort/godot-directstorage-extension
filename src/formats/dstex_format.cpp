@@ -14,6 +14,7 @@ void DSTex::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_file_info", "path"), &DSTex::get_file_info);
 
 	ClassDB::bind_static_method("DSTex", D_METHOD("godot_format_to_rd_format", "image_format"), &DSTex::godot_format_to_rd_format);
+	ClassDB::bind_static_method("DSTex", D_METHOD("rd_format_to_godot_format", "rd_format"), &DSTex::rd_format_to_godot_format);
 }
 
 DSTex::DSTex() {
@@ -80,6 +81,61 @@ int DSTex::godot_format_to_rd_format(int p_image_format) {
 			return RenderingDevice::DATA_FORMAT_R16G16B16A16_UNORM;
 		default:
 			return RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM;
+	}
+}
+
+int DSTex::rd_format_to_godot_format(int p_rd_format) {
+	switch (p_rd_format) {
+		case RenderingDevice::DATA_FORMAT_R8_UNORM:
+			return Image::FORMAT_R8;
+		case RenderingDevice::DATA_FORMAT_R8G8_UNORM:
+			return Image::FORMAT_RG8;
+		case RenderingDevice::DATA_FORMAT_R8G8B8_UNORM:
+			return Image::FORMAT_RGB8;
+		case RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM:
+			return Image::FORMAT_RGBA8;
+		case RenderingDevice::DATA_FORMAT_R32_SFLOAT:
+			return Image::FORMAT_RF;
+		case RenderingDevice::DATA_FORMAT_R32G32_SFLOAT:
+			return Image::FORMAT_RGF;
+		case RenderingDevice::DATA_FORMAT_R32G32B32_SFLOAT:
+			return Image::FORMAT_RGBF;
+		case RenderingDevice::DATA_FORMAT_R32G32B32A32_SFLOAT:
+			return Image::FORMAT_RGBAF;
+		case RenderingDevice::DATA_FORMAT_R16_SFLOAT:
+			return Image::FORMAT_RH;
+		case RenderingDevice::DATA_FORMAT_R16G16_SFLOAT:
+			return Image::FORMAT_RGH;
+		case RenderingDevice::DATA_FORMAT_R16G16B16_SFLOAT:
+			return Image::FORMAT_RGBH;
+		case RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT:
+			return Image::FORMAT_RGBAH;
+		case RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK:
+			return Image::FORMAT_DXT1;
+		case RenderingDevice::DATA_FORMAT_BC2_UNORM_BLOCK:
+			return Image::FORMAT_DXT3;
+		case RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK:
+			return Image::FORMAT_DXT5;
+		case RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK:
+			return Image::FORMAT_RGTC_R;
+		case RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK:
+			return Image::FORMAT_RGTC_RG;
+		case RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK:
+			return Image::FORMAT_BPTC_RGBA;
+		case RenderingDevice::DATA_FORMAT_BC6H_SFLOAT_BLOCK:
+			return Image::FORMAT_BPTC_RGBF;
+		case RenderingDevice::DATA_FORMAT_BC6H_UFLOAT_BLOCK:
+			return Image::FORMAT_BPTC_RGBFU;
+		case RenderingDevice::DATA_FORMAT_R16_UNORM:
+			return Image::FORMAT_R16;
+		case RenderingDevice::DATA_FORMAT_R16G16_UNORM:
+			return Image::FORMAT_RG16;
+		case RenderingDevice::DATA_FORMAT_R16G16B16_UNORM:
+			return Image::FORMAT_RGB16;
+		case RenderingDevice::DATA_FORMAT_R16G16B16A16_UNORM:
+			return Image::FORMAT_RGBA16;
+		default:
+			return Image::FORMAT_RGBA8;
 	}
 }
 
