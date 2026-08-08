@@ -1,0 +1,34 @@
+#ifndef DS_FALLBACK_BACKEND_H
+#define DS_FALLBACK_BACKEND_H
+
+#include "../platform_backend.h"
+#include <godot_cpp/templates/vector.hpp>
+
+namespace godot {
+
+class FallbackBackend : public PlatformBackend {
+private:
+	Vector<Ref<DSRequest>> pending_requests;
+	uint32_t num_workers = 4;
+
+public:
+	FallbackBackend();
+	~FallbackBackend() override = default;
+
+	bool is_available() const override;
+	String get_name() const override;
+
+	bool initialize() override;
+	void shutdown() override;
+
+	bool enqueue_request(Ref<DSRequest> p_request) override;
+	void submit_batch() override;
+	void cancel_requests_with_tag(uint64_t p_tag) override;
+
+private:
+	bool process_request(Ref<DSRequest> p_request);
+};
+
+} // namespace godot
+
+#endif // DS_FALLBACK_BACKEND_H

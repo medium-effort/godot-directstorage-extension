@@ -34,11 +34,13 @@ if env["platform"] == "windows":
 # Source files (GDExtension C++ code + GDeflate & libdeflate sources)
 sources = (
     Glob("src/*.cpp") +
-    Glob("src/**/*.cpp") +
+    Glob("src/*/*.cpp") +
+    Glob("src/*/*/*.cpp") +
     Glob("thirdparty/gdeflate/*.cpp") +
     Glob("thirdparty/libdeflate/lib/*.c") +
     Glob("thirdparty/libdeflate/lib/x86/*.c")
 )
+
 
 output_dir = "project/addons/directstorage_accelerator/bin/"
 target_name = "directstorage_accelerator" + env["suffix"] + env["SHLIBSUFFIX"]

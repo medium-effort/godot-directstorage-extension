@@ -6,6 +6,7 @@
 #include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include "ds_request.h"
+#include "../platform/platform_backend.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -25,6 +26,8 @@ private:
 	bool disable_gpu_decompression = false;
 	uint16_t queue_capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
 
+	PlatformBackend *active_backend = nullptr;
+
 #ifdef _WIN32
 	IDStorageFactory *factory = nullptr;
 	IDStorageQueue *memory_queue = nullptr;
@@ -42,6 +45,7 @@ public:
 	bool is_supported() const;
 	bool is_d3d12_backend() const;
 	bool is_initialized() const;
+	String get_active_backend_name() const;
 
 	bool initialize_ds();
 	void shutdown_ds();

@@ -1,6 +1,8 @@
 #include "ds_context.h"
 #include "ds_error_handler.h"
 #include "ds_profiler.h"
+#include "../platform/fallback/ds_fallback_backend.h"
+#include "../platform/win32/ds_win32_backend.h"
 
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
@@ -57,16 +59,18 @@ bool DSContext::is_initialized() const {
 	return initialized;
 }
 
+String DSContext::get_active_backend_name() const {
+	if (active_backend) {
+		return active_backend->get_name();
+	}
+	return "None";
+}
+
 bool DSContext::initialize_ds() {
 	if (initialized) {
 		return true;
 	}
 
-#ifndef _WIN32
-	UtilityFunctions::print("[DirectStorage] Fallback I/O mode active (non-Windows platform).");
-	initialized = false;
-	return false;
-#else
 	// Load settings from ProjectSettings or set defaults
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (ps) {
@@ -81,6 +85,7 @@ bool DSContext::initialize_ds() {
 		}
 	}
 
+#ifdef _WIN32
 	// Step 1: Set Configuration
 	DSTORAGE_CONFIGURATION config = {};
 	config.DisableTelemetry = TRUE;
@@ -88,54 +93,57 @@ bool DSContext::initialize_ds() {
 	config.DisableGpuDecompressionMetacommand = disable_gpu_decompression;
 
 	HRESULT hr = DStorageSetConfiguration(&config);
-	if (FAILED(hr)) {
-		UtilityFunctions::push_error(String("[DirectStorage] Failed to set configuration. HRESULT: 0x") + String::num_int64(hr, 16));
-		return false;
+	if (SUCCEEDED(hr)) {
+		hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
 	}
 
-	// Step 2: Get Factory
-	hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
-	if (FAILED(hr) || !factory) {
-		UtilityFunctions::push_error(String("[DirectStorage] Failed to get factory. HRESULT: 0x") + String::num_int64(hr, 16));
-		return false;
+	if (SUCCEEDED(hr) && factory) {
+		factory->SetDebugFlags(DSTORAGE_DEBUG_NONE);
+		factory->SetStagingBufferSize(staging_buffer_size_mb * 1024 * 1024);
+
+		DSTORAGE_QUEUE_DESC queueDesc = {};
+		queueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+		queueDesc.Capacity = queue_capacity;
+		queueDesc.Priority = DSTORAGE_PRIORITY_NORMAL;
+		queueDesc.Name = "DirectStorageMemoryQueue";
+		queueDesc.Device = nullptr;
+
+		hr = factory->CreateQueue(&queueDesc, IID_PPV_ARGS(&memory_queue));
 	}
 
-	factory->SetDebugFlags(DSTORAGE_DEBUG_NONE);
-	factory->SetStagingBufferSize(staging_buffer_size_mb * 1024 * 1024);
-
-	// Step 3: Create File-to-Memory Queue (Tier 1 Architecture)
-	DSTORAGE_QUEUE_DESC queueDesc = {};
-	queueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-	queueDesc.Capacity = queue_capacity;
-	queueDesc.Priority = DSTORAGE_PRIORITY_NORMAL;
-	queueDesc.Name = "DirectStorageMemoryQueue";
-	queueDesc.Device = nullptr; // Memory destination queue
-
-	hr = factory->CreateQueue(&queueDesc, IID_PPV_ARGS(&memory_queue));
-	if (FAILED(hr) || !memory_queue) {
-		UtilityFunctions::push_error(String("[DirectStorage] Failed to create queue. HRESULT: 0x") + String::num_int64(hr, 16));
-		if (factory) {
-			factory->Release();
-			factory = nullptr;
+	if (SUCCEEDED(hr) && memory_queue) {
+		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+		if (err_handler) {
+			err_handler->register_queue(memory_queue);
 		}
-		return false;
-	}
 
-	// Step 4: Register error handler
-	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
-	if (err_handler) {
-		err_handler->register_queue(memory_queue);
+		active_backend = memnew(Win32Backend);
+		active_backend->initialize();
+		initialized = true;
+		UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with Win32Backend.");
+		return true;
+	} else {
+		UtilityFunctions::print("[DirectStorage] Win32 DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
 	}
-
-	initialized = true;
-	UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized successfully (Memory Queue Ready).");
-	return true;
 #endif
+
+	// Fallback backend for non-Windows or if Win32 DirectStorage initialization failed
+	active_backend = memnew(FallbackBackend);
+	active_backend->initialize();
+	initialized = true;
+	UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with FallbackBackend.");
+	return true;
 }
 
 void DSContext::shutdown_ds() {
 	if (!initialized) {
 		return;
+	}
+
+	if (active_backend) {
+		active_backend->shutdown();
+		memdelete(active_backend);
+		active_backend = nullptr;
 	}
 
 #ifdef _WIN32
@@ -165,81 +173,71 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request) {
 		return false;
 	}
 
-	if (!initialized || !memory_queue) {
+	if (!initialized || !active_backend) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("DirectStorage Context not initialized.");
 		return false;
 	}
 
+	if (active_backend->get_name() == "Win32DirectStorage") {
 #ifdef _WIN32
-	String path = p_request->get_file_path();
-	std::wstring wpath = path.utf8().get_data() ? std::wstring(path.wide_string().get_data()) : L"";
+		String path = p_request->get_file_path();
+		std::wstring wpath = path.utf8().get_data() ? std::wstring(path.wide_string().get_data()) : L"";
 
-	IDStorageFile *file = nullptr;
-	HRESULT hr = factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&file));
-	if (FAILED(hr) || !file) {
-		p_request->set_status(DSRequest::STATUS_FAILED);
-		p_request->set_error_message("Failed to open file for DirectStorage access.");
-		return false;
-	}
+		IDStorageFile *file = nullptr;
+		HRESULT hr = factory ? factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&file)) : E_FAIL;
+		if (FAILED(hr) || !file) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("Failed to open file for DirectStorage access.");
+			return false;
+		}
 
-	DSTORAGE_REQUEST request = {};
-	request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-	request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
-	request.Options.CompressionFormat = (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE)
-			? DSTORAGE_COMPRESSION_FORMAT_GDEFLATE
-			: DSTORAGE_COMPRESSION_FORMAT_NONE;
+		DSTORAGE_REQUEST request = {};
+		request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+		request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
+		request.Options.CompressionFormat = (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE)
+				? DSTORAGE_COMPRESSION_FORMAT_GDEFLATE
+				: DSTORAGE_COMPRESSION_FORMAT_NONE;
 
-	request.Source.File.Source = file;
-	request.Source.File.Offset = p_request->get_offset();
-	request.Source.File.Size = p_request->get_size();
+		request.Source.File.Source = file;
+		request.Source.File.Offset = p_request->get_offset();
+		request.Source.File.Size = p_request->get_size();
 
-	PackedByteArray dest = p_request->get_destination_buffer();
-	if (dest.size() < p_request->get_size()) {
-		dest.resize(p_request->get_size());
-		p_request->set_destination_buffer(dest);
-	}
+		PackedByteArray dest = p_request->get_destination_buffer();
+		if (dest.size() < p_request->get_size()) {
+			dest.resize(p_request->get_size());
+			p_request->set_destination_buffer(dest);
+		}
 
-	request.Destination.Memory.Buffer = dest.ptrw();
-	request.Destination.Memory.Size = p_request->get_size();
-	request.UncompressedSize = p_request->get_size();
-	request.CancellationTag = p_request->get_cancellation_tag();
+		request.Destination.Memory.Buffer = dest.ptrw();
+		request.Destination.Memory.Size = p_request->get_size();
+		request.UncompressedSize = p_request->get_size();
+		request.CancellationTag = p_request->get_cancellation_tag();
 
-	memory_queue->EnqueueRequest(&request);
-	file->Close();
-	file->Release();
+		memory_queue->EnqueueRequest(&request);
+		file->Close();
+		file->Release();
 
-	p_request->set_status(DSRequest::STATUS_SUBMITTED);
-	return true;
-#else
-	p_request->set_status(DSRequest::STATUS_FAILED);
-	p_request->set_error_message("DirectStorage not supported on this platform.");
-	return false;
+		p_request->set_status(DSRequest::STATUS_SUBMITTED);
+		return true;
 #endif
+	}
+
+	return active_backend->enqueue_request(p_request);
 }
 
 void DSContext::flush_batch() {
-	if (!initialized) {
+	if (!initialized || !active_backend) {
 		return;
 	}
-
-#ifdef _WIN32
-	if (memory_queue) {
-		memory_queue->Submit();
-	}
-#endif
+	active_backend->submit_batch();
 }
 
 void DSContext::cancel_requests_with_tag(uint64_t p_tag) {
-	if (!initialized) {
+	if (!initialized || !active_backend) {
 		return;
 	}
-
-#ifdef _WIN32
-	if (memory_queue) {
-		memory_queue->CancelRequestsWithTag(UINT64_MAX, p_tag);
-	}
-#endif
+	active_backend->cancel_requests_with_tag(p_tag);
 }
 
 void DSContext::set_staging_buffer_size_mb(uint32_t p_size_mb) {
@@ -270,6 +268,7 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_supported"), &DSContext::is_supported);
 	ClassDB::bind_method(D_METHOD("is_d3d12_backend"), &DSContext::is_d3d12_backend);
 	ClassDB::bind_method(D_METHOD("is_initialized"), &DSContext::is_initialized);
+	ClassDB::bind_method(D_METHOD("get_active_backend_name"), &DSContext::get_active_backend_name);
 	ClassDB::bind_method(D_METHOD("initialize_ds"), &DSContext::initialize_ds);
 	ClassDB::bind_method(D_METHOD("shutdown_ds"), &DSContext::shutdown_ds);
 
