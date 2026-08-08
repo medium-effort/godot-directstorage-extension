@@ -10,14 +10,15 @@
 *.obj
 *.o
 *.os
-*.pdb
 *.idb
-*.exp
+*.pdb
 *.ilk
-*.lib
+*.exp
 
-# Compiled GDExtension target outputs
+# Compiled GDExtension target outputs and build artifacts
 project/addons/directstorage_accelerator/bin/directstorage_accelerator.*
+project/addons/directstorage_accelerator/bin/*.lib
+
 
 # Godot runtime cache & imports
 .godot/

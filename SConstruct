@@ -49,4 +49,16 @@ library = env.SharedLibrary(
     source=sources,
 )
 
-Default(library)
+targets = [library]
+
+# Copy DirectStorage runtime redistributable DLLs into output directory on Windows
+if env["platform"] == "windows":
+    ds_dlls = [
+        "thirdparty/directstorage/bin/x64/dstorage.dll",
+        "thirdparty/directstorage/bin/x64/dstoragecore.dll",
+    ]
+    installed_dlls = env.Install(output_dir, ds_dlls)
+    targets.append(installed_dlls)
+
+Default(targets)
+
