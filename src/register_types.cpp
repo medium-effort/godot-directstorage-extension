@@ -1,11 +1,19 @@
 #include "register_types.h"
 #include "core/ds_context.h"
+#include "core/ds_error_handler.h"
+#include "core/ds_profiler.h"
+#include "core/ds_request.h"
 
 #include <gdextension_interface.h>
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/core/defs.hpp>
 #include <godot_cpp/godot.hpp>
 
 using namespace godot;
+
+static DSContext *ds_context_singleton = nullptr;
+static DSErrorHandler *ds_error_handler_singleton = nullptr;
+static DSProfiler *ds_profiler_singleton = nullptr;
 
 void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
@@ -13,11 +21,48 @@ void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_lev
 	}
 
 	ClassDB::register_class<DSContext>();
+	ClassDB::register_class<DSRequest>();
+	ClassDB::register_class<DSErrorHandler>();
+	ClassDB::register_class<DSProfiler>();
+
+	ds_context_singleton = memnew(DSContext);
+	ds_error_handler_singleton = memnew(DSErrorHandler);
+	ds_profiler_singleton = memnew(DSProfiler);
+
+	Engine::get_singleton()->register_singleton("DSContext", DSContext::get_singleton());
+	Engine::get_singleton()->register_singleton("DSErrorHandler", DSErrorHandler::get_singleton());
+	Engine::get_singleton()->register_singleton("DSProfiler", DSProfiler::get_singleton());
 }
 
 void uninitialize_directstorage_accelerator_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
+	}
+
+	Engine *engine = Engine::get_singleton();
+	if (engine) {
+		if (engine->has_singleton("DSContext")) {
+			engine->unregister_singleton("DSContext");
+		}
+		if (engine->has_singleton("DSErrorHandler")) {
+			engine->unregister_singleton("DSErrorHandler");
+		}
+		if (engine->has_singleton("DSProfiler")) {
+			engine->unregister_singleton("DSProfiler");
+		}
+	}
+
+	if (ds_context_singleton) {
+		memdelete(ds_context_singleton);
+		ds_context_singleton = nullptr;
+	}
+	if (ds_error_handler_singleton) {
+		memdelete(ds_error_handler_singleton);
+		ds_error_handler_singleton = nullptr;
+	}
+	if (ds_profiler_singleton) {
+		memdelete(ds_profiler_singleton);
+		ds_profiler_singleton = nullptr;
 	}
 }
 

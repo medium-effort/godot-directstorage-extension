@@ -2,6 +2,7 @@
 /DirectStorageSample
 /mcp_tools
 
+
 # SCons build cache
 .sconsign.dblite
 .sconf_temp/
