@@ -1,3 +1,7 @@
 [submodule "thirdparty/libdeflate"]
 	path = thirdparty/libdeflate
-	url = https://github.com/ebiggers/libdeflate.git
+	url = https://github.com/NVIDIA/libdeflate.git
+[submodule "godot-cpp"]
+	path = godot-cpp
+	url = https://github.com/godotengine/godot-cpp.git
+

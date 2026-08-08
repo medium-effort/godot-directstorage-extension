@@ -2,6 +2,27 @@
 /DirectStorageSample
 /mcp_tools
 
+# SCons build cache
+.sconsign.dblite
+.sconf_temp/
+
+# C/C++ compiled objects & MSVC debug/intermediate build files
+*.obj
+*.o
+*.os
+*.pdb
+*.idb
+*.exp
+*.ilk
+*.lib
+
+# Compiled GDExtension target outputs
+project/addons/directstorage_accelerator/bin/directstorage_accelerator.*
+
+# Godot runtime cache & imports
+.godot/
+.import/
+
 # ==============================================================================
 # Local Tooling & Agent Metadata
 # ==============================================================================
