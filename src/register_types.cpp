@@ -5,6 +5,8 @@
 #include "core/ds_error_handler.h"
 #include "core/ds_profiler.h"
 #include "core/ds_request.h"
+#include "formats/dspkg_format.h"
+#include "formats/dstex_format.h"
 
 #include <gdextension_interface.h>
 #include <godot_cpp/classes/engine.hpp>
@@ -28,6 +30,8 @@ void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_lev
 	ClassDB::register_class<DSProfiler>();
 	ClassDB::register_class<GDeflateCompressor>();
 	ClassDB::register_class<GDeflateDecompressor>();
+	ClassDB::register_class<DSTex>();
+	ClassDB::register_class<DSPkg>();
 
 	ds_context_singleton = memnew(DSContext);
 	ds_error_handler_singleton = memnew(DSErrorHandler);
