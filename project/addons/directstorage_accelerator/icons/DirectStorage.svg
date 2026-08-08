@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Storage / Lightning NVMe Icon -->
+  <rect x="2" y="3" width="12" height="10" rx="1.5" fill="#478cbf" stroke="#335f80" stroke-width="1"/>
+  <line x1="4" y1="6" x2="8" y2="6" stroke="#ffffff" stroke-width="1.2" stroke-linecap="round"/>
+  <line x1="4" y1="8" x2="7" y2="8" stroke="#ffffff" stroke-width="1.2" stroke-linecap="round"/>
+  <line x1="4" y1="10" x2="9" y2="10" stroke="#ffffff" stroke-width="1.2" stroke-linecap="round"/>
+  <polygon points="12,5 9.5,9 11,9 10,12 13,8 11.5,8" fill="#ffe066"/>
+</svg>
