@@ -62,5 +62,71 @@ if env["platform"] == "windows":
     installed_dlls = env.Install(output_dir, ds_dlls)
     targets.append(installed_dlls)
 
+# Post-build action: generate build status manifest artifact (recording SUCCESS or FAILED)
+import json
+import datetime
+import subprocess
+import atexit
+import SCons.Script
+
+BUILD_START_TIME = datetime.datetime.now().astimezone()
+
+def write_build_manifest():
+    build_finish_time = datetime.datetime.now().astimezone()
+    duration_seconds = round((build_finish_time - BUILD_START_TIME).total_seconds(), 3)
+    manifest_path = os.path.join(output_dir, "build_manifest.json")
+    failures = SCons.Script.GetBuildFailures()
+
+    commit_hash = "unknown"
+    commit_short = "unknown"
+    commit_msg = ""
+    commit_date = ""
+    is_dirty = False
+
+    try:
+        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        commit_short = commit_hash[:7]
+        commit_msg = subprocess.check_output(["git", "log", "-1", "--pretty=%s"], text=True).strip()
+        commit_date = subprocess.check_output(["git", "log", "-1", "--pretty=%cI"], text=True).strip()
+        status_out = subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
+        is_dirty = len(status_out) > 0
+    except Exception:
+        pass
+
+    status = "FAILED" if failures else "SUCCESS"
+
+    manifest_data = {
+        "status": status,
+        "timestamps": {
+            "started_at": BUILD_START_TIME.isoformat(),
+            "finished_at": build_finish_time.isoformat(),
+            "duration_seconds": duration_seconds
+        },
+        "target": target_name,
+        "platform": env.get("platform", "unknown"),
+        "git": {
+            "commit": commit_hash,
+            "short_commit": commit_short,
+            "message": commit_msg,
+            "date": commit_date,
+            "dirty": is_dirty
+        }
+    }
+    if failures:
+        manifest_data["failures_count"] = len(failures)
+
+    try:
+        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest_data, f, indent=2)
+        print(f"[SCons] Updated build manifest ({status}): {manifest_path}")
+    except Exception as e:
+        print(f"[SCons] Failed to write build manifest: {e}")
+
+atexit.register(write_build_manifest)
+
+
 Default(targets)
+
+
 
