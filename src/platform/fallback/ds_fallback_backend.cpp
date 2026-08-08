@@ -73,7 +73,7 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 	}
 
 	if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE) {
-		PackedByteArray dest = p_request->get_destination_buffer();
+		PackedByteArray &dest = p_request->get_destination_buffer_ref();
 		if (dest.size() == 0) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
 			p_request->set_error_message("FallbackBackend: Destination buffer unallocated for GDeflate decompression.");

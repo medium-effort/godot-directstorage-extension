@@ -2,10 +2,24 @@
 #define DS_WIN32_BACKEND_H
 
 #include "../platform_backend.h"
+#include <godot_cpp/templates/vector.hpp>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <dstorage.h>
+#endif
 
 namespace godot {
 
 class Win32Backend : public PlatformBackend {
+private:
+#ifdef _WIN32
+	IDStorageFactory *factory = nullptr;
+	IDStorageQueue1 *memory_queue = nullptr;
+	HANDLE batch_event = nullptr;
+	Vector<Ref<DSRequest>> in_flight_requests;
+#endif
+
 public:
 	Win32Backend() = default;
 	~Win32Backend() override = default;

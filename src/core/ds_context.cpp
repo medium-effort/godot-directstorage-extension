@@ -86,44 +86,15 @@ bool DSContext::initialize_ds() {
 	}
 
 #ifdef _WIN32
-	// Step 1: Set Configuration
-	DSTORAGE_CONFIGURATION config = {};
-	config.DisableTelemetry = TRUE;
-	config.DisableGpuDecompression = disable_gpu_decompression;
-	config.DisableGpuDecompressionMetacommand = disable_gpu_decompression;
-
-	HRESULT hr = DStorageSetConfiguration(&config);
-	if (SUCCEEDED(hr)) {
-		hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
-	}
-
-	if (SUCCEEDED(hr) && factory) {
-		factory->SetDebugFlags(DSTORAGE_DEBUG_NONE);
-		factory->SetStagingBufferSize(staging_buffer_size_mb * 1024 * 1024);
-
-		DSTORAGE_QUEUE_DESC queueDesc = {};
-		queueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-		queueDesc.Capacity = queue_capacity;
-		queueDesc.Priority = DSTORAGE_PRIORITY_NORMAL;
-		queueDesc.Name = "DirectStorageMemoryQueue";
-		queueDesc.Device = nullptr;
-
-		hr = factory->CreateQueue(&queueDesc, IID_PPV_ARGS(&memory_queue));
-	}
-
-	if (SUCCEEDED(hr) && memory_queue) {
-		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
-		if (err_handler) {
-			err_handler->register_queue(memory_queue);
-		}
-
-		active_backend = memnew(Win32Backend);
-		active_backend->initialize();
+	active_backend = memnew(Win32Backend);
+	if (active_backend->initialize()) {
 		initialized = true;
 		UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with Win32Backend.");
 		return true;
 	} else {
-		UtilityFunctions::print("[DirectStorage] Win32 DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
+		memdelete(active_backend);
+		active_backend = nullptr;
+		UtilityFunctions::print("[DirectStorage] Win32DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
 	}
 #endif
 
@@ -146,24 +117,6 @@ void DSContext::shutdown_ds() {
 		active_backend = nullptr;
 	}
 
-#ifdef _WIN32
-	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
-	if (err_handler) {
-		err_handler->unregister_queue();
-	}
-
-	if (memory_queue) {
-		memory_queue->Close();
-		memory_queue->Release();
-		memory_queue = nullptr;
-	}
-
-	if (factory) {
-		factory->Release();
-		factory = nullptr;
-	}
-#endif
-
 	initialized = false;
 	UtilityFunctions::print("[DirectStorage] DirectStorage Context shut down.");
 }
@@ -177,50 +130,6 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("DirectStorage Context not initialized.");
 		return false;
-	}
-
-	if (active_backend->get_name() == "Win32DirectStorage") {
-#ifdef _WIN32
-		String path = p_request->get_file_path();
-		std::wstring wpath = path.utf8().get_data() ? std::wstring(path.wide_string().get_data()) : L"";
-
-		IDStorageFile *file = nullptr;
-		HRESULT hr = factory ? factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&file)) : E_FAIL;
-		if (FAILED(hr) || !file) {
-			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("Failed to open file for DirectStorage access.");
-			return false;
-		}
-
-		DSTORAGE_REQUEST request = {};
-		request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-		request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
-		request.Options.CompressionFormat = (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE)
-				? DSTORAGE_COMPRESSION_FORMAT_GDEFLATE
-				: DSTORAGE_COMPRESSION_FORMAT_NONE;
-
-		request.Source.File.Source = file;
-		request.Source.File.Offset = p_request->get_offset();
-		request.Source.File.Size = p_request->get_size();
-
-		PackedByteArray dest = p_request->get_destination_buffer();
-		if (dest.size() < p_request->get_size()) {
-			dest.resize(p_request->get_size());
-			p_request->set_destination_buffer(dest);
-		}
-
-		request.Destination.Memory.Buffer = dest.ptrw();
-		request.Destination.Memory.Size = p_request->get_size();
-		request.UncompressedSize = p_request->get_size();
-		request.CancellationTag = p_request->get_cancellation_tag();
-
-		memory_queue->EnqueueRequest(&request);
-		file->Close();
-		file->Release();
-
-		p_request->set_status(DSRequest::STATUS_SUBMITTED);
-		return true;
-#endif
 	}
 
 	return active_backend->enqueue_request(p_request);

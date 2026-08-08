@@ -54,6 +54,14 @@ PackedByteArray DSRequest::get_destination_buffer() const {
 	return destination_buffer;
 }
 
+PackedByteArray &DSRequest::get_destination_buffer_ref() {
+	return destination_buffer;
+}
+
+uint8_t *DSRequest::get_destination_buffer_ptrw() {
+	return destination_buffer.ptrw();
+}
+
 void DSRequest::set_status(Status p_status) {
 	status = p_status;
 }

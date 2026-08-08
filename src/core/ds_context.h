@@ -8,11 +8,6 @@
 #include "ds_request.h"
 #include "../platform/platform_backend.h"
 
-#ifdef _WIN32
-#include <windows.h>
-#include <dstorage.h>
-#endif
-
 namespace godot {
 
 class DSContext : public Object {
@@ -24,14 +19,9 @@ private:
 
 	uint32_t staging_buffer_size_mb = 32;
 	bool disable_gpu_decompression = false;
-	uint16_t queue_capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
+	uint16_t queue_capacity = 2000;
 
 	PlatformBackend *active_backend = nullptr;
-
-#ifdef _WIN32
-	IDStorageFactory *factory = nullptr;
-	IDStorageQueue *memory_queue = nullptr;
-#endif
 
 protected:
 	static void _bind_methods();

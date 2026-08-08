@@ -58,6 +58,8 @@ public:
 
 	void set_destination_buffer(const PackedByteArray &p_buffer);
 	PackedByteArray get_destination_buffer() const;
+	PackedByteArray &get_destination_buffer_ref();
+	uint8_t *get_destination_buffer_ptrw();
 
 	void set_status(Status p_status);
 	Status get_status() const;
