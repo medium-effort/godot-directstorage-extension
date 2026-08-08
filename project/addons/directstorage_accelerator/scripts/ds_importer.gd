@@ -47,11 +47,14 @@ func _get_option_visibility(path: String, option_name: StringName, options: Dict
 	return true
 
 func _import(source_file: String, save_path: String, options: Dictionary, platform_variants: Array[String], gen_files: Array[String]) -> Error:
-	var img := Image.new()
-	var err := img.load(source_file)
-	if err != OK:
-		push_error("[DirectStorage Importer] Failed to load source image: " + source_file)
-		return err
+	var global_path := ProjectSettings.globalize_path(source_file)
+	var img := Image.load_from_file(global_path)
+	if img == null or img.is_empty():
+		img = Image.new()
+		var err := img.load(source_file)
+		if err != OK:
+			push_error("[DirectStorage Importer] Failed to load source image: " + source_file)
+			return err
 
 	if not img.has_mipmaps():
 		img.generate_mipmaps()
@@ -78,5 +81,6 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		push_error("[DirectStorage Importer] Failed to write .dstex file to: " + out_file_path)
 		return write_err
 
+	gen_files.append(out_file_path)
 	print("[DirectStorage Importer] Imported ", source_file, " -> ", out_file_path, " (Level: ", compression_level, ")")
 	return OK

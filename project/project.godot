@@ -19,8 +19,9 @@ config/author="MediumEffort"
 
 [autoload]
 
-DSBatchManager="*res://addons/directstorage_accelerator/scripts/ds_batch_manager.gd"
+DSBatchManager="*uid://c3w3tb6oorh1f"
+_mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/directstorage_accelerator/plugin.cfg")
+enabled=PackedStringArray("res://addons/directstorage_accelerator/plugin.cfg", "res://addons/godot_ai/plugin.cfg")

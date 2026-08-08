@@ -3,6 +3,7 @@
 #include "../../core/ds_error_handler.h"
 #include "../../core/ds_profiler.h"
 
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -29,6 +30,12 @@ bool Win32Backend::initialize() {
 		return false;
 	}
 
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (ps) {
+		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
+		SetDllDirectoryW(reinterpret_cast<LPCWSTR>(bin_dir.utf16().get_data()));
+	}
+
 	uint32_t staging_mb = ctx->get_staging_buffer_size_mb();
 	bool disable_gpu = ctx->get_disable_gpu_decompression();
 	uint16_t capacity = ctx->get_queue_capacity();
@@ -38,8 +45,10 @@ bool Win32Backend::initialize() {
 	config.DisableGpuDecompression = disable_gpu;
 	config.DisableGpuDecompressionMetacommand = disable_gpu;
 
+	String step_name = "DStorageSetConfiguration";
 	HRESULT hr = DStorageSetConfiguration(&config);
 	if (SUCCEEDED(hr)) {
+		step_name = "DStorageGetFactory";
 		hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
 	}
 
@@ -54,6 +63,7 @@ bool Win32Backend::initialize() {
 		queueDesc.Name = "DirectStorageMemoryQueue";
 		queueDesc.Device = nullptr;
 
+		step_name = "CreateQueue";
 		hr = factory->CreateQueue(&queueDesc, IID_PPV_ARGS(&memory_queue));
 	}
 
@@ -67,7 +77,9 @@ bool Win32Backend::initialize() {
 		UtilityFunctions::print("[DirectStorage] Win32Backend DirectStorage Queue created successfully.");
 		return true;
 	} else {
-		UtilityFunctions::print("[DirectStorage] Win32Backend DirectStorage Queue creation failed.");
+		uint32_t u_hr = static_cast<uint32_t>(hr);
+		String hr_hex = String::num_uint64(u_hr, 16);
+		UtilityFunctions::print("[DirectStorage] Win32Backend DirectStorage " + step_name + " failed (HRESULT: 0x" + hr_hex + ").");
 		return false;
 	}
 #else

@@ -1,0 +1,17 @@
+[remap]
+
+importer="directstorage_texture"
+type="Texture2D"
+uid="uid://cx22typkah3gh"
+path="res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dstex"
+
+[deps]
+
+files=["res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dstex"]
+
+source_file="res://test_assets/test.png"
+dest_files=["res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dstex", "res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dstex"]
+
+[params]
+
+compression/level=1

@@ -126,6 +126,10 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request) {
 		return false;
 	}
 
+	if (!initialized) {
+		initialize_ds();
+	}
+
 	if (!initialized || !active_backend) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("DirectStorage Context not initialized.");

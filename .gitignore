@@ -26,6 +26,10 @@ project/addons/directstorage_accelerator/bin/build_manifest.json
 .godot/
 .import/
 
+
+/project/addons/godot_ai
+project/addons/directstorage_accelerator/bin/~*
+
 # ==============================================================================
 # Local Tooling & Agent Metadata
 # ==============================================================================

@@ -71,6 +71,12 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			if (cached.is_valid()) {
 				return cached;
 			}
+			if (!p_original_path.is_empty() && p_original_path != p_path) {
+				cached = cache->get_cached(p_original_path);
+				if (cached.is_valid()) {
+					return cached;
+				}
+			}
 		}
 	}
 
@@ -108,6 +114,10 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			return Variant();
 		}
 
+		if (!ds_ctx->is_initialized()) {
+			ds_ctx->initialize_ds();
+		}
+
 		ds_ctx->enqueue_request(req);
 		ds_ctx->flush_batch();
 
@@ -119,42 +129,10 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		PackedByteArray decompressed_data = req->get_destination_buffer();
 		Ref<Texture2D> result_texture;
 
-		RenderingServer *rs = RenderingServer::get_singleton();
-		RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
-
-		if (rd) {
-			Ref<RDTextureFormat> fmt;
-			fmt.instantiate();
-			fmt->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);
-			fmt->set_format(static_cast<RenderingDevice::DataFormat>(pixel_format));
-			fmt->set_width(width);
-			fmt->set_height(height);
-			fmt->set_depth(1);
-			fmt->set_array_layers(1);
-			fmt->set_mipmaps(mip_count);
-			fmt->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
-
-			Ref<RDTextureView> view;
-			view.instantiate();
-
-			TypedArray<PackedByteArray> data;
-			data.append(decompressed_data);
-
-			RID rd_rid = rd->texture_create(fmt, view, data);
-			if (rd_rid.is_valid()) {
-				Ref<Texture2DRD> tex_rd;
-				tex_rd.instantiate();
-				tex_rd->set_texture_rd_rid(rd_rid);
-				result_texture = tex_rd;
-			}
-		}
-
-		if (result_texture.is_null()) {
-			Image::Format img_fmt = static_cast<Image::Format>(DSTex::rd_format_to_godot_format(pixel_format));
-			Ref<Image> image = Image::create_from_data(width, height, mip_count > 1, img_fmt, decompressed_data);
-			if (image.is_valid() && !image->is_empty()) {
-				result_texture = ImageTexture::create_from_image(image);
-			}
+		Image::Format img_fmt = static_cast<Image::Format>(DSTex::rd_format_to_godot_format(pixel_format));
+		Ref<Image> image = Image::create_from_data(width, height, mip_count > 1, img_fmt, decompressed_data);
+		if (image.is_valid() && !image->is_empty()) {
+			result_texture = ImageTexture::create_from_image(image);
 		}
 
 		if (result_texture.is_valid()) {
@@ -162,6 +140,9 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 				DSTextureCache *cache = DSTextureCache::get_singleton();
 				if (cache) {
 					cache->store(p_path, result_texture);
+					if (!p_original_path.is_empty() && p_original_path != p_path) {
+						cache->store(p_original_path, result_texture);
+					}
 				}
 			}
 			return result_texture;
