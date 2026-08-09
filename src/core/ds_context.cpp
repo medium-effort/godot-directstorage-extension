@@ -2,7 +2,9 @@
 #include "ds_error_handler.h"
 #include "ds_profiler.h"
 #include "../platform/fallback/ds_fallback_backend.h"
+#ifdef _WIN32
 #include "../platform/win32/ds_win32_backend.h"
+#endif
 
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>

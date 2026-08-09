@@ -8,14 +8,17 @@ EnsurePythonVersion(3, 8)
 # Delegate environment initialization to godot-cpp/SConstruct
 env = SConscript("godot-cpp/SConstruct")
 
-# Add custom include paths for DirectStorage, GDeflate, libdeflate, and src
-env.Append(CPPPATH=[
+# Add cross-platform include paths. The DirectStorage SDK is Windows-only and
+# must not be visible to non-Windows toolchains.
+include_paths = [
     "src",
-    "thirdparty/directstorage/include",
     "thirdparty/gdeflate",
     "thirdparty/libdeflate",
     "thirdparty/libdeflate/lib",
-])
+]
+if env["platform"] == "windows":
+    include_paths.append("thirdparty/directstorage/include")
+env.Append(CPPPATH=include_paths)
 
 # Windows platform setup for DirectStorage SDK & MSVC compiler flags
 if env["platform"] == "windows":
@@ -32,15 +35,22 @@ if env["platform"] == "windows":
         # Suppress non-critical MSVC warnings in third-party libdeflate C code
         env.Append(CCFLAGS=["/wd4244", "/wd4127", "/wd4267", "/wd4100", "/wd4245", "/wd4456", "/wd4018", "/wd4146", "/wd4310"])
 
-# Source files (GDExtension C++ code + GDeflate & libdeflate sources)
+# Source files (GDExtension C++ code + GDeflate & libdeflate sources).
+# Keep the Windows backend out of non-Windows builds; its implementation uses
+# Win32 and DirectStorage APIs that are not available on those platforms.
 sources = (
     Glob("src/*.cpp") +
-    Glob("src/*/*.cpp") +
-    Glob("src/*/*/*.cpp") +
+    Glob("src/core/*.cpp") +
+    Glob("src/compression/*.cpp") +
+    Glob("src/formats/*.cpp") +
+    Glob("src/integration/*.cpp") +
+    Glob("src/platform/fallback/*.cpp") +
     Glob("thirdparty/gdeflate/*.cpp") +
     Glob("thirdparty/libdeflate/lib/*.c") +
     Glob("thirdparty/libdeflate/lib/x86/*.c")
 )
+if env["platform"] == "windows":
+    sources += Glob("src/platform/win32/*.cpp")
 
 
 output_dir = "project/addons/directstorage_accelerator/bin/"
@@ -206,6 +216,5 @@ atexit.register(write_build_manifest)
 
 
 Default(targets)
-
 
 

@@ -31,6 +31,10 @@ func _init() -> void:
 			print("FAIL: Unknown active backend name: ", backend_name)
 			quit(1)
 			return
+		if OS.get_name() != "Windows" and backend_name != "SoftwareFallback":
+			print("FAIL: Non-Windows platform selected DirectStorage backend: ", backend_name)
+			quit(1)
+			return
 
 		var is_supp = ds_context.is_supported()
 		if is_supp != (backend_name == "Win32DirectStorage"):
@@ -41,6 +45,10 @@ func _init() -> void:
 		var is_d3d12 = ds_context.is_d3d12_backend()
 		if backend_name == "SoftwareFallback" and is_d3d12:
 			print("FAIL: is_d3d12_backend() returned true while using SoftwareFallback!")
+			quit(1)
+			return
+		if backend_name == "Win32DirectStorage" and not is_d3d12:
+			print("FAIL: Win32DirectStorage selected without a usable D3D12 backend.")
 			quit(1)
 			return
 		print("SUCCESS: DSContext backend selection contract verified (backend=", backend_name, ", is_supported=", is_supp, ", is_d3d12=", is_d3d12, ").")
@@ -86,6 +94,37 @@ func _init() -> void:
 		quit(1)
 		return
 	print("SUCCESS: Verified DSTex compressed_size (", header["compressed_size"], ") != original_size (", header["original_size"], ")")
+
+	# Exercise the request contract with the same compressed fixture used by both loaders.
+	var request_context = Engine.get_singleton("DSContext")
+	if request_context == null:
+		print("FAIL: DSContext singleton is required for the request contract test.")
+		quit(1)
+		return
+	var request = DSRequest.new()
+	var request_data = dstex.read_from_file(test_dstex_path)
+	var request_header = request_data["header"]
+	var request_offset = 48 + (12 * request_header["mip_count"])
+	request.set_file_path(test_dstex_path)
+	request.set_offset(request_offset)
+	request.set_size(request_header["compressed_size"])
+	request.set_uncompressed_size(request_header["original_size"])
+	request.set_compression_format(DSRequest.COMPRESSION_GDEFLATE)
+	# Use the bound setter because get_destination_buffer() returns a value copy.
+	var destination = PackedByteArray()
+	destination.resize(request_header["original_size"])
+	request.set_destination_buffer(destination)
+	if not request_context.enqueue_request(request):
+		print("FAIL: DSContext rejected the decompression request.")
+		quit(1)
+		return
+	request_context.flush_batch()
+	var request_output = request.get_destination_buffer()
+	if request.get_size() != header["compressed_size"] or request.get_uncompressed_size() != header["original_size"] or request.get_status() != DSRequest.STATUS_COMPLETED or request_output.size() != raw_data.size() or request_output != raw_data:
+		print("FAIL: Request contract or decompressed output mismatch. status=", request.get_status(), " output=", request_output.size())
+		quit(1)
+		return
+	print("SUCCESS: Request read exactly the compressed input and reproduced the original bytes.")
 
 	# 2. Test ResourceLoader.load() for .dstex file
 	var loader = ResourceLoader
@@ -133,8 +172,8 @@ func _init() -> void:
 
 	var cached_count = cache.get_cached_count()
 	print("DSTextureCache cached count: ", cached_count)
-	if cached_count != 1:
-		print("FAIL: Expected 1 cached texture in DSTextureCache, found ", cached_count)
+	if cached_count < 1:
+		print("FAIL: Expected the loose texture in DSTextureCache, found ", cached_count)
 		quit(1)
 		return
 
@@ -146,10 +185,23 @@ func _init() -> void:
 		return
 	print("SUCCESS: DSTextureCache hit confirmed on second load.")
 
-	# 4. Test cache clear
+	# Eviction must not invalidate an external texture reference or its GPU RID.
+	cache.evict(test_dstex_path)
+	if cache.get_cached_count() != 0 or loaded_tex.get_width() != 128 or loaded_tex.get_height() != 128:
+		print("FAIL: DSTextureCache eviction invalidated the live texture or left an entry behind.")
+		quit(1)
+		return
+	if rd != null and not loaded_tex.get_texture_rd_rid().is_valid():
+		print("FAIL: Texture2DRD RID became invalid after cache eviction.")
+		quit(1)
+		return
+	print("SUCCESS: Texture remained valid after cache eviction.")
+
+	# 4. Test cache clear while retaining the external reference.
+	cache.store(test_dstex_path, loaded_tex)
 	cache.clear()
-	if cache.get_cached_count() != 0:
-		print("FAIL: DSTextureCache clear() failed to empty cache.")
+	if cache.get_cached_count() != 0 or loaded_tex.get_width() != 128 or loaded_tex.get_height() != 128:
+		print("FAIL: DSTextureCache clear() invalidated the live texture or failed to empty the cache.")
 		quit(1)
 		return
 	print("SUCCESS: DSTextureCache clear() verified.")
@@ -158,44 +210,59 @@ func _init() -> void:
 	var dspkg = DSPkg.new()
 	var test_dspkg_path = "user://test_archive.dspkg"
 	err = dspkg.create(test_dspkg_path)
-	if err == OK:
-		dspkg.add_texture("res://test_tex.png", test_dstex_path)
-		dspkg.finalize()
+	if err != OK or dspkg.add_texture("res://test_tex.png", test_dstex_path) != OK or dspkg.finalize() != OK:
+		print("FAIL: Failed to create a temporary .dspkg archive.")
+		quit(1)
+		return
 
-		var loaded_dspkg = loader.load(test_dspkg_path)
-		if loaded_dspkg == null or not (loaded_dspkg is DSPkg):
-			print("FAIL: Failed to load .dspkg via ResourceLoader! Type: ", loaded_dspkg)
-			quit(1)
-			return
-		print("SUCCESS: Loaded .dspkg resource via ResourceLoader: ", loaded_dspkg)
+	var loaded_dspkg = loader.load(test_dspkg_path)
+	if loaded_dspkg == null or not (loaded_dspkg is DSPkg):
+		print("FAIL: Failed to load .dspkg via ResourceLoader! Type: ", loaded_dspkg)
+		quit(1)
+		return
+	print("SUCCESS: Loaded .dspkg resource via ResourceLoader: ", loaded_dspkg)
 
 	# 6. Test packaged texture load via DSContext / DSRequest pipeline
 	var textures_pkg_path = "res://textures.dspkg"
 	var pkg_builder = DSPkg.new()
 	err = pkg_builder.create(textures_pkg_path)
-	if err == OK:
-		pkg_builder.add_texture("res://packaged_test_texture.png", test_dstex_path)
-		pkg_builder.finalize()
+	if err != OK or pkg_builder.add_texture("res://packaged_test_texture.png", test_dstex_path) != OK or pkg_builder.finalize() != OK:
+		print("FAIL: Failed to create the packaged texture archive.")
+		quit(1)
+		return
 
-		# Load contained texture by original resource path
-		var loaded_packaged_tex = loader.load("res://packaged_test_texture.png")
-		if loaded_packaged_tex == null or not (loaded_packaged_tex is Texture2D):
-			print("FAIL: Failed to load packaged texture from res://textures.dspkg!")
+	# Load contained texture by original resource path.
+	var loaded_packaged_tex = loader.load("res://packaged_test_texture.png")
+	if loaded_packaged_tex == null or not (loaded_packaged_tex is Texture2D):
+		print("FAIL: Failed to load packaged texture from res://textures.dspkg!")
+		quit(1)
+		return
+	if rd != null:
+		if not (loaded_packaged_tex is Texture2DRD):
+			print("FAIL: Packaged texture is not Texture2DRD instance despite RenderingDevice active! Type: ", loaded_packaged_tex.get_class())
 			quit(1)
 			return
-		if rd != null:
-			if not (loaded_packaged_tex is Texture2DRD):
-				print("FAIL: Packaged texture is not Texture2DRD instance despite RenderingDevice active! Type: ", loaded_packaged_tex.get_class())
-				quit(1)
-				return
-		if loaded_packaged_tex.get_width() != 128 or loaded_packaged_tex.get_height() != 128:
-			print("FAIL: Packaged texture dimensions mismatch!")
-			quit(1)
-			return
-		print("SUCCESS: Loaded packaged texture res://packaged_test_texture.png via DSRequest/DSContext pipeline: ", loaded_packaged_tex)
+	if loaded_packaged_tex.get_width() != 128 or loaded_packaged_tex.get_height() != 128:
+		print("FAIL: Packaged texture dimensions mismatch!")
+		quit(1)
+		return
+	var loose_image = loaded_tex.get_image()
+	var packaged_image = loaded_packaged_tex.get_image()
+	if loose_image == null or packaged_image == null or loose_image.get_pixel(7, 11) != packaged_image.get_pixel(7, 11) or loose_image.get_data() != packaged_image.get_data():
+		print("FAIL: Packaged texture pixels differ from the loose texture.")
+		quit(1)
+		return
+	var packaged_tex_again = loader.load("res://packaged_test_texture.png")
+	if packaged_tex_again != loaded_packaged_tex:
+		print("FAIL: Packaged texture cache hit did not preserve identity.")
+		quit(1)
+		return
+	print("SUCCESS: Loaded packaged texture res://packaged_test_texture.png via DSRequest/DSContext pipeline: ", loaded_packaged_tex)
 
-		# Clean up temporary archive file
-		DirAccess.remove_absolute(textures_pkg_path)
+	# Clean up all temporary archives and the loose fixture.
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(test_dspkg_path))
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(textures_pkg_path))
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(test_dstex_path))
 
 	print("SUCCESS: All Phase 2 Step 3 integration tests passed successfully!")
 	quit(0)

@@ -3,7 +3,7 @@ extends SceneTree
 
 func _init():
 	print("[TestManifest] Starting GDExtension manifest validation...")
-	
+
 	var candidates = [
 		"res://addons/directstorage_accelerator/directstorage_accelerator.gdextension",
 		"project/addons/directstorage_accelerator/directstorage_accelerator.gdextension"
@@ -53,7 +53,7 @@ func _init():
 			quit(1)
 			return
 
-	# Validate libraries keys
+	# Validate library declarations for the platform and target currently running.
 	var lib_keys = sections["libraries"].keys()
 	print("[TestManifest] Declared library targets: ", lib_keys)
 
@@ -62,14 +62,39 @@ func _init():
 		quit(1)
 		return
 
-	# Verify declared library files exist on disk
+	var platform_name = {
+		"Windows": "windows",
+		"Linux": "linux",
+		"macOS": "macos"
+	}.get(OS.get_name(), "")
+	if platform_name.is_empty():
+		printerr("[TestManifest] FAILED: Unsupported test platform: ", OS.get_name())
+		quit(1)
+		return
+
+	var target_name = "release" if OS.has_feature("template_release") else "debug"
+	var target_prefix = platform_name + "." + target_name + "."
+	var target_key = platform_name + "." + target_name
+	var active_library_count = 0
+
+	# Verify only artifacts for the active build target. Other target/platform
+	# artifacts are produced by their corresponding release build job.
 	for k in lib_keys:
+		var key_str = String(k)
+		if key_str != target_key and not key_str.begins_with(target_prefix):
+			continue
+		active_library_count += 1
 		var rel_path = sections["libraries"][k].strip_edges().trim_prefix("\"").trim_suffix("\"")
 		var full_path = "res://addons/directstorage_accelerator/" + rel_path
 		if not FileAccess.file_exists(full_path):
 			printerr("[TestManifest] FAILED: Declared library binary file does not exist on disk: ", full_path)
 			quit(1)
 			return
+
+	if active_library_count == 0:
+		printerr("[TestManifest] FAILED: No library entry declared for active target: ", target_prefix)
+		quit(1)
+		return
 
 	# Validate dependencies keys (must be Windows only)
 	var dep_keys = sections["dependencies"].keys()
@@ -82,6 +107,12 @@ func _init():
 			quit(1)
 			return
 
+	for k in lib_keys:
+		var key_str = String(k)
+		if (key_str.begins_with("linux.") or key_str.begins_with("macos.")) and sections["dependencies"].has(k):
+			printerr("[TestManifest] FAILED: Non-Windows library target has a dependency entry: ", key_str)
+			quit(1)
+			return
+
 	print("[TestManifest] SUCCESS: Manifest structural validation passed!")
 	quit(0)
-

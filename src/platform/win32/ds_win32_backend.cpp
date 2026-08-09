@@ -4,6 +4,8 @@
 #include "../../core/ds_profiler.h"
 
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/rendering_device.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -25,6 +27,100 @@ struct DS_BYPASSIO_OUTPUT {
 	uint32_t VolumeDriverState;
 	uint32_t StorageDriverState;
 };
+
+#ifdef _WIN32
+struct DSRuntimeProbe {
+	bool available = false;
+	String reason;
+};
+
+static void unload_runtime_modules(HMODULE p_core, HMODULE p_dstorage) {
+	if (p_dstorage) {
+		FreeLibrary(p_dstorage);
+	}
+	if (p_core) {
+		FreeLibrary(p_core);
+	}
+}
+
+struct DllDirectoryScope {
+	wchar_t previous[MAX_PATH] = {0};
+	bool had_previous = false;
+
+	DllDirectoryScope() {
+		had_previous = GetDllDirectoryW(MAX_PATH, previous) > 0;
+	}
+
+	~DllDirectoryScope() {
+		SetDllDirectoryW(had_previous ? previous : nullptr);
+	}
+};
+
+static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_capacity) {
+	DSRuntimeProbe result;
+	HMODULE core = nullptr;
+	HMODULE dstorage = nullptr;
+	String core_path = p_bin_dir + String("/dstoragecore.dll");
+	String dstorage_path = p_bin_dir + String("/dstorage.dll");
+	std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(p_bin_dir.utf16().get_data()));
+	std::wstring w_core_path(reinterpret_cast<const wchar_t *>(core_path.utf16().get_data()));
+	std::wstring w_dstorage_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
+
+	DllDirectoryScope dll_directory_scope;
+	SetDllDirectoryW(w_bin_dir.c_str());
+	core = LoadLibraryW(w_core_path.c_str());
+	if (!core) {
+		result.reason = "DirectStorage runtime DLL 'dstoragecore.dll' could not be loaded from '" + p_bin_dir + "'.";
+		return result;
+	}
+	dstorage = LoadLibraryW(w_dstorage_path.c_str());
+	if (!dstorage) {
+		result.reason = "DirectStorage runtime DLL 'dstorage.dll' could not be loaded from '" + p_bin_dir + "'.";
+		unload_runtime_modules(core, nullptr);
+		return result;
+	}
+
+	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	uint64_t device_handle = rd ? rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0) : 0;
+	if (!rd || device_handle == 0) {
+		result.reason = "A usable D3D12 RenderingDevice is not active.";
+		unload_runtime_modules(core, dstorage);
+		return result;
+	}
+
+	IDStorageFactory *probe_factory = nullptr;
+	HRESULT hr = DStorageGetFactory(IID_PPV_ARGS(&probe_factory));
+	if (FAILED(hr) || !probe_factory) {
+		result.reason = "DStorageGetFactory failed (HRESULT: 0x" + String::num_uint64(static_cast<uint32_t>(hr), 16) + ").";
+		unload_runtime_modules(core, dstorage);
+		return result;
+	}
+
+	DSTORAGE_QUEUE_DESC queue_desc = {};
+	queue_desc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+	queue_desc.Capacity = p_queue_capacity;
+	queue_desc.Priority = DSTORAGE_PRIORITY_NORMAL;
+	queue_desc.Name = "DirectStorageCapabilityProbe";
+	queue_desc.Device = reinterpret_cast<ID3D12Device *>(device_handle);
+	IDStorageQueue1 *probe_queue = nullptr;
+	hr = probe_factory->CreateQueue(&queue_desc, IID_PPV_ARGS(&probe_queue));
+	if (FAILED(hr) || !probe_queue) {
+		result.reason = "DirectStorage queue creation failed (HRESULT: 0x" + String::num_uint64(static_cast<uint32_t>(hr), 16) + ").";
+		probe_factory->Release();
+		unload_runtime_modules(core, dstorage);
+		return result;
+	}
+
+	probe_queue->Close();
+	probe_queue->Release();
+	probe_factory->Release();
+	unload_runtime_modules(core, dstorage);
+	result.available = true;
+	result.reason = "DirectStorage runtime, D3D12 device, factory, and queue are available.";
+	return result;
+}
+#endif
 
 Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	Dictionary res;
@@ -165,27 +261,21 @@ bool Win32Backend::is_available() const {
 #ifdef _WIN32
 	Dictionary drive_info = get_drive_info_for_path("res://");
 	if (!drive_info.get("directstorage_supported", false)) {
+		UtilityFunctions::print("[DirectStorage] Backend unavailable: " + String(drive_info["reason"]));
 		return false;
 	}
 
 	ProjectSettings *ps = ProjectSettings::get_singleton();
-	if (ps) {
-		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
-		String dstoragecore_path = bin_dir + "/dstoragecore.dll";
-		String dstorage_path = bin_dir + "/dstorage.dll";
-
-		std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(bin_dir.utf16().get_data()));
-		std::wstring w_core_path(reinterpret_cast<const wchar_t *>(dstoragecore_path.utf16().get_data()));
-		std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
-
-		SetDllDirectoryW(w_bin_dir.c_str());
-		HMODULE h_core = LoadLibraryW(w_core_path.c_str());
-		HMODULE h_ds = LoadLibraryW(w_ds_path.c_str());
-		if (!h_core || !h_ds) {
-			return false;
-		}
+	if (!ps) {
+		UtilityFunctions::print("[DirectStorage] Backend unavailable: ProjectSettings is not initialized.");
+		return false;
 	}
-	return true;
+
+	DSRuntimeProbe probe = probe_runtime(ps->globalize_path("res://addons/directstorage_accelerator/bin"), 2000);
+	if (!probe.available) {
+		UtilityFunctions::print("[DirectStorage] Backend unavailable: " + probe.reason);
+	}
+	return probe.available;
 #else
 	return false;
 #endif
@@ -209,8 +299,18 @@ bool Win32Backend::initialize() {
 	}
 
 	ProjectSettings *ps = ProjectSettings::get_singleton();
-	if (ps) {
+	if (!ps) {
+		UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: ProjectSettings is not initialized.");
+		return false;
+	}
+	{
 		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
+		uint16_t capacity = ctx->get_queue_capacity();
+		DSRuntimeProbe probe = probe_runtime(bin_dir, capacity);
+		if (!probe.available) {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: " + probe.reason);
+			return false;
+		}
 		String dstoragecore_path = bin_dir + "/dstoragecore.dll";
 		String dstorage_path = bin_dir + "/dstorage.dll";
 
@@ -219,10 +319,13 @@ bool Win32Backend::initialize() {
 		std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
 
 		SetDllDirectoryW(w_bin_dir.c_str());
-		HMODULE h_core = LoadLibraryW(w_core_path.c_str());
-		HMODULE h_ds = LoadLibraryW(w_ds_path.c_str());
-		if (!h_core || !h_ds) {
+		dstoragecore_module = LoadLibraryW(w_core_path.c_str());
+		dstorage_module = LoadLibraryW(w_ds_path.c_str());
+		if (!dstoragecore_module || !dstorage_module) {
 			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLLs could not be loaded from '" + bin_dir + "'.");
+			unload_runtime_modules(dstoragecore_module, dstorage_module);
+			dstoragecore_module = nullptr;
+			dstorage_module = nullptr;
 			return false;
 		}
 	}
@@ -251,7 +354,14 @@ bool Win32Backend::initialize() {
 		queueDesc.Capacity = capacity;
 		queueDesc.Priority = DSTORAGE_PRIORITY_NORMAL;
 		queueDesc.Name = "DirectStorageMemoryQueue";
-		queueDesc.Device = nullptr;
+		RenderingServer *rs = RenderingServer::get_singleton();
+		RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+		uint64_t device_handle = rd ? rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0) : 0;
+		if (!rd || device_handle == 0) {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: A usable D3D12 RenderingDevice is not active.");
+			return false;
+		}
+		queueDesc.Device = reinterpret_cast<ID3D12Device *>(device_handle);
 
 		step_name = "CreateQueue";
 		hr = factory->CreateQueue(&queueDesc, IID_PPV_ARGS(&memory_queue));
@@ -308,6 +418,9 @@ void Win32Backend::shutdown() {
 	}
 	open_files.clear();
 	in_flight_requests.clear();
+	unload_runtime_modules(dstoragecore_module, dstorage_module);
+	dstoragecore_module = nullptr;
+	dstorage_module = nullptr;
 #endif
 }
 

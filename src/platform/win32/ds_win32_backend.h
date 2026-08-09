@@ -17,13 +17,15 @@ private:
 	IDStorageFactory *factory = nullptr;
 	IDStorageQueue1 *memory_queue = nullptr;
 	HANDLE batch_event = nullptr;
+	HMODULE dstoragecore_module = nullptr;
+	HMODULE dstorage_module = nullptr;
 	Vector<Ref<DSRequest>> in_flight_requests;
 	Vector<IDStorageFile *> open_files;
 #endif
 
 public:
 	Win32Backend() = default;
-	~Win32Backend() override = default;
+	~Win32Backend() override { shutdown(); }
 
 	bool is_available() const override;
 	String get_name() const override;

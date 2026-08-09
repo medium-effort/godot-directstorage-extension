@@ -5,6 +5,44 @@
 
 namespace godot {
 
+namespace {
+
+constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE = 50;
+constexpr uint64_t DSPKG_ENTRY_PREFIX_SIZE = 10;
+constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE = 40;
+constexpr uint64_t DSPKG_MAX_PAYLOAD_SIZE = static_cast<uint64_t>(INT32_MAX);
+
+bool checked_add(uint64_t p_left, uint64_t p_right, uint64_t &r_result) {
+	if (p_right > UINT64_MAX - p_left) {
+		return false;
+	}
+	r_result = p_left + p_right;
+	return true;
+}
+
+bool checked_multiply(uint64_t p_left, uint64_t p_right, uint64_t &r_result) {
+	if (p_left != 0 && p_right > UINT64_MAX / p_left) {
+		return false;
+	}
+	r_result = p_left * p_right;
+	return true;
+}
+
+bool range_is_within(uint64_t p_start, uint64_t p_size, uint64_t p_end) {
+	return p_start <= p_end && p_size <= p_end - p_start;
+}
+
+bool get_payload_range(const DSPkgHeader &p_header, const DSPkgEntry &p_entry, uint64_t &r_start, uint64_t &r_end) {
+	return checked_add(p_header.data_offset, p_entry.data_offset, r_start) && checked_add(r_start, p_entry.compressed_size, r_end);
+}
+
+bool payload_sizes_are_supported(const DSPkgEntry &p_entry) {
+	return p_entry.compressed_size > 0 && p_entry.original_size > 0 &&
+			p_entry.compressed_size <= DSPKG_MAX_PAYLOAD_SIZE && p_entry.original_size <= DSPKG_MAX_PAYLOAD_SIZE;
+}
+
+} // namespace
+
 void DSPkg::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("create", "output_path"), &DSPkg::create);
 	ClassDB::bind_method(D_METHOD("add_texture", "resource_path", "dstex_path"), &DSPkg::add_texture);
@@ -74,11 +112,23 @@ Error DSPkg::finalize() {
 		Dictionary item = staging_entries[i];
 		String res_path = item["resource_path"];
 		CharString utf8_path = res_path.utf8();
+		if (utf8_path.length() > UINT16_MAX) {
+			UtilityFunctions::push_error("DSPkg: Resource path is too long to store in archive.");
+			return ERR_INVALID_PARAMETER;
+		}
 		uint16_t path_len = static_cast<uint16_t>(utf8_path.length());
-		entry_table_size += (8 + 2 + path_len + 8 + 8 + 8 + 4 + 4 + 4 + 4);
+		uint64_t entry_size = 0;
+		if (!checked_add(DSPKG_FIXED_ENTRY_SIZE, path_len, entry_size) || !checked_add(entry_table_size, entry_size, entry_table_size)) {
+			UtilityFunctions::push_error("DSPkg: Entry table size overflow.");
+			return ERR_INVALID_PARAMETER;
+		}
 	}
 
-	uint64_t total_data_offset = header_size + entry_table_size;
+	uint64_t total_data_offset = 0;
+	if (!checked_add(header_size, entry_table_size, total_data_offset)) {
+		UtilityFunctions::push_error("DSPkg: Archive header and entry table size overflow.");
+		return ERR_INVALID_PARAMETER;
+	}
 
 	Ref<FileAccess> file = FileAccess::open(build_output_path, FileAccess::WRITE);
 	if (file.is_null() || !file->is_open()) {
@@ -150,6 +200,7 @@ Error DSPkg::open(const String &p_path) {
 	entries_by_hash.clear();
 	is_opened = false;
 	opened_path = "";
+	loaded_header = DSPkgHeader{};
 
 	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ);
 	if (file.is_null() || !file->is_open()) {
@@ -157,90 +208,86 @@ Error DSPkg::open(const String &p_path) {
 		return FileAccess::get_open_error();
 	}
 
+	auto fail = [&](Error p_error, const String &p_message) -> Error {
+		entries_by_path.clear();
+		entries_by_hash.clear();
+		is_opened = false;
+		opened_path = "";
+		loaded_header = DSPkgHeader{};
+		file->close();
+		UtilityFunctions::push_error("DSPkg: ", p_message);
+		return p_error;
+	};
+
 	uint64_t file_len = file->get_length();
 
 	if (file_len < sizeof(DSPkgHeader)) {
-		UtilityFunctions::push_error("DSPkg: Archive file too small for header (length: ", file_len, ", expected: ", sizeof(DSPkgHeader), ")");
-		return ERR_FILE_CORRUPT;
+		return fail(ERR_FILE_CORRUPT, "Archive file too small for header.");
 	}
 
 	PackedByteArray header_bytes = file->get_buffer(sizeof(DSPkgHeader));
 	if (header_bytes.size() < sizeof(DSPkgHeader)) {
-		UtilityFunctions::push_error("DSPkg: Failed to read complete header bytes.");
-		return ERR_FILE_CORRUPT;
+		return fail(ERR_FILE_CORRUPT, "Failed to read complete header bytes.");
 	}
 	memcpy(&loaded_header, header_bytes.ptr(), sizeof(DSPkgHeader));
 
 	if (loaded_header.magic != 0x474B5044) {
-		UtilityFunctions::push_error("DSPkg: Invalid magic number in archive.");
-		return ERR_FILE_UNRECOGNIZED;
+		return fail(ERR_FILE_UNRECOGNIZED, "Invalid magic number in archive.");
 	}
 
 	if (loaded_header.version != 1) {
-		UtilityFunctions::push_error("DSPkg: Unsupported archive version: ", loaded_header.version);
-		return ERR_FILE_UNRECOGNIZED;
+		return fail(ERR_FILE_UNRECOGNIZED, "Unsupported archive version.");
 	}
 
 	if (loaded_header.flags != 0 || loaded_header.reserved != 0) {
-		UtilityFunctions::push_error("DSPkg: Invalid flags or reserved fields in header.");
-		return ERR_FILE_CORRUPT;
+		return fail(ERR_FILE_CORRUPT, "Invalid flags or reserved fields in header.");
 	}
 
-	const uint64_t MIN_ENTRY_SIZE = 50;
 	uint64_t entry_count = loaded_header.entry_count;
-
-	if (entry_count > 0 && entry_count > (UINT64_MAX - sizeof(DSPkgHeader)) / MIN_ENTRY_SIZE) {
-		UtilityFunctions::push_error("DSPkg: Oversized entry_count in header: ", entry_count);
-		return ERR_FILE_CORRUPT;
+	uint64_t min_table_size = 0;
+	uint64_t min_data_offset = 0;
+	if (!checked_multiply(entry_count, DSPKG_FIXED_ENTRY_SIZE, min_table_size) ||
+			!checked_add(sizeof(DSPkgHeader), min_table_size, min_data_offset)) {
+		return fail(ERR_FILE_CORRUPT, "Entry table size overflow.");
 	}
-
-	uint64_t min_table_size = entry_count * MIN_ENTRY_SIZE;
-	uint64_t min_data_offset = sizeof(DSPkgHeader) + min_table_size;
 
 	if (file_len < min_data_offset) {
-		UtilityFunctions::push_error("DSPkg: Archive truncated for declared entry count.");
-		return ERR_FILE_CORRUPT;
+		return fail(ERR_FILE_CORRUPT, "Archive truncated for declared entry count.");
 	}
 
 	if (loaded_header.data_offset < min_data_offset || loaded_header.data_offset > file_len) {
-		UtilityFunctions::push_error("DSPkg: Invalid data_offset (", loaded_header.data_offset, ") in header.");
-		return ERR_FILE_CORRUPT;
+		return fail(ERR_FILE_CORRUPT, "Invalid data_offset in header.");
 	}
 
 	uint64_t current_pos = sizeof(DSPkgHeader);
 
 	for (uint32_t i = 0; i < loaded_header.entry_count; ++i) {
-		if (current_pos + 10 > loaded_header.data_offset) {
-			UtilityFunctions::push_error("DSPkg: Entry ", i, " header extends past archive data_offset.");
-			entries_by_path.clear();
-			entries_by_hash.clear();
-			return ERR_FILE_CORRUPT;
+		if (!range_is_within(current_pos, DSPKG_ENTRY_PREFIX_SIZE, loaded_header.data_offset)) {
+			return fail(ERR_FILE_CORRUPT, "Entry header extends past archive data_offset.");
 		}
 
 		DSPkgEntry entry;
 		entry.path_hash = file->get_64();
 		uint16_t path_len = file->get_16();
-		current_pos += 10;
-
-		if (path_len > (loaded_header.data_offset - current_pos) || (current_pos + path_len + 40) > loaded_header.data_offset) {
-			UtilityFunctions::push_error("DSPkg: Entry ", i, " path or fields extend past archive data_offset.");
-			entries_by_path.clear();
-			entries_by_hash.clear();
-			return ERR_FILE_CORRUPT;
+		if (!checked_add(current_pos, DSPKG_ENTRY_PREFIX_SIZE, current_pos)) {
+			return fail(ERR_FILE_CORRUPT, "Entry header offset overflow.");
 		}
 
-		if (path_len > 0) {
-			PackedByteArray path_bytes = file->get_buffer(path_len);
-			if (path_bytes.size() < path_len) {
-				UtilityFunctions::push_error("DSPkg: Failed to read path bytes for entry ", i);
-				entries_by_path.clear();
-				entries_by_hash.clear();
-				return ERR_FILE_CORRUPT;
-			}
-			String path_str = String::utf8(reinterpret_cast<const char *>(path_bytes.ptr()), path_len);
-			entry.path = path_str;
+		if (path_len == 0 || !range_is_within(current_pos, path_len, loaded_header.data_offset)) {
+			return fail(ERR_FILE_CORRUPT, "Entry path extends past archive data_offset or is empty.");
 		}
-		current_pos += path_len;
+
+		uint64_t path_end = 0;
+		if (!checked_add(current_pos, path_len, path_end) || !range_is_within(path_end, DSPKG_ENTRY_FIELDS_SIZE, loaded_header.data_offset)) {
+			return fail(ERR_FILE_CORRUPT, "Entry path or fixed fields extend past archive data_offset.");
+		}
+
+		PackedByteArray path_bytes = file->get_buffer(path_len);
+		if (path_bytes.size() < path_len) {
+			return fail(ERR_FILE_CORRUPT, "Failed to read complete entry path.");
+		}
+		entry.path = String::utf8(reinterpret_cast<const char *>(path_bytes.ptr()), path_len);
+		current_pos = path_end;
 
 		entry.data_offset = file->get_64();
 		entry.compressed_size = file->get_64();
@@ -249,50 +296,25 @@ Error DSPkg::open(const String &p_path) {
 		entry.height = file->get_32();
 		entry.pixel_format = file->get_32();
 		entry.mip_count = file->get_32();
-		current_pos += 40;
+		if (!checked_add(current_pos, DSPKG_ENTRY_FIELDS_SIZE, current_pos)) {
+			return fail(ERR_FILE_CORRUPT, "Entry fixed fields offset overflow.");
+		}
 
 		if (entry.width == 0 || entry.height == 0 || entry.mip_count == 0) {
-			UtilityFunctions::push_error("DSPkg: Invalid entry dimensions in entry ", i);
-			entries_by_path.clear();
-			entries_by_hash.clear();
-			return ERR_FILE_CORRUPT;
+			return fail(ERR_FILE_CORRUPT, "Invalid entry dimensions or mip count.");
 		}
 
-		if (entry.compressed_size == 0 || entry.original_size == 0) {
-			UtilityFunctions::push_error("DSPkg: Invalid entry sizes in entry ", i);
-			entries_by_path.clear();
-			entries_by_hash.clear();
-			return ERR_FILE_CORRUPT;
+		if (!payload_sizes_are_supported(entry)) {
+			return fail(ERR_FILE_CORRUPT, "Entry payload size is zero or exceeds the supported limit.");
 		}
 
-		if (entry.original_size > 0x7FFFFFFF) {
-			UtilityFunctions::push_error("DSPkg: Entry original_size exceeds maximum allowed size: ", entry.original_size);
-			entries_by_path.clear();
-			entries_by_hash.clear();
-			return ERR_FILE_CORRUPT;
+		uint64_t abs_payload_offset = 0;
+		uint64_t abs_payload_end = 0;
+		if (!get_payload_range(loaded_header, entry, abs_payload_offset, abs_payload_end)) {
+			return fail(ERR_FILE_CORRUPT, "Entry payload offset arithmetic overflow.");
 		}
-
-		if (entry.data_offset > UINT64_MAX - loaded_header.data_offset) {
-			UtilityFunctions::push_error("DSPkg: Entry data_offset overflow in entry ", i);
-			entries_by_path.clear();
-			entries_by_hash.clear();
-			return ERR_FILE_CORRUPT;
-		}
-
-		uint64_t abs_payload_offset = loaded_header.data_offset + entry.data_offset;
-		if (entry.compressed_size > UINT64_MAX - abs_payload_offset) {
-			UtilityFunctions::push_error("DSPkg: Entry compressed_size range overflow in entry ", i);
-			entries_by_path.clear();
-			entries_by_hash.clear();
-			return ERR_FILE_CORRUPT;
-		}
-
-		uint64_t abs_payload_end = abs_payload_offset + entry.compressed_size;
 		if (abs_payload_end > file_len) {
-			UtilityFunctions::push_error("DSPkg: Entry payload extends past archive length in entry ", i);
-			entries_by_path.clear();
-			entries_by_hash.clear();
-			return ERR_FILE_CORRUPT;
+			return fail(ERR_FILE_CORRUPT, "Entry payload extends past archive length.");
 		}
 
 		entries_by_path[entry.path] = entry;
@@ -300,10 +322,7 @@ Error DSPkg::open(const String &p_path) {
 	}
 
 	if (current_pos > loaded_header.data_offset) {
-		UtilityFunctions::push_error("DSPkg: Entry table position exceeds data_offset.");
-		entries_by_path.clear();
-		entries_by_hash.clear();
-		return ERR_FILE_CORRUPT;
+		return fail(ERR_FILE_CORRUPT, "Entry table position exceeds data_offset.");
 	}
 
 	file->close();
@@ -339,6 +358,10 @@ Dictionary DSPkg::read_texture(const String &p_resource_path) const {
 		UtilityFunctions::push_error("DSPkg: Texture path not found in archive: ", p_resource_path);
 		return result;
 	}
+	if (!payload_sizes_are_supported(entry)) {
+		UtilityFunctions::push_error("DSPkg: Entry payload size is no longer supported.");
+		return result;
+	}
 
 	Ref<FileAccess> file = FileAccess::open(opened_path, FileAccess::READ);
 	if (file.is_null() || !file->is_open()) {
@@ -347,14 +370,15 @@ Dictionary DSPkg::read_texture(const String &p_resource_path) const {
 	}
 
 	uint64_t file_len = file->get_length();
-	if (UINT64_MAX - loaded_header.data_offset < entry.data_offset) {
-		UtilityFunctions::push_error("DSPkg: Integer overflow calculating entry target offset.");
+	uint64_t target_offset = 0;
+	uint64_t payload_end = 0;
+	if (!get_payload_range(loaded_header, entry, target_offset, payload_end)) {
+		UtilityFunctions::push_error("DSPkg: Integer overflow calculating entry payload range.");
 		file->close();
 		return result;
 	}
-	uint64_t target_offset = loaded_header.data_offset + entry.data_offset;
 
-	if (target_offset > file_len || entry.compressed_size > file_len - target_offset) {
+	if (target_offset > file_len || payload_end > file_len) {
 		UtilityFunctions::push_error("DSPkg: Entry payload extends past end of file at read time.");
 		file->close();
 		return result;
@@ -364,7 +388,7 @@ Dictionary DSPkg::read_texture(const String &p_resource_path) const {
 	PackedByteArray compressed_data = file->get_buffer(static_cast<int64_t>(entry.compressed_size));
 	file->close();
 
-	if (static_cast<uint64_t>(compressed_data.size()) < entry.compressed_size) {
+	if (static_cast<uint64_t>(compressed_data.size()) != entry.compressed_size) {
 		UtilityFunctions::push_error("DSPkg: Failed to read complete compressed data for entry: ", entry.path);
 		return Dictionary();
 	}
@@ -397,10 +421,21 @@ Dictionary DSPkg::get_entry_info(const String &p_resource_path) const {
 		UtilityFunctions::push_error("DSPkg: Texture path not found in archive: ", p_resource_path);
 		return result;
 	}
+	if (!payload_sizes_are_supported(entry)) {
+		UtilityFunctions::push_error("DSPkg: Entry payload size is no longer supported.");
+		return result;
+	}
+
+	uint64_t data_offset = 0;
+	uint64_t payload_end = 0;
+	if (!get_payload_range(loaded_header, entry, data_offset, payload_end)) {
+		UtilityFunctions::push_error("DSPkg: Integer overflow calculating entry payload range.");
+		return result;
+	}
 
 	result["archive_path"] = opened_path;
 	result["path"] = entry.path;
-	result["data_offset"] = loaded_header.data_offset + entry.data_offset;
+	result["data_offset"] = data_offset;
 	result["compressed_size"] = entry.compressed_size;
 	result["original_size"] = entry.original_size;
 	result["width"] = entry.width;

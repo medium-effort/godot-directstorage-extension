@@ -6,7 +6,13 @@ reloadable = true
 [libraries]
 windows.debug.x86_64 = "bin/directstorage_accelerator.windows.template_debug.x86_64.dll"
 windows.debug.x86_64.dev = "bin/directstorage_accelerator.windows.template_debug.dev.x86_64.dll"
+windows.release.x86_64 = "bin/directstorage_accelerator.windows.template_release.x86_64.dll"
+linux.debug.x86_64 = "bin/libdirectstorage_accelerator.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "bin/libdirectstorage_accelerator.linux.template_release.x86_64.so"
+macos.debug = "bin/libdirectstorage_accelerator.macos.template_debug.universal.dylib"
+macos.release = "bin/libdirectstorage_accelerator.macos.template_release.universal.dylib"
 
 [dependencies]
 windows.debug.x86_64 = {"bin/dstorage.dll": "", "bin/dstoragecore.dll": ""}
 windows.debug.x86_64.dev = {"bin/dstorage.dll": "", "bin/dstoragecore.dll": ""}
+windows.release.x86_64 = {"bin/dstorage.dll": "", "bin/dstoragecore.dll": ""}

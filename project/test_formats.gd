@@ -1,6 +1,27 @@
 @tool
 extends SceneTree
 
+func _write_dspkg_header(file: FileAccess, version: int, flags: int, entry_count: int, data_offset: int, reserved: int = 0) -> void:
+	file.store_32(0x474B5044)
+	file.store_16(version)
+	file.store_16(flags)
+	file.store_32(entry_count)
+	file.store_64(data_offset)
+	file.store_64(reserved)
+
+func _write_dspkg_entry(file: FileAccess, path: String, data_offset: int, compressed_size: int, original_size: int, width: int = 256, height: int = 256, mip_count: int = 1) -> void:
+	var path_bytes = path.to_utf8_buffer()
+	file.store_64(path.hash())
+	file.store_16(path_bytes.size())
+	file.store_buffer(path_bytes)
+	file.store_64(data_offset)
+	file.store_64(compressed_size)
+	file.store_64(original_size)
+	file.store_32(width)
+	file.store_32(height)
+	file.store_32(Image.FORMAT_RGBA8)
+	file.store_32(mip_count)
+
 func _init() -> void:
 	print("--- Running DirectStorage Phase 2 Step 2 Formats Test ---")
 
@@ -167,6 +188,8 @@ func _init() -> void:
 	bad_offset_file.store_32(1)
 	bad_offset_file.store_64(20)
 	bad_offset_file.store_64(0)
+	for b in range(50):
+		bad_offset_file.store_8(0)
 	bad_offset_file.close()
 	reader = DSPkg.new()
 	if reader.open(test_bad_path) == OK:
@@ -234,6 +257,81 @@ func _init() -> void:
 		quit(1)
 		return
 	print("SUCCESS: Zero dimensions correctly rejected.")
+
+	# 8. Invalid zero mip count
+	var bad_mips_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(bad_mips_file, 1, 0, 1, 28 + 50 + path_len)
+	_write_dspkg_entry(bad_mips_file, dummy_path, 0, 1, 1, 256, 256, 0)
+	bad_mips_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Zero mip count accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Zero mip count correctly rejected.")
+
+	# 9. Entry path length extends past the entry table boundary
+	var bad_path_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(bad_path_file, 1, 0, 1, 28 + 50)
+	bad_path_file.store_64(dummy_path.hash())
+	bad_path_file.store_16(100)
+	for b in range(40):
+		bad_path_file.store_8(0)
+	bad_path_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Entry path length overflow accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Entry path length overflow correctly rejected.")
+
+	# 10. Entry payload offset arithmetic overflow
+	var bad_arithmetic_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(bad_arithmetic_file, 1, 0, 1, 28 + 50 + path_len)
+	_write_dspkg_entry(bad_arithmetic_file, dummy_path, -1, 1, 1)
+	bad_arithmetic_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Entry payload offset overflow accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Entry payload offset overflow correctly rejected.")
+
+	# 11. Compressed size exceeds the backend/allocation limit
+	var bad_compressed_size_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(bad_compressed_size_file, 1, 0, 1, 28 + 50 + path_len)
+	_write_dspkg_entry(bad_compressed_size_file, dummy_path, 0, 2147483648, 1)
+	bad_compressed_size_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Oversized compressed size accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Oversized compressed size correctly rejected.")
+
+	# 12. Original size exceeds the backend/allocation limit
+	var bad_original_size_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(bad_original_size_file, 1, 0, 1, 28 + 50 + path_len)
+	_write_dspkg_entry(bad_original_size_file, dummy_path, 0, 1, 2147483648)
+	bad_original_size_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Oversized original size accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Oversized original size correctly rejected.")
+
+	# A failed reopen must not leave the previous archive exposed.
+	var state_reader = DSPkg.new()
+	if state_reader.open(test_dspkg_path) != OK:
+		print("FAIL: Could not prepare DSPkg reader state reset test.")
+		quit(1)
+		return
+	if state_reader.open(test_bad_path) == OK or state_reader.get_entry_count() != 0 or state_reader.has_texture(dummy_path):
+		print("FAIL: Failed DSPkg.open() left stale archive state exposed.")
+		quit(1)
+		return
+	print("SUCCESS: Failed DSPkg.open() resets reader state.")
 
 	print("SUCCESS: All Phase 2 Step 2 & Boundary Validation tests passed successfully!")
 	quit(0)
