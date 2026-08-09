@@ -32,14 +32,21 @@ DSContext::~DSContext() {
 }
 
 bool DSContext::is_supported() const {
+	if (active_backend) {
+		return active_backend->get_name() == "Win32DirectStorage";
+	}
 #ifdef _WIN32
-	return true;
+	Win32Backend backend;
+	return backend.is_available();
 #else
 	return false;
 #endif
 }
 
 bool DSContext::is_d3d12_backend() const {
+	if (!is_supported()) {
+		return false;
+	}
 #ifdef _WIN32
 	RenderingServer *rs = RenderingServer::get_singleton();
 	if (!rs) {

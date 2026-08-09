@@ -28,7 +28,10 @@
 			The byte offset in the file to start reading from.
 		</member>
 		<member name="size" type="int" setter="set_size" getter="get_size" default="0">
-			The number of bytes to read from the file.
+			The number of bytes to read from the file (compressed size when using GDeflate).
+		</member>
+		<member name="uncompressed_size" type="int" setter="set_uncompressed_size" getter="get_uncompressed_size" default="0">
+			The expected decompressed size in bytes for compressed requests.
 		</member>
 		<member name="status" type="int" setter="set_status" getter="get_status" enum="DSRequest.Status" default="0">
 			The current status of this request ([code]STATUS_PENDING[/code], [code]STATUS_SUBMITTED[/code], [code]STATUS_COMPLETED[/code], or [code]STATUS_FAILED[/code]).

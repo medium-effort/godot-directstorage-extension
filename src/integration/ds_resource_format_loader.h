@@ -14,6 +14,20 @@ namespace godot {
 class DSResourceFormatLoader : public ResourceFormatLoader {
 	GDCLASS(DSResourceFormatLoader, ResourceFormatLoader);
 
+private:
+	Variant _load_texture_payload(
+			const String &p_file_path,
+			uint64_t p_offset,
+			uint64_t p_compressed_size,
+			uint64_t p_original_size,
+			uint32_t p_width,
+			uint32_t p_height,
+			uint32_t p_pixel_format,
+			uint32_t p_mip_count,
+			const String &p_cache_key,
+			const String &p_original_cache_key,
+			int32_t p_cache_mode) const;
+
 protected:
 	static void _bind_methods();
 

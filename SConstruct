@@ -22,7 +22,7 @@ if env["platform"] == "windows":
     env.Append(LIBPATH=["thirdparty/directstorage/lib/x64"])
     env.Append(LIBS=["dstorage.lib"])
     if "msvc" in env["TOOLS"]:
-        env.Append(LINKFLAGS=["/DELAYLOAD:dstorage.dll", "delayimp.lib"])
+        env.Append(LINKFLAGS=["/DELAYLOAD:dstorage.dll", "delayimp.lib", "/ignore:4099"])
         # Replace /std:c++17 with /std:c++20 to eliminate MSVC warning D9025
         env["CXXFLAGS"] = [flag if flag != "/std:c++17" else "/std:c++20" for flag in env.get("CXXFLAGS", [])]
         if "/std:c++20" not in env["CXXFLAGS"]:

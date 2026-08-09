@@ -60,6 +60,16 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 
 	uint64_t offset = p_request->get_offset();
 	uint32_t read_size = p_request->get_size();
+	uint32_t uncompressed_size = p_request->get_uncompressed_size();
+	if (p_request->get_compression_format() == DSRequest::COMPRESSION_NONE && uncompressed_size == 0) {
+		uncompressed_size = read_size;
+	}
+
+	if (read_size == 0 || uncompressed_size == 0) {
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message("FallbackBackend: Invalid size parameters (read_size=" + String::num_uint64(read_size) + ", uncompressed_size=" + String::num_uint64(uncompressed_size) + ").");
+		return false;
+	}
 
 	if (offset > 0) {
 		file->seek(offset);
@@ -74,6 +84,9 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 
 	if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE) {
 		PackedByteArray &dest = p_request->get_destination_buffer_ref();
+		if (dest.size() < static_cast<int64_t>(uncompressed_size)) {
+			dest.resize(static_cast<int64_t>(uncompressed_size));
+		}
 		if (dest.size() == 0) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
 			p_request->set_error_message("FallbackBackend: Destination buffer unallocated for GDeflate decompression.");

@@ -163,6 +163,28 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 
 bool Win32Backend::is_available() const {
 #ifdef _WIN32
+	Dictionary drive_info = get_drive_info_for_path("res://");
+	if (!drive_info.get("directstorage_supported", false)) {
+		return false;
+	}
+
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (ps) {
+		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
+		String dstoragecore_path = bin_dir + "/dstoragecore.dll";
+		String dstorage_path = bin_dir + "/dstorage.dll";
+
+		std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(bin_dir.utf16().get_data()));
+		std::wstring w_core_path(reinterpret_cast<const wchar_t *>(dstoragecore_path.utf16().get_data()));
+		std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
+
+		SetDllDirectoryW(w_bin_dir.c_str());
+		HMODULE h_core = LoadLibraryW(w_core_path.c_str());
+		HMODULE h_ds = LoadLibraryW(w_ds_path.c_str());
+		if (!h_core || !h_ds) {
+			return false;
+		}
+	}
 	return true;
 #else
 	return false;
@@ -180,6 +202,12 @@ bool Win32Backend::initialize() {
 		return false;
 	}
 
+	Dictionary drive_info = get_drive_info_for_path("res://");
+	if (!drive_info.get("directstorage_supported", false)) {
+		UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Drive " + String(drive_info["drive"]) + " is unsupported (" + String(drive_info["reason"]) + ").");
+		return false;
+	}
+
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (ps) {
 		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
@@ -191,13 +219,12 @@ bool Win32Backend::initialize() {
 		std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
 
 		SetDllDirectoryW(w_bin_dir.c_str());
-		LoadLibraryW(w_core_path.c_str());
-		LoadLibraryW(w_ds_path.c_str());
-	}
-
-	Dictionary drive_info = get_drive_info_for_path("res://");
-	if (!drive_info["directstorage_supported"]) {
-		UtilityFunctions::push_warning("[DirectStorage] Warning: Current drive " + String(drive_info["drive"]) + " is unsupported (" + String(drive_info["reason"]) + ").");
+		HMODULE h_core = LoadLibraryW(w_core_path.c_str());
+		HMODULE h_ds = LoadLibraryW(w_ds_path.c_str());
+		if (!h_core || !h_ds) {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLLs could not be loaded from '" + bin_dir + "'.");
+			return false;
+		}
 	}
 
 	uint32_t staging_mb = ctx->get_staging_buffer_size_mb();
@@ -309,6 +336,18 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		return false;
 	}
 
+	uint32_t src_size = p_request->get_size();
+	uint32_t uncompressed_size = p_request->get_uncompressed_size();
+	if (p_request->get_compression_format() == DSRequest::COMPRESSION_NONE && uncompressed_size == 0) {
+		uncompressed_size = src_size;
+	}
+
+	if (src_size == 0 || uncompressed_size == 0) {
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message("Win32Backend: Invalid size parameters (src_size=" + String::num_uint64(src_size) + ", uncompressed_size=" + String::num_uint64(uncompressed_size) + ").");
+		return false;
+	}
+
 	DSTORAGE_REQUEST request = {};
 	request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
 	request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -318,16 +357,16 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 
 	request.Source.File.Source = file;
 	request.Source.File.Offset = p_request->get_offset();
-	request.Source.File.Size = p_request->get_size();
+	request.Source.File.Size = src_size;
 
 	PackedByteArray &dest = p_request->get_destination_buffer_ref();
-	if (dest.size() < p_request->get_size()) {
-		dest.resize(p_request->get_size());
+	if (dest.size() < static_cast<int64_t>(uncompressed_size)) {
+		dest.resize(static_cast<int64_t>(uncompressed_size));
 	}
 
 	request.Destination.Memory.Buffer = dest.ptrw();
-	request.Destination.Memory.Size = p_request->get_size();
-	request.UncompressedSize = p_request->get_size();
+	request.Destination.Memory.Size = uncompressed_size;
+	request.UncompressedSize = uncompressed_size;
 	request.CancellationTag = p_request->get_cancellation_tag();
 
 	memory_queue->EnqueueRequest(&request);
@@ -350,7 +389,8 @@ void Win32Backend::submit_batch() {
 	uint64_t total_bytes = 0;
 	for (int i = 0; i < in_flight_requests.size(); i++) {
 		if (in_flight_requests[i].is_valid()) {
-			total_bytes += in_flight_requests[i]->get_size();
+			uint32_t req_unc_size = in_flight_requests[i]->get_uncompressed_size();
+			total_bytes += (req_unc_size > 0) ? req_unc_size : in_flight_requests[i]->get_size();
 		}
 	}
 

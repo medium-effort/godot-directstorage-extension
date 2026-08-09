@@ -69,6 +69,7 @@ public:
 	Error open(const String &p_path);
 	bool has_texture(const String &p_resource_path) const;
 	Dictionary read_texture(const String &p_resource_path) const;
+	Dictionary get_entry_info(const String &p_resource_path) const;
 	int get_entry_count() const;
 	Array get_entries() const;
 };

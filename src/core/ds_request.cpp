@@ -30,6 +30,14 @@ uint32_t DSRequest::get_size() const {
 	return size;
 }
 
+void DSRequest::set_uncompressed_size(uint32_t p_size) {
+	uncompressed_size = p_size;
+}
+
+uint32_t DSRequest::get_uncompressed_size() const {
+	return uncompressed_size;
+}
+
 void DSRequest::set_cancellation_tag(uint64_t p_tag) {
 	cancellation_tag = p_tag;
 }
@@ -88,6 +96,9 @@ void DSRequest::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_size", "size"), &DSRequest::set_size);
 	ClassDB::bind_method(D_METHOD("get_size"), &DSRequest::get_size);
 
+	ClassDB::bind_method(D_METHOD("set_uncompressed_size", "uncompressed_size"), &DSRequest::set_uncompressed_size);
+	ClassDB::bind_method(D_METHOD("get_uncompressed_size"), &DSRequest::get_uncompressed_size);
+
 	ClassDB::bind_method(D_METHOD("set_cancellation_tag", "tag"), &DSRequest::set_cancellation_tag);
 	ClassDB::bind_method(D_METHOD("get_cancellation_tag"), &DSRequest::get_cancellation_tag);
 
@@ -106,6 +117,7 @@ void DSRequest::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "file_path"), "set_file_path", "get_file_path");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "offset"), "set_offset", "get_offset");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "size"), "set_size", "get_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "uncompressed_size"), "set_uncompressed_size", "get_uncompressed_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "cancellation_tag"), "set_cancellation_tag", "get_cancellation_tag");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "compression_format"), "set_compression_format", "get_compression_format");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "destination_buffer"), "set_destination_buffer", "get_destination_buffer");

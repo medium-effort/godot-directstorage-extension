@@ -28,6 +28,7 @@ private:
 	String file_path;
 	uint64_t offset = 0;
 	uint32_t size = 0;
+	uint32_t uncompressed_size = 0;
 	uint64_t cancellation_tag = 0;
 	CompressionFormat compression_format = COMPRESSION_NONE;
 	PackedByteArray destination_buffer;
@@ -49,6 +50,9 @@ public:
 
 	void set_size(uint32_t p_size);
 	uint32_t get_size() const;
+
+	void set_uncompressed_size(uint32_t p_size);
+	uint32_t get_uncompressed_size() const;
 
 	void set_cancellation_tag(uint64_t p_tag);
 	uint64_t get_cancellation_tag() const;
