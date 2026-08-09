@@ -1,0 +1,20 @@
+[remap]
+
+importer="directstorage_texture"
+type="Texture2D"
+uid="uid://b4nyrc5fhb0bc"
+path="res://.godot/imported/steampunk_underwater_explorer_0.png-ef0e43bbc03ca555d8faaf9968cb0364.dstex"
+generator_parameters={
+"md5": "f588a0aaa15bc0ede32ebc661b42c9cb"
+}
+
+[deps]
+
+files=["res://.godot/imported/steampunk_underwater_explorer_0.png-ef0e43bbc03ca555d8faaf9968cb0364.dstex"]
+
+source_file="res://test_assets/steampunk_underwater_explorer_0.png"
+dest_files=["res://.godot/imported/steampunk_underwater_explorer_0.png-ef0e43bbc03ca555d8faaf9968cb0364.dstex", "res://.godot/imported/steampunk_underwater_explorer_0.png-ef0e43bbc03ca555d8faaf9968cb0364.dstex"]
+
+[params]
+
+compression/level=1
