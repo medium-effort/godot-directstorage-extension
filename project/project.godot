@@ -22,6 +22,14 @@ config/author="MediumEffort"
 DSBatchManager="*uid://c3w3tb6oorh1f"
 _mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
 
+[directstorage]
+
+staging_buffer_size_mb=128.0
+
 [editor_plugins]
 
 enabled=PackedStringArray("res://addons/directstorage_accelerator/plugin.cfg", "res://addons/godot_ai/plugin.cfg")
+
+[rendering]
+
+rendering_device/driver.windows="d3d12"

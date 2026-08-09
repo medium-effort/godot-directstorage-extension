@@ -3,6 +3,7 @@
 #include "../../core/ds_error_handler.h"
 #include "../../core/ds_profiler.h"
 
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
@@ -81,6 +82,13 @@ static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_ca
 	}
 
 	RenderingServer *rs = RenderingServer::get_singleton();
+	String driver_name = rs ? rs->get_current_rendering_driver_name().to_lower() : "";
+	if (driver_name != "d3d12") {
+		result.reason = "Rendering driver is '" + driver_name + "' (Direct3D 12 is required for DirectStorage GPU queues).";
+		unload_runtime_modules(core, dstorage);
+		return result;
+	}
+
 	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
 	uint64_t device_handle = rd ? rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0) : 0;
 	if (!rd || device_handle == 0) {
@@ -355,6 +363,11 @@ bool Win32Backend::initialize() {
 		queueDesc.Priority = DSTORAGE_PRIORITY_NORMAL;
 		queueDesc.Name = "DirectStorageMemoryQueue";
 		RenderingServer *rs = RenderingServer::get_singleton();
+		String driver_name = rs ? rs->get_current_rendering_driver_name().to_lower() : "";
+		if (driver_name != "d3d12") {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Rendering driver is '" + driver_name + "' (Direct3D 12 is required).");
+			return false;
+		}
 		RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
 		uint64_t device_handle = rd ? rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0) : 0;
 		if (!rd || device_handle == 0) {

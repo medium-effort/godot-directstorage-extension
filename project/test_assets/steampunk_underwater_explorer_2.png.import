@@ -1,12 +1,10 @@
 [remap]
 
 importer="directstorage_texture"
+importer_version=1
 type="Texture2D"
 uid="uid://b2g0r7rc1wp27"
 path="res://.godot/imported/steampunk_underwater_explorer_2.png-bef46e88882fbdcaf0a151c2b6316569.dstex"
-generator_parameters={
-"md5": "194f2c23b0ec8efeb5027795e7c34b28"
-}
 
 [deps]
 

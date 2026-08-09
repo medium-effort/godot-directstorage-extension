@@ -206,7 +206,19 @@ func _init() -> void:
 		return
 	print("SUCCESS: DSTextureCache clear() verified.")
 
-	# 5. Test .dspkg loading via ResourceFormatLoader
+	# 5. Verify an imported mipmapped texture reaches the GPU upload path.
+	var imported_tex = loader.load("res://test_assets/test.png")
+	if imported_tex == null or not (imported_tex is Texture2D):
+		print("FAIL: Imported mipmapped texture did not load as Texture2D!")
+		quit(1)
+		return
+	if rd != null and not (imported_tex is Texture2DRD):
+		print("FAIL: Imported mipmapped texture is not Texture2DRD despite RenderingDevice active! Type: ", imported_tex.get_class())
+		quit(1)
+		return
+	print("SUCCESS: Loaded imported mipmapped texture: ", imported_tex, " [", imported_tex.get_width(), "x", imported_tex.get_height(), "]")
+
+	# 6. Test .dspkg loading via ResourceFormatLoader
 	var dspkg = DSPkg.new()
 	var test_dspkg_path = "user://test_archive.dspkg"
 	err = dspkg.create(test_dspkg_path)
@@ -222,7 +234,7 @@ func _init() -> void:
 		return
 	print("SUCCESS: Loaded .dspkg resource via ResourceLoader: ", loaded_dspkg)
 
-	# 6. Test packaged texture load via DSContext / DSRequest pipeline
+	# 7. Test packaged texture load via DSContext / DSRequest pipeline
 	var textures_pkg_path = "res://textures.dspkg"
 	var pkg_builder = DSPkg.new()
 	err = pkg_builder.create(textures_pkg_path)

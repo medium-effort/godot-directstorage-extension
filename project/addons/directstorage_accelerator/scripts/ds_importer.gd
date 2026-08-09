@@ -21,6 +21,9 @@ func _get_save_extension() -> String:
 func _get_resource_type() -> String:
 	return "Texture2D"
 
+func _get_format_version() -> int:
+	return 1
+
 func _get_priority() -> float:
 	return 2.0
 
@@ -56,6 +59,9 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 			push_error("[DirectStorage Importer] Failed to load source image: " + source_file)
 			return err
 
+	if img.get_format() == Image.FORMAT_RGB8:
+		img.convert(Image.FORMAT_RGBA8)
+
 	if not img.has_mipmaps():
 		img.generate_mipmaps()
 
@@ -63,7 +69,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	var width := img.get_width()
 	var height := img.get_height()
 	var format := img.get_format()
-	var mip_count := img.get_mipmap_count()
+	var mip_count: int = (img.get_mipmap_count() + 1) if img.has_mipmaps() else 1
 	var compression_level: int = options.get("compression/level", 1)
 
 	if not ClassDB.class_exists("DSTex"):

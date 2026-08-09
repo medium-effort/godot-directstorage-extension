@@ -217,6 +217,9 @@ func run_comparison_benchmark() -> void:
 	print("DirectStorage Measured Throughput : ", String.num(ds_throughput_mbps, 2), " MB/s")
 	print("==========================================================")
 
+	if DisplayServer.get_name() == "headless":
+		get_tree().quit()
+
 func _spawn_3d_explorer_sync() -> void:
 	if ResourceLoader.exists(model_path):
 		var loaded_res = ResourceLoader.load(model_path)

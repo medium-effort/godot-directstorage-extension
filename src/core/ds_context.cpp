@@ -51,7 +51,7 @@ bool DSContext::is_d3d12_backend() const {
 	}
 #ifdef _WIN32
 	RenderingServer *rs = RenderingServer::get_singleton();
-	if (!rs) {
+	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		return false;
 	}
 	RenderingDevice *rd = rs->get_rendering_device();
