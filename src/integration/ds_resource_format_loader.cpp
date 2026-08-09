@@ -1,5 +1,6 @@
 #include "ds_resource_format_loader.h"
 #include "ds_texture_cache.h"
+#include "../compression/gdeflate_decompressor.h"
 #include "../core/ds_context.h"
 #include "../core/ds_request.h"
 #include "../formats/dspkg_format.h"
@@ -29,12 +30,16 @@ PackedStringArray DSResourceFormatLoader::_get_recognized_extensions() const {
 	PackedStringArray ext;
 	ext.append("dstex");
 	ext.append("dspkg");
+	ext.append("png");
+	ext.append("jpg");
+	ext.append("jpeg");
+	ext.append("webp");
 	return ext;
 }
 
 bool DSResourceFormatLoader::_recognize_path(const String &p_path, const StringName &p_type) const {
 	String ext = p_path.get_extension().to_lower();
-	if (ext == "dstex" || ext == "dspkg") {
+	if (ext == "dstex" || ext == "dspkg" || ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp") {
 		return true;
 	}
 	return false;
@@ -50,7 +55,7 @@ bool DSResourceFormatLoader::_handles_type(const StringName &p_type) const {
 
 String DSResourceFormatLoader::_get_resource_type(const String &p_path) const {
 	String ext = p_path.get_extension().to_lower();
-	if (ext == "dstex") {
+	if (ext == "dstex" || ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp") {
 		return "Texture2D";
 	}
 	if (ext == "dspkg") {
@@ -60,7 +65,17 @@ String DSResourceFormatLoader::_get_resource_type(const String &p_path) const {
 }
 
 bool DSResourceFormatLoader::_exists(const String &p_path) const {
-	return FileAccess::file_exists(p_path);
+	if (FileAccess::file_exists(p_path)) {
+		return true;
+	}
+	if (FileAccess::file_exists("res://textures.dspkg")) {
+		Ref<DSPkg> pkg;
+		pkg.instantiate();
+		if (pkg->open("res://textures.dspkg") == OK && pkg->has_texture(p_path)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_original_path, bool p_use_sub_threads, int32_t p_cache_mode) const {
@@ -80,7 +95,63 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		}
 	}
 
+	String target_path = p_path;
+	bool in_dspkg = false;
+	Ref<DSPkg> dspkg_instance;
+
 	if (!FileAccess::file_exists(p_path)) {
+		if (FileAccess::file_exists("res://textures.dspkg")) {
+			dspkg_instance.instantiate();
+			if (dspkg_instance->open("res://textures.dspkg") == OK) {
+				if (dspkg_instance->has_texture(p_path)) {
+					target_path = p_path;
+					in_dspkg = true;
+				} else if (!p_original_path.is_empty() && dspkg_instance->has_texture(p_original_path)) {
+					target_path = p_original_path;
+					in_dspkg = true;
+				}
+			}
+		}
+		if (!in_dspkg) {
+			return Variant();
+		}
+	}
+
+	if (in_dspkg && dspkg_instance.is_valid()) {
+		Dictionary entry_data = dspkg_instance->read_texture(target_path);
+		if (entry_data.has("compressed_data") && entry_data.has("width")) {
+			int width = entry_data["width"];
+			int height = entry_data["height"];
+			int pixel_format = entry_data["pixel_format"];
+			int mip_count = entry_data["mip_count"];
+			uint64_t original_size = entry_data["original_size"];
+			PackedByteArray compressed_data = entry_data["compressed_data"];
+
+			Ref<GDeflateDecompressor> decomp;
+			decomp.instantiate();
+			PackedByteArray decompressed_data = decomp->decompress(compressed_data, static_cast<int>(original_size));
+
+			if (decompressed_data.size() > 0) {
+				Image::Format img_fmt = static_cast<Image::Format>(DSTex::rd_format_to_godot_format(pixel_format));
+				Ref<Image> image = Image::create_from_data(width, height, mip_count > 1, img_fmt, decompressed_data);
+				if (image.is_valid() && !image->is_empty()) {
+					Ref<Texture2D> result_texture = ImageTexture::create_from_image(image);
+					if (result_texture.is_valid()) {
+						if (p_cache_mode != ResourceFormatLoader::CACHE_MODE_IGNORE && p_cache_mode != ResourceFormatLoader::CACHE_MODE_IGNORE_DEEP) {
+							DSTextureCache *cache = DSTextureCache::get_singleton();
+							if (cache) {
+								cache->store(p_path, result_texture);
+								if (!p_original_path.is_empty() && p_original_path != p_path) {
+									cache->store(p_original_path, result_texture);
+								}
+							}
+						}
+						return result_texture;
+					}
+				}
+			}
+		}
+		UtilityFunctions::push_error("DSResourceFormatLoader: Failed to load texture from res://textures.dspkg for ", target_path);
 		return Variant();
 	}
 

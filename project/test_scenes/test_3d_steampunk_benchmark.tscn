@@ -18,6 +18,14 @@ ambient_light_color = Color(0.8, 0.85, 0.9, 1)
 ambient_light_sky_contribution = 0.5
 reflected_light_source = 2
 
+[sub_resource type="BoxMesh" id="BoxMesh_cube"]
+size = Vector3(1.2, 1.2, 1.2)
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_cube"]
+albedo_color = Color(1, 0.45, 0.1, 1)
+metallic = 0.8
+roughness = 0.2
+
 [sub_resource type="Gradient" id="Gradient_522rh"]
 offsets = PackedFloat32Array(0)
 colors = PackedColorArray(0.8745098, 0.8745098, 0.8745098, 1)
@@ -26,14 +34,6 @@ colors = PackedColorArray(0.8745098, 0.8745098, 0.8745098, 1)
 gradient = SubResource("Gradient_522rh")
 width = 16
 height = 16
-
-[sub_resource type="BoxMesh" id="BoxMesh_cube"]
-size = Vector3(1.2, 1.2, 1.2)
-
-[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_cube"]
-albedo_color = Color(1, 0.45, 0.1, 1)
-metallic = 0.8
-roughness = 0.2
 
 [node name="Test3DSteampunkBenchmark" type="Control" unique_id=285542536]
 layout_mode = 3

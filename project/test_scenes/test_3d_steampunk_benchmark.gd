@@ -95,32 +95,32 @@ func run_standard_benchmark() -> void:
 	clear_cache_and_model()
 	await get_tree().process_frame
 
-	_prepare_standard_textures()
+	# _prepare_standard_textures()
 
 	if is_non_blocking:
 		# True Non-Blocking Mode: Parse GLB in background thread and load textures with frame yields
 		standard_freeze_ms = 0.0
-		var loaded_textures: Array[Texture2D] = []
-		for i in range(texture_count):
-			var tex_path := "user://std_texture_" + str(i) + ".png"
-			var img := Image.load_from_file(ProjectSettings.globalize_path(tex_path))
-			if img and not img.is_empty():
-				var tex := ImageTexture.create_from_image(img)
-				loaded_textures.append(tex)
-			await get_tree().process_frame
+		# var loaded_textures: Array[Texture2D] = []
+		# for i in range(texture_count):
+		# 	var tex_path := "user://std_texture_" + str(i) + ".png"
+		# 	var img := Image.load_from_file(ProjectSettings.globalize_path(tex_path))
+		# 	if img and not img.is_empty():
+		# 		var tex := ImageTexture.create_from_image(img)
+		# 		loaded_textures.append(tex)
+		# 	await get_tree().process_frame
 		
 		# Background thread GLB model spawn (main thread never freezes)
 		await _async_spawn_3d_explorer()
 	else:
 		# Blocking Mode: Synchronous main thread GLB parsing + synchronous image loading
 		var start_freeze_usec := Time.get_ticks_usec()
-		var loaded_textures: Array[Texture2D] = []
-		for i in range(texture_count):
-			var tex_path := "user://std_texture_" + str(i) + ".png"
-			var img := Image.load_from_file(ProjectSettings.globalize_path(tex_path))
-			if img and not img.is_empty():
-				var tex := ImageTexture.create_from_image(img)
-				loaded_textures.append(tex)
+		# var loaded_textures: Array[Texture2D] = []
+		# for i in range(texture_count):
+		# 	var tex_path := "user://std_texture_" + str(i) + ".png"
+		# 	var img := Image.load_from_file(ProjectSettings.globalize_path(tex_path))
+		# 	if img and not img.is_empty():
+		# 		var tex := ImageTexture.create_from_image(img)
+		# 		loaded_textures.append(tex)
 		_spawn_3d_explorer_sync()
 		var end_freeze_usec := Time.get_ticks_usec()
 		standard_freeze_ms = (end_freeze_usec - start_freeze_usec) / 1000.0
@@ -151,17 +151,17 @@ func run_directstorage_benchmark() -> void:
 	if ctx and not ctx.is_initialized():
 		ctx.initialize_ds()
 
-	_prepare_directstorage_textures()
+	# _prepare_directstorage_textures()
 
 	if is_non_blocking:
 		# True Non-Blocking Mode: DirectStorage requests queued per frame + background thread GLB spawn
 		ds_freeze_ms = 0.0
-		for i in range(texture_count):
-			var dstex_path := "user://ds_texture_" + str(i) + ".dstex"
-			ResourceLoader.load(dstex_path)
-			if ctx:
-				ctx.flush_batch()
-			await get_tree().process_frame
+		# for i in range(texture_count):
+		# 	var dstex_path := "user://ds_texture_" + str(i) + ".dstex"
+		# 	ResourceLoader.load(dstex_path)
+		# 	if ctx:
+		# 		ctx.flush_batch()
+		# 	await get_tree().process_frame
 
 		var profiler = Engine.get_singleton("DSProfiler")
 		if profiler:
@@ -172,9 +172,9 @@ func run_directstorage_benchmark() -> void:
 	else:
 		# Blocking Mode: Synchronous main thread GLB parsing + synchronous DirectStorage batch load
 		var start_freeze_usec := Time.get_ticks_usec()
-		for i in range(texture_count):
-			var dstex_path := "user://ds_texture_" + str(i) + ".dstex"
-			ResourceLoader.load(dstex_path)
+		# for i in range(texture_count):
+		# 	var dstex_path := "user://ds_texture_" + str(i) + ".dstex"
+		# 	ResourceLoader.load(dstex_path)
 
 		if ctx:
 			ctx.flush_batch()
@@ -218,8 +218,20 @@ func run_comparison_benchmark() -> void:
 	print("==========================================================")
 
 func _spawn_3d_explorer_sync() -> void:
+	if ResourceLoader.exists(model_path):
+		var loaded_res = ResourceLoader.load(model_path)
+		if loaded_res is PackedScene:
+			var scene_instance = loaded_res.instantiate()
+			if scene_instance:
+				model_holder.add_child(scene_instance)
+				scene_instance.position = Vector3(0, -1.0, 0)
+				scene_instance.scale = Vector3(0.5, 0.5, 0.5)
+				return
+
 	if not FileAccess.file_exists(model_path):
+		print("[DS 3D Benchmark] ERROR: Model file not found: ", model_path)
 		return
+
 	var gltf_doc = GLTFDocument.new()
 	var gltf_state = GLTFState.new()
 	if gltf_doc.append_from_file(model_path, gltf_state) == OK:
@@ -230,7 +242,18 @@ func _spawn_3d_explorer_sync() -> void:
 			node.scale = Vector3(0.5, 0.5, 0.5)
 
 func _async_spawn_3d_explorer() -> void:
+	if ResourceLoader.exists(model_path):
+		var loaded_res = ResourceLoader.load(model_path)
+		if loaded_res is PackedScene:
+			var scene_instance = loaded_res.instantiate()
+			if scene_instance:
+				model_holder.add_child(scene_instance)
+				scene_instance.position = Vector3(0, -1.0, 0)
+				scene_instance.scale = Vector3(0.5, 0.5, 0.5)
+				return
+
 	if not FileAccess.file_exists(model_path):
+		print("[DS 3D Benchmark] ERROR: Model file not found: ", model_path)
 		return
 
 	var thread := Thread.new()
@@ -249,6 +272,16 @@ func _async_spawn_3d_explorer() -> void:
 		node.scale = Vector3(0.5, 0.5, 0.5)
 
 func _bg_load_gltf_thread(path: String) -> Node3D:
+	if ResourceLoader.exists(path):
+		var loaded_res = ResourceLoader.load(path)
+		if loaded_res is PackedScene:
+			var scene_instance = loaded_res.instantiate()
+			if scene_instance is Node3D:
+				return scene_instance as Node3D
+
+	if not FileAccess.file_exists(path):
+		return null
+
 	var gltf_doc = GLTFDocument.new()
 	var gltf_state = GLTFState.new()
 	if gltf_doc.append_from_file(path, gltf_state) == OK:
@@ -256,35 +289,12 @@ func _bg_load_gltf_thread(path: String) -> Node3D:
 	return null
 
 func _prepare_standard_textures() -> void:
-	var width := 512
-	var height := 512
-	for i in range(texture_count):
-		var tex_path := "user://std_texture_" + str(i) + ".png"
-		if not FileAccess.file_exists(tex_path):
-			var img := Image.create(width, height, false, Image.FORMAT_RGBA8)
-			img.fill(Color((i * 15) % 256 / 255.0, (i * 30) % 256 / 255.0, (i * 45) % 256 / 255.0))
-			img.save_png(tex_path)
+	# Disabled synthetic test texture generation
+	pass
 
 func _prepare_directstorage_textures() -> void:
-	var width := 512
-	var height := 512
-	var dstex = DSTex.new()
-
-	for i in range(texture_count):
-		var dstex_path := "user://ds_texture_" + str(i) + ".dstex"
-		if not FileAccess.file_exists(dstex_path):
-			var raw_bytes := PackedByteArray()
-			raw_bytes.resize(width * height * 4)
-			var r_byte := (i * 15) % 256
-			var g_byte := (i * 30) % 256
-			var b_byte := (i * 45) % 256
-			for j in range(0, raw_bytes.size(), 4):
-				raw_bytes[j] = r_byte
-				raw_bytes[j + 1] = g_byte
-				raw_bytes[j + 2] = b_byte
-				raw_bytes[j + 3] = 255
-
-			dstex.write_to_file(dstex_path, raw_bytes, width, height, Image.FORMAT_RGBA8, 1, 1)
+	# Disabled synthetic test texture generation
+	pass
 
 func _update_results_display() -> void:
 	var is_non_blocking: bool = check_non_blocking.button_pressed
