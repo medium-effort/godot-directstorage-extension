@@ -24,6 +24,14 @@ func _write_dspkg_entry(file: FileAccess, path: String, data_offset: int, compre
 
 func _init() -> void:
 	print("--- Running DirectStorage Phase 2 Step 2 Formats Test ---")
+	var error_handler = Engine.get_singleton("DSErrorHandler")
+	if error_handler != null and error_handler.has_method("describe_hresult"):
+		var mapped_error: String = error_handler.call("describe_hresult", 0x89240008)
+		if mapped_error.is_empty() or not mapped_error.to_lower().contains("staging"):
+			print("FAIL: E_DSTORAGE_REQUEST_TOO_LARGE was not mapped to an actionable message.")
+			quit(1)
+			return
+		print("SUCCESS: DirectStorage HRESULT mapping verified.")
 
 	# Test 1: DSTex write & read
 	var raw_data = PackedByteArray()

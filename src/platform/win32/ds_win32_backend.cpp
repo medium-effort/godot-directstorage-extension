@@ -387,7 +387,11 @@ bool Win32Backend::initialize() {
 		if (err_handler) {
 			err_handler->register_queue(memory_queue);
 		}
-		UtilityFunctions::print("[DirectStorage] Win32Backend DirectStorage Queue created successfully.");
+		RenderingServer *rs = RenderingServer::get_singleton();
+		String driver_name = rs ? rs->get_current_rendering_driver_name().to_lower() : "unknown";
+		UtilityFunctions::print("[DirectStorage] Win32DirectStorage ready: driver=" + driver_name +
+				", staging_buffer=" + String::num_uint64(staging_mb) + " MiB, queue_capacity=" +
+				String::num_uint64(capacity) + ", gpu_decompression=" + (disable_gpu ? "disabled" : "enabled"));
 		return true;
 	} else {
 		uint32_t u_hr = static_cast<uint32_t>(hr);
@@ -469,8 +473,25 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	}
 
 	if (src_size == 0 || uncompressed_size == 0) {
+		file->Close();
+		file->Release();
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("Win32Backend: Invalid size parameters (src_size=" + String::num_uint64(src_size) + ", uncompressed_size=" + String::num_uint64(uncompressed_size) + ").");
+		return false;
+	}
+
+	DSContext *ctx = DSContext::get_singleton();
+	uint64_t staging_size = ctx ? static_cast<uint64_t>(ctx->get_staging_buffer_size_mb()) * 1024ULL * 1024ULL : 0;
+	uint64_t request_size = MAX(static_cast<uint64_t>(src_size), static_cast<uint64_t>(uncompressed_size));
+	if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE && staging_size > 0 && request_size > staging_size) {
+		file->Close();
+		file->Release();
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message("DirectStorage request rejected: file '" + path + "' has compressed payload " +
+				String::num_uint64(src_size) + " bytes and decompressed payload " + String::num_uint64(uncompressed_size) +
+				" bytes, but the staging buffer is " + String::num_uint64(ctx->get_staging_buffer_size_mb()) +
+				" MiB. Increase Project Settings > DirectStorage > Staging Buffer Size to at least " +
+				String::num_uint64((request_size + 1048575ULL) / 1048576ULL) + " MiB.");
 		return false;
 	}
 
@@ -521,6 +542,10 @@ void Win32Backend::submit_batch() {
 	}
 
 	uint64_t start_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
+	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+	if (err_handler) {
+		err_handler->clear_error();
+	}
 
 	if (batch_event) {
 		memory_queue->EnqueueSetEvent(batch_event);
@@ -532,10 +557,18 @@ void Win32Backend::submit_batch() {
 		if (wait_res == WAIT_OBJECT_0) {
 			uint64_t end_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
 			uint64_t duration_us = (end_time > start_time) ? (end_time - start_time) : 1;
+			if (err_handler) {
+				err_handler->process_queue_errors();
+			}
 
 			for (int i = 0; i < in_flight_requests.size(); i++) {
 				if (in_flight_requests[i].is_valid()) {
-					in_flight_requests[i]->set_status(DSRequest::STATUS_COMPLETED);
+					if (err_handler && err_handler->has_error()) {
+						in_flight_requests[i]->set_status(DSRequest::STATUS_FAILED);
+						in_flight_requests[i]->set_error_message(err_handler->get_last_error());
+					} else {
+						in_flight_requests[i]->set_status(DSRequest::STATUS_COMPLETED);
+					}
 				}
 			}
 

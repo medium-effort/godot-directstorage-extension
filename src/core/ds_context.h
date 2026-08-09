@@ -17,7 +17,7 @@ private:
 	static DSContext *singleton;
 	bool initialized = false;
 
-	uint32_t staging_buffer_size_mb = 32;
+	uint32_t staging_buffer_size_mb = 128;
 	bool disable_gpu_decompression = false;
 	uint16_t queue_capacity = 2000;
 
@@ -27,6 +27,8 @@ protected:
 	static void _bind_methods();
 
 public:
+	static constexpr uint32_t DEFAULT_STAGING_BUFFER_SIZE_MB = 128;
+
 	static DSContext *get_singleton();
 
 	DSContext();

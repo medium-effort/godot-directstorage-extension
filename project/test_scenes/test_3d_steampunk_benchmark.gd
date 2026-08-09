@@ -150,6 +150,14 @@ func run_directstorage_benchmark() -> void:
 	var ctx = Engine.get_singleton("DSContext")
 	if ctx and not ctx.is_initialized():
 		ctx.initialize_ds()
+	if ctx and ctx.get_active_backend_name() == "Win32DirectStorage":
+		var error_handler = Engine.get_singleton("DSErrorHandler")
+		var staging_mb: int = ctx.get_staging_buffer_size_mb()
+		if staging_mb < 128 and (error_handler == null or not error_handler.has_method("describe_hresult") or not error_handler.has_method("process_queue_errors")):
+			status_label.text = "Status: DirectStorage extension must be rebuilt for CPU fallback"
+			push_warning("[DS 3D Benchmark] DirectStorage fallback is unavailable because the loaded GDExtension does not contain the diagnostics-safe request path. Rebuild the extension before testing with a staging buffer below 128 MiB.")
+			is_benchmarking = false
+			return
 
 	# _prepare_directstorage_textures()
 

@@ -1,6 +1,8 @@
 @tool
 extends EditorImportPlugin
 
+static var _staging_warnings: Dictionary = {}
+
 ## DirectStorage Texture Import Plugin
 ##
 ## Author: MediumEffort
@@ -71,6 +73,11 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	var format := img.get_format()
 	var mip_count: int = (img.get_mipmap_count() + 1) if img.has_mipmaps() else 1
 	var compression_level: int = options.get("compression/level", 1)
+	var configured_staging_mb: float = float(ProjectSettings.get_setting("directstorage/staging_buffer_size_mb", 128.0))
+	var staging_mb: float = configured_staging_mb if configured_staging_mb > 0.0 else 128.0
+	if raw_data.size() > int(staging_mb * 1024.0 * 1024.0) and not _staging_warnings.has(source_file):
+		_staging_warnings[source_file] = true
+		push_warning("[DirectStorage Importer] Asset '" + source_file + "' requires " + str(ceili(float(raw_data.size()) / 1048576.0)) + " MiB of staging memory, but DirectStorage is configured for " + str(staging_mb) + " MiB. Increase Project Settings > DirectStorage > Staging Buffer Size.")
 
 	if not ClassDB.class_exists("DSTex"):
 		push_error("[DirectStorage Importer] ClassDB entry 'DSTex' missing. Is GDExtension built?")

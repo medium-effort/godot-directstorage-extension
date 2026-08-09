@@ -116,7 +116,8 @@ bool DSContext::initialize_ds() {
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (ps) {
 		if (ps->has_setting("directstorage/staging_buffer_size_mb")) {
-			staging_buffer_size_mb = ps->get_setting("directstorage/staging_buffer_size_mb");
+			uint32_t configured_size = ps->get_setting("directstorage/staging_buffer_size_mb");
+			staging_buffer_size_mb = configured_size > 0 ? configured_size : DEFAULT_STAGING_BUFFER_SIZE_MB;
 		}
 		if (ps->has_setting("directstorage/disable_gpu_decompression")) {
 			disable_gpu_decompression = ps->get_setting("directstorage/disable_gpu_decompression");
@@ -195,7 +196,7 @@ void DSContext::cancel_requests_with_tag(uint64_t p_tag) {
 }
 
 void DSContext::set_staging_buffer_size_mb(uint32_t p_size_mb) {
-	staging_buffer_size_mb = p_size_mb;
+	staging_buffer_size_mb = p_size_mb > 0 ? p_size_mb : DEFAULT_STAGING_BUFFER_SIZE_MB;
 }
 
 uint32_t DSContext::get_staging_buffer_size_mb() const {

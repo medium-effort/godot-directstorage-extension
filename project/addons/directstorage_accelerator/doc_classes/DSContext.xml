@@ -73,7 +73,7 @@
 		<member name="queue_capacity" type="int" setter="set_queue_capacity" getter="get_queue_capacity" default="128">
 			The maximum request capacity for the DirectStorage queue.
 		</member>
-		<member name="staging_buffer_size_mb" type="int" setter="set_staging_buffer_size_mb" getter="get_staging_buffer_size_mb" default="32">
+		<member name="staging_buffer_size_mb" type="int" setter="set_staging_buffer_size_mb" getter="get_staging_buffer_size_mb" default="128">
 			The size in megabytes of each staging buffer allocated by DirectStorage.
 		</member>
 	</members>

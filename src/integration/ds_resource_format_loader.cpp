@@ -115,15 +115,44 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		ds_ctx->initialize_ds();
 	}
 
-	ds_ctx->enqueue_request(req);
-	ds_ctx->flush_batch();
-
-	if (req->get_status() != DSRequest::STATUS_COMPLETED) {
-		UtilityFunctions::push_error("DSResourceFormatLoader: DirectStorage load failed for ", p_cache_key, ": ", req->get_error_message());
-		return Variant();
+	uint64_t staging_size = static_cast<uint64_t>(ds_ctx->get_staging_buffer_size_mb()) * 1024ULL * 1024ULL;
+	uint64_t request_size = MAX(p_compressed_size, p_original_size);
+	bool oversized = staging_size > 0 && request_size > staging_size;
+	bool enqueued = !oversized && ds_ctx->enqueue_request(req);
+	PackedByteArray decompressed_data;
+	if (enqueued) {
+		ds_ctx->flush_batch();
 	}
 
-	PackedByteArray decompressed_data = req->get_destination_buffer();
+	if (!enqueued || req->get_status() != DSRequest::STATUS_COMPLETED) {
+		if (oversized || req->get_error_message().find("staging buffer") >= 0) {
+			Ref<GDeflateDecompressor> cpu_decompressor;
+			cpu_decompressor.instantiate();
+			Ref<FileAccess> file = FileAccess::open(p_file_path, FileAccess::READ);
+			if (file.is_valid()) {
+				file->seek(p_offset);
+				PackedByteArray compressed_data = file->get_buffer(static_cast<int64_t>(p_compressed_size));
+				PackedByteArray cpu_data = cpu_decompressor->decompress(compressed_data, static_cast<int>(p_original_size));
+				if (cpu_data.size() == static_cast<int64_t>(p_original_size)) {
+					UtilityFunctions::push_warning("DSResourceFormatLoader: Using CPU GDeflate fallback for '" + p_cache_key +
+							"'. Increase Project Settings > DirectStorage > Staging Buffer Size to at least " +
+							String::num_uint64((request_size + 1048575ULL) / 1048576ULL) + " MiB to restore DirectStorage acceleration.");
+					decompressed_data = cpu_data;
+				} else {
+					UtilityFunctions::push_error("DSResourceFormatLoader: CPU fallback decompression failed for ", p_cache_key);
+					return Variant();
+				}
+			} else {
+				UtilityFunctions::push_error("DSResourceFormatLoader: DirectStorage load failed for ", p_cache_key, ": ", req->get_error_message());
+				return Variant();
+			}
+		} else {
+			UtilityFunctions::push_error("DSResourceFormatLoader: DirectStorage load failed for ", p_cache_key, ": ", req->get_error_message());
+			return Variant();
+		}
+	} else {
+		decompressed_data = req->get_destination_buffer();
+	}
 	Ref<Texture2D> result_texture;
 
 	RenderingServer *rs = RenderingServer::get_singleton();

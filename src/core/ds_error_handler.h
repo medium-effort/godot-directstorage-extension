@@ -4,6 +4,7 @@
 #include <godot_cpp/classes/object.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/string.hpp>
+#include <cstdint>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -23,8 +24,6 @@ private:
 #ifdef _WIN32
 	HANDLE registered_wait_handle = nullptr;
 	IDStorageQueue *observed_queue = nullptr;
-
-	static VOID NTAPI error_callback(PVOID pData, BOOLEAN bTimeout);
 #endif
 
 protected:
@@ -32,6 +31,7 @@ protected:
 
 public:
 	static DSErrorHandler *get_singleton();
+	static String describe_hresult(uint32_t p_hresult);
 
 	DSErrorHandler();
 	~DSErrorHandler();
@@ -39,6 +39,7 @@ public:
 #ifdef _WIN32
 	bool register_queue(IDStorageQueue *p_queue);
 	void unregister_queue();
+	void process_queue_errors();
 #endif
 
 	bool has_error() const;
