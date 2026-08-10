@@ -1,7 +1,7 @@
 [remap]
 
 importer="directstorage_texture"
-importer_version=1
+importer_version=3
 type="Texture2D"
 uid="uid://derv6i6xxnoe5"
 path="res://.godot/imported/steampunk_underwater_explorer_4.png-bcf9166502233d3bfc809fa636f36229.dstex"
@@ -15,4 +15,6 @@ dest_files=["res://.godot/imported/steampunk_underwater_explorer_4.png-bcf916650
 
 [params]
 
-compression/level=1
+compression/mode=0
+compression/source=1
+compression/gdeflate_level=1

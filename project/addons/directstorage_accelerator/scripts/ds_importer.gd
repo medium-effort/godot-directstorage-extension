@@ -24,7 +24,7 @@ func _get_resource_type() -> String:
 	return "Texture2D"
 
 func _get_format_version() -> int:
-	return 1
+	return 3
 
 func _get_priority() -> float:
 	return 2.0
@@ -41,10 +41,22 @@ func _get_preset_name(preset_index: int) -> String:
 func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 	return [
 		{
-			"name": "compression/level",
+			"name": "compression/mode",
+			"default_value": 0,
+			"property_hint": PROPERTY_HINT_ENUM,
+			"hint_string": "VRAM Compressed (S3TC),VRAM Uncompressed",
+		},
+		{
+			"name": "compression/source",
+			"default_value": Image.COMPRESS_SOURCE_SRGB,
+			"property_hint": PROPERTY_HINT_ENUM,
+			"hint_string": "Generic,sRGB,Normal Map",
+		},
+		{
+			"name": "compression/gdeflate_level",
 			"default_value": 1,
 			"property_hint": PROPERTY_HINT_RANGE,
-			"hint_string": "1,12,1",
+			"hint_string": "1,12,1,prefer_slider",
 		}
 	]
 
@@ -67,12 +79,20 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	if not img.has_mipmaps():
 		img.generate_mipmaps()
 
+	var compression_mode: int = int(options.get("compression/mode", 0))
+	var compression_source: int = int(options.get("compression/source", Image.COMPRESS_SOURCE_SRGB))
+	if compression_mode == 0:
+		var compress_err := img.compress(Image.COMPRESS_S3TC, compression_source)
+		if compress_err != OK:
+			push_warning("[DirectStorage Importer] S3TC compression unavailable for '" + source_file + "'; falling back to lossless GDeflate.")
+			compression_mode = 1
+
 	var raw_data := img.get_data()
 	var width := img.get_width()
 	var height := img.get_height()
 	var format := img.get_format()
 	var mip_count: int = (img.get_mipmap_count() + 1) if img.has_mipmaps() else 1
-	var compression_level: int = options.get("compression/level", 1)
+	var gdeflate_level: int = int(options.get("compression/gdeflate_level", options.get("compression/level", 1)))
 	var configured_staging_mb: float = float(ProjectSettings.get_setting("directstorage/staging_buffer_size_mb", 128.0))
 	var staging_mb: float = configured_staging_mb if configured_staging_mb > 0.0 else 128.0
 	if raw_data.size() > int(staging_mb * 1024.0 * 1024.0) and not _staging_warnings.has(source_file):
@@ -89,11 +109,11 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		return ERR_CANT_CREATE
 
 	var out_file_path := save_path + "." + _get_save_extension()
-	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, compression_level)
+	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level)
 	if write_err != OK:
 		push_error("[DirectStorage Importer] Failed to write .dstex file to: " + out_file_path)
 		return write_err
 
 	gen_files.append(out_file_path)
-	print("[DirectStorage Importer] Imported ", source_file, " -> ", out_file_path, " (Level: ", compression_level, ")")
+	print("[DirectStorage Importer] Imported ", source_file, " -> ", out_file_path, " (Mode: ", "S3TC" if compression_mode == 0 else "GDeflate", ", GDeflate Level: ", gdeflate_level, ")")
 	return OK
