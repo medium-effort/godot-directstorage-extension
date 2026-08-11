@@ -52,6 +52,15 @@ sources = (
 if env["platform"] == "windows":
     sources += Glob("src/platform/win32/*.cpp")
 
+# Embed GDExtension class reference data in editor/debug builds so Godot can
+# show the extension API in the Help window and on Ctrl-click.
+if env["target"] in ["editor", "template_debug"]:
+    doc_data = env.GodotCPPDocData(
+        "src/gen/doc_data.gen.cpp",
+        source=Glob("project/addons/directstorage_accelerator/doc_classes/*.xml"),
+    )
+    sources.append(doc_data)
+
 
 output_dir = "project/addons/directstorage_accelerator/bin/"
 target_name = "directstorage_accelerator" + env["suffix"] + env["SHLIBSUFFIX"]
@@ -216,5 +225,4 @@ atexit.register(write_build_manifest)
 
 
 Default(targets)
-
 

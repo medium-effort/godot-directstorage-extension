@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="GDeflateDecompressor" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Decompresses byte arrays encoded with the GDeflate tile format.
+	</brief_description>
+	<description>
+		[GDeflateDecompressor] is the software decompression counterpart to [GDeflateCompressor]. It is used automatically as a CPU fallback when a payload cannot be processed by the configured DirectStorage path.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="decompress">
+			<return type="PackedByteArray" />
+			<param index="0" name="compressed" type="PackedByteArray" />
+			<param index="1" name="original_size" type="int" />
+			<description>Decompresses [param compressed] into an output array of [param original_size] bytes. Returns an empty array for invalid input or decompression failure.</description>
+		</method>
+		<method name="get_worker_count" qualifiers="const">
+			<return type="int" />
+			<description>Returns the number of worker threads used for decompression.</description>
+		</method>
+		<method name="set_worker_count">
+			<return type="void" />
+			<param index="0" name="count" type="int" />
+			<description>Sets the worker count, clamped to the range [code]1[/code] through [code]8[/code].</description>
+		</method>
+	</methods>
+	<members>
+		<member name="worker_count" type="int" setter="set_worker_count" getter="get_worker_count" default="4">
+			Number of worker threads used for software decompression. The constructor selects a value from [code]1[/code] through [code]8[/code] based on available processors.
+		</member>
+	</members>
+</class>

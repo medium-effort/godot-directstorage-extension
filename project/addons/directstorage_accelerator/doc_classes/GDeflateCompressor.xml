@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="GDeflateCompressor" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Compresses byte arrays using the GDeflate tile format.
+	</brief_description>
+	<description>
+		[GDeflateCompressor] produces data compatible with [GDeflateDecompressor] and the DirectStorage GDeflate request path. Compression levels range from [code]1[/code] through [code]12[/code]. The default [member compression_level] is [code]1[/code].
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="compress">
+			<return type="PackedByteArray" />
+			<param index="0" name="input" type="PackedByteArray" />
+			<param index="1" name="level" type="int" default="-1" />
+			<description>Compresses [param input]. An invalid [param level], including [code]-1[/code], uses [member compression_level]. Returns an empty array for empty input or compression failure.</description>
+		</method>
+		<method name="compress_bound" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="input_size" type="int" />
+			<description>Returns an upper bound for the compressed size of an input with [param input_size] bytes. Returns [code]0[/code] for non-positive sizes.</description>
+		</method>
+		<method name="get_compression_level" qualifiers="const">
+			<return type="int" />
+			<description>Returns the default compression level used when [method compress] receives an invalid level.</description>
+		</method>
+		<method name="set_compression_level">
+			<return type="void" />
+			<param index="0" name="level" type="int" />
+			<description>Sets the default compression level, clamped to the range [code]1[/code] through [code]12[/code].</description>
+		</method>
+	</methods>
+	<members>
+		<member name="compression_level" type="int" setter="set_compression_level" getter="get_compression_level" default="1">
+			Default GDeflate compression level, from [code]1[/code] through [code]12[/code].
+		</member>
+	</members>
+</class>

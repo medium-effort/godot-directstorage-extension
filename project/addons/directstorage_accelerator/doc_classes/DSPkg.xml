@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSPkg" inherits="Resource" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Builds and reads archives of DirectStorage texture payloads.
+	</brief_description>
+	<description>
+		[DSPkg] packages existing [code].dstex[/code] files into a [code].dspkg[/code] archive without recompressing their payloads. Use [method create], [method add_texture], and [method finalize] to build an archive. Use [method open] and the reader methods to inspect or extract entry data. The resource loader also uses [code]res://textures.dspkg[/code] for bundled texture lookups.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_texture">
+			<return type="Error" />
+			<param index="0" name="resource_path" type="String" />
+			<param index="1" name="dstex_path" type="String" />
+			<description>Adds an existing [code].dstex[/code] file to an archive currently being built. Call [method create] first.</description>
+		</method>
+		<method name="create">
+			<return type="Error" />
+			<param index="0" name="output_path" type="String" />
+			<description>Starts building a new archive at [param output_path]. Call [method add_texture] for each entry, then call [method finalize].</description>
+		</method>
+		<method name="finalize">
+			<return type="Error" />
+			<description>Writes the archive header, entry table, and staged payloads. Returns an error if the archive is not being built or contains no textures.</description>
+		</method>
+		<method name="get_entries" qualifiers="const">
+			<return type="Array" />
+			<description>Returns an array of resource paths for all entries in the opened archive, or an empty array when no archive is open.</description>
+		</method>
+		<method name="get_entry_count" qualifiers="const">
+			<return type="int" />
+			<description>Returns the number of entries in the opened archive.</description>
+		</method>
+		<method name="get_entry_info" qualifiers="const">
+			<return type="Dictionary" />
+			<param index="0" name="resource_path" type="String" />
+			<description>Returns metadata for an entry, including [code]archive_path[/code], [code]path[/code], [code]data_offset[/code], [code]compressed_size[/code], [code]original_size[/code], [code]width[/code], [code]height[/code], [code]pixel_format[/code], and [code]mip_count[/code].</description>
+		</method>
+		<method name="has_texture" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="resource_path" type="String" />
+			<description>Returns whether the opened archive contains [param resource_path].</description>
+		</method>
+		<method name="open">
+			<return type="Error" />
+			<param index="0" name="path" type="String" />
+			<description>Opens and validates a [code].dspkg[/code] archive for reading. A failed open clears any previously loaded archive state.</description>
+		</method>
+		<method name="read_texture" qualifiers="const">
+			<return type="Dictionary" />
+			<param index="0" name="resource_path" type="String" />
+			<description>Reads an entry's compressed payload and metadata. The result contains [code]path[/code], [code]compressed_data[/code], [code]width[/code], [code]height[/code], [code]pixel_format[/code], [code]mip_count[/code], [code]original_size[/code], and [code]compressed_size[/code].</description>
+		</method>
+	</methods>
+</class>

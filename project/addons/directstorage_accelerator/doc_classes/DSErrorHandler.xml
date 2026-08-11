@@ -4,11 +4,16 @@
 		Asynchronous error bridge for DirectStorage kernel events.
 	</brief_description>
 	<description>
-		[DSErrorHandler] registers a Windows Threadpool wait on DirectStorage error events. When a background I/O error occurs, it retrieves [code]DSTORAGE_ERROR_RECORD[/code] diagnostics and routes error messages to Godot's Output panel via [method push_error].
+		[DSErrorHandler] stores asynchronous DirectStorage diagnostics and routes native failures to Godot's Output panel. The extension registers it as the [Engine] singleton named [code]"DSErrorHandler"[/code]. Queue monitoring is available on Windows builds; [method describe_hresult] can also translate known DirectStorage HRESULT values on any build.
 	</description>
 	<tutorials>
 	</tutorials>
 	<methods>
+		<method name="describe_hresult" qualifiers="static">
+			<return type="String" />
+			<param index="0" name="hresult" type="int" />
+			<description>Returns a readable description for a known DirectStorage HRESULT. Returns an empty string when the code is not recognized.</description>
+		</method>
 		<method name="clear_error">
 			<return type="void" />
 			<description>
@@ -33,6 +38,10 @@
 			<description>
 				Manually flags and reports an error message to the error handler.
 			</description>
+		</method>
+		<method name="process_queue_errors">
+			<return type="void" />
+			<description>Retrieves and reports pending DirectStorage queue failures. This method is available only on Windows builds and is normally called by the native backend.</description>
 		</method>
 	</methods>
 </class>

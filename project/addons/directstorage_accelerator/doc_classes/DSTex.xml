@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSTex" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Reads and writes the DirectStorage compressed texture format.
+	</brief_description>
+	<description>
+		[DSTex] creates and inspects [code].dstex[/code] files. A file stores texture dimensions, a Godot-to-RenderingDevice pixel format, mip metadata, and a GDeflate-compressed payload. The resource loader can load [code].dstex[/code] files as [Texture2D] resources automatically.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_file_info">
+			<return type="Dictionary" />
+			<param index="0" name="path" type="String" />
+			<description>Returns the same header dictionary as [method read_header].</description>
+		</method>
+		<method name="godot_format_to_rd_format" qualifiers="static">
+			<return type="int" />
+			<param index="0" name="image_format" type="int" />
+			<description>Converts an [Image] format value to the corresponding [RenderingDevice] data format value.</description>
+		</method>
+		<method name="read_from_file">
+			<return type="Dictionary" />
+			<param index="0" name="path" type="String" />
+			<description>Reads a complete [code].dstex[/code] file. The result contains [code]header[/code], [code]compressed_data[/code], [code]mip_offsets[/code], and [code]mip_sizes[/code]. Returns an empty dictionary when the file is invalid or cannot be opened.</description>
+		</method>
+		<method name="read_header">
+			<return type="Dictionary" />
+			<param index="0" name="path" type="String" />
+			<description>Reads only the [code].dstex[/code] header. The result contains [code]magic[/code], [code]version[/code], [code]flags[/code], [code]width[/code], [code]height[/code], [code]pixel_format[/code], [code]mip_count[/code], [code]original_size[/code], [code]compressed_size[/code], and [code]reserved[/code].</description>
+		</method>
+		<method name="rd_format_to_godot_format" qualifiers="static">
+			<return type="int" />
+			<param index="0" name="rd_format" type="int" />
+			<description>Converts a [RenderingDevice] data format value to the corresponding [Image] format value.</description>
+		</method>
+		<method name="write_to_file">
+			<return type="Error" />
+			<param index="0" name="path" type="String" />
+			<param index="1" name="raw_data" type="PackedByteArray" />
+			<param index="2" name="width" type="int" />
+			<param index="3" name="height" type="int" />
+			<param index="4" name="format" type="int" />
+			<param index="5" name="mip_count" type="int" default="1" />
+			<param index="6" name="compression_level" type="int" default="1" />
+			<description>Compresses [param raw_data] with GDeflate and writes a [code].dstex[/code] file. [param format] is an [Image] format value. Returns [constant OK] on success or a Godot [Error] code on invalid data, compression failure, or file access failure.</description>
+		</method>
+	</methods>
+</class>

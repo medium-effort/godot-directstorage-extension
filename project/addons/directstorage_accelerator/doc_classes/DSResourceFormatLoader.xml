@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSResourceFormatLoader" inherits="ResourceFormatLoader" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Automatic resource loader for DirectStorage texture and package files.
+	</brief_description>
+	<description>
+		[DSResourceFormatLoader] is registered automatically by the extension and normally does not need to be instantiated by user code. It recognizes [code].dstex[/code] and [code].dspkg[/code] files, loads [code].dstex[/code] as [Texture2D], loads [code].dspkg[/code] as [Resource], and can resolve bundled texture paths from [code]res://textures.dspkg[/code]. It uses [DSContext], [DSRequest], [GDeflateDecompressor], and [DSTextureCache] internally.
+	</description>
+	<tutorials>
+	</tutorials>
+</class>

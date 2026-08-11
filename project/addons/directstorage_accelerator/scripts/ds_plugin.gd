@@ -4,8 +4,9 @@ extends EditorPlugin
 ## DirectStorage Accelerator Editor Plugin
 ##
 ## Author: MediumEffort
-## Description: Handles registration of the DSBatchManager autoload singleton,
-## custom DSTex importer, and DSPkg export plugin in Godot Editor.
+## Description: Registers the DSBatchManager autoload, DSTex importer, and
+## DSPkg export plugin in the Godot Editor. Enable this plugin to get the
+## automatic texture import and archive bundling workflow.
 
 const AUTOLOAD_NAME: String = "DSBatchManager"
 const AUTOLOAD_PATH: String = "res://addons/directstorage_accelerator/scripts/ds_batch_manager.gd"
@@ -13,7 +14,8 @@ const AUTOLOAD_PATH: String = "res://addons/directstorage_accelerator/scripts/ds
 var _importer: EditorImportPlugin = null
 var _export_plugin: EditorExportPlugin = null
 
-## Called when the plugin enters the scene tree in Godot Editor.
+## Registers the autoload, import plugin, export plugin, and DirectStorage
+## runtime when the addon is enabled.
 func _enter_tree() -> void:
 	if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
 		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
@@ -41,7 +43,7 @@ func _enter_tree() -> void:
 	if ds_context:
 		ds_context.initialize_ds()
 
-## Called when the plugin exits the scene tree or is disabled in Godot Editor.
+## Unregisters the autoload, import plugin, and export plugin when disabled.
 func _exit_tree() -> void:
 	if _importer != null:
 		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
@@ -60,4 +62,3 @@ func _exit_tree() -> void:
 			ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, null)
 
 	print("[DirectStorage] Plugin disabled. Autoload, Importer, and Exporter unregistered.")
-

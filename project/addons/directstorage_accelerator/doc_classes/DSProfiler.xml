@@ -4,7 +4,7 @@
 		Performance profiling and NVMe transfer throughput monitor for DirectStorage.
 	</brief_description>
 	<description>
-		[DSProfiler] tracks read workload durations and bytes transferred. It registers the custom monitor [code]"directstorage/throughput_mbps"[/code] in Godot's [Performance] monitor, allowing real-time MB/s throughput inspection in Godot Editor debugger graphs.
+		[DSProfiler] tracks read workload durations and bytes transferred. The extension registers it as the [Engine] singleton named [code]"DSProfiler"[/code]. [method register_performance_monitors] adds [code]"directstorage/throughput_mbps"[/code] to Godot's [Performance] monitors.
 	</description>
 	<tutorials>
 	</tutorials>

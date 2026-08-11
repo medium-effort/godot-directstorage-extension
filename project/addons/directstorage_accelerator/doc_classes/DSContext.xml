@@ -4,11 +4,17 @@
 		Core singleton manager for DirectStorage hardware acceleration and fallback backends in Godot.
 	</brief_description>
 	<description>
-		[DSContext] manages the lifecycle of the Microsoft DirectStorage factory, memory queues, staging buffers, and cross-platform I/O fallback backends. It provides batch request submission and cancellation for NVMe streaming pipelines.
+		[DSContext] manages the lifecycle of the DirectStorage runtime, memory queues, staging buffers, and software fallback backend. The extension registers it as the [Engine] singleton named [code]"DSContext"[/code]. Use [method initialize_ds] before submitting requests, then call [method flush_batch] after enqueuing requests. The addon autoload normally performs this per-frame flush automatically.
 	</description>
 	<tutorials>
 	</tutorials>
 	<methods>
+		<method name="get_active_backend_name" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the active backend name. The DirectStorage backend is named [code]"Win32DirectStorage"[/code]; the software backend is named [code]"SoftwareFallback"[/code]. Returns [code]"None"[/code] before initialization.
+			</description>
+		</method>
 		<method name="cancel_requests_with_tag">
 			<return type="void" />
 			<param index="0" name="tag" type="int" />
@@ -20,20 +26,31 @@
 			<return type="bool" />
 			<param index="0" name="request" type="DSRequest" />
 			<description>
-				Enqueues a [DSRequest] object into the active DirectStorage/fallback I/O queue. Returns [code]true[/code] if enqueued successfully.
+				Enqueues a configured [DSRequest] into the active I/O queue. The request is not submitted until [method flush_batch] is called. Returns [code]true[/code] if it was accepted; a null request or unavailable backend returns [code]false[/code].
 			</description>
 		</method>
 		<method name="flush_batch">
 			<return type="void" />
 			<description>
-				Flushes and submits all enqueued requests in the queue to the DirectStorage runtime or fallback worker threadpool.
+				Submits all requests currently queued to the DirectStorage runtime or software fallback worker pool. Request completion is reflected in each request's [member DSRequest.status].
 			</description>
 		</method>
-		<method name="get_active_backend_name" qualifiers="const">
-			<return type="String" />
-			<description>
-				Returns the name of the active I/O backend ([code]"Win32DirectStorage"[/code] or [code]"SoftwareFallback"[/code]).
-			</description>
+		<method name="get_disable_gpu_decompression" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether GPU decompression has been disabled.</description>
+		</method>
+		<method name="get_drive_info" qualifiers="const">
+			<return type="Dictionary" />
+			<param index="0" name="path" type="String" default="res://" />
+			<description>Returns drive capability information for [param path], including [code]drive[/code], [code]bus_type[/code], [code]file_system[/code], [code]directstorage_supported[/code], and, when applicable, [code]reason[/code].</description>
+		</method>
+		<method name="get_queue_capacity" qualifiers="const">
+			<return type="int" />
+			<description>Returns the maximum number of requests allowed in a queue. The default is [code]2000[/code].</description>
+		</method>
+		<method name="get_staging_buffer_size_mb" qualifiers="const">
+			<return type="int" />
+			<description>Returns the configured staging buffer size in MiB. The default is [code]128[/code].</description>
 		</method>
 		<method name="initialize_ds">
 			<return type="bool" />
@@ -44,7 +61,7 @@
 		<method name="is_d3d12_backend" qualifiers="const">
 			<return type="bool" />
 			<description>
-				Returns [code]true[/code] if Godot is running with the Direct3D 12 rendering driver.
+				Returns [code]true[/code] when DirectStorage is supported and Godot is using a valid Direct3D 12 logical device.
 			</description>
 		</method>
 		<method name="is_initialized" qualifiers="const">
@@ -53,10 +70,19 @@
 				Returns [code]true[/code] if [DSContext] has been initialized.
 			</description>
 		</method>
+		<method name="is_current_drive_supported" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether the drive containing the running executable supports DirectStorage.</description>
+		</method>
+		<method name="is_path_supported" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="path" type="String" />
+			<description>Returns whether the drive containing [param path] supports DirectStorage. This does not initialize the runtime.</description>
+		</method>
 		<method name="is_supported" qualifiers="const">
 			<return type="bool" />
 			<description>
-				Returns [code]true[/code] if the current OS platform supports DirectStorage.
+				Returns [code]true[/code] when the native Windows DirectStorage backend is available. A software fallback can still initialize on unsupported platforms, but this method remains [code]false[/code].
 			</description>
 		</method>
 		<method name="shutdown_ds">
@@ -65,13 +91,28 @@
 				Shuts down DirectStorage queues, releases COM interfaces, and cleans up active backend resources.
 			</description>
 		</method>
+		<method name="set_disable_gpu_decompression">
+			<return type="void" />
+			<param index="0" name="disable" type="bool" />
+			<description>Enables or disables GPU decompression for subsequent initialization and requests.</description>
+		</method>
+		<method name="set_queue_capacity">
+			<return type="void" />
+			<param index="0" name="capacity" type="int" />
+			<description>Sets the maximum queue capacity used by the backend.</description>
+		</method>
+		<method name="set_staging_buffer_size_mb">
+			<return type="void" />
+			<param index="0" name="size_mb" type="int" />
+			<description>Sets the staging buffer size in MiB. A value less than or equal to zero restores the default of [code]128[/code] MiB.</description>
+		</method>
 	</methods>
 	<members>
 		<member name="disable_gpu_decompression" type="bool" setter="set_disable_gpu_decompression" getter="get_disable_gpu_decompression" default="false">
 			If [code]true[/code], forces DirectStorage runtime to perform CPU decompression instead of GPU decompression shaders.
 		</member>
 		<member name="queue_capacity" type="int" setter="set_queue_capacity" getter="get_queue_capacity" default="128">
-			The maximum request capacity for the DirectStorage queue.
+			The maximum request capacity for the DirectStorage queue. The default is [code]2000[/code].
 		</member>
 		<member name="staging_buffer_size_mb" type="int" setter="set_staging_buffer_size_mb" getter="get_staging_buffer_size_mb" default="128">
 			The size in megabytes of each staging buffer allocated by DirectStorage.

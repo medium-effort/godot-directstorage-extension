@@ -6,38 +6,51 @@ static var _staging_warnings: Dictionary = {}
 ## DirectStorage Texture Import Plugin
 ##
 ## Author: MediumEffort
-## Description: Custom EditorImportPlugin to convert textures (.png, .jpg, .jpeg, .webp) into .dstex format.
+## Description: Converts .png, .jpg, .jpeg, and .webp sources into .dstex
+## resources. The importer runs in the editor and exposes compression settings
+## in the Import dock.
 
+## Returns the stable importer identifier stored in .import metadata.
 func _get_importer_name() -> String:
 	return "directstorage_texture"
 
+## Returns the importer name shown in the Import dock.
 func _get_visible_name() -> String:
 	return "DirectStorage Texture"
 
+## Returns the source image extensions handled by this importer.
 func _get_recognized_extensions() -> PackedStringArray:
 	return PackedStringArray(["png", "jpg", "jpeg", "webp"])
 
+## Returns the generated resource extension.
 func _get_save_extension() -> String:
 	return "dstex"
 
+## Returns the Godot resource type produced by the importer.
 func _get_resource_type() -> String:
 	return "Texture2D"
 
+## Returns the importer format version used to invalidate old imports.
 func _get_format_version() -> int:
 	return 3
 
+## Gives this importer priority over Godot's default texture importer.
 func _get_priority() -> float:
 	return 2.0
 
+## Returns the import order used by the editor import pipeline.
 func _get_import_order() -> int:
 	return 0
 
+## Returns the number of named import presets.
 func _get_preset_count() -> int:
 	return 1
 
+## Returns the display name of an import preset.
 func _get_preset_name(preset_index: int) -> String:
 	return "Default"
 
+## Declares compression mode, source color space, and GDeflate level options.
 func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 	return [
 		{
@@ -60,9 +73,12 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 		}
 	]
 
+## Keeps all importer options visible in the Import dock.
 func _get_option_visibility(path: String, option_name: StringName, options: Dictionary) -> bool:
 	return true
 
+## Converts one source image into a compressed .dstex file and reports it to
+## Godot's import pipeline through gen_files.
 func _import(source_file: String, save_path: String, options: Dictionary, platform_variants: Array[String], gen_files: Array[String]) -> Error:
 	var global_path := ProjectSettings.globalize_path(source_file)
 	var img := Image.load_from_file(global_path)

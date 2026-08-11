@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSTextureCache" inherits="Object" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Thread-safe least-recently-used cache for DirectStorage textures.
+	</brief_description>
+	<description>
+		[DSTextureCache] stores loaded [Texture2D] resources by path and promotes entries when they are read. The extension registers it as the [Engine] singleton named [code]"DSTextureCache"[/code]. The resource loader uses this cache unless a resource load explicitly ignores caching.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="clear">
+			<return type="void" />
+			<description>Removes every cached texture.</description>
+		</method>
+		<method name="evict">
+			<return type="void" />
+			<param index="0" name="path" type="String" />
+			<description>Removes the cached texture stored under [param path], if present.</description>
+		</method>
+		<method name="get_cached">
+			<return type="Texture2D" />
+			<param index="0" name="path" type="String" />
+			<description>Returns the cached texture for [param path] and marks it as recently used. Returns [code]null[/code] when no entry exists.</description>
+		</method>
+		<method name="get_cached_count" qualifiers="const">
+			<return type="int" />
+			<description>Returns the number of textures currently cached.</description>
+		</method>
+		<method name="get_max_entries" qualifiers="const">
+			<return type="int" />
+			<description>Returns the maximum number of entries retained by the cache.</description>
+		</method>
+		<method name="set_max_entries">
+			<return type="void" />
+			<param index="0" name="max" type="int" />
+			<description>Sets the cache capacity. Values less than [code]1[/code] are clamped to [code]1[/code]; excess oldest entries are evicted immediately.</description>
+		</method>
+		<method name="store">
+			<return type="void" />
+			<param index="0" name="path" type="String" />
+			<param index="1" name="texture" type="Texture2D" />
+			<description>Stores [param texture] under [param path] and marks it as recently used. Null textures are ignored.</description>
+		</method>
+	</methods>
+	<members>
+		<member name="max_entries" type="int" setter="set_max_entries" getter="get_max_entries" default="256">
+			Maximum number of textures retained by the least-recently-used cache.
+		</member>
+	</members>
+</class>

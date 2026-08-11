@@ -5,7 +5,8 @@ extends Node
 ## Author: MediumEffort
 ## Description: Flushes and submits all enqueued DirectStorage read requests at the end of each frame (_process).
 
-## Called when the autoload node enters the scene tree.
+## Initializes [DSContext] and reports the selected backend when the autoload
+## enters the scene tree.
 func _ready() -> void:
 	if ClassDB.class_exists("DSContext"):
 		var ctx = Engine.get_singleton("DSContext")
@@ -15,14 +16,14 @@ func _ready() -> void:
 	else:
 		push_warning("[DirectStorage] GDExtension ClassDB entry 'DSContext' not found. Ensure GDExtension library built.")
 
-## Per-frame update loop. Flushes enqueued I/O requests to DirectStorage.
+## Submits all requests queued during the frame through [DSContext.flush_batch].
 func _process(_delta: float) -> void:
 	if ClassDB.class_exists("DSContext"):
 		var ctx = Engine.get_singleton("DSContext")
 		if ctx and ctx.is_initialized():
 			ctx.flush_batch()
 
-## Called when the node is deleted or shutting down.
+## Shuts down [DSContext] before the autoload is deleted.
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_PREDELETE:
 		if ClassDB.class_exists("DSContext"):

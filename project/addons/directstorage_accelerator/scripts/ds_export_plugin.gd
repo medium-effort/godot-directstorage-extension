@@ -4,15 +4,19 @@ extends EditorExportPlugin
 ## DirectStorage Export Plugin
 ##
 ## Author: MediumEffort
-## Description: EditorExportPlugin for bundling .dstex texture files into a single .dspkg archive upon export.
+## Description: Bundles imported .dstex texture files into one .dspkg archive
+## during project export. The resulting archive is written as
+## res://textures.dspkg for the runtime resource loader.
 
 var _dspkg: RefCounted = null
 var _temp_dspkg_path: String = "user://temp_textures.dspkg"
 var _has_textures: bool = false
 
+## Returns the stable export plugin name shown to Godot.
 func _get_name() -> String:
 	return "DirectStorageExporter"
 
+## Starts a temporary DSPkg archive for the current export.
 func _export_begin(features: PackedStringArray, is_debug: bool, path: String, flags: int) -> void:
 	print("[DirectStorage Exporter] Export started for target: ", path)
 	if not ClassDB.class_exists("DSPkg"):
@@ -29,6 +33,8 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		else:
 			print("[DirectStorage Exporter] Initialized temporary DSPkg archive at: ", _temp_dspkg_path)
 
+## Adds an imported .dstex resource to the archive and prevents the individual
+## texture from being copied into the exported PCK.
 func _export_file(path: String, type: String, features: PackedStringArray) -> void:
 	if _dspkg == null:
 		return
@@ -59,6 +65,7 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 		else:
 			push_error("[DirectStorage Exporter] Failed to add texture to archive: " + dstex_path)
 
+## Finalizes the archive, adds it to the export, and removes the temporary file.
 func _export_end() -> void:
 	if _dspkg != null:
 		if _has_textures:
@@ -77,4 +84,3 @@ func _export_end() -> void:
 	_dspkg = null
 	if FileAccess.file_exists(_temp_dspkg_path):
 		DirAccess.remove_absolute(_temp_dspkg_path)
-
