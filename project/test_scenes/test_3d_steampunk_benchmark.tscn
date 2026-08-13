@@ -26,15 +26,6 @@ albedo_color = Color(1, 0.45, 0.1, 1)
 metallic = 0.8
 roughness = 0.2
 
-[sub_resource type="Gradient" id="Gradient_522rh"]
-offsets = PackedFloat32Array(0)
-colors = PackedColorArray(0.8745098, 0.8745098, 0.8745098, 1)
-
-[sub_resource type="GradientTexture2D" id="GradientTexture2D_6kbpj"]
-gradient = SubResource("Gradient_522rh")
-width = 16
-height = 16
-
 [node name="Test3DSteampunkBenchmark" type="Control" unique_id=285542536]
 layout_mode = 3
 anchors_preset = 15
@@ -98,7 +89,7 @@ theme_override_constants/separation = 10
 [node name="TitleLabel" type="Label" parent="HUD/VBoxContainer" unique_id=755505493]
 layout_mode = 2
 theme_override_font_sizes/font_size = 20
-text = "DirectStorage 3D Heavy Asset Benchmark"
+text = "DirectStorage 3D Model Load Benchmark"
 horizontal_alignment = 2
 
 [node name="StatusLabel" type="Label" parent="HUD/VBoxContainer" unique_id=631511865]
@@ -117,27 +108,18 @@ horizontal_alignment = 2
 unique_name_in_owner = true
 layout_mode = 2
 theme_override_font_sizes/font_size = 14
-text = "--- BENCHMARK RESULTS ---
+text = "--- BENCHMARK RESULTS (Blocking Raw GLB Load) ---
 [Standard I/O]
+  Model Load Time        : -- ms
   Click-to-Render Latency: -- ms
   Main Thread Freeze     : -- ms
 
-[DirectStorage Stream]
+[DirectStorage I/O]
+  Model Load Time        : -- ms
   Click-to-Render Latency: -- ms
   Main Thread Freeze     : -- ms
   DirectStorage Throughput: -- MB/s"
 horizontal_alignment = 2
-
-[node name="OptionContainer" type="HBoxContainer" parent="HUD/VBoxContainer" unique_id=945714023]
-layout_mode = 2
-alignment = 2
-
-[node name="CheckNonBlocking" type="CheckBox" parent="HUD/VBoxContainer/OptionContainer" unique_id=1022664248]
-unique_name_in_owner = true
-layout_mode = 2
-theme_override_icons/unchecked = SubResource("GradientTexture2D_6kbpj")
-text = "Enable Non-Blocking
-Asynchronous Mode"
 
 [node name="ButtonContainer" type="HBoxContainer" parent="HUD/VBoxContainer" unique_id=1313361438]
 layout_mode = 2
