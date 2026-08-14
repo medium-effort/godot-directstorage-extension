@@ -1,0 +1,78 @@
+[gd_scene format=3 uid="uid://c6j8m1n2p3q4r"]
+
+[ext_resource type="Script" uid="uid://cepnk2y1eqk5m" path="res://test_scenes/test_portable_benchmark_requirements.gd" id="1_requirements_test_script"]
+
+[node name="TestPortableBenchmarkRequirements" type="Control" unique_id=864710478]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_requirements_test_script")
+
+[node name="MarginContainer" type="MarginContainer" parent="." unique_id=860018568]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/margin_left = 24
+theme_override_constants/margin_top = 20
+theme_override_constants/margin_right = 24
+theme_override_constants/margin_bottom = 20
+
+[node name="VBoxContainer" type="VBoxContainer" parent="MarginContainer" unique_id=1691096135]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="TitleLabel" type="Label" parent="MarginContainer/VBoxContainer" unique_id=153858506]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 22
+text = "DirectStorage Portable Benchmark Requirements Verification"
+horizontal_alignment = 1
+
+[node name="StatusLabel" type="Label" parent="MarginContainer/VBoxContainer" unique_id=1362686145]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 15
+text = "Status: Ready"
+horizontal_alignment = 1
+
+[node name="SummaryLabel" type="Label" parent="MarginContainer/VBoxContainer" unique_id=1935741267]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 14
+text = "Passed: 0 | Failed: 0 | Total: 0"
+horizontal_alignment = 1
+
+[node name="ButtonContainer" type="HBoxContainer" parent="MarginContainer/VBoxContainer" unique_id=149690583]
+layout_mode = 2
+theme_override_constants/separation = 16
+alignment = 1
+
+[node name="RunAllButton" type="Button" parent="MarginContainer/VBoxContainer/ButtonContainer" unique_id=553759650]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(180, 40)
+layout_mode = 2
+text = "Run All Test Suites"
+
+[node name="ClearButton" type="Button" parent="MarginContainer/VBoxContainer/ButtonContainer" unique_id=1553293360]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "Clear Log"
+
+[node name="LogPanel" type="PanelContainer" parent="MarginContainer/VBoxContainer" unique_id=1988169202]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="LogOutput" type="RichTextLabel" parent="MarginContainer/VBoxContainer/LogPanel" unique_id=372181492]
+unique_name_in_owner = true
+layout_mode = 2
+focus_mode = 2
+bbcode_enabled = true
+scroll_following = true
+selection_enabled = true

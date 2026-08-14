@@ -21,10 +21,29 @@
 				Returns the microsecond duration of the last profiled workload.
 			</description>
 		</method>
+		<method name="get_last_result" qualifiers="const">
+			<return type="DSProfilerResult" />
+			<description>
+				Returns the most recently recorded [DSProfilerResult] metric report, or [code]null[/code] if no workload has been recorded.
+			</description>
+		</method>
 		<method name="get_last_throughput_mbps" qualifiers="const">
 			<return type="float" />
 			<description>
 				Returns the calculated transfer throughput in megabytes per second (MB/s).
+			</description>
+		</method>
+		<method name="get_result_history" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Returns an [Array] containing previously recorded [DSProfilerResult] instances representing profiling history.
+			</description>
+		</method>
+		<method name="record_result">
+			<return type="void" />
+			<param index="0" name="result" type="DSProfilerResult" />
+			<description>
+				Records a completed [DSProfilerResult] metric object into the profiler history and updates last-workload metrics.
 			</description>
 		</method>
 		<method name="record_workload">

@@ -20,6 +20,11 @@
 			<param index="0" name="input_size" type="int" />
 			<description>Returns an upper bound for the compressed size of an input with [param input_size] bytes. Returns [code]0[/code] for non-positive sizes.</description>
 		</method>
+		<method name="compress_with_stats" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="data" type="PackedByteArray" />
+			<description>Compresses [param data] with GDeflate and returns a [Dictionary] containing compression telemetry: [code]compressed_data[/code] ([PackedByteArray]), [code]original_size[/code] ([int]), [code]compressed_size[/code] ([int]), [code]compression_ratio[/code] ([float]), and [code]success[/code] ([bool]).</description>
+		</method>
 		<method name="get_compression_level" qualifiers="const">
 			<return type="int" />
 			<description>Returns the default compression level used when [method compress] receives an invalid level.</description>
@@ -28,6 +33,11 @@
 			<return type="void" />
 			<param index="0" name="level" type="int" />
 			<description>Sets the default compression level, clamped to the range [code]1[/code] through [code]12[/code].</description>
+		</method>
+		<method name="verify_round_trip" qualifiers="static">
+			<return type="bool" />
+			<param index="0" name="data" type="PackedByteArray" />
+			<description>Compresses and immediately decompresses [param data] in memory to verify that the compression and decompression round-trip produces bit-identical output. Returns [code]true[/code] if the round-trip succeeds.</description>
 		</method>
 	</methods>
 	<members>

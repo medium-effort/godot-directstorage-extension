@@ -16,6 +16,11 @@
 *.ilk
 *.exp
 
+# Generated source files & doc data
+src/gen/
+*.gen.cpp
+*.gen.h
+
 # Compiled GDExtension target outputs and build artifacts
 project/addons/directstorage_accelerator/bin/directstorage_accelerator.*
 project/addons/directstorage_accelerator/bin/*.lib

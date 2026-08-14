@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSProfilerResult" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Stores detailed timing, throughput, and error metrics for a DirectStorage I/O batch execution or workload.
+	</brief_description>
+	<description>
+		[DSProfilerResult] encapsulates performance and execution telemetry recorded during DirectStorage and fallback batch processing. It reports physical storage read durations, CPU/GPU decompression timing, byte counts, and calculated logical and physical throughput in decimal (MB/s) and binary (MiB/s) units. Instances are created by [DSProfiler] and retrieved via [method DSProfiler.get_last_result] or [method DSProfiler.get_result_history].
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_compressed_bytes_read" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the total number of physical/compressed bytes read from storage during the workload.
+			</description>
+		</method>
+		<method name="get_decompression_duration_usec" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the decompression duration in microseconds, or [code]-1[/code] if decompression was integrated with GPU completion or not separately measurable.
+			</description>
+		</method>
+		<method name="get_error_state" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the error status code recorded during the workload ([code]0[/code] for success, non-zero on error).
+			</description>
+		</method>
+		<method name="get_logical_throughput_mbps" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the logical decompression throughput in decimal megabytes per second (MB/s).
+			</description>
+		</method>
+		<method name="get_logical_throughput_mibps" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the logical decompression throughput in mebibytes per second (MiB/s).
+			</description>
+		</method>
+		<method name="get_physical_read_duration_usec" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the physical storage I/O read duration in microseconds.
+			</description>
+		</method>
+		<method name="get_physical_throughput_mbps" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the physical storage read throughput in decimal megabytes per second (MB/s).
+			</description>
+		</method>
+		<method name="get_physical_throughput_mibps" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the physical storage read throughput in mebibytes per second (MiB/s).
+			</description>
+		</method>
+		<method name="get_request_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of read requests included in the profiled workload.
+			</description>
+		</method>
+		<method name="get_uncompressed_bytes_produced" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the total number of uncompressed (logical) bytes produced after decompression.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="compressed_bytes_read" type="int" setter="" getter="get_compressed_bytes_read" default="0">
+			Total number of physical/compressed bytes read from storage.
+		</member>
+		<member name="decompression_duration_usec" type="int" setter="" getter="get_decompression_duration_usec" default="-1">
+			Duration of decompression in microseconds, or [code]-1[/code] when decompression timing is integrated into GPU completion.
+		</member>
+		<member name="error_state" type="int" setter="" getter="get_error_state" default="0">
+			Error state code recorded during the workload ([code]0[/code] for success, non-zero on failure).
+		</member>
+		<member name="logical_throughput_mbps" type="float" setter="" getter="get_logical_throughput_mbps" default="0.0">
+			Logical decompression throughput in decimal megabytes per second (MB/s).
+		</member>
+		<member name="physical_read_duration_usec" type="int" setter="" getter="get_physical_read_duration_usec" default="0">
+			Physical storage I/O duration in microseconds.
+		</member>
+		<member name="physical_throughput_mbps" type="float" setter="" getter="get_physical_throughput_mbps" default="0.0">
+			Physical storage read throughput in decimal megabytes per second (MB/s).
+		</member>
+		<member name="request_count" type="int" setter="" getter="get_request_count" default="0">
+			Number of read requests included in the batch.
+		</member>
+		<member name="uncompressed_bytes_produced" type="int" setter="" getter="get_uncompressed_bytes_produced" default="0">
+			Total number of uncompressed (logical) bytes produced after decompression.
+		</member>
+	</members>
+</class>

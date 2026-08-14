@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- actually unused because godot doesn't support docs for EditorImportPlugin for now, 4.7 -->
+<class name="ResourceImporterDirectStorageTexture" inherits="EditorImportPlugin" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Imports an image for use as a DirectStorage compressed texture ([DSTex]).
+	</brief_description>
+	<description>
+		This importer imports [DSTex] ([code].dstex[/code]) compressed texture resources for DirectStorage-accelerated streaming.
+		Image files ([code].png[/code], [code].jpg[/code], [code].jpeg[/code], [code].webp[/code]) are processed with optional S3TC block compression and compressed using Microsoft GDeflate.
+		During export, [EditorExportPlugin] bundles [code].dstex[/code] resources into [code]res://textures.dspkg[/code] via [DSPkg], allowing [DSResourceFormatLoader] and [DSContext] to stream textures directly to GPU or CPU memory at runtime.
+		See also [ResourceImporterTexture], [DSTex], and [DSContext].
+	</description>
+	<tutorials>
+	</tutorials>
+	<members>
+		<member name="compression/gdeflate_level" type="int" setter="" getter="" default="1">
+			The Microsoft GDeflate compression level applied to the texture data payload in the generated [code].dstex[/code] file, ranging from [code]1[/code] through [code]12[/code].
+			Lower values (such as the default [code]1[/code]) maximize encoding speed in the editor and provide the highest DirectStorage decompression throughput.
+			Higher values achieve smaller file sizes on disk at the cost of slower import times and increased decompression workload.
+		</member>
+		<member name="compression/mode" type="int" setter="" getter="" default="0">
+			The compression mode to use for the imported texture.
+			[b]VRAM Compressed (S3TC):[/b] Compresses texture mipmaps using S3TC block compression (BC1/DXT1 for opaque images, BC3/DXT5 for images with transparency or normal maps) prior to GDeflate compression. This significantly reduces GPU VRAM consumption and optimizes streaming bandwidth. Recommended for standard 3D and 2D textures.
+			[b]VRAM Uncompressed:[/b] Retains uncompressed raw pixel data (such as RGBA8) with mipmaps, compressed only on disk using lossless GDeflate. Preserves perfect pixel fidelity with zero block compression artifacts (ideal for pixel art, crisp UI elements, or lookup tables), but requires significantly more VRAM at runtime.
+		</member>
+		<member name="compression/source" type="int" setter="" getter="" default="1">
+			Controls the source color space and channel interpretation during S3TC block compression:
+			[b]Generic:[/b] Generic linear data texture (such as roughness, metallic, masks, or lookup tables). Color channel distances are evaluated linearly without assuming sRGB gamma encoding.
+			[b]sRGB:[/b] Standard color texture (such as albedo or diffuse maps). Color distances are weighted according to perceptual human vision in sRGB space.
+			[b]Normal Map:[/b] Tangent-space normal map. Red and green channels are prioritized to minimize normal vector distortion and lighting artifacts.
+		</member>
+	</members>
+</class>

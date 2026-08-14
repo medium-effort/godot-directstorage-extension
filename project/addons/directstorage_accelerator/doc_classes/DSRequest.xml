@@ -4,7 +4,7 @@
 		Encapsulates a single DirectStorage read request.
 	</brief_description>
 	<description>
-		[DSRequest] contains the source file path, byte offset, read size, cancellation tag, compression format, destination memory buffer, and execution status for one DirectStorage or software-fallback read. Allocate [member destination_buffer] before enqueueing. For [constant COMPRESSION_GDEFLATE], [member size] is the compressed byte count and [member uncompressed_size] is the required destination size.
+		[DSRequest] contains the source file path, byte offset, read size, cancellation tag, compression format, destination target (CPU memory buffer, GPU buffer, or GPU texture), and execution status for one DirectStorage or software-fallback read. For [constant COMPRESSION_GDEFLATE], [member size] is the compressed byte count and [member uncompressed_size] is the required destination size.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -19,7 +19,15 @@
 		</method>
 		<method name="get_destination_buffer" qualifiers="const">
 			<return type="PackedByteArray" />
-			<description>Returns the destination bytes. After completion, this contains the raw or decompressed request output.</description>
+			<description>Returns the destination bytes. After completion, this contains the raw or decompressed request output when targeting system memory.</description>
+		</method>
+		<method name="get_destination_resource" qualifiers="const">
+			<return type="RID" />
+			<description>Returns the [RID] of the target GPU buffer or GPU texture resource when [member destination_type] is [constant DESTINATION_GPU_BUFFER] or [constant DESTINATION_GPU_TEXTURE].</description>
+		</method>
+		<method name="get_destination_type" qualifiers="const">
+			<return type="int" enum="DSRequest.DSDestinationType" />
+			<description>Returns the destination target type ([constant DESTINATION_MEMORY], [constant DESTINATION_GPU_BUFFER], or [constant DESTINATION_GPU_TEXTURE]).</description>
 		</method>
 		<method name="get_error_message" qualifiers="const">
 			<return type="String" />
@@ -28,6 +36,10 @@
 		<method name="get_file_path" qualifiers="const">
 			<return type="String" />
 			<description>Returns the source file path.</description>
+		</method>
+		<method name="get_first_subresource" qualifiers="const">
+			<return type="int" />
+			<description>Returns the zero-based index of the first subresource (mip level or array layer) targeted in a GPU texture destination request.</description>
 		</method>
 		<method name="get_offset" qualifiers="const">
 			<return type="int" />
@@ -40,6 +52,18 @@
 		<method name="get_status" qualifiers="const">
 			<return type="int" enum="DSRequest.Status" />
 			<description>Returns the current request status.</description>
+		</method>
+		<method name="get_subresource_count" qualifiers="const">
+			<return type="int" />
+			<description>Returns the number of consecutive subresources (mip levels or array layers) written in a GPU texture destination request.</description>
+		</method>
+		<method name="get_texture_format" qualifiers="const">
+			<return type="int" />
+			<description>Returns the native driver texture data format identifier used for destination validation.</description>
+		</method>
+		<method name="get_texture_layout" qualifiers="const">
+			<return type="int" />
+			<description>Returns the native driver texture layout identifier used for destination validation.</description>
 		</method>
 		<method name="get_uncompressed_size" qualifiers="const">
 			<return type="int" />
@@ -60,6 +84,16 @@
 			<param index="0" name="buffer" type="PackedByteArray" />
 			<description>Sets the destination buffer. Its size must be large enough for the request output before enqueueing.</description>
 		</method>
+		<method name="set_destination_resource">
+			<return type="void" />
+			<param index="0" name="resource" type="RID" />
+			<description>Sets the target GPU buffer or texture [RID] when [member destination_type] is [constant DESTINATION_GPU_BUFFER] or [constant DESTINATION_GPU_TEXTURE].</description>
+		</method>
+		<method name="set_destination_type">
+			<return type="void" />
+			<param index="0" name="type" type="int" enum="DSRequest.DSDestinationType" />
+			<description>Sets the destination target type ([constant DESTINATION_MEMORY], [constant DESTINATION_GPU_BUFFER], or [constant DESTINATION_GPU_TEXTURE]).</description>
+		</method>
 		<method name="set_error_message">
 			<return type="void" />
 			<param index="0" name="message" type="String" />
@@ -69,6 +103,11 @@
 			<return type="void" />
 			<param index="0" name="path" type="String" />
 			<description>Sets the source file path to read.</description>
+		</method>
+		<method name="set_first_subresource">
+			<return type="void" />
+			<param index="0" name="subresource" type="int" />
+			<description>Sets the zero-based index of the first subresource (mip level or array layer) targeted in a GPU texture destination request.</description>
 		</method>
 		<method name="set_offset">
 			<return type="void" />
@@ -85,6 +124,21 @@
 			<param index="0" name="status" type="int" enum="DSRequest.Status" />
 			<description>Sets the request status. This is primarily used by the active backend; user code should normally only read [member status].</description>
 		</method>
+		<method name="set_subresource_count">
+			<return type="void" />
+			<param index="0" name="count" type="int" />
+			<description>Sets the number of consecutive subresources written in a GPU texture destination request.</description>
+		</method>
+		<method name="set_texture_format">
+			<return type="void" />
+			<param index="0" name="format" type="int" />
+			<description>Sets the native driver texture data format identifier for GPU destination compatibility validation.</description>
+		</method>
+		<method name="set_texture_layout">
+			<return type="void" />
+			<param index="0" name="layout" type="int" />
+			<description>Sets the native driver texture layout identifier for GPU destination compatibility validation.</description>
+		</method>
 		<method name="set_uncompressed_size">
 			<return type="void" />
 			<param index="0" name="uncompressed_size" type="int" />
@@ -99,7 +153,13 @@
 			The compression format of the source data ([code]COMPRESSION_NONE[/code] or [code]COMPRESSION_GDEFLATE[/code]).
 		</member>
 		<member name="destination_buffer" type="PackedByteArray" setter="set_destination_buffer" getter="get_destination_buffer" default="PackedByteArray()">
-			The destination memory buffer where decompressed or raw uncompressed bytes are written.
+			The destination memory buffer where decompressed or raw uncompressed bytes are written when [member destination_type] is [constant DESTINATION_MEMORY].
+		</member>
+		<member name="destination_resource" type="RID" setter="set_destination_resource" getter="get_destination_resource" default="RID()">
+			The GPU buffer or texture resource [RID] when [member destination_type] is [constant DESTINATION_GPU_BUFFER] or [constant DESTINATION_GPU_TEXTURE].
+		</member>
+		<member name="destination_type" type="int" setter="set_destination_type" getter="get_destination_type" enum="DSRequest.DSDestinationType" default="0">
+			The destination type where read data will be delivered ([constant DESTINATION_MEMORY], [constant DESTINATION_GPU_BUFFER], or [constant DESTINATION_GPU_TEXTURE]).
 		</member>
 		<member name="error_message" type="String" setter="set_error_message" getter="get_error_message" default="&quot;&quot;">
 			Error diagnostic string set if the request failed.
@@ -107,11 +167,23 @@
 		<member name="file_path" type="String" setter="set_file_path" getter="get_file_path" default="&quot;&quot;">
 			The file path on disk to read from.
 		</member>
+		<member name="first_subresource" type="int" setter="set_first_subresource" getter="get_first_subresource" default="0">
+			The first subresource index (mip level or array layer) targeted in a GPU texture destination request.
+		</member>
 		<member name="offset" type="int" setter="set_offset" getter="get_offset" default="0">
 			The byte offset in the file to start reading from.
 		</member>
 		<member name="size" type="int" setter="set_size" getter="get_size" default="0">
 			The number of bytes to read from the file (compressed size when using GDeflate).
+		</member>
+		<member name="subresource_count" type="int" setter="set_subresource_count" getter="get_subresource_count" default="1">
+			The number of consecutive subresources written in a GPU texture destination request.
+		</member>
+		<member name="texture_format" type="int" setter="set_texture_format" getter="get_texture_format" default="0">
+			Expected native GPU driver texture format identifier for destination compatibility validation.
+		</member>
+		<member name="texture_layout" type="int" setter="set_texture_layout" getter="get_texture_layout" default="0">
+			Expected native GPU driver texture layout identifier for destination compatibility validation.
 		</member>
 		<member name="uncompressed_size" type="int" setter="set_uncompressed_size" getter="get_uncompressed_size" default="0">
 			The expected decompressed size in bytes for compressed requests.
@@ -138,6 +210,15 @@
 		</constant>
 		<constant name="COMPRESSION_GDEFLATE" value="1" enum="CompressionFormat">
 			Data is compressed with GPUOpen/NVIDIA GDeflate tile format.
+		</constant>
+		<constant name="DESTINATION_MEMORY" value="0" enum="DSDestinationType">
+			Destination is a CPU system memory buffer ([member destination_buffer]).
+		</constant>
+		<constant name="DESTINATION_GPU_BUFFER" value="1" enum="DSDestinationType">
+			Destination is a GPU buffer identified by [member destination_resource].
+		</constant>
+		<constant name="DESTINATION_GPU_TEXTURE" value="2" enum="DSDestinationType">
+			Destination is a GPU texture identified by [member destination_resource].
 		</constant>
 	</constants>
 </class>

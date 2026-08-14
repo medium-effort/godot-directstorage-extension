@@ -9,12 +9,6 @@
 	<tutorials>
 	</tutorials>
 	<methods>
-		<method name="get_active_backend_name" qualifiers="const">
-			<return type="String" />
-			<description>
-				Returns the active backend name. The DirectStorage backend is named [code]"Win32DirectStorage"[/code]; the software backend is named [code]"SoftwareFallback"[/code]. Returns [code]"None"[/code] before initialization.
-			</description>
-		</method>
 		<method name="cancel_requests_with_tag">
 			<return type="void" />
 			<param index="0" name="tag" type="int" />
@@ -35,6 +29,30 @@
 				Submits all requests currently queued to the DirectStorage runtime or software fallback worker pool. Request completion is reflected in each request's [member DSRequest.status].
 			</description>
 		</method>
+		<method name="get_active_backend_name" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the active backend name. The DirectStorage backend is named [code]"Win32DirectStorage"[/code]; the software backend is named [code]"SoftwareFallback"[/code]. Returns [code]"None"[/code] before initialization.
+			</description>
+		</method>
+		<method name="get_actual_backend" qualifiers="const">
+			<return type="String" />
+			<param index="0" name="request" type="DSRequest" />
+			<description>Returns the backend name that processed or was assigned to process [param request].</description>
+		</method>
+		<method name="get_actual_destination_type" qualifiers="const">
+			<return type="int" enum="DSRequest.DSDestinationType" />
+			<param index="0" name="request" type="DSRequest" />
+			<description>Returns the actual destination type used to process [param request].</description>
+		</method>
+		<method name="get_capability_report" qualifiers="const">
+			<return type="Dictionary" />
+			<description>Returns a comprehensive [Dictionary] detailing the active backend, Direct3D 12 device status, GPU decompression support tier, GPU decompression enabled status, queue capacity, and staging buffer configuration.</description>
+		</method>
+		<method name="get_completion_fence" qualifiers="const">
+			<return type="int" />
+			<description>Returns the most recent D3D12 completion fence value used for GPU request synchronization.</description>
+		</method>
 		<method name="get_disable_gpu_decompression" qualifiers="const">
 			<return type="bool" />
 			<description>Returns whether GPU decompression has been disabled.</description>
@@ -44,9 +62,18 @@
 			<param index="0" name="path" type="String" default="res://" />
 			<description>Returns drive capability information for [param path], including [code]drive[/code], [code]bus_type[/code], [code]file_system[/code], [code]directstorage_supported[/code], and, when applicable, [code]reason[/code].</description>
 		</method>
+		<method name="get_gpu_decompression_support_tier" qualifiers="const">
+			<return type="int" />
+			<description>Returns the GPU decompression support tier reported by DirectStorage ([code]0[/code] for unsupported or software-only, [code]1[/code] or higher for hardware GPU decompression support).</description>
+		</method>
 		<method name="get_queue_capacity" qualifiers="const">
 			<return type="int" />
 			<description>Returns the maximum number of requests allowed in a queue. The default is [code]2000[/code].</description>
+		</method>
+		<method name="get_request_execution_report" qualifiers="const">
+			<return type="Dictionary" />
+			<param index="0" name="request" type="DSRequest" />
+			<description>Returns a telemetry [Dictionary] for [param request], containing [code]actual_destination_type[/code] ([int]), [code]actual_backend[/code] ([String]), and [code]was_gpu_decompression_used[/code] ([bool]).</description>
 		</method>
 		<method name="get_staging_buffer_size_mb" qualifiers="const">
 			<return type="int" />
@@ -58,21 +85,34 @@
 				Initializes DirectStorage hardware queues and staging buffers. Returns [code]true[/code] if initialized successfully.
 			</description>
 		</method>
+		<method name="initialize_ds_for_path">
+			<return type="int" enum="@GlobalScope.Error" />
+			<param index="0" name="path" type="String" />
+			<description>Initializes DirectStorage targeting the specific volume where [param path] is located. Validates volume bypass eligibility and DirectStorage support before initializing. If the specified path is on an unsupported drive, falls back to default [code]res://[/code] initialization or software fallback. Returns [constant @GlobalScope.OK] on success.</description>
+		</method>
+		<method name="is_current_drive_supported" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether the drive containing the running executable supports DirectStorage.</description>
+		</method>
 		<method name="is_d3d12_backend" qualifiers="const">
 			<return type="bool" />
 			<description>
 				Returns [code]true[/code] when DirectStorage is supported and Godot is using a valid Direct3D 12 logical device.
 			</description>
 		</method>
+		<method name="is_gpu_decompression_available" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if hardware GPU decompression is supported by the GPU adapter, Direct3D 12 device, and DirectStorage runtime.</description>
+		</method>
+		<method name="is_gpu_decompression_enabled" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if GPU decompression is currently enabled and available (i.e. supported and not disabled via [member disable_gpu_decompression]).</description>
+		</method>
 		<method name="is_initialized" qualifiers="const">
 			<return type="bool" />
 			<description>
 				Returns [code]true[/code] if [DSContext] has been initialized.
 			</description>
-		</method>
-		<method name="is_current_drive_supported" qualifiers="const">
-			<return type="bool" />
-			<description>Returns whether the drive containing the running executable supports DirectStorage.</description>
 		</method>
 		<method name="is_path_supported" qualifiers="const">
 			<return type="bool" />
@@ -83,12 +123,6 @@
 			<return type="bool" />
 			<description>
 				Returns [code]true[/code] when the native Windows DirectStorage backend is available. A software fallback can still initialize on unsupported platforms, but this method remains [code]false[/code].
-			</description>
-		</method>
-		<method name="shutdown_ds">
-			<return type="void" />
-			<description>
-				Shuts down DirectStorage queues, releases COM interfaces, and cleans up active backend resources.
 			</description>
 		</method>
 		<method name="set_disable_gpu_decompression">
@@ -105,6 +139,22 @@
 			<return type="void" />
 			<param index="0" name="size_mb" type="int" />
 			<description>Sets the staging buffer size in MiB. A value less than or equal to zero restores the default of [code]128[/code] MiB.</description>
+		</method>
+		<method name="shutdown_ds">
+			<return type="void" />
+			<description>
+				Shuts down DirectStorage queues, releases COM interfaces, and cleans up active backend resources.
+			</description>
+		</method>
+		<method name="wait_for_completion">
+			<return type="bool" />
+			<param index="0" name="timeout_msec" type="int" />
+			<description>Blocks execution until the pending GPU completion fence is signaled and RenderingDevice synchronization completes, or until [param timeout_msec] milliseconds elapse. Returns [code]true[/code] if the fence completed successfully.</description>
+		</method>
+		<method name="was_gpu_decompression_used" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="request" type="DSRequest" />
+			<description>Returns [code]true[/code] if hardware GPU decompression was used for decompressing [param request].</description>
 		</method>
 	</methods>
 	<members>

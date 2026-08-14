@@ -1,4 +1,5 @@
 @tool
+class_name ResourceImporterDirectStorageTexture
 extends EditorImportPlugin
 
 static var _staging_warnings: Dictionary = {}
@@ -8,7 +9,10 @@ static var _staging_warnings: Dictionary = {}
 ## Author: MediumEffort
 ## Description: Converts .png, .jpg, .jpeg, and .webp sources into .dstex
 ## resources. The importer runs in the editor and exposes compression settings
-## in the Import dock.
+## in the Import dock:
+## - [b]compression/mode[/b]: S3TC VRAM block compression vs VRAM uncompressed.
+## - [b]compression/source[/b]: Source color space (Generic, sRGB, Normal Map).
+## - [b]compression/gdeflate_level[/b]: GDeflate compression level (1-12).
 
 ## Returns the stable importer identifier stored in .import metadata.
 func _get_importer_name() -> String:
