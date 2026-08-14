@@ -31,12 +31,14 @@ public:
 	String get_name() const override;
 
 	bool initialize() override;
+	bool initialize(const String &p_path);
 	void shutdown() override;
 
 	bool enqueue_request(Ref<DSRequest> p_request) override;
 	void submit_batch() override;
 	void cancel_requests_with_tag(uint64_t p_tag) override;
 
+	static bool is_path_valid(const String &p_path);
 	static Dictionary get_drive_info_for_path(const String &p_path);
 };
 

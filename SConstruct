@@ -142,6 +142,15 @@ def sync_changed_files(src_dir, dst_dir):
     return copied_count
 
 def write_build_manifest():
+    # Skip manifest generation and post-build sync on dry-run, clean, help, or question invocations
+    if (
+        SCons.Script.GetOption("no_exec")
+        or SCons.Script.GetOption("clean")
+        or SCons.Script.GetOption("help")
+        or SCons.Script.GetOption("question")
+    ):
+        return
+
     build_finish_time = datetime.datetime.now().astimezone()
     duration_seconds = round((build_finish_time - BUILD_START_TIME).total_seconds(), 3)
     manifest_path = os.path.join(output_dir, "build_manifest.json")

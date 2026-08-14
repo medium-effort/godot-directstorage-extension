@@ -5,6 +5,8 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
+#include "ds_profiler.h"
 #include "ds_request.h"
 #include "../platform/platform_backend.h"
 
@@ -22,6 +24,10 @@ private:
 	uint16_t queue_capacity = 2000;
 
 	PlatformBackend *active_backend = nullptr;
+	String initialization_path;
+	bool gpu_requests_pending = false;
+	uint64_t completion_fence = 0;
+	Dictionary request_execution_reports;
 
 protected:
 	static void _bind_methods();
@@ -38,16 +44,27 @@ public:
 	bool is_d3d12_backend() const;
 	bool is_initialized() const;
 	String get_active_backend_name() const;
+	bool is_gpu_decompression_available() const;
+	bool is_gpu_decompression_enabled() const;
+	int get_gpu_decompression_support_tier() const;
+	Dictionary get_capability_report() const;
+	Dictionary get_request_execution_report(Ref<DSRequest> p_request) const;
+	DSRequest::DSDestinationType get_actual_destination_type(Ref<DSRequest> p_request) const;
+	String get_actual_backend(Ref<DSRequest> p_request) const;
+	bool was_gpu_decompression_used(Ref<DSRequest> p_request) const;
 
 	bool is_current_drive_supported() const;
 	bool is_path_supported(const String &p_path) const;
 	Dictionary get_drive_info(const String &p_path = "res://") const;
 
 	bool initialize_ds();
+	Error initialize_ds_for_path(const String &p_path);
 	void shutdown_ds();
 
 	bool enqueue_request(Ref<DSRequest> p_request);
 	void flush_batch();
+	uint64_t get_completion_fence() const;
+	bool wait_for_completion(int p_timeout_msec);
 	void cancel_requests_with_tag(uint64_t p_tag);
 
 	// Settings getters/setters

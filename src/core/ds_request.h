@@ -4,6 +4,7 @@
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
+#include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/string.hpp>
 
 namespace godot {
@@ -24,6 +25,12 @@ public:
 		COMPRESSION_GDEFLATE = 1,
 	};
 
+	enum DSDestinationType {
+		DESTINATION_MEMORY = 0,
+		DESTINATION_GPU_BUFFER = 1,
+		DESTINATION_GPU_TEXTURE = 2,
+	};
+
 private:
 	String file_path;
 	uint64_t offset = 0;
@@ -32,6 +39,12 @@ private:
 	uint64_t cancellation_tag = 0;
 	CompressionFormat compression_format = COMPRESSION_NONE;
 	PackedByteArray destination_buffer;
+	DSDestinationType destination_type = DESTINATION_MEMORY;
+	RID destination_resource;
+	uint32_t first_subresource = 0;
+	uint32_t subresource_count = 1;
+	uint32_t texture_format = 0;
+	uint32_t texture_layout = 0;
 	Status status = STATUS_PENDING;
 	String error_message;
 
@@ -65,6 +78,24 @@ public:
 	PackedByteArray &get_destination_buffer_ref();
 	uint8_t *get_destination_buffer_ptrw();
 
+	void set_destination_type(DSDestinationType p_type);
+	DSDestinationType get_destination_type() const;
+
+	void set_destination_resource(const RID &p_resource);
+	RID get_destination_resource() const;
+
+	void set_first_subresource(uint32_t p_subresource);
+	uint32_t get_first_subresource() const;
+
+	void set_subresource_count(uint32_t p_count);
+	uint32_t get_subresource_count() const;
+
+	void set_texture_format(uint32_t p_format);
+	uint32_t get_texture_format() const;
+
+	void set_texture_layout(uint32_t p_layout);
+	uint32_t get_texture_layout() const;
+
 	void set_status(Status p_status);
 	Status get_status() const;
 
@@ -76,5 +107,6 @@ public:
 
 VARIANT_ENUM_CAST(DSRequest::Status);
 VARIANT_ENUM_CAST(DSRequest::CompressionFormat);
+VARIANT_ENUM_CAST(DSRequest::DSDestinationType);
 
 #endif // DS_REQUEST_H

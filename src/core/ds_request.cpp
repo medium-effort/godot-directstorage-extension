@@ -70,6 +70,54 @@ uint8_t *DSRequest::get_destination_buffer_ptrw() {
 	return destination_buffer.ptrw();
 }
 
+void DSRequest::set_destination_type(DSDestinationType p_type) {
+	destination_type = p_type;
+}
+
+DSRequest::DSDestinationType DSRequest::get_destination_type() const {
+	return destination_type;
+}
+
+void DSRequest::set_destination_resource(const RID &p_resource) {
+	destination_resource = p_resource;
+}
+
+RID DSRequest::get_destination_resource() const {
+	return destination_resource;
+}
+
+void DSRequest::set_first_subresource(uint32_t p_subresource) {
+	first_subresource = p_subresource;
+}
+
+uint32_t DSRequest::get_first_subresource() const {
+	return first_subresource;
+}
+
+void DSRequest::set_subresource_count(uint32_t p_count) {
+	subresource_count = p_count;
+}
+
+uint32_t DSRequest::get_subresource_count() const {
+	return subresource_count;
+}
+
+void DSRequest::set_texture_format(uint32_t p_format) {
+	texture_format = p_format;
+}
+
+uint32_t DSRequest::get_texture_format() const {
+	return texture_format;
+}
+
+void DSRequest::set_texture_layout(uint32_t p_layout) {
+	texture_layout = p_layout;
+}
+
+uint32_t DSRequest::get_texture_layout() const {
+	return texture_layout;
+}
+
 void DSRequest::set_status(Status p_status) {
 	status = p_status;
 }
@@ -108,6 +156,24 @@ void DSRequest::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_destination_buffer", "buffer"), &DSRequest::set_destination_buffer);
 	ClassDB::bind_method(D_METHOD("get_destination_buffer"), &DSRequest::get_destination_buffer);
 
+	ClassDB::bind_method(D_METHOD("set_destination_type", "type"), &DSRequest::set_destination_type);
+	ClassDB::bind_method(D_METHOD("get_destination_type"), &DSRequest::get_destination_type);
+
+	ClassDB::bind_method(D_METHOD("set_destination_resource", "resource"), &DSRequest::set_destination_resource);
+	ClassDB::bind_method(D_METHOD("get_destination_resource"), &DSRequest::get_destination_resource);
+
+	ClassDB::bind_method(D_METHOD("set_first_subresource", "subresource"), &DSRequest::set_first_subresource);
+	ClassDB::bind_method(D_METHOD("get_first_subresource"), &DSRequest::get_first_subresource);
+
+	ClassDB::bind_method(D_METHOD("set_subresource_count", "count"), &DSRequest::set_subresource_count);
+	ClassDB::bind_method(D_METHOD("get_subresource_count"), &DSRequest::get_subresource_count);
+
+	ClassDB::bind_method(D_METHOD("set_texture_format", "format"), &DSRequest::set_texture_format);
+	ClassDB::bind_method(D_METHOD("get_texture_format"), &DSRequest::get_texture_format);
+
+	ClassDB::bind_method(D_METHOD("set_texture_layout", "layout"), &DSRequest::set_texture_layout);
+	ClassDB::bind_method(D_METHOD("get_texture_layout"), &DSRequest::get_texture_layout);
+
 	ClassDB::bind_method(D_METHOD("set_status", "status"), &DSRequest::set_status);
 	ClassDB::bind_method(D_METHOD("get_status"), &DSRequest::get_status);
 
@@ -121,6 +187,12 @@ void DSRequest::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "cancellation_tag"), "set_cancellation_tag", "get_cancellation_tag");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "compression_format"), "set_compression_format", "get_compression_format");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "destination_buffer"), "set_destination_buffer", "get_destination_buffer");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "destination_type"), "set_destination_type", "get_destination_type");
+	ADD_PROPERTY(PropertyInfo(Variant::RID, "destination_resource"), "set_destination_resource", "get_destination_resource");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "first_subresource"), "set_first_subresource", "get_first_subresource");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "subresource_count"), "set_subresource_count", "get_subresource_count");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_format"), "set_texture_format", "get_texture_format");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_layout"), "set_texture_layout", "get_texture_layout");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "status"), "set_status", "get_status");
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "error_message"), "set_error_message", "get_error_message");
 
@@ -131,6 +203,10 @@ void DSRequest::_bind_methods() {
 
 	BIND_ENUM_CONSTANT(COMPRESSION_NONE);
 	BIND_ENUM_CONSTANT(COMPRESSION_GDEFLATE);
+
+	BIND_ENUM_CONSTANT(DESTINATION_MEMORY);
+	BIND_ENUM_CONSTANT(DESTINATION_GPU_BUFFER);
+	BIND_ENUM_CONSTANT(DESTINATION_GPU_TEXTURE);
 }
 
 } // namespace godot

@@ -18,6 +18,8 @@
 
 namespace godot {
 
+void ds_profiler_set_batch_metrics(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes, int p_request_count, int64_t p_decompression_duration_us, int p_error_state);
+
 #ifndef FSCTL_GET_BYPASSIO_STATE
 #define FSCTL_GET_BYPASSIO_STATE CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 238, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #endif
@@ -56,6 +58,62 @@ struct DllDirectoryScope {
 		SetDllDirectoryW(had_previous ? previous : nullptr);
 	}
 };
+
+static Win32Backend *s_backend_instance = nullptr;
+static ID3D12Fence *s_completion_fence = nullptr;
+static HANDLE s_completion_event = nullptr;
+static uint64_t s_completion_fence_value = 0;
+static uint64_t s_completed_fence_value = 0;
+
+static void release_completion_sync() {
+	if (s_completion_event) {
+		CloseHandle(s_completion_event);
+		s_completion_event = nullptr;
+	}
+	if (s_completion_fence) {
+		s_completion_fence->Release();
+		s_completion_fence = nullptr;
+	}
+	s_completion_fence_value = 0;
+	s_completed_fence_value = 0;
+}
+
+uint64_t ds_win32_get_completion_fence(PlatformBackend *p_backend) {
+	if (p_backend != s_backend_instance || !s_completion_fence) {
+		return 0;
+	}
+	return s_completion_fence_value;
+}
+
+bool ds_win32_wait_for_completion(PlatformBackend *p_backend, uint64_t p_fence_value, uint32_t p_timeout_msec) {
+	if (p_fence_value == 0) {
+		return true;
+	}
+	if (p_backend != s_backend_instance || !s_completion_fence || !s_completion_event) {
+		return false;
+	}
+
+	uint64_t completed_value = s_completion_fence->GetCompletedValue();
+	if (completed_value == UINT64_MAX) {
+		return false;
+	}
+	if (completed_value < p_fence_value) {
+		if (FAILED(s_completion_fence->SetEventOnCompletion(p_fence_value, s_completion_event))) {
+			return false;
+		}
+		DWORD wait_result = WaitForSingleObject(s_completion_event, static_cast<DWORD>(p_timeout_msec));
+		if (wait_result != WAIT_OBJECT_0) {
+			return false;
+		}
+		completed_value = s_completion_fence->GetCompletedValue();
+	}
+
+	if (completed_value < p_fence_value || completed_value == UINT64_MAX) {
+		return false;
+	}
+	s_completed_fence_value = completed_value;
+	return true;
+}
 
 static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_capacity) {
 	DSRuntimeProbe result;
@@ -294,13 +352,40 @@ String Win32Backend::get_name() const {
 }
 
 bool Win32Backend::initialize() {
+	return initialize("");
+}
+
+bool Win32Backend::is_path_valid(const String &p_path) {
 #ifdef _WIN32
+	if (p_path.length() < 3 || p_path[1] != ':' || (p_path[2] != '\\' && p_path[2] != '/')) {
+		return false;
+	}
+
+	std::wstring w_path(reinterpret_cast<const wchar_t *>(p_path.utf16().get_data()));
+	DWORD attributes = GetFileAttributesW(w_path.c_str());
+	return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+	return false;
+#endif
+}
+
+bool Win32Backend::initialize(const String &p_path) {
+#ifdef _WIN32
+	s_backend_instance = this;
+	s_completion_fence_value = 0;
+	s_completed_fence_value = 0;
 	DSContext *ctx = DSContext::get_singleton();
 	if (!ctx) {
 		return false;
 	}
 
-	Dictionary drive_info = get_drive_info_for_path("res://");
+	String validation_path = p_path.is_empty() ? "res://" : p_path;
+	if (!p_path.is_empty() && !is_path_valid(p_path)) {
+		UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Path '" + p_path + "' does not exist or is not an absolute directory.");
+		return false;
+	}
+
+	Dictionary drive_info = get_drive_info_for_path(validation_path);
 	if (!drive_info.get("directstorage_supported", false)) {
 		UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Drive " + String(drive_info["drive"]) + " is unsupported (" + String(drive_info["reason"]) + ").");
 		return false;
@@ -376,12 +461,26 @@ bool Win32Backend::initialize() {
 		}
 		queueDesc.Device = reinterpret_cast<ID3D12Device *>(device_handle);
 
+		if (FAILED(reinterpret_cast<ID3D12Device *>(device_handle)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s_completion_fence))) || !s_completion_fence) {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Could not create the D3D12 completion fence.");
+			return false;
+		}
+		s_completion_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+		if (!s_completion_event) {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Could not create the completion event.");
+			return false;
+		}
+
 		step_name = "CreateQueue";
 		hr = factory->CreateQueue(&queueDesc, IID_PPV_ARGS(&memory_queue));
 	}
 
 	if (SUCCEEDED(hr) && memory_queue) {
 		batch_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+		if (!batch_event) {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Could not create the batch completion event.");
+			return false;
+		}
 
 		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 		if (err_handler) {
@@ -435,6 +534,10 @@ void Win32Backend::shutdown() {
 	}
 	open_files.clear();
 	in_flight_requests.clear();
+	release_completion_sync();
+	if (s_backend_instance == this) {
+		s_backend_instance = nullptr;
+	}
 	unload_runtime_modules(dstoragecore_module, dstorage_module);
 	dstoragecore_module = nullptr;
 	dstorage_module = nullptr;
@@ -495,9 +598,117 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		return false;
 	}
 
+	bool gpu_buffer_destination = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER;
+	bool gpu_texture_destination = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE;
+	ID3D12Resource *destination_buffer = nullptr;
+	ID3D12Resource *destination_texture = nullptr;
+	if (gpu_buffer_destination) {
+		String destination_error;
+		RenderingServer *rs = RenderingServer::get_singleton();
+		if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+			destination_error = "Win32Backend: GPU buffer destination requires the D3D12 rendering driver.";
+		} else {
+			RenderingDevice *rd = rs->get_rendering_device();
+			RID destination_rid = p_request->get_destination_resource();
+			if (!rd) {
+				destination_error = "Win32Backend: No D3D12 RenderingDevice is active for the GPU buffer destination.";
+			} else if (!destination_rid.is_valid()) {
+				destination_error = "Win32Backend: GPU buffer destination resource RID is invalid.";
+			} else {
+				// Godot exposes the backend resource through its public driver-resource API.
+				// The returned pointer is owned by RenderingDevice; the caller must keep the
+					// RID alive until the synchronously flushed DirectStorage batch completes.
+					uint64_t resource_handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_BUFFER, destination_rid, 0);
+					destination_buffer = reinterpret_cast<ID3D12Resource *>(resource_handle);
+					if (!destination_buffer) {
+						destination_error = "Win32Backend: GPU buffer RID could not be mapped to an ID3D12Resource.";
+					} else {
+						D3D12_RESOURCE_DESC buffer_desc = destination_buffer->GetDesc();
+						if (buffer_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || uncompressed_size > buffer_desc.Width) {
+							destination_error = "Win32Backend: GPU buffer destination size exceeds the mapped D3D12 buffer resource.";
+						}
+					}
+				}
+		}
+
+		if (!destination_error.is_empty()) {
+			file->Close();
+			file->Release();
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message(destination_error);
+			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+			if (err_handler) {
+				err_handler->report_error(destination_error);
+			}
+			return false;
+		}
+	}
+	if (gpu_texture_destination) {
+		String destination_error;
+		RenderingServer *rs = RenderingServer::get_singleton();
+		if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+			destination_error = "Win32Backend: GPU texture destination requires the D3D12 rendering driver.";
+		} else {
+			RenderingDevice *rd = rs->get_rendering_device();
+			RID destination_rid = p_request->get_destination_resource();
+			if (!rd) {
+				destination_error = "Win32Backend: No D3D12 RenderingDevice is active for the GPU texture destination.";
+			} else if (!destination_rid.is_valid()) {
+				destination_error = "Win32Backend: GPU texture destination resource RID is invalid.";
+			} else {
+				uint64_t resource_handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE, destination_rid, 0);
+				destination_texture = reinterpret_cast<ID3D12Resource *>(resource_handle);
+				if (!destination_texture) {
+					destination_error = "Win32Backend: GPU texture RID could not be mapped to an ID3D12Resource.";
+				} else {
+					D3D12_RESOURCE_DESC texture_desc = destination_texture->GetDesc();
+					if (texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+							texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+							texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+						destination_error = "Win32Backend: GPU texture destination RID does not reference a texture resource.";
+					} else {
+						uint64_t mip_levels = texture_desc.MipLevels > 0 ? texture_desc.MipLevels : 1;
+						uint64_t array_size = texture_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : texture_desc.DepthOrArraySize;
+						uint64_t subresource_total = mip_levels * array_size;
+						uint32_t first_subresource = p_request->get_first_subresource();
+						uint32_t subresource_count = p_request->get_subresource_count();
+						if (subresource_count == 0 || first_subresource >= subresource_total ||
+								subresource_count > subresource_total - first_subresource) {
+							destination_error = "Win32Backend: GPU texture subresource range is out of bounds (first=" +
+									String::num_uint64(first_subresource) + ", count=" + String::num_uint64(subresource_count) +
+									", available=" + String::num_uint64(subresource_total) + ").";
+						} else if (p_request->get_texture_layout() != 0 &&
+								p_request->get_texture_layout() != static_cast<uint32_t>(texture_desc.Layout)) {
+							destination_error = "Win32Backend: GPU texture layout metadata does not match the destination resource.";
+						} else if (p_request->get_texture_format() != 0) {
+							uint64_t native_format = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, destination_rid, 0);
+							if (native_format == 0 || p_request->get_texture_format() != native_format) {
+								destination_error = "Win32Backend: GPU texture format metadata does not match the destination resource.";
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if (!destination_error.is_empty()) {
+			file->Close();
+			file->Release();
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message(destination_error);
+			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+			if (err_handler) {
+				err_handler->report_error(destination_error);
+			}
+			return false;
+		}
+	}
+
 	DSTORAGE_REQUEST request = {};
 	request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-	request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
+	request.Options.DestinationType = gpu_buffer_destination ? DSTORAGE_REQUEST_DESTINATION_BUFFER :
+				gpu_texture_destination ? (p_request->get_subresource_count() > 1 ? DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES_RANGE : DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION) :
+				DSTORAGE_REQUEST_DESTINATION_MEMORY;
 	request.Options.CompressionFormat = (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE)
 			? DSTORAGE_COMPRESSION_FORMAT_GDEFLATE
 			: DSTORAGE_COMPRESSION_FORMAT_NONE;
@@ -506,13 +717,37 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	request.Source.File.Offset = p_request->get_offset();
 	request.Source.File.Size = src_size;
 
-	PackedByteArray &dest = p_request->get_destination_buffer_ref();
-	if (dest.size() < static_cast<int64_t>(uncompressed_size)) {
-		dest.resize(static_cast<int64_t>(uncompressed_size));
-	}
+	if (gpu_buffer_destination) {
+		request.Destination.Buffer.Resource = destination_buffer;
+		request.Destination.Buffer.Offset = 0;
+		request.Destination.Buffer.Size = uncompressed_size;
+	} else if (gpu_texture_destination) {
+		D3D12_RESOURCE_DESC texture_desc = destination_texture->GetDesc();
+		uint64_t mip_levels = texture_desc.MipLevels > 0 ? texture_desc.MipLevels : 1;
+		uint32_t first_subresource = p_request->get_first_subresource();
+		uint32_t subresource_count = p_request->get_subresource_count();
+		if (subresource_count > 1) {
+			request.Destination.MultipleSubresourcesRange.Resource = destination_texture;
+			request.Destination.MultipleSubresourcesRange.FirstSubresource = first_subresource;
+			request.Destination.MultipleSubresourcesRange.NumSubresources = subresource_count;
+		} else {
+			uint64_t mip_level = first_subresource % mip_levels;
+			uint64_t width = MAX(static_cast<uint64_t>(1), texture_desc.Width >> mip_level);
+			uint64_t height = texture_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1 : MAX(static_cast<uint64_t>(1), static_cast<uint64_t>(texture_desc.Height) >> mip_level);
+			uint64_t depth = texture_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? MAX(static_cast<uint64_t>(1), static_cast<uint64_t>(texture_desc.DepthOrArraySize) >> mip_level) : 1;
+			request.Destination.Texture.Resource = destination_texture;
+			request.Destination.Texture.SubresourceIndex = first_subresource;
+			request.Destination.Texture.Region = { 0, 0, 0, static_cast<UINT>(width), static_cast<UINT>(height), static_cast<UINT>(depth) };
+		}
+	} else {
+		PackedByteArray &dest = p_request->get_destination_buffer_ref();
+		if (dest.size() < static_cast<int64_t>(uncompressed_size)) {
+			dest.resize(static_cast<int64_t>(uncompressed_size));
+		}
 
-	request.Destination.Memory.Buffer = dest.ptrw();
-	request.Destination.Memory.Size = uncompressed_size;
+		request.Destination.Memory.Buffer = dest.ptrw();
+		request.Destination.Memory.Size = uncompressed_size;
+	}
 	request.UncompressedSize = uncompressed_size;
 	request.CancellationTag = p_request->get_cancellation_tag();
 
@@ -533,11 +768,16 @@ void Win32Backend::submit_batch() {
 		return;
 	}
 
-	uint64_t total_bytes = 0;
+	uint64_t total_compressed_bytes = 0;
+	uint64_t total_uncompressed_bytes = 0;
+	int request_count = 0;
 	for (int i = 0; i < in_flight_requests.size(); i++) {
 		if (in_flight_requests[i].is_valid()) {
+			uint32_t req_size = in_flight_requests[i]->get_size();
 			uint32_t req_unc_size = in_flight_requests[i]->get_uncompressed_size();
-			total_bytes += (req_unc_size > 0) ? req_unc_size : in_flight_requests[i]->get_size();
+			total_compressed_bytes += req_size;
+			total_uncompressed_bytes += (req_unc_size > 0) ? req_unc_size : req_size;
+			request_count++;
 		}
 	}
 
@@ -547,14 +787,43 @@ void Win32Backend::submit_batch() {
 		err_handler->clear_error();
 	}
 
-	if (batch_event) {
-		memory_queue->EnqueueSetEvent(batch_event);
+	bool batch_submitted = true;
+	if (!batch_event || !s_completion_fence || !s_completion_event) {
+		UtilityFunctions::push_error("[DirectStorage] GPU/DirectStorage completion synchronization is unavailable.");
+		for (int i = 0; i < in_flight_requests.size(); i++) {
+			if (in_flight_requests[i].is_valid()) {
+				in_flight_requests[i]->set_status(DSRequest::STATUS_FAILED);
+				in_flight_requests[i]->set_error_message("DirectStorage completion fence is unavailable.");
+			}
+		}
+		batch_submitted = false;
+	} else {
+		uint64_t completion_value = s_completion_fence_value + 1;
+		ResetEvent(s_completion_event);
+		if (FAILED(s_completion_fence->SetEventOnCompletion(completion_value, s_completion_event))) {
+			s_completion_fence_value = completion_value;
+			UtilityFunctions::push_error("[DirectStorage] Failed to arm the D3D12 completion fence.");
+			for (int i = 0; i < in_flight_requests.size(); i++) {
+				if (in_flight_requests[i].is_valid()) {
+					in_flight_requests[i]->set_status(DSRequest::STATUS_FAILED);
+					in_flight_requests[i]->set_error_message("Failed to arm the DirectStorage completion fence.");
+				}
+			}
+			batch_submitted = false;
+		} else {
+			s_completion_fence_value = completion_value;
+			memory_queue->EnqueueSignal(s_completion_fence, completion_value);
+			memory_queue->EnqueueSetEvent(batch_event);
+		}
 	}
-	memory_queue->Submit();
+	if (batch_submitted) {
+		memory_queue->Submit();
+	}
 
-	if (batch_event) {
+	if (batch_submitted) {
 		DWORD wait_res = WaitForSingleObject(batch_event, 5000);
 		if (wait_res == WAIT_OBJECT_0) {
+			s_completed_fence_value = s_completion_fence ? s_completion_fence->GetCompletedValue() : s_completed_fence_value;
 			uint64_t end_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
 			uint64_t duration_us = (end_time > start_time) ? (end_time - start_time) : 1;
 			if (err_handler) {
@@ -574,7 +843,13 @@ void Win32Backend::submit_batch() {
 
 			DSProfiler *profiler = DSProfiler::get_singleton();
 			if (profiler) {
-				profiler->record_workload(total_bytes, duration_us);
+				ds_profiler_set_batch_metrics(
+						total_compressed_bytes,
+						total_uncompressed_bytes,
+						request_count,
+						-1, // GPU decompression is included in completion time, not separately measurable.
+						(err_handler && err_handler->has_error()) ? 1 : 0);
+				profiler->record_workload(total_compressed_bytes, duration_us);
 			}
 		} else {
 			UtilityFunctions::push_error("[DirectStorage] Win32Backend batch submit wait timed out or failed.");
