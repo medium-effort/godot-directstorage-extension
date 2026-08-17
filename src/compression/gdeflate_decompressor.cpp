@@ -37,7 +37,7 @@ bool validate_stream(const PackedByteArray &p_compressed, int p_original_size) {
 	const size_t compressed_data_size = static_cast<size_t>(p_compressed.size()) - tile_table_size;
 	for (uint32_t tile_index = 0; tile_index < header->numTiles; tile_index++) {
 		const size_t tile_offset = tile_index > 0 ? tile_offsets[tile_index] : 0;
-		const size_t next_offset = tile_index + 1 < header->numTiles ? tile_offsets[tile_index + 1] : tile_offsets[0];
+		const size_t next_offset = tile_index + 1 < header->numTiles ? tile_offsets[tile_index + 1] : (tile_offset + tile_offsets[0]);
 		if (next_offset < tile_offset || tile_offset > compressed_data_size || next_offset > compressed_data_size) {
 			return false;
 		}

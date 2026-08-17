@@ -16,17 +16,29 @@
 				Cancels all enqueued read requests whose cancellation tag matches [param tag].
 			</description>
 		</method>
+		<method name="collect_completed_results">
+			<return type="void" />
+			<description>
+				Polls and processes completed results from asynchronous batch submissions, updating request statuses and emitting [signal batch_completed] or [signal batch_failed].
+			</description>
+		</method>
 		<method name="enqueue_request">
 			<return type="bool" />
 			<param index="0" name="request" type="DSRequest" />
 			<description>
-				Enqueues a configured [DSRequest] into the active I/O queue. The request is not submitted until [method flush_batch] is called. Returns [code]true[/code] if it was accepted; a null request or unavailable backend returns [code]false[/code].
+				Enqueues a configured [DSRequest] into the active I/O queue. The request is not submitted until [method flush_batch] or [method flush_batch_async] is called. When targeting GPU textures with GDeflate compression, automatically splits requests larger than the configured staging buffer into per-mip requests. Returns [code]true[/code] if it was accepted; a null request or unavailable backend returns [code]false[/code].
 			</description>
 		</method>
 		<method name="flush_batch">
 			<return type="void" />
 			<description>
-				Submits all requests currently queued to the DirectStorage runtime or software fallback worker pool. Request completion is reflected in each request's [member DSRequest.status].
+				Submits all requests currently queued to the DirectStorage runtime or software fallback worker pool synchronously. Request completion is reflected in each request's [member DSRequest.status].
+			</description>
+		</method>
+		<method name="flush_batch_async">
+			<return type="void" />
+			<description>
+				Submits all requests currently queued to the DirectStorage runtime asynchronously without blocking the calling thread. Completion is signaled via [signal batch_completed] or [signal batch_failed].
 			</description>
 		</method>
 		<method name="get_active_backend_name" qualifiers="const">
@@ -79,6 +91,10 @@
 			<return type="int" />
 			<description>Returns the configured staging buffer size in MiB. The default is [code]128[/code].</description>
 		</method>
+		<method name="has_pending_results" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if there are pending asynchronous batch results waiting to be collected via [method collect_completed_results].</description>
+		</method>
 		<method name="initialize_ds">
 			<return type="bool" />
 			<description>
@@ -89,6 +105,10 @@
 			<return type="int" enum="@GlobalScope.Error" />
 			<param index="0" name="path" type="String" />
 			<description>Initializes DirectStorage targeting the specific volume where [param path] is located. Validates volume bypass eligibility and DirectStorage support before initializing. Accepts file paths, directory paths, and Godot virtual paths ([code]res://[/code], [code]user://[/code]). If the specified path is on an unsupported drive, falls back to default [code]res://[/code] initialization or software fallback. Returns [constant @GlobalScope.OK] on success.</description>
+		</method>
+		<method name="is_batch_complete" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if the current asynchronous batch has completed execution on the storage and GPU queues.</description>
 		</method>
 		<method name="is_current_drive_supported" qualifiers="const">
 			<return type="bool" />
@@ -168,4 +188,20 @@
 			The size in megabytes of each staging buffer allocated by DirectStorage.
 		</member>
 	</members>
+	<signals>
+		<signal name="batch_completed">
+			<param index="0" name="fence_value" type="int" />
+			<param index="1" name="completed_count" type="int" />
+			<description>
+				Emitted when an asynchronous batch submission finishes executing on the storage and GPU queues.
+			</description>
+		</signal>
+		<signal name="batch_failed">
+			<param index="0" name="error_code" type="int" />
+			<param index="1" name="error_message" type="String" />
+			<description>
+				Emitted when an asynchronous batch submission fails.
+			</description>
+		</signal>
+	</signals>
 </class>

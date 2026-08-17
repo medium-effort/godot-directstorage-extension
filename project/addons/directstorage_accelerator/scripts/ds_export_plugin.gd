@@ -40,6 +40,25 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		else:
 			print("[DirectStorage Exporter] Initialized temporary DSPkg archive at: ", _temp_dspkg_path)
 
+## Reads v2 per-mip footprint data so DSPkg can preserve GPU upload layouts.
+func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
+	if not ClassDB.class_exists("DSTex"):
+		return {}
+	var dstex: RefCounted = ClassDB.instantiate("DSTex")
+	if dstex == null:
+		return {}
+	var metadata: Dictionary = dstex.read_header(dstex_path)
+	if int(metadata.get("version", 0)) != 2:
+		return {}
+	var mip_count := int(metadata.get("mip_count", 0))
+	var mip_sizes: PackedInt32Array = metadata.get("mip_sizes", PackedInt32Array())
+	var mip_uncompressed_sizes: PackedInt32Array = metadata.get("mip_uncompressed_sizes", PackedInt32Array())
+	var mip_row_pitches: PackedInt32Array = metadata.get("mip_row_pitches", PackedInt32Array())
+	if mip_count <= 0 or mip_sizes.size() != mip_count or mip_uncompressed_sizes.size() != mip_count or mip_row_pitches.size() != mip_count:
+		push_warning("[DirectStorage Exporter] Invalid v2 footprint metadata in: " + dstex_path)
+		return {}
+	return metadata
+
 ## Adds an imported .dstex resource to the archive and prevents the individual
 ## texture from being copied into the exported PCK.
 func _export_file(path: String, type: String, features: PackedStringArray) -> void:
@@ -64,7 +83,8 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 						resource_path = resource_path.trim_suffix(".import")
 
 	if not dstex_path.is_empty() and FileAccess.file_exists(dstex_path):
-		var add_err: Error = _dspkg.add_texture(resource_path, dstex_path)
+		var mip_metadata := _read_v2_footprint_metadata(dstex_path)
+		var add_err: Error = _dspkg.add_texture(resource_path, dstex_path, mip_metadata)
 		if add_err == OK:
 			_has_textures = true
 			print("[DirectStorage Exporter] Added texture to archive: ", resource_path, " (from ", dstex_path, ")")

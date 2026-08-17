@@ -101,10 +101,10 @@ func _init() -> void:
 		print("FAIL: DSContext singleton is required for the request contract test.")
 		quit(1)
 		return
-	var request = DSRequest.new()
 	var request_data = dstex.read_from_file(test_dstex_path)
 	var request_header = request_data["header"]
-	var request_offset = 48 + (12 * request_header["mip_count"])
+	var request_offset = request_data["mip_offsets"][0] if request_data.has("mip_offsets") and request_data["mip_offsets"].size() > 0 else (48 + (12 * request_header["mip_count"]))
+	var request = DSRequest.new()
 	request.set_file_path(test_dstex_path)
 	request.set_offset(request_offset)
 	request.set_size(request_header["compressed_size"])

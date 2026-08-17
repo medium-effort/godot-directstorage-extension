@@ -5,6 +5,8 @@
 #include <godot_cpp/classes/resource_format_loader.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_int64_array.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/variant.hpp>
@@ -24,6 +26,11 @@ private:
 			uint32_t p_height,
 			uint32_t p_pixel_format,
 			uint32_t p_mip_count,
+			bool p_is_v2,
+			const PackedInt64Array &p_mip_offsets,
+			const PackedInt32Array &p_mip_sizes,
+			const PackedInt32Array &p_mip_uncompressed_sizes,
+			const PackedInt32Array &p_mip_row_pitches,
 			const String &p_cache_key,
 			const String &p_original_cache_key,
 			int32_t p_cache_mode) const;

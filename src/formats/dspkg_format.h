@@ -17,13 +17,25 @@ namespace godot {
 #pragma pack(push, 1)
 struct DSPkgHeader {
 	uint32_t magic;       // 0x474B5044 ("DPKG" little-endian)
-	uint16_t version;     // 1
-	uint16_t flags;       // 0
+	uint16_t version;     // 1 for legacy archives, 2 for GPU mip metadata
+	uint16_t flags;       // DSPKG_FLAG_GPU_MIP_METADATA for version 2
 	uint32_t entry_count; // Number of entries
 	uint64_t data_offset; // Byte offset to start of data blob
 	uint64_t reserved;    // 0
 };
 #pragma pack(pop)
+
+#pragma pack(push, 1)
+struct DSPkgMipEntry {
+	uint64_t offset;            // byte offset from archive start to compressed mip data
+	uint32_t compressed_size;   // compressed mip payload size
+	uint32_t uncompressed_size; // D3D12 footprint size in bytes
+	uint32_t row_pitch;         // D3D12 256-byte aligned row pitch
+	uint32_t reserved;          // reserved alignment padding
+};
+#pragma pack(pop)
+
+static_assert(sizeof(DSPkgMipEntry) == 24, "DSPkgMipEntry must match DSTexMipEntryV2");
 
 struct DSPkgEntry {
 	String path;
@@ -35,6 +47,11 @@ struct DSPkgEntry {
 	uint32_t height = 0;
 	uint32_t pixel_format = 0;
 	uint32_t mip_count = 0;
+	PackedInt64Array mip_offsets;
+	PackedInt32Array mip_sizes;
+	PackedInt32Array mip_uncompressed_sizes;
+	PackedInt32Array mip_row_pitches;
+	bool has_gpu_metadata = false;
 };
 
 class DSPkg : public Resource {
@@ -62,7 +79,7 @@ public:
 
 	// Archive Builder
 	Error create(const String &p_output_path);
-	Error add_texture(const String &p_resource_path, const String &p_dstex_path);
+	Error add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata = Dictionary());
 	Error finalize();
 
 	// Archive Reader

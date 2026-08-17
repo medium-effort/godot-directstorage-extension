@@ -4,7 +4,8 @@
 		Automatic resource loader for DirectStorage texture and package files.
 	</brief_description>
 	<description>
-		[DSResourceFormatLoader] is registered automatically by the extension and normally does not need to be instantiated by user code. It recognizes [code].dstex[/code] and [code].dspkg[/code] files, loads [code].dstex[/code] as [Texture2D], loads [code].dspkg[/code] as [Resource], and can resolve bundled texture paths from [code]res://textures.dspkg[/code]. It uses [DSContext], [DSRequest], [GDeflateDecompressor], and [DSTextureCache] internally.
+		[DSResourceFormatLoader] is registered automatically by the extension and normally does not need to be instantiated by user code. It recognizes [code].dstex[/code] and [code].dspkg[/code] files, loads [code].dstex[/code] as [Texture2D], loads [code].dspkg[/code] as [Resource], and can resolve bundled texture paths from [code]res://textures.dspkg[/code].
+		When running with a Direct3D 12 [RenderingDevice] and GPU decompression enabled on version 2 assets, it creates a [Texture2DRD] and streams compressed mips directly into VRAM via hardware DirectStorage GDeflate decompression. It seamlessly falls back to CPU GDeflate software decompression and standard [ImageTexture] creation for version 1 assets, non-D3D12 backends, or when GPU decompression is disabled. It uses [DSContext], [DSRequest], [GDeflateDecompressor], and [DSTextureCache] internally.
 	</description>
 	<tutorials>
 	</tutorials>

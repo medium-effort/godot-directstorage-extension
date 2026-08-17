@@ -28,7 +28,7 @@ func assert_true(condition: bool, message: String) -> bool:
 	total_assertions += 1
 	if not condition:
 		tests_failed += 1
-		printerr("  [FAIL] " + current_suite + " -> " + message)
+		print("  [FAIL] " + current_suite + " -> " + message)
 		return false
 	tests_passed += 1
 	print("  [PASS] " + message)
@@ -39,7 +39,11 @@ func assert_false(condition: bool, message: String) -> bool:
 
 func assert_eq(actual: Variant, expected: Variant, message: String) -> bool:
 	var passed: bool = (actual == expected)
-	var detail: String = message + " (Expected: " + str(expected) + ", Got: " + str(actual) + ")"
+	var detail: String
+	if typeof(actual) == TYPE_PACKED_BYTE_ARRAY and typeof(expected) == TYPE_PACKED_BYTE_ARRAY:
+		detail = message + " (PackedByteArray actual_size=" + str(actual.size()) + ", expected_size=" + str(expected.size()) + ", equal=" + str(passed) + ")"
+	else:
+		detail = message + " (Expected: " + str(expected) + ", Got: " + str(actual) + ")"
 	return assert_true(passed, detail)
 
 func assert_ne(actual: Variant, unexpected: Variant, message: String) -> bool:
@@ -79,12 +83,15 @@ func _generate_synthetic_dstex(path: String, width: int, height: int, mip_count:
 	if err != OK:
 		return {"error": err}
 
+	var importer_script = load("uid://kqg57i3wmiw")
+	var expected_data: PackedByteArray = importer_script._pad_texture_data(raw_data, width, height, Image.FORMAT_RGBA8, mip_count) if importer_script != null else raw_data
 	var header: Dictionary = dstex.read_header(path)
-	var data_offset: int = 48 + (12 * mip_count) # sizeof(DSTexHeader: 48) + sizeof(DSTexMipEntry: 12) * mip_count
+	var decoded: Dictionary = dstex.read_from_file(path)
+	var data_offset: int = decoded["mip_offsets"][0] if decoded.has("mip_offsets") and decoded["mip_offsets"].size() > 0 else (48 + (12 * mip_count))
 	return {
 		"error": OK,
 		"path": path,
-		"raw_data": raw_data,
+		"raw_data": expected_data,
 		"width": width,
 		"height": height,
 		"mip_count": mip_count,
@@ -371,9 +378,9 @@ func test_suite_006_staging_buffer_chunking_oversized_payloads(ctx: Object) -> v
 	if ctx == null:
 		return
 
-	# Generate a multi-mip texture fixture (256x256 with 4 mip levels)
-	var fix: Dictionary = _generate_synthetic_dstex("user://test_chunking_oversized.dstex", 256, 256, 4)
-	assert_eq(fix["error"], OK, "Generated multi-mip synthetic fixture for chunking test")
+	# Generate a 1 MiB texture fixture (512x512 with 1 mip level = 1,048,576 bytes)
+	var fix: Dictionary = _generate_synthetic_dstex("user://test_chunking_oversized.dstex", 512, 512, 1)
+	assert_eq(fix["error"], OK, "Generated 1 MiB synthetic fixture for chunking test")
 
 	# Set staging buffer size to 1 MiB to trigger chunking / staging limit logic
 	var orig_staging_mb: int = ctx.get_staging_buffer_size_mb()

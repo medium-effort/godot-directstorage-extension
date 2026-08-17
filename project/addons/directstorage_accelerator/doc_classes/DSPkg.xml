@@ -4,7 +4,7 @@
 		Builds and reads archives of DirectStorage texture payloads.
 	</brief_description>
 	<description>
-		[DSPkg] packages existing [code].dstex[/code] files into a [code].dspkg[/code] archive without recompressing their payloads. Use [method create], [method add_texture], and [method finalize] to build an archive. Use [method open] and the reader methods to inspect or extract entry data. The resource loader also uses [code]res://textures.dspkg[/code] for bundled texture lookups.
+		[DSPkg] packages existing [code].dstex[/code] files into a [code].dspkg[/code] archive without recompressing their payloads. Supports version 1 and version 2 archives. Version 2 archives store per-entry GPU mip metadata ([code]DSPkgMipEntry[/code]), enabling direct GPU streaming and hardware decompression from package files into VRAM. Use [method create], [method add_texture], and [method finalize] to build an archive. Use [method open] and the reader methods to inspect or extract entry data. The resource loader also uses [code]res://textures.dspkg[/code] for bundled texture lookups.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -13,7 +13,8 @@
 			<return type="Error" />
 			<param index="0" name="resource_path" type="String" />
 			<param index="1" name="dstex_path" type="String" />
-			<description>Adds an existing [code].dstex[/code] file to an archive currently being built. Call [method create] first.</description>
+			<param index="2" name="mip_metadata" type="Dictionary" default="{}" />
+			<description>Adds an existing [code].dstex[/code] file to an archive currently being built. [param mip_metadata] can provide per-mip footprint metadata ([code]mip_sizes[/code], [code]mip_uncompressed_sizes[/code], [code]mip_row_pitches[/code]) for version 2 archive generation; if empty, metadata is read automatically from the source [code].dstex[/code] file. Call [method create] first.</description>
 		</method>
 		<method name="create">
 			<return type="Error" />
@@ -22,7 +23,7 @@
 		</method>
 		<method name="finalize">
 			<return type="Error" />
-			<description>Writes the archive header, entry table, and staged payloads. Returns an error if the archive is not being built or contains no textures.</description>
+			<description>Writes the archive header, entry table, and staged payloads. If entries have GPU mip metadata, writes a version 2 archive with [code]DSPkgMipEntry[/code] tables. Returns an error if the archive is not being built or contains no textures.</description>
 		</method>
 		<method name="get_entries" qualifiers="const">
 			<return type="Array" />
@@ -35,7 +36,7 @@
 		<method name="get_entry_info" qualifiers="const">
 			<return type="Dictionary" />
 			<param index="0" name="resource_path" type="String" />
-			<description>Returns metadata for an entry, including [code]archive_path[/code], [code]path[/code], [code]data_offset[/code], [code]compressed_size[/code], [code]original_size[/code], [code]width[/code], [code]height[/code], [code]pixel_format[/code], and [code]mip_count[/code].</description>
+			<description>Returns metadata for an entry, including [code]archive_path[/code] ([String]), [code]path[/code] ([String]), [code]data_offset[/code] ([int]), [code]compressed_size[/code] ([int]), [code]original_size[/code] ([int]), [code]width[/code] ([int]), [code]height[/code] ([int]), [code]pixel_format[/code] ([int]), [code]mip_count[/code] ([int]), [code]has_gpu_metadata[/code] ([bool]), [code]mip_offsets[/code] ([PackedInt64Array]), [code]mip_sizes[/code] ([PackedInt32Array]), [code]mip_uncompressed_sizes[/code] ([PackedInt32Array]), and [code]mip_row_pitches[/code] ([PackedInt32Array]).</description>
 		</method>
 		<method name="has_texture" qualifiers="const">
 			<return type="bool" />
@@ -45,12 +46,12 @@
 		<method name="open">
 			<return type="Error" />
 			<param index="0" name="path" type="String" />
-			<description>Opens and validates a [code].dspkg[/code] archive for reading. A failed open clears any previously loaded archive state.</description>
+			<description>Opens and validates a [code].dspkg[/code] archive (version 1 or version 2) for reading. A failed open clears any previously loaded archive state.</description>
 		</method>
 		<method name="read_texture" qualifiers="const">
 			<return type="Dictionary" />
 			<param index="0" name="resource_path" type="String" />
-			<description>Reads an entry's compressed payload and metadata. The result contains [code]path[/code], [code]compressed_data[/code], [code]width[/code], [code]height[/code], [code]pixel_format[/code], [code]mip_count[/code], [code]original_size[/code], and [code]compressed_size[/code].</description>
+			<description>Reads an entry's compressed payload and metadata. The result contains [code]path[/code] ([String]), [code]compressed_data[/code] ([PackedByteArray]), [code]width[/code] ([int]), [code]height[/code] ([int]), [code]pixel_format[/code] ([int]), [code]mip_count[/code] ([int]), [code]original_size[/code] ([int]), [code]compressed_size[/code] ([int]), [code]has_gpu_metadata[/code] ([bool]), [code]mip_offsets[/code] ([PackedInt64Array]), [code]mip_sizes[/code] ([PackedInt32Array]), [code]mip_uncompressed_sizes[/code] ([PackedInt32Array]), and [code]mip_row_pitches[/code] ([PackedInt32Array]).</description>
 		</method>
 	</methods>
 </class>

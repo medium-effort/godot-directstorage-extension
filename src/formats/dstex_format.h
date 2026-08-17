@@ -32,7 +32,25 @@ struct DSTexMipEntry {
 	uint64_t offset; // byte offset from file start
 	uint32_t size;   // compressed mip size in bytes
 };
+
+struct DSTexMipEntryV2 {
+	uint64_t offset;            // byte offset from file start to compressed mip data
+	uint32_t compressed_size;   // compressed mip payload size
+	uint32_t uncompressed_size; // footprint-aligned uncompressed size in bytes
+	uint32_t row_pitch;         // D3D12 256-byte aligned row pitch
+	uint32_t reserved;          // reserved alignment padding
+};
 #pragma pack(pop)
+
+static_assert(sizeof(DSTexMipEntryV2) == 24, "DSTexMipEntryV2 must be 24 bytes");
+
+struct DSTexMipLayout {
+	uint64_t source_row_bytes = 0;
+	uint64_t row_count = 0;
+	uint64_t row_pitch = 0;
+	uint64_t footprint_size = 0;
+	uint64_t source_size = 0;
+};
 
 class DSTex : public RefCounted {
 	GDCLASS(DSTex, RefCounted);
@@ -48,6 +66,9 @@ public:
 	Dictionary read_header(const String &p_path);
 	Dictionary read_from_file(const String &p_path);
 	Dictionary get_file_info(const String &p_path);
+
+	static DSTexMipLayout get_mip_layout(uint32_t p_width, uint32_t p_height, int p_image_format);
+	static PackedByteArray unpad_footprint_mip(const PackedByteArray &p_footprint, uint32_t p_width, uint32_t p_height, int p_image_format);
 
 	static int godot_format_to_rd_format(int p_image_format);
 	static int rd_format_to_godot_format(int p_rd_format);

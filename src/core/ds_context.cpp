@@ -622,7 +622,7 @@ void DSContext::collect_completed_results() {
 				call_deferred("emit_signal", "batch_completed", static_cast<int64_t>(fence_value), completed_count);
 			}
 		}
-		if (gpu_requests_pending) {
+		if (gpu_requests_pending && backend->is_batch_complete()) {
 			gpu_requests_pending = false;
 		}
 		return;

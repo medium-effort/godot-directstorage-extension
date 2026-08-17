@@ -45,6 +45,10 @@
 			<return type="int" />
 			<description>Returns the byte offset at which the file read starts.</description>
 		</method>
+		<method name="get_priority" qualifiers="const">
+			<return type="int" enum="DSRequest.DSPriority" />
+			<description>Returns the queue priority level of this request ([constant PRIORITY_LOW], [constant PRIORITY_NORMAL], or [constant PRIORITY_HIGH]).</description>
+		</method>
 		<method name="get_size" qualifiers="const">
 			<return type="int" />
 			<description>Returns the number of source bytes to read. For GDeflate, this is the compressed size.</description>
@@ -114,6 +118,11 @@
 			<param index="0" name="offset" type="int" />
 			<description>Sets the byte offset at which the file read starts.</description>
 		</method>
+		<method name="set_priority">
+			<return type="void" />
+			<param index="0" name="priority" type="int" enum="DSRequest.DSPriority" />
+			<description>Sets the queue priority level of this request ([constant PRIORITY_LOW], [constant PRIORITY_NORMAL], or [constant PRIORITY_HIGH]).</description>
+		</method>
 		<method name="set_size">
 			<return type="void" />
 			<param index="0" name="size" type="int" />
@@ -173,6 +182,9 @@
 		<member name="offset" type="int" setter="set_offset" getter="get_offset" default="0">
 			The byte offset in the file to start reading from.
 		</member>
+		<member name="priority" type="int" setter="set_priority" getter="get_priority" enum="DSRequest.DSPriority" default="1">
+			Queue priority level for this request ([constant PRIORITY_LOW], [constant PRIORITY_NORMAL], or [constant PRIORITY_HIGH]).
+		</member>
 		<member name="size" type="int" setter="set_size" getter="get_size" default="0">
 			The number of bytes to read from the file (compressed size when using GDeflate).
 		</member>
@@ -219,6 +231,15 @@
 		</constant>
 		<constant name="DESTINATION_GPU_TEXTURE" value="2" enum="DSDestinationType">
 			Destination is a GPU texture identified by [member destination_resource].
+		</constant>
+		<constant name="PRIORITY_LOW" value="0" enum="DSPriority">
+			Low queue priority for background asset streaming.
+		</constant>
+		<constant name="PRIORITY_NORMAL" value="1" enum="DSPriority">
+			Normal queue priority for standard read requests.
+		</constant>
+		<constant name="PRIORITY_HIGH" value="2" enum="DSPriority">
+			High queue priority for urgent or blocking asset loads.
 		</constant>
 	</constants>
 </class>
