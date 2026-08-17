@@ -40,11 +40,11 @@ static bool synchronize_rendering_device(const String &p_phase) {
 		return false;
 	}
 
-	// DirectStorage requires GPU destinations to be in COMMON/COPY_DEST. Godot
-	// 4.7 exposes no per-resource D3D12 state transition API, so submit/sync is
-	// the only supported boundary and the resource must not be in an active draw.
-	rd->submit();
-	rd->sync();
+	// DirectStorage transfers write directly into D3D12 resources on the DirectStorage queue
+	// and are synchronized via ID3D12Fence / IDStorageQueue completion fences.
+	// Godot's main RenderingDevice instance submits and synchronizes command buffers
+	// automatically per-frame; manual submit()/sync() on the main instance is prohibited
+	// by Godot (Condition "is_main_instance" is true).
 	return true;
 #else
 	UtilityFunctions::push_error("[DirectStorage] RenderingDevice synchronization unavailable during " + p_phase + ": platform is not Windows.");
@@ -347,7 +347,7 @@ Dictionary DSContext::get_drive_info(const String &p_path) const {
 }
 
 Error DSContext::initialize_ds_for_path(const String &p_path) {
-	if (p_path.is_empty()) {
+	if (p_path.strip_edges().is_empty()) {
 		UtilityFunctions::push_warning("[DirectStorage] Empty path supplied; falling back to res:// initialization.");
 		return initialize_ds() ? OK : ERR_CANT_CREATE;
 	}

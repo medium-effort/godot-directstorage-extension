@@ -203,14 +203,24 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	if (ps && (p_path.begins_with("res://") || p_path.begins_with("user://"))) {
 		global_path = ps->globalize_path(p_path);
 	}
-	if (global_path.is_empty()) {
+	if (global_path.strip_edges().is_empty()) {
 		global_path = "C:\\";
 	}
 
-	// Format drive root cleanly as "X:\"
-	String drive_root = global_path.substr(0, 2) + "\\";
-	if (drive_root.length() < 3 || drive_root[1] != ':') {
-		drive_root = "C:\\";
+	String norm_path = global_path.replace("/", "\\");
+	std::wstring w_norm_path(reinterpret_cast<const wchar_t *>(norm_path.utf16().get_data()));
+	wchar_t volume_path[MAX_PATH] = {0};
+	String drive_root;
+	if (GetVolumePathNameW(w_norm_path.c_str(), volume_path, MAX_PATH)) {
+		drive_root = String(reinterpret_cast<const char16_t *>(volume_path));
+	} else {
+		drive_root = norm_path.substr(0, 2) + "\\";
+		if (drive_root.length() < 3 || drive_root[1] != ':') {
+			drive_root = "C:\\";
+		}
+	}
+	if (!drive_root.ends_with("\\")) {
+		drive_root += "\\";
 	}
 	res["drive"] = drive_root;
 
@@ -357,13 +367,47 @@ bool Win32Backend::initialize() {
 
 bool Win32Backend::is_path_valid(const String &p_path) {
 #ifdef _WIN32
-	if (p_path.length() < 3 || p_path[1] != ':' || (p_path[2] != '\\' && p_path[2] != '/')) {
+	if (p_path.strip_edges().is_empty()) {
 		return false;
 	}
 
-	std::wstring w_path(reinterpret_cast<const wchar_t *>(p_path.utf16().get_data()));
+	String global_path = p_path;
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (ps && (p_path.begins_with("res://") || p_path.begins_with("user://"))) {
+		global_path = ps->globalize_path(p_path);
+	}
+
+	String norm_path = global_path.replace("/", "\\");
+	if (norm_path.length() < 3 || (norm_path[1] != ':' && !norm_path.begins_with("\\\\"))) {
+		return false;
+	}
+
+	std::wstring w_path(reinterpret_cast<const wchar_t *>(norm_path.utf16().get_data()));
 	DWORD attributes = GetFileAttributesW(w_path.c_str());
-	return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+	if (attributes != INVALID_FILE_ATTRIBUTES) {
+		return true;
+	}
+
+	// If specific file does not exist yet, check its parent directory
+	String parent_dir = norm_path.get_base_dir();
+	if (!parent_dir.is_empty() && parent_dir != norm_path) {
+		std::wstring w_parent(reinterpret_cast<const wchar_t *>(parent_dir.utf16().get_data()));
+		DWORD parent_attribs = GetFileAttributesW(w_parent.c_str());
+		if (parent_attribs != INVALID_FILE_ATTRIBUTES && (parent_attribs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+			return true;
+		}
+	}
+
+	// Check if the drive root volume itself is valid
+	wchar_t volume_path[MAX_PATH] = {0};
+	if (GetVolumePathNameW(w_path.c_str(), volume_path, MAX_PATH)) {
+		DWORD vol_attribs = GetFileAttributesW(volume_path);
+		if (vol_attribs != INVALID_FILE_ATTRIBUTES) {
+			return true;
+		}
+	}
+
+	return false;
 #else
 	return false;
 #endif
@@ -381,7 +425,7 @@ bool Win32Backend::initialize(const String &p_path) {
 
 	String validation_path = p_path.is_empty() ? "res://" : p_path;
 	if (!p_path.is_empty() && !is_path_valid(p_path)) {
-		UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Path '" + p_path + "' does not exist or is not an absolute directory.");
+		UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Path '" + p_path + "' does not exist or is not a valid path.");
 		return false;
 	}
 
@@ -559,7 +603,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	if (ps && (path.begins_with("res://") || path.begins_with("user://"))) {
 		path = ps->globalize_path(path);
 	}
-	std::wstring wpath = path.utf8().get_data() ? std::wstring(path.wide_string().get_data()) : L"";
+	String norm_file_path = path.replace("/", "\\");
+	std::wstring wpath(reinterpret_cast<const wchar_t *>(norm_file_path.utf16().get_data()));
 
 	IDStorageFile *file = nullptr;
 	HRESULT hr = factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&file));

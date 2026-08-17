@@ -311,6 +311,14 @@ func test_suite_004_path_aware_initialization() -> void:
 	var err_proj: Error = ctx.initialize_ds_for_path(global_res_path)
 	assert_true(err_proj == OK or err_proj == ERR_UNAVAILABLE or err_proj == ERR_CANT_CREATE, "initialize_ds_for_path(global_res_path) executes cleanly")
 
+	# Path-aware initialization: user:// virtual path and file path
+	var err_user: Error = ctx.initialize_ds_for_path("user://")
+	assert_true(err_user == OK or err_user == ERR_UNAVAILABLE or err_user == ERR_CANT_CREATE, "initialize_ds_for_path('user://') executes cleanly")
+
+	var user_file_path: String = ProjectSettings.globalize_path("user://benchmark_test_file.bin")
+	var err_file: Error = ctx.initialize_ds_for_path(user_file_path)
+	assert_true(err_file == OK or err_file == ERR_UNAVAILABLE or err_file == ERR_CANT_CREATE, "initialize_ds_for_path on file path executes cleanly")
+
 ## Module 4: CPU GDeflate Verification Utilities (TASK_005)
 func test_suite_005_cpu_gdeflate_verification() -> void:
 	current_suite = "Suite 4: CPU GDeflate Verification Utilities (TASK_005)"
