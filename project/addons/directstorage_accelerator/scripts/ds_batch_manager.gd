@@ -16,12 +16,14 @@ func _ready() -> void:
 	else:
 		push_warning("[DirectStorage] GDExtension ClassDB entry 'DSContext' not found. Ensure GDExtension library built.")
 
-## Submits all requests queued during the frame through [DSContext.flush_batch].
+## Submits all requests queued during the frame without blocking the main thread.
 func _process(_delta: float) -> void:
 	if ClassDB.class_exists("DSContext"):
 		var ctx = Engine.get_singleton("DSContext")
 		if ctx and ctx.is_initialized():
-			ctx.flush_batch()
+			if ctx.is_batch_complete():
+				ctx.collect_completed_results()
+			ctx.flush_batch_async()
 
 ## Shuts down [DSContext] before the autoload is deleted.
 func _notification(what: int) -> void:

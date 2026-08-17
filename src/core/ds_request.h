@@ -31,6 +31,12 @@ public:
 		DESTINATION_GPU_TEXTURE = 2,
 	};
 
+	enum DSPriority {
+		PRIORITY_LOW = 0,
+		PRIORITY_NORMAL = 1,
+		PRIORITY_HIGH = 2,
+	};
+
 private:
 	String file_path;
 	uint64_t offset = 0;
@@ -45,6 +51,7 @@ private:
 	uint32_t subresource_count = 1;
 	uint32_t texture_format = 0;
 	uint32_t texture_layout = 0;
+	DSPriority priority = PRIORITY_NORMAL;
 	Status status = STATUS_PENDING;
 	String error_message;
 
@@ -81,6 +88,9 @@ public:
 	void set_destination_type(DSDestinationType p_type);
 	DSDestinationType get_destination_type() const;
 
+	void set_priority(DSPriority p_priority);
+	DSPriority get_priority() const;
+
 	void set_destination_resource(const RID &p_resource);
 	RID get_destination_resource() const;
 
@@ -108,5 +118,6 @@ public:
 VARIANT_ENUM_CAST(DSRequest::Status);
 VARIANT_ENUM_CAST(DSRequest::CompressionFormat);
 VARIANT_ENUM_CAST(DSRequest::DSDestinationType);
+VARIANT_ENUM_CAST(DSRequest::DSPriority);
 
 #endif // DS_REQUEST_H

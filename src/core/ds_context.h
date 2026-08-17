@@ -6,6 +6,7 @@
 #include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <deque>
 #include "ds_profiler.h"
 #include "ds_request.h"
 #include "../platform/platform_backend.h"
@@ -28,6 +29,8 @@ private:
 	bool gpu_requests_pending = false;
 	uint64_t completion_fence = 0;
 	Dictionary request_execution_reports;
+	int pending_request_count = 0;
+	std::deque<int> pending_batch_request_counts;
 
 protected:
 	static void _bind_methods();
@@ -63,6 +66,10 @@ public:
 
 	bool enqueue_request(Ref<DSRequest> p_request);
 	void flush_batch();
+	void flush_batch_async();
+	bool is_batch_complete() const;
+	bool has_pending_results() const;
+	void collect_completed_results();
 	uint64_t get_completion_fence() const;
 	bool wait_for_completion(int p_timeout_msec);
 	void cancel_requests_with_tag(uint64_t p_tag);

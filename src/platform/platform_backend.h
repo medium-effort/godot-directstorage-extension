@@ -19,6 +19,9 @@ public:
 
 	virtual bool enqueue_request(Ref<DSRequest> p_request) = 0;
 	virtual void submit_batch() = 0;
+	virtual void submit_async() = 0;
+	virtual bool is_batch_complete() const = 0;
+	virtual void collect_completed_results() = 0;
 	virtual void cancel_requests_with_tag(uint64_t p_tag) = 0;
 };
 

@@ -78,6 +78,14 @@ DSRequest::DSDestinationType DSRequest::get_destination_type() const {
 	return destination_type;
 }
 
+void DSRequest::set_priority(DSPriority p_priority) {
+	priority = p_priority;
+}
+
+DSRequest::DSPriority DSRequest::get_priority() const {
+	return priority;
+}
+
 void DSRequest::set_destination_resource(const RID &p_resource) {
 	destination_resource = p_resource;
 }
@@ -159,6 +167,9 @@ void DSRequest::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_destination_type", "type"), &DSRequest::set_destination_type);
 	ClassDB::bind_method(D_METHOD("get_destination_type"), &DSRequest::get_destination_type);
 
+	ClassDB::bind_method(D_METHOD("set_priority", "priority"), &DSRequest::set_priority);
+	ClassDB::bind_method(D_METHOD("get_priority"), &DSRequest::get_priority);
+
 	ClassDB::bind_method(D_METHOD("set_destination_resource", "resource"), &DSRequest::set_destination_resource);
 	ClassDB::bind_method(D_METHOD("get_destination_resource"), &DSRequest::get_destination_resource);
 
@@ -188,6 +199,7 @@ void DSRequest::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "compression_format"), "set_compression_format", "get_compression_format");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "destination_buffer"), "set_destination_buffer", "get_destination_buffer");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "destination_type"), "set_destination_type", "get_destination_type");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "priority", PROPERTY_HINT_ENUM, "Low,Normal,High"), "set_priority", "get_priority");
 	ADD_PROPERTY(PropertyInfo(Variant::RID, "destination_resource"), "set_destination_resource", "get_destination_resource");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "first_subresource"), "set_first_subresource", "get_first_subresource");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "subresource_count"), "set_subresource_count", "get_subresource_count");
@@ -207,6 +219,10 @@ void DSRequest::_bind_methods() {
 	BIND_ENUM_CONSTANT(DESTINATION_MEMORY);
 	BIND_ENUM_CONSTANT(DESTINATION_GPU_BUFFER);
 	BIND_ENUM_CONSTANT(DESTINATION_GPU_TEXTURE);
+
+	BIND_ENUM_CONSTANT(PRIORITY_LOW);
+	BIND_ENUM_CONSTANT(PRIORITY_NORMAL);
+	BIND_ENUM_CONSTANT(PRIORITY_HIGH);
 }
 
 } // namespace godot

@@ -8,6 +8,12 @@ DSProfiler *DSProfiler::singleton = nullptr;
 
 namespace {
 
+constexpr const char *THROUGHPUT_MONITOR = "DirectStorage/Throughput (MB/s)";
+constexpr const char *REQUESTS_PER_SECOND_MONITOR = "DirectStorage/Requests/Second";
+constexpr const char *AVERAGE_LATENCY_MONITOR = "DirectStorage/Avg Latency (ms)";
+constexpr const char *QUEUE_DEPTH_MONITOR = "DirectStorage/Queue Depth";
+constexpr const char *GPU_DECOMPRESSION_MONITOR = "DirectStorage/GPU Decompression Active";
+
 struct PendingBatchMetrics {
 	bool valid = false;
 	uint64_t compressed_bytes = 0;
@@ -78,10 +84,12 @@ double DSProfilerResult::get_physical_throughput_mibps() const {
 DSProfiler::DSProfiler() {
 	if (singleton == nullptr) {
 		singleton = this;
+		register_performance_monitors();
 	}
 }
 
 DSProfiler::~DSProfiler() {
+	unregister_performance_monitors();
 	if (singleton == this) {
 		singleton = nullptr;
 	}
@@ -122,6 +130,11 @@ void DSProfiler::record_result(const Ref<DSProfilerResult> &p_result) {
 	last_bytes = p_result->compressed_bytes_read > 0 ? static_cast<uint64_t>(p_result->compressed_bytes_read) : 0;
 	last_duration_us = p_result->physical_read_duration_usec > 0 ? static_cast<uint64_t>(p_result->physical_read_duration_usec) : 0;
 	last_throughput_mbps = p_result->get_logical_throughput_mbps();
+	const int request_count = p_result->request_count > 0 ? p_result->request_count : 0;
+	last_requests_per_second = last_duration_us > 0 ? static_cast<double>(request_count) * 1000000.0 / static_cast<double>(last_duration_us) : 0.0;
+	last_average_latency_ms = request_count > 0 ? static_cast<double>(last_duration_us) / static_cast<double>(request_count) / 1000.0 : 0.0;
+	last_queue_depth = 0;
+	last_gpu_decompression_active = p_result->decompression_duration_usec >= 0;
 }
 
 Ref<DSProfilerResult> DSProfiler::get_last_result() const {
@@ -145,11 +158,57 @@ uint64_t DSProfiler::get_last_duration_us() const {
 }
 
 void DSProfiler::register_performance_monitors() {
-	Performance *perf = Performance::get_singleton();
-	if (perf) {
-		Callable callable = Callable(this, "get_last_throughput_mbps");
-		perf->add_custom_monitor("directstorage/throughput_mbps", callable);
+	if (performance_monitors_registered) {
+		return;
 	}
+
+	Performance *perf = Performance::get_singleton();
+	if (perf == nullptr) {
+		return;
+	}
+
+	perf->add_custom_monitor(THROUGHPUT_MONITOR, Callable(this, "_get_throughput_monitor"));
+	perf->add_custom_monitor(REQUESTS_PER_SECOND_MONITOR, Callable(this, "_get_requests_per_second_monitor"));
+	perf->add_custom_monitor(AVERAGE_LATENCY_MONITOR, Callable(this, "_get_average_latency_monitor"));
+	perf->add_custom_monitor(QUEUE_DEPTH_MONITOR, Callable(this, "_get_queue_depth_monitor"));
+	perf->add_custom_monitor(GPU_DECOMPRESSION_MONITOR, Callable(this, "_get_gpu_decompression_active_monitor"));
+	performance_monitors_registered = true;
+}
+
+void DSProfiler::unregister_performance_monitors() {
+	if (!performance_monitors_registered) {
+		return;
+	}
+
+	Performance *perf = Performance::get_singleton();
+	if (perf != nullptr) {
+		perf->remove_custom_monitor(THROUGHPUT_MONITOR);
+		perf->remove_custom_monitor(REQUESTS_PER_SECOND_MONITOR);
+		perf->remove_custom_monitor(AVERAGE_LATENCY_MONITOR);
+		perf->remove_custom_monitor(QUEUE_DEPTH_MONITOR);
+		perf->remove_custom_monitor(GPU_DECOMPRESSION_MONITOR);
+	}
+	performance_monitors_registered = false;
+}
+
+double DSProfiler::_get_throughput_monitor() const {
+	return last_throughput_mbps;
+}
+
+double DSProfiler::_get_requests_per_second_monitor() const {
+	return last_requests_per_second;
+}
+
+double DSProfiler::_get_average_latency_monitor() const {
+	return last_average_latency_ms;
+}
+
+int DSProfiler::_get_queue_depth_monitor() const {
+	return last_queue_depth;
+}
+
+int DSProfiler::_get_gpu_decompression_active_monitor() const {
+	return last_gpu_decompression_active ? 1 : 0;
 }
 
 void DSProfiler::_bind_methods() {
@@ -163,6 +222,12 @@ void DSProfiler::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_last_bytes"), &DSProfiler::get_last_bytes);
 	ClassDB::bind_method(D_METHOD("get_last_duration_us"), &DSProfiler::get_last_duration_us);
 	ClassDB::bind_method(D_METHOD("register_performance_monitors"), &DSProfiler::register_performance_monitors);
+	ClassDB::bind_method(D_METHOD("unregister_performance_monitors"), &DSProfiler::unregister_performance_monitors);
+	ClassDB::bind_method(D_METHOD("_get_throughput_monitor"), &DSProfiler::_get_throughput_monitor);
+	ClassDB::bind_method(D_METHOD("_get_requests_per_second_monitor"), &DSProfiler::_get_requests_per_second_monitor);
+	ClassDB::bind_method(D_METHOD("_get_average_latency_monitor"), &DSProfiler::_get_average_latency_monitor);
+	ClassDB::bind_method(D_METHOD("_get_queue_depth_monitor"), &DSProfiler::_get_queue_depth_monitor);
+	ClassDB::bind_method(D_METHOD("_get_gpu_decompression_active_monitor"), &DSProfiler::_get_gpu_decompression_active_monitor);
 }
 
 void DSProfilerResult::_bind_methods() {

@@ -17,6 +17,35 @@ FallbackBackend::FallbackBackend() {
 	}
 }
 
+void FallbackBackend::completion_thread_func() {
+	while (true) {
+		Vector<Ref<DSRequest>> batch;
+		{
+			std::unique_lock<std::mutex> lock(batch_mutex);
+			batch_cv.wait(lock, [this]() {
+				return completion_thread_stop.load() || !completion_queue.empty();
+			});
+			if (completion_queue.empty() && completion_thread_stop.load()) {
+				batch_in_flight.store(false);
+				return;
+			}
+			batch = completion_queue.front();
+			completion_queue.pop_front();
+		}
+
+		for (int i = 0; i < batch.size(); i++) {
+			process_request(batch[i]);
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(batch_mutex);
+			completed_batches.push_back(batch);
+			batch_in_flight.store(false);
+			batch_cv.notify_all();
+		}
+	}
+}
+
 bool FallbackBackend::is_available() const {
 	return true;
 }
@@ -26,13 +55,29 @@ String FallbackBackend::get_name() const {
 }
 
 bool FallbackBackend::initialize() {
+	completion_thread_stop.store(false);
+	batch_in_flight.store(false);
 	pending_requests.clear();
+	completion_queue.clear();
+	completed_batches.clear();
+	completion_thread = std::thread(&FallbackBackend::completion_thread_func, this);
 	UtilityFunctions::print("[DirectStorage] FallbackBackend initialized (CPU Workers: " + String::num_int64(num_workers) + ").");
 	return true;
 }
 
 void FallbackBackend::shutdown() {
+	completion_thread_stop.store(true);
+	batch_cv.notify_all();
+	if (completion_thread.joinable()) {
+		completion_thread.join();
+	}
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		completion_queue.clear();
+		completed_batches.clear();
+	}
 	pending_requests.clear();
+	batch_in_flight.store(false);
 }
 
 bool FallbackBackend::enqueue_request(Ref<DSRequest> p_request) {
@@ -114,13 +159,46 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 }
 
 void FallbackBackend::submit_batch() {
+	{
+		std::unique_lock<std::mutex> lock(batch_mutex);
+		batch_cv.wait(lock, [this]() { return !batch_in_flight.load(); });
+	}
 	for (int i = 0; i < pending_requests.size(); i++) {
 		process_request(pending_requests[i]);
 	}
 	pending_requests.clear();
 }
 
+void FallbackBackend::submit_async() {
+	if (pending_requests.size() == 0) {
+		return;
+	}
+
+	Vector<Ref<DSRequest>> batch;
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		if (batch_in_flight.load()) {
+			return;
+		}
+		batch = pending_requests;
+		pending_requests.clear();
+		completion_queue.push_back(batch);
+		batch_in_flight.store(true);
+	}
+	batch_cv.notify_one();
+}
+
+bool FallbackBackend::is_batch_complete() const {
+	return !batch_in_flight.load();
+}
+
+void FallbackBackend::collect_completed_results() {
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	completed_batches.clear();
+}
+
 void FallbackBackend::cancel_requests_with_tag(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(batch_mutex);
 	Vector<Ref<DSRequest>> remaining;
 	for (int i = 0; i < pending_requests.size(); i++) {
 		if (pending_requests[i].is_valid() && (pending_requests[i]->get_cancellation_tag() & UINT64_MAX) == p_tag) {

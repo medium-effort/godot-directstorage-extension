@@ -15,6 +15,7 @@
 namespace godot {
 
 #ifdef _WIN32
+ID3D12Device *ds_win32_get_d3d12_device();
 uint64_t ds_win32_get_completion_fence(PlatformBackend *p_backend);
 bool ds_win32_wait_for_completion(PlatformBackend *p_backend, uint64_t p_fence_value, uint32_t p_timeout_msec);
 #endif
@@ -30,13 +31,6 @@ static bool synchronize_rendering_device(const String &p_phase) {
 	RenderingDevice *rd = rs->get_rendering_device();
 	if (!rd) {
 		UtilityFunctions::push_error("[DirectStorage] RenderingDevice synchronization unavailable during " + p_phase + ": no RenderingDevice is active.");
-		return false;
-	}
-
-	uint64_t device_handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0);
-	uint64_t command_queue_handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_COMMAND_QUEUE, RID(), 0);
-	if (device_handle == 0 || command_queue_handle == 0) {
-		UtilityFunctions::push_error("[DirectStorage] RenderingDevice synchronization unavailable during " + p_phase + ": native D3D12 device or command queue is invalid.");
 		return false;
 	}
 
@@ -93,11 +87,7 @@ bool DSContext::is_d3d12_backend() const {
 		return false;
 	}
 	RenderingDevice *rd = rs->get_rendering_device();
-	if (!rd) {
-		return false;
-	}
-	uint64_t handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0);
-	return (handle != 0);
+	return rd != nullptr;
 #else
 	return false;
 #endif
@@ -111,14 +101,24 @@ namespace {
 
 #ifdef _WIN32
 static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_queue_capacity) {
+	static DSTORAGE_COMPRESSION_SUPPORT s_cached_support = DSTORAGE_COMPRESSION_SUPPORT_NONE;
+	static bool s_support_cached = false;
+	if (s_support_cached) {
+		return s_cached_support;
+	}
+
 	RenderingServer *rs = RenderingServer::get_singleton();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		return DSTORAGE_COMPRESSION_SUPPORT_NONE;
 	}
 
 	RenderingDevice *rd = rs->get_rendering_device();
-	uint64_t device_handle = rd ? rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0) : 0;
-	if (!rd || device_handle == 0) {
+	if (!rd) {
+		return DSTORAGE_COMPRESSION_SUPPORT_NONE;
+	}
+
+	ID3D12Device *d3d12_device = ds_win32_get_d3d12_device();
+	if (!d3d12_device) {
 		return DSTORAGE_COMPRESSION_SUPPORT_NONE;
 	}
 
@@ -155,7 +155,7 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 			queue_desc.Capacity = MIN(static_cast<uint16_t>(DSTORAGE_MAX_QUEUE_CAPACITY), queue_desc.Capacity);
 			queue_desc.Priority = DSTORAGE_PRIORITY_NORMAL;
 			queue_desc.Name = "DirectStorageCapabilityReport";
-			queue_desc.Device = reinterpret_cast<ID3D12Device *>(device_handle);
+			queue_desc.Device = d3d12_device;
 
 			IDStorageQueue1 *queue = nullptr;
 			if (SUCCEEDED(factory->CreateQueue(&queue_desc, __uuidof(IDStorageQueue1), reinterpret_cast<void **>(&queue))) && queue) {
@@ -179,6 +179,8 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 	if (release_core_module) {
 		FreeLibrary(core_module);
 	}
+	s_cached_support = support;
+	s_support_cached = true;
 	return support;
 }
 #endif
@@ -451,6 +453,8 @@ void DSContext::shutdown_ds() {
 	initialized = false;
 	gpu_requests_pending = false;
 	completion_fence = 0;
+	pending_request_count = 0;
+	pending_batch_request_counts.clear();
 	UtilityFunctions::print("[DirectStorage] DirectStorage Context shut down.");
 }
 
@@ -498,6 +502,7 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request) {
 		gpu_requests_pending = true;
 	}
 	if (enqueued) {
+		pending_request_count++;
 		Dictionary report;
 		report["actual_destination_type"] = static_cast<int>(p_request->get_destination_type());
 		report["actual_backend"] = active_backend->get_name();
@@ -513,6 +518,7 @@ void DSContext::flush_batch() {
 	}
 	bool had_gpu_requests = gpu_requests_pending;
 	active_backend->submit_batch();
+	pending_request_count = 0;
 	if (had_gpu_requests) {
 		if (get_completion_fence() == 0 || !wait_for_completion(5000)) {
 			UtilityFunctions::push_error("[DirectStorage] GPU destination completion was not made visible to RenderingDevice.");
@@ -521,8 +527,121 @@ void DSContext::flush_batch() {
 		gpu_requests_pending = false;
 	}
 
-	uint64_t backend_fence = get_completion_fence();
-	completion_fence = backend_fence != 0 ? backend_fence : completion_fence + 1;
+#ifdef _WIN32
+	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
+		uint64_t backend_fence = ds_win32_get_completion_fence(active_backend);
+		if (backend_fence != 0) {
+			completion_fence = backend_fence;
+		} else {
+			completion_fence++;
+		}
+	} else {
+		completion_fence++;
+	}
+#else
+	completion_fence++;
+#endif
+}
+
+void DSContext::flush_batch_async() {
+	if (!initialized || !active_backend) {
+		return;
+	}
+	bool is_win32_backend = active_backend->get_name() == "Win32DirectStorage";
+	bool backend_was_ready = is_win32_backend || active_backend->is_batch_complete();
+	int submitted_request_count = pending_request_count;
+	active_backend->submit_async();
+	if (!is_win32_backend && backend_was_ready && submitted_request_count > 0) {
+		pending_batch_request_counts.push_back(submitted_request_count);
+	}
+	pending_request_count = 0;
+
+#ifdef _WIN32
+	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
+		uint64_t backend_fence = ds_win32_get_completion_fence(active_backend);
+		if (backend_fence != 0) {
+			completion_fence = backend_fence;
+		} else {
+			completion_fence++;
+		}
+	} else {
+		completion_fence++;
+	}
+#else
+	completion_fence++;
+#endif
+}
+
+bool DSContext::is_batch_complete() const {
+	if (!active_backend) {
+		return true;
+	}
+#ifdef _WIN32
+	if (active_backend->get_name() == "Win32DirectStorage") {
+		Win32Backend *backend = static_cast<Win32Backend *>(active_backend);
+		return backend->is_batch_complete() || backend->has_pending_results();
+	}
+#endif
+	return active_backend->is_batch_complete();
+}
+
+bool DSContext::has_pending_results() const {
+	if (!initialized || !active_backend) {
+		return false;
+	}
+#ifdef _WIN32
+	if (active_backend->get_name() == "Win32DirectStorage") {
+		return static_cast<Win32Backend *>(active_backend)->has_pending_results();
+	}
+#endif
+	return active_backend->is_batch_complete() && !pending_batch_request_counts.empty();
+}
+
+void DSContext::collect_completed_results() {
+	if (!initialized || !active_backend) {
+		return;
+	}
+
+	#ifdef _WIN32
+	if (active_backend->get_name() == "Win32DirectStorage") {
+		Win32Backend *backend = static_cast<Win32Backend *>(active_backend);
+		if (!backend->has_pending_results()) {
+			return;
+		}
+		if (gpu_requests_pending && !synchronize_rendering_device("DirectStorage async completion")) {
+			return;
+		}
+		uint64_t fence_value = 0;
+		int completed_count = 0;
+		int error_code = 0;
+		String error_message;
+		while (backend->collect_completed_batch(fence_value, completed_count, error_code, error_message)) {
+			if (error_code != 0) {
+				call_deferred("emit_signal", "batch_failed", error_code, error_message);
+			} else {
+				call_deferred("emit_signal", "batch_completed", static_cast<int64_t>(fence_value), completed_count);
+			}
+		}
+		if (gpu_requests_pending) {
+			gpu_requests_pending = false;
+		}
+		return;
+	}
+	#endif
+
+	if (!active_backend->is_batch_complete() || pending_batch_request_counts.empty()) {
+		return;
+	}
+	active_backend->collect_completed_results();
+	int completed_count = pending_batch_request_counts.front();
+	pending_batch_request_counts.pop_front();
+	if (gpu_requests_pending) {
+		if (!synchronize_rendering_device("DirectStorage async completion")) {
+			return;
+		}
+		gpu_requests_pending = false;
+	}
+	call_deferred("emit_signal", "batch_completed", static_cast<int64_t>(get_completion_fence()), completed_count);
 }
 
 void DSContext::cancel_requests_with_tag(uint64_t p_tag) {
@@ -574,6 +693,10 @@ void DSContext::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("enqueue_request", "request"), &DSContext::enqueue_request);
 	ClassDB::bind_method(D_METHOD("flush_batch"), &DSContext::flush_batch);
+	ClassDB::bind_method(D_METHOD("flush_batch_async"), &DSContext::flush_batch_async);
+	ClassDB::bind_method(D_METHOD("is_batch_complete"), &DSContext::is_batch_complete);
+	ClassDB::bind_method(D_METHOD("has_pending_results"), &DSContext::has_pending_results);
+	ClassDB::bind_method(D_METHOD("collect_completed_results"), &DSContext::collect_completed_results);
 	ClassDB::bind_method(D_METHOD("get_completion_fence"), &DSContext::get_completion_fence);
 	ClassDB::bind_method(D_METHOD("wait_for_completion", "timeout_msec"), &DSContext::wait_for_completion);
 	ClassDB::bind_method(D_METHOD("cancel_requests_with_tag", "tag"), &DSContext::cancel_requests_with_tag);
@@ -594,6 +717,13 @@ void DSContext::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "staging_buffer_size_mb"), "set_staging_buffer_size_mb", "get_staging_buffer_size_mb");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disable_gpu_decompression"), "set_disable_gpu_decompression", "get_disable_gpu_decompression");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "queue_capacity"), "set_queue_capacity", "get_queue_capacity");
+
+	ADD_SIGNAL(MethodInfo("batch_completed",
+		PropertyInfo(Variant::INT, "fence_value"),
+		PropertyInfo(Variant::INT, "completed_count")));
+	ADD_SIGNAL(MethodInfo("batch_failed",
+		PropertyInfo(Variant::INT, "error_code"),
+		PropertyInfo(Variant::STRING, "error_message")));
 }
 
 } // namespace godot

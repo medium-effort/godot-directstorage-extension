@@ -23,7 +23,7 @@ env.Append(CPPPATH=include_paths)
 # Windows platform setup for DirectStorage SDK & MSVC compiler flags
 if env["platform"] == "windows":
     env.Append(LIBPATH=["thirdparty/directstorage/lib/x64"])
-    env.Append(LIBS=["dstorage.lib"])
+    env.Append(LIBS=["dstorage.lib", "d3d12.lib", "dxgi.lib"])
     if "msvc" in env["TOOLS"]:
         env.Append(LINKFLAGS=["/DELAYLOAD:dstorage.dll", "delayimp.lib", "/ignore:4099"])
         # Replace /std:c++17 with /std:c++20 to eliminate MSVC warning D9025

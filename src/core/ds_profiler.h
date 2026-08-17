@@ -51,8 +51,13 @@ private:
 	Ref<DSProfilerResult> last_result;
 	Array result_history;
 	double last_throughput_mbps = 0.0;
+	double last_requests_per_second = 0.0;
+	double last_average_latency_ms = 0.0;
+	int last_queue_depth = 0;
+	bool last_gpu_decompression_active = false;
 	uint64_t last_bytes = 0;
 	uint64_t last_duration_us = 0;
+	bool performance_monitors_registered = false;
 
 protected:
 	static void _bind_methods();
@@ -72,6 +77,13 @@ public:
 	uint64_t get_last_duration_us() const;
 
 	void register_performance_monitors();
+	void unregister_performance_monitors();
+
+	double _get_throughput_monitor() const;
+	double _get_requests_per_second_monitor() const;
+	double _get_average_latency_monitor() const;
+	int _get_queue_depth_monitor() const;
+	int _get_gpu_decompression_active_monitor() const;
 };
 
 } // namespace godot
