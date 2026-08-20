@@ -66,35 +66,35 @@ void uninitialize_directstorage_accelerator_module(ModuleInitializationLevel p_l
 
 	Engine *engine = Engine::get_singleton();
 	if (engine) {
-		if (engine->has_singleton("DSContext")) {
-			engine->unregister_singleton("DSContext");
-		}
-		if (engine->has_singleton("DSErrorHandler")) {
-			engine->unregister_singleton("DSErrorHandler");
+		if (engine->has_singleton("DSTextureCache")) {
+			engine->unregister_singleton("DSTextureCache");
 		}
 		if (engine->has_singleton("DSProfiler")) {
 			engine->unregister_singleton("DSProfiler");
 		}
-		if (engine->has_singleton("DSTextureCache")) {
-			engine->unregister_singleton("DSTextureCache");
+		if (engine->has_singleton("DSErrorHandler")) {
+			engine->unregister_singleton("DSErrorHandler");
+		}
+		if (engine->has_singleton("DSContext")) {
+			engine->unregister_singleton("DSContext");
 		}
 	}
 
-	if (ds_context_singleton) {
-		memdelete(ds_context_singleton);
-		ds_context_singleton = nullptr;
-	}
-	if (ds_error_handler_singleton) {
-		memdelete(ds_error_handler_singleton);
-		ds_error_handler_singleton = nullptr;
+	if (ds_texture_cache_singleton) {
+		memdelete(ds_texture_cache_singleton);
+		ds_texture_cache_singleton = nullptr;
 	}
 	if (ds_profiler_singleton) {
 		memdelete(ds_profiler_singleton);
 		ds_profiler_singleton = nullptr;
 	}
-	if (ds_texture_cache_singleton) {
-		memdelete(ds_texture_cache_singleton);
-		ds_texture_cache_singleton = nullptr;
+	if (ds_error_handler_singleton) {
+		memdelete(ds_error_handler_singleton);
+		ds_error_handler_singleton = nullptr;
+	}
+	if (ds_context_singleton) {
+		memdelete(ds_context_singleton);
+		ds_context_singleton = nullptr;
 	}
 }
 

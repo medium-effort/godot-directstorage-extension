@@ -8,6 +8,8 @@
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
+#include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rd_texture_format.hpp>
 #include <godot_cpp/classes/rd_texture_view.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
@@ -27,16 +29,15 @@ DSResourceFormatLoader::DSResourceFormatLoader() {
 }
 
 DSResourceFormatLoader::~DSResourceFormatLoader() {
+	std::lock_guard<std::mutex> lock(archive_mutex);
+	cached_dspkg.unref();
+	cached_archive_path = String();
 }
 
 PackedStringArray DSResourceFormatLoader::_get_recognized_extensions() const {
 	PackedStringArray ext;
 	ext.append("dstex");
 	ext.append("dspkg");
-	ext.append("png");
-	ext.append("jpg");
-	ext.append("jpeg");
-	ext.append("webp");
 	return ext;
 }
 
@@ -46,10 +47,13 @@ bool DSResourceFormatLoader::_recognize_path(const String &p_path, const StringN
 	}
 
 	String ext = p_path.get_extension().to_lower();
-	if (ext == "dstex" || ext == "dspkg" || ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp") {
+	if (ext == "dstex" || ext == "dspkg") {
 		return true;
 	}
-	return false;
+
+	// Physical source images belong to the importer; only virtual archive entries
+	// should be recognized for their source extensions.
+	return !FileAccess::file_exists(p_path) && _exists(p_path);
 }
 
 bool DSResourceFormatLoader::_handles_type(const StringName &p_type) const {
@@ -66,27 +70,77 @@ bool DSResourceFormatLoader::_handles_type(const StringName &p_type) const {
 
 String DSResourceFormatLoader::_get_resource_type(const String &p_path) const {
 	String ext = p_path.get_extension().to_lower();
-	if (ext == "dstex" || ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp") {
+	if (ext == "dstex") {
 		return "Texture2D";
 	}
 	if (ext == "dspkg") {
 		return "Resource";
 	}
+	if (_is_texture_archive_entry(p_path)) {
+		return "Texture2D";
+	}
 	return "";
+}
+
+String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_path) const {
+	if (FileAccess::file_exists(p_logical_path)) {
+		return p_logical_path;
+	}
+
+	if (p_logical_path != "res://textures.dspkg") {
+		return String();
+	}
+
+	OS *os = OS::get_singleton();
+	if (os) {
+		String executable_archive = os->get_executable_path().get_base_dir().path_join("textures.dspkg");
+		if (FileAccess::file_exists(executable_archive)) {
+			return executable_archive;
+		}
+	}
+
+	ProjectSettings *project_settings = ProjectSettings::get_singleton();
+	if (project_settings) {
+		String globalized_archive = project_settings->globalize_path(p_logical_path);
+		if (FileAccess::file_exists(globalized_archive)) {
+			return globalized_archive;
+		}
+	}
+
+	return String();
+}
+
+Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_path) const {
+	if (p_archive_path.is_empty()) {
+		return Ref<DSPkg>();
+	}
+
+	std::lock_guard<std::mutex> lock(archive_mutex);
+	if (cached_archive_path == p_archive_path && cached_dspkg.is_valid()) {
+		return cached_dspkg;
+	}
+
+	Ref<DSPkg> archive;
+	archive.instantiate();
+	if (archive->open(p_archive_path) != OK) {
+		return Ref<DSPkg>();
+	}
+
+	cached_archive_path = p_archive_path;
+	cached_dspkg = archive;
+	return cached_dspkg;
+}
+
+bool DSResourceFormatLoader::_is_texture_archive_entry(const String &p_path) const {
+	Ref<DSPkg> archive = _get_or_open_archive(_resolve_archive_path("res://textures.dspkg"));
+	return archive.is_valid() && archive->has_texture(p_path);
 }
 
 bool DSResourceFormatLoader::_exists(const String &p_path) const {
 	if (FileAccess::file_exists(p_path)) {
 		return true;
 	}
-	if (FileAccess::file_exists("res://textures.dspkg")) {
-		Ref<DSPkg> pkg;
-		pkg.instantiate();
-		if (pkg->open("res://textures.dspkg") == OK && pkg->has_texture(p_path)) {
-			return true;
-		}
-	}
-	return false;
+	return _is_texture_archive_entry(p_path);
 }
 
 Variant DSResourceFormatLoader::_load_texture_payload(
@@ -406,12 +460,12 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	}
 
 	if (result_texture.is_valid()) {
-		if (p_cache_mode != ResourceFormatLoader::CACHE_MODE_IGNORE && p_cache_mode != ResourceFormatLoader::CACHE_MODE_IGNORE_DEEP) {
+		if (p_cache_mode == ResourceFormatLoader::CACHE_MODE_REUSE || p_cache_mode == ResourceFormatLoader::CACHE_MODE_REPLACE) {
 			DSTextureCache *cache = DSTextureCache::get_singleton();
 			if (cache) {
-				cache->store(p_cache_key, result_texture);
+				cache->store(p_cache_key, result_texture, p_cache_mode);
 				if (!p_original_cache_key.is_empty() && p_original_cache_key != p_cache_key) {
-					cache->store(p_original_cache_key, result_texture);
+					cache->store(p_original_cache_key, result_texture, p_cache_mode);
 				}
 			}
 		}
@@ -423,15 +477,15 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 }
 
 Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_original_path, bool p_use_sub_threads, int32_t p_cache_mode) const {
-	if (p_cache_mode != ResourceFormatLoader::CACHE_MODE_IGNORE && p_cache_mode != ResourceFormatLoader::CACHE_MODE_IGNORE_DEEP) {
+	if (p_cache_mode == ResourceFormatLoader::CACHE_MODE_REUSE) {
 		DSTextureCache *cache = DSTextureCache::get_singleton();
 		if (cache) {
-			Ref<Texture2D> cached = cache->get_cached(p_path);
+			Ref<Texture2D> cached = cache->get_cached(p_path, p_cache_mode);
 			if (cached.is_valid()) {
 				return cached;
 			}
 			if (!p_original_path.is_empty() && p_original_path != p_path) {
-				cached = cache->get_cached(p_original_path);
+				cached = cache->get_cached(p_original_path, p_cache_mode);
 				if (cached.is_valid()) {
 					return cached;
 				}
@@ -443,10 +497,22 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 	bool in_dspkg = false;
 	Ref<DSPkg> dspkg_instance;
 
+	String resolved_archive_path = _resolve_archive_path(p_path);
+	String ext = p_path.get_extension().to_lower();
+	if (ext == "dspkg" && !resolved_archive_path.is_empty()) {
+		Ref<DSPkg> pkg = _get_or_open_archive(resolved_archive_path);
+		if (pkg.is_valid()) {
+			return pkg;
+		}
+		UtilityFunctions::push_error("DSResourceFormatLoader: Failed to open DSPkg archive: ", p_path);
+		return Variant();
+	}
+
 	if (!FileAccess::file_exists(p_path)) {
-		if (FileAccess::file_exists("res://textures.dspkg")) {
-			dspkg_instance.instantiate();
-			if (dspkg_instance->open("res://textures.dspkg") == OK) {
+		resolved_archive_path = _resolve_archive_path("res://textures.dspkg");
+		if (!resolved_archive_path.is_empty()) {
+			dspkg_instance = _get_or_open_archive(resolved_archive_path);
+			if (dspkg_instance.is_valid()) {
 				if (dspkg_instance->has_texture(p_path)) {
 					target_path = p_path;
 					in_dspkg = true;
@@ -485,8 +551,6 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		return Variant();
 	}
 
-	String ext = p_path.get_extension().to_lower();
-
 	if (ext == "dstex") {
 		Ref<DSTex> dstex;
 		dstex.instantiate();
@@ -517,10 +581,8 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 	}
 
 	if (ext == "dspkg") {
-		Ref<DSPkg> pkg;
-		pkg.instantiate();
-		Error err = pkg->open(p_path);
-		if (err == OK) {
+		Ref<DSPkg> pkg = _get_or_open_archive(p_path);
+		if (pkg.is_valid()) {
 			return pkg;
 		}
 		UtilityFunctions::push_error("DSResourceFormatLoader: Failed to open DSPkg archive: ", p_path);

@@ -5,28 +5,46 @@
 namespace godot {
 
 DSTextureCache *DSTextureCache::singleton = nullptr;
+std::mutex DSTextureCache::singleton_mutex;
 
 DSTextureCache *DSTextureCache::get_singleton() {
+	std::lock_guard<std::mutex> lock(singleton_mutex);
 	return singleton;
 }
 
 void DSTextureCache::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("get_cached", "path"), &DSTextureCache::get_cached);
-	ClassDB::bind_method(D_METHOD("store", "path", "texture"), &DSTextureCache::store);
+	BIND_ENUM_CONSTANT(CACHE_MODE_IGNORE);
+	BIND_ENUM_CONSTANT(CACHE_MODE_REUSE);
+	BIND_ENUM_CONSTANT(CACHE_MODE_REPLACE);
+	BIND_ENUM_CONSTANT(CACHE_MODE_IGNORE_DEEP);
+
+	ClassDB::bind_method(D_METHOD("get_cached", "path", "cache_mode"), &DSTextureCache::get_cached, DEFVAL(static_cast<int>(CACHE_MODE_REUSE)));
+	ClassDB::bind_method(D_METHOD("store", "path", "texture", "cache_mode"), &DSTextureCache::store, DEFVAL(static_cast<int>(CACHE_MODE_REUSE)));
 	ClassDB::bind_method(D_METHOD("evict", "path"), &DSTextureCache::evict);
 	ClassDB::bind_method(D_METHOD("clear"), &DSTextureCache::clear);
+
+	ClassDB::bind_method(D_METHOD("set_enabled", "enabled"), &DSTextureCache::set_enabled);
+	ClassDB::bind_method(D_METHOD("is_enabled"), &DSTextureCache::is_enabled);
+	ClassDB::bind_method(D_METHOD("is_cache_mode_ignored", "cache_mode"), &DSTextureCache::is_cache_mode_ignored);
 
 	ClassDB::bind_method(D_METHOD("set_max_entries", "max"), &DSTextureCache::set_max_entries);
 	ClassDB::bind_method(D_METHOD("get_max_entries"), &DSTextureCache::get_max_entries);
 	ClassDB::bind_method(D_METHOD("get_cached_count"), &DSTextureCache::get_cached_count);
 
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "enabled"), "set_enabled", "is_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_entries"), "set_max_entries", "get_max_entries");
 }
 
 DSTextureCache::DSTextureCache() {
-	singleton = this;
+	{
+		std::lock_guard<std::mutex> lock(singleton_mutex);
+		singleton = this;
+	}
 
 	ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (ps && ps->has_setting("directstorage/texture_cache_enabled")) {
+		enabled = ps->get_setting("directstorage/texture_cache_enabled");
+	}
 	if (ps && ps->has_setting("directstorage/texture_cache_max_entries")) {
 		max_entries = ps->get_setting("directstorage/texture_cache_max_entries");
 		if (max_entries < 1) {
@@ -37,29 +55,59 @@ DSTextureCache::DSTextureCache() {
 
 DSTextureCache::~DSTextureCache() {
 	clear();
-	if (singleton == this) {
-		singleton = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(singleton_mutex);
+		if (singleton == this) {
+			singleton = nullptr;
+		}
 	}
 }
 
-void DSTextureCache::_evict_oldest() {
+bool DSTextureCache::_evict_oldest() {
 	if (lru_list.is_empty()) {
+		return false;
+	}
+
+	List<String>::Element *oldest = lru_list.back();
+	const String oldest_path = oldest->get();
+	lru_list.erase(oldest);
+	cache_map.erase(oldest_path);
+	return true;
+}
+
+void DSTextureCache::_remove_entry(const String &p_path) {
+	if (!cache_map.has(p_path)) {
 		return;
 	}
 
-	String oldest_path = lru_list.back()->get();
-	lru_list.pop_back();
-	cache_map.erase(oldest_path);
+	CacheEntry entry = cache_map[p_path];
+	if (entry.lru_element) {
+		lru_list.erase(entry.lru_element);
+	}
+	cache_map.erase(p_path);
 }
 
-Ref<Texture2D> DSTextureCache::get_cached(const String &p_path) {
+bool DSTextureCache::_is_cache_mode_ignored(int p_cache_mode) {
+	return p_cache_mode == CACHE_MODE_IGNORE || p_cache_mode == CACHE_MODE_IGNORE_DEEP;
+}
+
+bool DSTextureCache::_is_cache_mode_replace(int p_cache_mode) {
+	return p_cache_mode == CACHE_MODE_REPLACE;
+}
+
+Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode) {
 	std::lock_guard<std::mutex> lock(cache_mutex);
 
-	if (!cache_map.has(p_path)) {
+	if (!enabled || _is_cache_mode_ignored(p_cache_mode) || _is_cache_mode_replace(p_cache_mode) || !cache_map.has(p_path)) {
 		return Ref<Texture2D>();
 	}
 
 	CacheEntry &entry = cache_map[p_path];
+	if (entry.texture.is_null() || !entry.texture.is_valid()) {
+		_remove_entry(p_path);
+		return Ref<Texture2D>();
+	}
+
 	if (entry.lru_element && entry.lru_element != lru_list.front()) {
 		lru_list.move_to_front(entry.lru_element);
 	}
@@ -67,12 +115,12 @@ Ref<Texture2D> DSTextureCache::get_cached(const String &p_path) {
 	return entry.texture;
 }
 
-void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture) {
-	if (p_texture.is_null()) {
+void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode) {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+
+	if (!enabled || _is_cache_mode_ignored(p_cache_mode) || p_texture.is_null() || !p_texture.is_valid()) {
 		return;
 	}
-
-	std::lock_guard<std::mutex> lock(cache_mutex);
 
 	if (cache_map.has(p_path)) {
 		CacheEntry &entry = cache_map[p_path];
@@ -84,7 +132,10 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 	}
 
 	while (static_cast<int>(cache_map.size()) >= max_entries) {
-		_evict_oldest();
+		if (!_evict_oldest()) {
+			cache_map.clear();
+			break;
+		}
 	}
 
 	lru_list.push_front(p_path);
@@ -101,11 +152,7 @@ void DSTextureCache::evict(const String &p_path) {
 		return;
 	}
 
-	CacheEntry entry = cache_map[p_path];
-	if (entry.lru_element) {
-		lru_list.erase(entry.lru_element);
-	}
-	cache_map.erase(p_path);
+	_remove_entry(p_path);
 }
 
 void DSTextureCache::clear() {
@@ -115,12 +162,39 @@ void DSTextureCache::clear() {
 	lru_list.clear();
 }
 
+void DSTextureCache::set_enabled(bool p_enabled) {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+
+	if (enabled == p_enabled) {
+		return;
+	}
+
+	enabled = p_enabled;
+	if (!enabled) {
+		cache_map.clear();
+		lru_list.clear();
+	}
+}
+
+bool DSTextureCache::is_enabled() const {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	return enabled;
+}
+
+bool DSTextureCache::is_cache_mode_ignored(int p_cache_mode) const {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	return _is_cache_mode_ignored(p_cache_mode);
+}
+
 void DSTextureCache::set_max_entries(int p_max) {
 	std::lock_guard<std::mutex> lock(cache_mutex);
 
 	max_entries = p_max < 1 ? 1 : p_max;
 	while (static_cast<int>(cache_map.size()) > max_entries) {
-		_evict_oldest();
+		if (!_evict_oldest()) {
+			cache_map.clear();
+			break;
+		}
 	}
 }
 

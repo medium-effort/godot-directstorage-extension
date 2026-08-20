@@ -4,7 +4,7 @@
 		Thread-safe least-recently-used cache for DirectStorage textures.
 	</brief_description>
 	<description>
-		[DSTextureCache] stores loaded [Texture2D] resources by path and promotes entries when they are read. The extension registers it as the [Engine] singleton named [code]"DSTextureCache"[/code]. The resource loader uses this cache unless a resource load explicitly ignores caching.
+		[DSTextureCache] provides an optional thread-safe least-recently-used (LRU) cache for loaded [Texture2D] resources. The extension registers it as the [Engine] singleton named [code]"DSTextureCache"[/code]. When enabled, the resource loader can query and store textures according to the requested cache mode ([constant CACHE_MODE_REUSE], [constant CACHE_MODE_IGNORE], or [constant CACHE_MODE_REPLACE]).
 	</description>
 	<tutorials>
 	</tutorials>
@@ -21,7 +21,8 @@
 		<method name="get_cached">
 			<return type="Texture2D" />
 			<param index="0" name="path" type="String" />
-			<description>Returns the cached texture for [param path] and marks it as recently used. Returns [code]null[/code] when no entry exists.</description>
+			<param index="1" name="cache_mode" type="int" enum="DSTextureCache.CacheMode" default="1" />
+			<description>Returns the cached texture for [param path] and marks it as recently used unless [param cache_mode] ignores or replaces caching. Returns [code]null[/code] when no entry exists or caching is disabled.</description>
 		</method>
 		<method name="get_cached_count" qualifiers="const">
 			<return type="int" />
@@ -30,6 +31,20 @@
 		<method name="get_max_entries" qualifiers="const">
 			<return type="int" />
 			<description>Returns the maximum number of entries retained by the cache.</description>
+		</method>
+		<method name="is_cache_mode_ignored" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="cache_mode" type="int" enum="DSTextureCache.CacheMode" />
+			<description>Returns whether the given [param cache_mode] specifies bypassing cache storage and lookup ([constant CACHE_MODE_IGNORE] or [constant CACHE_MODE_IGNORE_DEEP]).</description>
+		</method>
+		<method name="is_enabled" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether the texture cache is actively enabled.</description>
+		</method>
+		<method name="set_enabled">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>Enables or disables the texture cache. Disabling the cache clears all currently retained entries.</description>
 		</method>
 		<method name="set_max_entries">
 			<return type="void" />
@@ -40,12 +55,30 @@
 			<return type="void" />
 			<param index="0" name="path" type="String" />
 			<param index="1" name="texture" type="Texture2D" />
-			<description>Stores [param texture] under [param path] and marks it as recently used. Null textures are ignored.</description>
+			<param index="2" name="cache_mode" type="int" enum="DSTextureCache.CacheMode" default="1" />
+			<description>Stores [param texture] under [param path] and marks it as recently used if caching is enabled and [param cache_mode] is not ignored. Null textures are ignored.</description>
 		</method>
 	</methods>
 	<members>
+		<member name="enabled" type="bool" setter="set_enabled" getter="is_enabled" default="false">
+			Whether the texture cache is enabled. When disabled, queries return [code]null[/code] and new entries are not stored.
+		</member>
 		<member name="max_entries" type="int" setter="set_max_entries" getter="get_max_entries" default="256">
 			Maximum number of textures retained by the least-recently-used cache.
 		</member>
 	</members>
+	<constants>
+		<constant name="CACHE_MODE_IGNORE" value="0" enum="CacheMode">
+			Bypasses cache lookup and storage.
+		</constant>
+		<constant name="CACHE_MODE_REUSE" value="1" enum="CacheMode">
+			Queries the cache and stores the loaded texture if caching is enabled.
+		</constant>
+		<constant name="CACHE_MODE_REPLACE" value="2" enum="CacheMode">
+			Bypasses cache lookup and updates or replaces the existing cache entry.
+		</constant>
+		<constant name="CACHE_MODE_IGNORE_DEEP" value="3" enum="CacheMode">
+			Bypasses caching for this resource and any nested sub-resources.
+		</constant>
+	</constants>
 </class>

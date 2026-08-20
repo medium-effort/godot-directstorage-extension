@@ -50,7 +50,25 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 ## Starts a temporary DSPkg archive for the current export if bundling is enabled.
 func _export_begin(features: PackedStringArray, is_debug: bool, path: String, flags: int) -> void:
 	print("[DirectStorage Exporter] Export started for target: ", path)
-	_target_export_dir = path.get_base_dir()
+	var resolved_export_path := path.strip_edges().simplify_path()
+	if resolved_export_path.is_empty():
+		_target_export_dir = ""
+		push_error("[DirectStorage Exporter] Export path is empty; archive and binary deployment will be skipped.")
+	else:
+		if resolved_export_path.begins_with("res://") or resolved_export_path.begins_with("user://"):
+			resolved_export_path = ProjectSettings.globalize_path(resolved_export_path)
+		elif not resolved_export_path.is_absolute_path():
+			resolved_export_path = ProjectSettings.globalize_path("res://" + resolved_export_path.trim_prefix("./"))
+		_target_export_dir = resolved_export_path.get_base_dir().simplify_path()
+		if not _target_export_dir.is_absolute_path():
+			push_error("[DirectStorage Exporter] Could not resolve an absolute export directory from: " + path)
+			_target_export_dir = ""
+		else:
+			var target_dir_err := DirAccess.make_dir_recursive_absolute(_target_export_dir)
+			if target_dir_err != OK and not DirAccess.dir_exists_absolute(_target_export_dir):
+				push_error("[DirectStorage Exporter] Failed to prepare export directory '" + _target_export_dir + "': " + error_string(target_dir_err) + ". Verify the export path is writable.")
+			else:
+				print("[DirectStorage Exporter] Resolved export directory: ", _target_export_dir)
 	_export_features = features
 	_is_debug_export = is_debug
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
@@ -67,11 +85,12 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		push_warning("[DirectStorage Exporter] DSPkg class not found. Skipping archive bundling.")
 		return
 
+	_cleanup_temp_dspkg()
 	_dspkg = ClassDB.instantiate("DSPkg")
 	if _dspkg != null:
 		var err: Error = _dspkg.create(_temp_dspkg_path)
 		if err != OK:
-			push_error("[DirectStorage Exporter] Failed to create temporary DSPkg archive at: " + _temp_dspkg_path)
+			push_error("[DirectStorage Exporter] Failed to create temporary DSPkg archive at: " + _temp_dspkg_path + ": " + error_string(err))
 			_dspkg = null
 		else:
 			print("[DirectStorage Exporter] Initialized temporary DSPkg archive at: ", _temp_dspkg_path)
@@ -103,6 +122,7 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 
 	# Never skip .import files so Godot preserves remap tables in PCK
 	if path.ends_with(".import"):
+		print("[DirectStorage Exporter] Preserving remap metadata in PCK: ", path)
 		return
 
 	var dstex_path: String = ""
@@ -124,15 +144,18 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 		var mip_metadata := _read_v2_footprint_metadata(dstex_path)
 		var add_err: Error = _dspkg.add_texture(resource_path, dstex_path, mip_metadata)
 		if dstex_path != resource_path:
-			_dspkg.add_texture(dstex_path, dstex_path, mip_metadata)
+			var remapped_add_err: Error = _dspkg.add_texture(dstex_path, dstex_path, mip_metadata)
+			if add_err == OK:
+				add_err = remapped_add_err
 
 		if add_err == OK:
 			_has_textures = true
 			print("[DirectStorage Exporter] Added texture to archive: ", resource_path, " (from ", dstex_path, ")")
-			# Skip texture payload from PCK so it is only stored in textures.dspkg
+			# Skip texture payload from PCK so it is only stored in textures.dspkg.
 			skip()
+			print("[DirectStorage Exporter] Skipped texture payload from PCK: ", resource_path)
 		else:
-			push_error("[DirectStorage Exporter] Failed to add texture to archive: " + dstex_path)
+			push_error("[DirectStorage Exporter] Failed to add texture to archive ('" + resource_path + "' and remap target '" + dstex_path + "'): " + error_string(add_err) + ". The texture will remain in the PCK.")
 
 ## Finalizes the archive, writes textures.dspkg (if enabled), and deploys binaries.
 func _export_end() -> void:
@@ -142,25 +165,37 @@ func _export_end() -> void:
 			if err == OK:
 				if not _target_export_dir.is_empty():
 					var target_dspkg_path := _target_export_dir.path_join("textures.dspkg")
-					var copy_err := DirAccess.copy_absolute(_temp_dspkg_path, target_dspkg_path)
-					if copy_err == OK:
-						print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", target_dspkg_path)
+					var temp_dspkg_path := ProjectSettings.globalize_path(_temp_dspkg_path)
+					if not FileAccess.file_exists(temp_dspkg_path):
+						push_error("[DirectStorage Exporter] Finalized archive is missing at '" + temp_dspkg_path + "'; textures.dspkg was not deployed.")
 					else:
-						push_error("[DirectStorage Exporter] Failed to copy textures.dspkg to export directory: " + error_string(copy_err))
+						var copy_err := DirAccess.copy_absolute(temp_dspkg_path, target_dspkg_path)
+						if copy_err == OK:
+							print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", target_dspkg_path)
+						else:
+							push_error("[DirectStorage Exporter] Failed to copy textures.dspkg to '" + target_dspkg_path + "': " + error_string(copy_err) + ". Verify the export directory is writable and not locked by another process.")
 				else:
-					push_error("[DirectStorage Exporter] Target export directory is empty; could not deploy textures.dspkg.")
+					push_error("[DirectStorage Exporter] Target export directory is empty; could not deploy textures.dspkg. Verify the export path passed to _export_begin().")
 			else:
-				push_error("[DirectStorage Exporter] Failed to finalize DSPkg archive.")
+				push_error("[DirectStorage Exporter] Failed to finalize DSPkg archive: " + error_string(err) + ". The temporary archive will be removed.")
 		else:
 			print("[DirectStorage Exporter] Export finished. No DirectStorage (.dstex) textures were found to bundle.")
 
 	_dspkg = null
-	if FileAccess.file_exists(_temp_dspkg_path):
-		DirAccess.remove_absolute(_temp_dspkg_path)
+	_cleanup_temp_dspkg()
 
 	# Deploy native shared libraries to the exact subfolder expected by GDExtension runtime
 	if not _target_export_dir.is_empty() and _export_features.has("windows"):
 		_deploy_windows_binaries(_target_export_dir, _is_debug_export, _export_features)
+
+## Removes the per-export archive without leaving stale user:// artifacts behind.
+func _cleanup_temp_dspkg() -> void:
+	if not FileAccess.file_exists(_temp_dspkg_path):
+		return
+	var temp_dspkg_path := ProjectSettings.globalize_path(_temp_dspkg_path)
+	var remove_err := DirAccess.remove_absolute(temp_dspkg_path)
+	if remove_err != OK and FileAccess.file_exists(_temp_dspkg_path):
+		push_warning("[DirectStorage Exporter] Could not remove temporary archive '" + _temp_dspkg_path + "': " + error_string(remove_err) + ". Remove it before the next export.")
 
 ## Deploys the GDExtension DLL and DirectStorage runtime dependencies to addons/directstorage_accelerator/bin.
 func _deploy_windows_binaries(target_base_dir: String, is_debug: bool, features: PackedStringArray) -> void:

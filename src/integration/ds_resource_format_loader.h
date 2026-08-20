@@ -2,6 +2,7 @@
 #define DS_RESOURCE_FORMAT_LOADER_H
 
 #include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/classes/resource_format_loader.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/core/class_db.hpp>
@@ -11,7 +12,11 @@
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/variant.hpp>
 
+#include <mutex>
+
 namespace godot {
+
+class DSPkg;
 
 class DSResourceFormatLoader : public ResourceFormatLoader {
 	GDCLASS(DSResourceFormatLoader, ResourceFormatLoader);
@@ -30,6 +35,14 @@ class DSResourceFormatLoader : public ResourceFormatLoader {
 	//   512-byte placement); the GPU path uploads padded footprints directly,
 	//   while the CPU fallback unpads via DSTex::get_mip_layout().
 private:
+	mutable std::mutex archive_mutex;
+	mutable String cached_archive_path;
+	mutable Ref<DSPkg> cached_dspkg;
+
+	String _resolve_archive_path(const String &p_logical_path) const;
+	Ref<DSPkg> _get_or_open_archive(const String &p_archive_path) const;
+	bool _is_texture_archive_entry(const String &p_path) const;
+
 	Variant _load_texture_payload(
 			const String &p_file_path,
 			uint64_t p_offset,
