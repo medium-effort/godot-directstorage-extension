@@ -212,7 +212,7 @@ void FallbackBackend::cancel_requests_with_tag(uint64_t p_tag) {
 	std::lock_guard<std::mutex> lock(batch_mutex);
 	Vector<Ref<DSRequest>> remaining;
 	for (int i = 0; i < pending_requests.size(); i++) {
-		if (pending_requests[i].is_valid() && (pending_requests[i]->get_cancellation_tag() & UINT64_MAX) == p_tag) {
+		if (pending_requests[i].is_valid() && pending_requests[i]->get_cancellation_tag() == p_tag) {
 			pending_requests[i]->set_status(DSRequest::STATUS_FAILED);
 			pending_requests[i]->set_error_message("Request cancelled by tag.");
 		} else {

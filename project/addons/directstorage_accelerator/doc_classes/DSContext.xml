@@ -78,9 +78,13 @@
 			<return type="int" />
 			<description>Returns the GPU decompression support tier reported by DirectStorage ([code]0[/code] for unsupported or software-only, [code]1[/code] or higher for hardware GPU decompression support).</description>
 		</method>
+		<method name="get_pending_request_count" qualifiers="const">
+			<return type="int" />
+			<description>Returns the number of requests currently enqueued in [DSContext] awaiting synchronous ([method flush_batch]) or asynchronous ([method flush_batch_async]) submission.</description>
+		</method>
 		<method name="get_queue_capacity" qualifiers="const">
 			<return type="int" />
-			<description>Returns the maximum number of requests allowed in a queue. The default is [code]2000[/code].</description>
+			<description>Returns the maximum number of requests allowed in a queue. The default is [code]512[/code].</description>
 		</method>
 		<method name="get_request_execution_report" qualifiers="const">
 			<return type="Dictionary" />
@@ -181,8 +185,8 @@
 		<member name="disable_gpu_decompression" type="bool" setter="set_disable_gpu_decompression" getter="get_disable_gpu_decompression" default="false">
 			If [code]true[/code], forces DirectStorage runtime to perform CPU decompression instead of GPU decompression shaders.
 		</member>
-		<member name="queue_capacity" type="int" setter="set_queue_capacity" getter="get_queue_capacity" default="128">
-			The maximum request capacity for the DirectStorage queue. The default is [code]2000[/code].
+		<member name="queue_capacity" type="int" setter="set_queue_capacity" getter="get_queue_capacity" default="512">
+			The maximum request capacity for the DirectStorage queue. The default is [code]512[/code].
 		</member>
 		<member name="staging_buffer_size_mb" type="int" setter="set_staging_buffer_size_mb" getter="get_staging_buffer_size_mb" default="128">
 			The size in megabytes of each staging buffer allocated by DirectStorage.

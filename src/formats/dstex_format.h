@@ -72,6 +72,7 @@ public:
 	Error write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count = 1, int p_compression_level = 1, bool p_is_srgb = false);
 	Dictionary read_header(const String &p_path);
 	Dictionary read_from_file(const String &p_path);
+	/// Convenience alias for read_header; returns the same header metadata dictionary.
 	Dictionary get_file_info(const String &p_path);
 
 	static DSTexMipLayout get_mip_layout(uint32_t p_width, uint32_t p_height, int p_image_format);

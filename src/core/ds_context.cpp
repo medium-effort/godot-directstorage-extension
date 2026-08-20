@@ -57,6 +57,8 @@ static bool synchronize_rendering_device(const String &p_phase) {
 }
 
 DSContext *DSContext::singleton = nullptr;
+std::once_flag DSContext::support_probe_once;
+bool DSContext::supported_probe_result = false;
 
 DSContext *DSContext::get_singleton() {
 	return singleton;
@@ -123,12 +125,15 @@ bool DSContext::is_supported() const {
 	if (active_backend) {
 		return active_backend->get_name() == "Win32DirectStorage";
 	}
+	std::call_once(support_probe_once, []() {
 #ifdef _WIN32
-	Win32Backend backend;
-	return backend.is_available();
+		Win32Backend backend;
+		DSContext::supported_probe_result = backend.is_available();
 #else
-	return false;
+		DSContext::supported_probe_result = false;
 #endif
+	});
+	return supported_probe_result;
 }
 
 bool DSContext::is_d3d12_backend() const {
@@ -426,7 +431,7 @@ Error DSContext::initialize_ds_for_path(const String &p_path) {
 		if (initialized) {
 			shutdown_ds();
 		}
-		return initialize_ds() ? ERR_FILE_NOT_FOUND : ERR_CANT_CREATE;
+		return initialize_ds() ? OK : ERR_CANT_CREATE;
 	}
 
 	Dictionary drive_info = Win32Backend::get_drive_info_for_path(p_path);
@@ -435,7 +440,7 @@ Error DSContext::initialize_ds_for_path(const String &p_path) {
 		if (initialized) {
 			shutdown_ds();
 		}
-		return initialize_ds() ? ERR_UNAVAILABLE : ERR_CANT_CREATE;
+		return initialize_ds() ? OK : ERR_CANT_CREATE;
 	}
 
 	if (initialized) {
@@ -454,11 +459,10 @@ Error DSContext::initialize_ds_for_path(const String &p_path) {
 		shutdown_ds();
 	}
 	UtilityFunctions::push_warning("[DirectStorage] Path-aware DirectStorage initialization failed; falling back to res:// initialization.");
-	initialize_ds();
-	return ERR_CANT_CREATE;
+	return initialize_ds() ? OK : ERR_CANT_CREATE;
 #else
 	UtilityFunctions::push_warning("[DirectStorage] Path-aware initialization is unavailable on this platform; falling back to res:// initialization.");
-	return initialize_ds() ? ERR_UNAVAILABLE : ERR_CANT_CREATE;
+	return initialize_ds() ? OK : ERR_CANT_CREATE;
 #endif
 }
 
@@ -524,6 +528,7 @@ void DSContext::shutdown_ds() {
 		pending_batch_request_counts.clear();
 		request_execution_reports.clear();
 		tracked_requests.clear();
+		pending_request_ids.clear();
 		report_order.clear();
 	}
 	initialized = false;
@@ -591,11 +596,17 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request) {
 		remove_report_locked(request_id);
 		request_execution_reports[request_id] = report;
 		tracked_requests[request_id] = p_request;
+		pending_request_ids.insert(request_id);
 		report_order.push_back(request_id);
 		finalize_completed_reports_locked();
 		evict_old_reports_if_needed_locked();
 	}
 	return enqueued;
+}
+
+int DSContext::get_pending_request_count() const {
+	std::lock_guard<std::mutex> lock(context_mutex);
+	return pending_request_count;
 }
 
 void DSContext::flush_batch() {
@@ -618,16 +629,13 @@ void DSContext::flush_batch() {
 #endif
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
+		pending_request_ids.clear();
 		pending_request_count = 0;
 		if (submitted_request_count > 0) {
 			completion_fence = backend_fence != 0 ? backend_fence : completion_fence + 1;
 		}
 	}
 	if (had_gpu_requests) {
-		if (get_completion_fence() == 0 || !wait_for_completion(5000)) {
-			UtilityFunctions::push_error("[DirectStorage] GPU destination completion was not made visible to RenderingDevice.");
-			return;
-		}
 		std::lock_guard<std::mutex> lock(context_mutex);
 		gpu_requests_pending = false;
 	}
@@ -643,13 +651,16 @@ void DSContext::flush_batch_async() {
 	if (!initialized || !active_backend) {
 		return;
 	}
-	bool is_win32_backend = active_backend->get_name() == "Win32DirectStorage";
-	bool backend_was_ready = is_win32_backend || active_backend->is_batch_complete();
 	int submitted_request_count = 0;
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
 		submitted_request_count = pending_request_count;
 	}
+	if (submitted_request_count == 0) {
+		return;
+	}
+	bool is_win32_backend = active_backend->get_name() == "Win32DirectStorage";
+	bool backend_was_ready = is_win32_backend || active_backend->is_batch_complete();
 	active_backend->submit_async();
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
@@ -666,6 +677,7 @@ void DSContext::flush_batch_async() {
 		if (submitted_request_count > 0) {
 			completion_fence = backend_fence != 0 ? backend_fence : completion_fence + 1;
 		}
+		pending_request_ids.clear();
 		finalize_completed_reports_locked();
 		evict_old_reports_if_needed_locked();
 	}
@@ -677,8 +689,7 @@ bool DSContext::is_batch_complete() const {
 	}
 #ifdef _WIN32
 	if (active_backend->get_name() == "Win32DirectStorage") {
-		Win32Backend *backend = static_cast<Win32Backend *>(active_backend);
-		return backend->is_batch_complete() || backend->has_pending_results();
+		return active_backend->is_batch_complete();
 	}
 #endif
 	// For fallback backend, completion is determined by backend state; guard pending counts.
@@ -778,9 +789,27 @@ void DSContext::cancel_requests_with_tag(uint64_t p_tag) {
 	if (!initialized || !active_backend) {
 		return;
 	}
+	std::unordered_set<int64_t> cancelled_pending_request_ids;
+	{
+		std::lock_guard<std::mutex> lock(context_mutex);
+		for (std::unordered_set<int64_t>::const_iterator it = pending_request_ids.begin(); it != pending_request_ids.end(); ++it) {
+			std::unordered_map<int64_t, Ref<DSRequest>>::const_iterator request_it = tracked_requests.find(*it);
+			if (request_it != tracked_requests.end() && request_it->second.is_valid() &&
+					request_it->second->get_cancellation_tag() == p_tag) {
+				cancelled_pending_request_ids.insert(*it);
+			}
+		}
+	}
 	active_backend->cancel_requests_with_tag(p_tag);
 	std::lock_guard<std::mutex> lock(context_mutex);
-	pending_request_count = 0;
+	for (std::unordered_set<int64_t>::const_iterator it = cancelled_pending_request_ids.begin(); it != cancelled_pending_request_ids.end(); ++it) {
+		pending_request_ids.erase(*it);
+	}
+	if (cancelled_pending_request_ids.size() >= static_cast<size_t>(pending_request_count)) {
+		pending_request_count = 0;
+	} else {
+		pending_request_count -= static_cast<int>(cancelled_pending_request_ids.size());
+	}
 	if (!pending_batch_request_counts.empty()) {
 		pending_batch_request_counts.clear();
 	}
@@ -829,6 +858,7 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("shutdown_ds"), &DSContext::shutdown_ds);
 
 	ClassDB::bind_method(D_METHOD("enqueue_request", "request"), &DSContext::enqueue_request);
+	ClassDB::bind_method(D_METHOD("get_pending_request_count"), &DSContext::get_pending_request_count);
 	ClassDB::bind_method(D_METHOD("flush_batch"), &DSContext::flush_batch);
 	ClassDB::bind_method(D_METHOD("flush_batch_async"), &DSContext::flush_batch_async);
 	ClassDB::bind_method(D_METHOD("is_batch_complete"), &DSContext::is_batch_complete);

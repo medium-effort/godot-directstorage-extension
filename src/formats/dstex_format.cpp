@@ -846,6 +846,7 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	return result;
 }
 
+// Keep the legacy file-info API as an explicit convenience alias for read_header.
 Dictionary DSTex::get_file_info(const String &p_path) {
 	return read_header(p_path);
 }

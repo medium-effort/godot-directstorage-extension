@@ -32,25 +32,35 @@ if env["platform"] == "windows":
             env.Append(CXXFLAGS=["/std:c++20"])
         if "/EHsc" not in env["CXXFLAGS"]:
             env.Append(CXXFLAGS=["/EHsc"])
-        # Suppress non-critical MSVC warnings in third-party libdeflate C code
-        env.Append(CCFLAGS=["/wd4244", "/wd4127", "/wd4267", "/wd4100", "/wd4245", "/wd4456", "/wd4018", "/wd4146", "/wd4310"])
 
 # Source files (GDExtension C++ code + GDeflate & libdeflate sources).
 # Keep the Windows backend out of non-Windows builds; its implementation uses
 # Win32 and DirectStorage APIs that are not available on those platforms.
-sources = (
+project_sources = (
     Glob("src/*.cpp") +
     Glob("src/core/*.cpp") +
     Glob("src/compression/*.cpp") +
     Glob("src/formats/*.cpp") +
     Glob("src/integration/*.cpp") +
-    Glob("src/platform/fallback/*.cpp") +
+    Glob("src/platform/fallback/*.cpp")
+)
+thirdparty_sources = (
     Glob("thirdparty/gdeflate/*.cpp") +
     Glob("thirdparty/libdeflate/lib/*.c") +
     Glob("thirdparty/libdeflate/lib/x86/*.c")
 )
 if env["platform"] == "windows":
-    sources += Glob("src/platform/win32/*.cpp")
+    project_sources += Glob("src/platform/win32/*.cpp")
+
+# Keep non-critical MSVC warning suppressions scoped to third-party sources so
+# legitimate diagnostics in the extension's src/ code remain visible.
+thirdparty_objects = thirdparty_sources
+if env["platform"] == "windows" and "msvc" in env["TOOLS"]:
+    thirdparty_env = env.Clone()
+    thirdparty_env.Append(CCFLAGS=["/wd4244", "/wd4127", "/wd4267", "/wd4100", "/wd4245", "/wd4456", "/wd4018", "/wd4146", "/wd4310"])
+    thirdparty_objects = thirdparty_env.SharedObject(thirdparty_sources)
+
+sources = project_sources + thirdparty_objects
 
 # Embed GDExtension class reference data in editor/debug builds so Godot can
 # show the extension API in the Help window and on Ctrl-click.
@@ -95,6 +105,8 @@ if sys.platform == "win32":
 
 BUILD_START_TIME = datetime.datetime.now().astimezone()
 
+# Automatic external synchronization to D:\directstorage-test is opt-in via
+# ENABLE_EXTERNAL_SYNC and additionally requires this development machine GUID.
 TARGET_MACHINE_GUID = "4e2b44a0-d5af-4b59-aa22-7a24d8187a63"
 # Keep verification builds workspace-local unless an explicit sync is requested.
 ENABLE_EXTERNAL_SYNC = os.environ.get("DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC") == "1"
@@ -109,6 +121,10 @@ def get_machine_guid():
             pass
     return None
 
+# Automatic post-build synchronization uses this helper only after
+# ENABLE_EXTERNAL_SYNC is enabled and the host machine GUID matches
+# TARGET_MACHINE_GUID. Explicit sync aliases remain machine-GUID gated; the
+# destination may be D:\directstorage-test or another approved sync target.
 def sync_changed_files(src_dir, dst_dir, file_filter=None):
     copied_count = 0
     for root, dirs, files in os.walk(src_dir):
@@ -511,4 +527,3 @@ env.AlwaysBuild(alias_sync_test)
 
 alias_sync_all = env.Alias("sync-all", [], env.Action(run_sync_all, "[SCons] Syncing all targets..."))
 env.AlwaysBuild(alias_sync_all)
-

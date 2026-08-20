@@ -22,8 +22,10 @@ func _process(_delta: float) -> void:
 		var ctx = Engine.get_singleton("DSContext")
 		if ctx and ctx.is_initialized():
 			if ctx.is_batch_complete():
-				ctx.collect_completed_results()
-			ctx.flush_batch_async()
+				if ctx.has_pending_results():
+					ctx.collect_completed_results()
+			if ctx.get_pending_request_count() > 0:
+				ctx.flush_batch_async()
 
 ## Shuts down [DSContext] before the autoload is deleted.
 func _notification(what: int) -> void:

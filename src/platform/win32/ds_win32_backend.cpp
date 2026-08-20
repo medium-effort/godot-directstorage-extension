@@ -343,6 +343,16 @@ static int count_logical_requests(const Vector<Ref<DSRequest>> &p_requests) {
 	return static_cast<int>(logical_requests.size());
 }
 
+static int count_completed_requests(const Vector<Ref<DSRequest>> &p_requests) {
+	int completed_count = 0;
+	for (int i = 0; i < p_requests.size(); i++) {
+		if (p_requests[i].is_valid() && p_requests[i]->get_status() == DSRequest::STATUS_COMPLETED) {
+			completed_count++;
+		}
+	}
+	return completed_count;
+}
+
 static void complete_chunked_requests() {
 	for (std::unordered_map<DSRequest *, DSChunkedRequestState>::iterator it = s_chunked_requests.begin(); it != s_chunked_requests.end();) {
 		DSChunkedRequestState &state = it->second;
@@ -586,9 +596,9 @@ void Win32Backend::update_profiler_queue_depth_locked() {
 	}
 }
 
-void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch) {
+void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &) {
 	poll_batch_status(p_queue, p_slot.requests, p_slot.fence_value);
-	p_slot.completed_count = p_batch.request_count;
+	p_slot.completed_count = count_completed_requests(p_slot.requests);
 	p_slot.error_code = 0;
 	p_slot.error_message = String();
 	for (int i = 0; i < p_slot.requests.size(); i++) {
@@ -639,7 +649,7 @@ void Win32Backend::completion_thread_func() {
 			close_batch_files(slot.files);
 			complete_chunked_requests();
 			release_resource_guards(slot.requests);
-			slot.completed_count = batch.request_count;
+			slot.completed_count = count_completed_requests(slot.requests);
 			slot.error_code = -1;
 			slot.error_message = p_message;
 			slot.submitted = false;
@@ -1083,11 +1093,6 @@ bool Win32Backend::initialize(const String &p_path) {
 	{
 		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
 		uint16_t capacity = ctx->get_queue_capacity();
-		DSRuntimeProbe probe = probe_runtime(bin_dir, capacity);
-		if (!probe.available) {
-			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: " + probe.reason);
-			return false;
-		}
 		String dstoragecore_path = bin_dir + "/dstoragecore.dll";
 		String dstorage_path = bin_dir + "/dstorage.dll";
 
@@ -1098,9 +1103,13 @@ bool Win32Backend::initialize(const String &p_path) {
 		DllDirectoryScope dll_scope;
 		SetDllDirectoryW(w_bin_dir.c_str());
 		dstoragecore_module = LoadLibraryW(w_core_path.c_str());
+		if (!dstoragecore_module) {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstoragecore.dll' could not be loaded from '" + bin_dir + "'.");
+			return false;
+		}
 		dstorage_module = LoadLibraryW(w_ds_path.c_str());
-		if (!dstoragecore_module || !dstorage_module) {
-			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLLs could not be loaded from '" + bin_dir + "'.");
+		if (!dstorage_module) {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstorage.dll' could not be loaded from '" + bin_dir + "'.");
 			unload_runtime_modules(dstoragecore_module, dstorage_module);
 			dstoragecore_module = nullptr;
 			dstorage_module = nullptr;
@@ -1514,7 +1523,9 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			dest.resize(static_cast<int64_t>(uncompressed_size));
 		}
 
-		request.Destination.Memory.Buffer = dest.ptrw();
+		// PackedByteArray is copy-on-write. Resize before acquiring the writable pointer,
+		// then keep this request's storage stable while DirectStorage owns the async write.
+		request.Destination.Memory.Buffer = p_child->get_destination_buffer_ptrw();
 		request.Destination.Memory.Size = uncompressed_size;
 	}
 	request.UncompressedSize = uncompressed_size;
@@ -2006,7 +2017,7 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 		for (BatchSlot &slot : queue.batch_slots) {
 			Vector<Ref<DSRequest>> remaining;
 			for (int i = 0; i < slot.requests.size(); i++) {
-				if (slot.requests[i].is_valid() && (slot.requests[i]->get_cancellation_tag() & UINT64_MAX) == p_tag) {
+				if (slot.requests[i].is_valid() && slot.requests[i]->get_cancellation_tag() == p_tag) {
 					slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
 					slot.requests[i]->set_error_message("Request cancelled by tag.");
 					if (slot.submitted) {

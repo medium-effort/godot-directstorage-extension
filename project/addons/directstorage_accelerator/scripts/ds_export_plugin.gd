@@ -13,6 +13,7 @@ const OPTION_BUNDLE_DSPKG: StringName = &"directstorage/bundle_textures_dspkg"
 var _dspkg: RefCounted = null
 var _temp_dspkg_path: String = "user://temp_textures.dspkg"
 var _has_textures: bool = false
+var _archive_failed: bool = false
 var _target_export_dir: String = ""
 var _export_features: PackedStringArray = []
 var _is_debug_export: bool = false
@@ -73,6 +74,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_is_debug_export = is_debug
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
 	_has_textures = false
+	_archive_failed = false
 	_dspkg = null
 
 	if not _bundle_dspkg_enabled:
@@ -143,23 +145,31 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 	if not dstex_path.is_empty() and FileAccess.file_exists(dstex_path):
 		var mip_metadata := _read_v2_footprint_metadata(dstex_path)
 		var add_err: Error = _dspkg.add_texture(resource_path, dstex_path, mip_metadata)
-		if dstex_path != resource_path:
+		if add_err == OK and dstex_path != resource_path:
 			var remapped_add_err: Error = _dspkg.add_texture(dstex_path, dstex_path, mip_metadata)
-			if add_err == OK:
-				add_err = remapped_add_err
+			if remapped_add_err != OK:
+				_archive_failed = true
+				_dspkg = null
+				push_error("[DirectStorage Exporter] Failed to add remapped texture entry '" + dstex_path + "': " + error_string(remapped_add_err) + ". DSPkg bundling was aborted and the texture will remain in the PCK.")
+				return
 
-		if add_err == OK:
-			_has_textures = true
-			print("[DirectStorage Exporter] Added texture to archive: ", resource_path, " (from ", dstex_path, ")")
-			# Skip texture payload from PCK so it is only stored in textures.dspkg.
-			skip()
-			print("[DirectStorage Exporter] Skipped texture payload from PCK: ", resource_path)
-		else:
-			push_error("[DirectStorage Exporter] Failed to add texture to archive ('" + resource_path + "' and remap target '" + dstex_path + "'): " + error_string(add_err) + ". The texture will remain in the PCK.")
+		if add_err != OK:
+			_archive_failed = true
+			_dspkg = null
+			push_error("[DirectStorage Exporter] Failed to add texture to archive ('" + resource_path + "' and remap target '" + dstex_path + "'): " + error_string(add_err) + ". DSPkg bundling was aborted and the texture will remain in the PCK.")
+			return
+
+		_has_textures = true
+		print("[DirectStorage Exporter] Added texture to archive: ", resource_path, " (from ", dstex_path, ")")
+		# Skip texture payload from PCK so it is only stored in textures.dspkg.
+		skip()
+		print("[DirectStorage Exporter] Skipped texture payload from PCK: ", resource_path)
 
 ## Finalizes the archive, writes textures.dspkg (if enabled), and deploys binaries.
 func _export_end() -> void:
-	if _dspkg != null and _bundle_dspkg_enabled:
+	if _archive_failed:
+		print("[DirectStorage Exporter] Export finished without a textures.dspkg archive because bundling was aborted after an entry failure.")
+	elif _dspkg != null and _bundle_dspkg_enabled:
 		if _has_textures:
 			var err: Error = _dspkg.finalize()
 			if err == OK:

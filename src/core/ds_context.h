@@ -9,6 +9,7 @@
 #include <deque>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include "ds_profiler.h"
 #include "ds_request.h"
 #include "../platform/platform_backend.h"
@@ -20,6 +21,8 @@ class DSContext : public Object {
 
 private:
 	static DSContext *singleton;
+	static std::once_flag support_probe_once;
+	static bool supported_probe_result;
 	bool initialized = false;
 
 	uint32_t staging_buffer_size_mb = 128;
@@ -34,6 +37,7 @@ private:
 	static constexpr size_t MAX_EXECUTION_REPORTS = 1024;
 	Dictionary request_execution_reports;
 	std::unordered_map<int64_t, Ref<DSRequest>> tracked_requests;
+	std::unordered_set<int64_t> pending_request_ids;
 	std::deque<int64_t> report_order;
 	int pending_request_count = 0;
 	std::deque<int> pending_batch_request_counts;
@@ -75,6 +79,7 @@ public:
 	void shutdown_ds();
 
 	bool enqueue_request(Ref<DSRequest> p_request);
+	int get_pending_request_count() const;
 	void flush_batch();
 	void flush_batch_async();
 	bool is_batch_complete() const;

@@ -12,6 +12,7 @@
 
 #include <gdextension_interface.h>
 #include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/core/defs.hpp>
 #include <godot_cpp/godot.hpp>
@@ -24,10 +25,41 @@ static DSProfiler *ds_profiler_singleton = nullptr;
 static DSTextureCache *ds_texture_cache_singleton = nullptr;
 static Ref<DSResourceFormatLoader> ds_resource_format_loader;
 
+static void register_directstorage_project_settings() {
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (!ps) {
+		return;
+	}
+
+	auto register_setting = [ps](const StringName &p_name, Variant::Type p_type, const Variant &p_default, PropertyHint p_hint, const String &p_hint_string) {
+		if (!ps->has_setting(p_name)) {
+			ps->set_setting(p_name, p_default);
+		}
+
+		ps->set_initial_value(p_name, p_default);
+
+		Dictionary property_info;
+		property_info["name"] = p_name;
+		property_info["type"] = static_cast<int>(p_type);
+		property_info["hint"] = static_cast<int>(p_hint);
+		property_info["hint_string"] = p_hint_string;
+		ps->add_property_info(property_info);
+		ps->set_as_basic(p_name, true);
+	};
+
+	register_setting("directstorage/staging_buffer_size_mb", Variant::INT, 128, PROPERTY_HINT_RANGE, "16,1024,16");
+	register_setting("directstorage/disable_gpu_decompression", Variant::BOOL, false, PROPERTY_HINT_NONE, "");
+	register_setting("directstorage/queue_capacity", Variant::INT, 512, PROPERTY_HINT_RANGE, "64,8192,64");
+	register_setting("directstorage/texture_cache_enabled", Variant::BOOL, true, PROPERTY_HINT_NONE, "");
+	register_setting("directstorage/texture_cache_max_entries", Variant::INT, 128, PROPERTY_HINT_RANGE, "16,2048,16");
+}
+
 void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
+
+	register_directstorage_project_settings();
 
 	ClassDB::register_class<DSContext>();
 	ClassDB::register_class<DSRequest>();

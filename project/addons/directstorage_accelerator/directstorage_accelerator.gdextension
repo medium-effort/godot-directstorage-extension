@@ -1,6 +1,6 @@
 [configuration]
 entry_symbol = "directstorage_accelerator_init"
-compatibility_minimum = "4.1"
+compatibility_minimum = "4.3"
 reloadable = true
 
 [libraries]
