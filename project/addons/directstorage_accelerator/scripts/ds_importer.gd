@@ -38,7 +38,7 @@ func _get_resource_type() -> String:
 
 ## Returns the importer format version used to invalidate old imports.
 func _get_format_version() -> int:
-	return 3
+	return 4
 
 ## Gives this importer priority over Godot's default texture importer.
 func _get_priority() -> float:
@@ -215,8 +215,9 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		push_error("[DirectStorage Importer] Failed to instantiate DSTex.")
 		return ERR_CANT_CREATE
 
+	var is_srgb: bool = (compression_source == Image.COMPRESS_SOURCE_SRGB)
 	var out_file_path := save_path + "." + _get_save_extension()
-	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level)
+	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level, is_srgb)
 	if write_err != OK:
 		push_error("[DirectStorage Importer] Failed to write .dstex file to: " + out_file_path)
 		return write_err

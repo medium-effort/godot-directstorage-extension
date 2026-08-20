@@ -14,6 +14,7 @@ const AUTOLOAD_PATH: String = "res://addons/directstorage_accelerator/scripts/ds
 var _importer: EditorImportPlugin = null
 var _export_plugin: EditorExportPlugin = null
 
+
 ## Registers the autoload, import plugin, export plugin, and DirectStorage
 ## runtime when the addon is enabled.
 func _enter_tree() -> void:
@@ -23,36 +24,37 @@ func _enter_tree() -> void:
 		else:
 			ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, "*" + AUTOLOAD_PATH)
 
-	print("[DirectStorage] Plugin enabled by MediumEffort. Autoload, Importer, and Exporter registered.")
+	print(
+		"[DirectStorage] Plugin enabled by MediumEffort. Autoload, Importer, and Exporter registered."
+	)
 
 	if _importer == null:
 		var importer_script = load("res://addons/directstorage_accelerator/scripts/ds_importer.gd")
 		if importer_script:
 			_importer = importer_script.new()
-			if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
-				add_import_plugin(_importer)
+			add_import_plugin(_importer)
 
 	if _export_plugin == null:
-		var exporter_script = load("res://addons/directstorage_accelerator/scripts/ds_export_plugin.gd")
+		var exporter_script = load(
+			"res://addons/directstorage_accelerator/scripts/ds_export_plugin.gd"
+		)
 		if exporter_script:
 			_export_plugin = exporter_script.new()
-			if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
-				add_export_plugin(_export_plugin)
+			add_export_plugin(_export_plugin)
 
 	var ds_context = Engine.get_singleton("DSContext")
 	if ds_context:
 		ds_context.initialize_ds()
 
+
 ## Unregisters the autoload, import plugin, and export plugin when disabled.
 func _exit_tree() -> void:
 	if _importer != null:
-		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
-			remove_import_plugin(_importer)
+		remove_import_plugin(_importer)
 		_importer = null
 
 	if _export_plugin != null:
-		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
-			remove_export_plugin(_export_plugin)
+		remove_export_plugin(_export_plugin)
 		_export_plugin = null
 
 	if ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):

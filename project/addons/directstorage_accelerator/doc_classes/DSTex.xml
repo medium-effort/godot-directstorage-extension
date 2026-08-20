@@ -17,7 +17,8 @@
 		<method name="godot_format_to_rd_format" qualifiers="static">
 			<return type="int" />
 			<param index="0" name="image_format" type="int" />
-			<description>Converts an [Image] format value to the corresponding [RenderingDevice] data format value.</description>
+			<param index="1" name="is_srgb" type="bool" default="false" />
+			<description>Converts an [Image] format value to the corresponding [RenderingDevice] data format value. If [param is_srgb] is [code]true[/code], returns the corresponding sRGB format variant when supported.</description>
 		</method>
 		<method name="read_from_file">
 			<return type="Dictionary" />
@@ -43,7 +44,8 @@
 			<param index="4" name="format" type="int" />
 			<param index="5" name="mip_count" type="int" default="1" />
 			<param index="6" name="compression_level" type="int" default="1" />
-			<description>Compresses [param raw_data] with GDeflate and writes a version 2 [code].dstex[/code] file. Calculates D3D12 footprint metadata (256-byte aligned row pitch and 512-byte aligned mip data placements) for hardware GPU decompression. [param format] is an [Image] format value. Returns [constant OK] on success or a Godot [Error] code on invalid data, compression failure, or file access failure.</description>
+			<param index="7" name="is_srgb" type="bool" default="false" />
+			<description>Compresses [param raw_data] with GDeflate and writes a version 2 [code].dstex[/code] file. Calculates D3D12 footprint metadata (256-byte aligned row pitch and 512-byte aligned mip data placements) for hardware GPU decompression. [param format] is an [Image] format value. If [param is_srgb] is [code]true[/code], sets the sRGB format flag in the header and encodes the format as sRGB. Returns [constant OK] on success or a Godot [Error] code on invalid data, compression failure, or file access failure.</description>
 		</method>
 	</methods>
 </class>

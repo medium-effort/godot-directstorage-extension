@@ -32,6 +32,7 @@ protected:
 public:
 	static DSErrorHandler *get_singleton();
 	static String describe_hresult(uint32_t p_hresult);
+	static String describe_command_type(int32_t p_command_type);
 
 	DSErrorHandler();
 	~DSErrorHandler();

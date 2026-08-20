@@ -277,13 +277,18 @@ static String retrieve_queue_error(IDStorageQueue1 *p_queue) {
 	}
 
 	const DSTORAGE_ERROR_FIRST_FAILURE &failure = error_record.FirstFailure;
+	String hresult_desc = DSErrorHandler::describe_hresult(static_cast<uint32_t>(failure.HResult));
+	if (hresult_desc.is_empty()) {
+		hresult_desc = "No system message is available for this DirectStorage HRESULT.";
+	}
+
+	String command_type_str = DSErrorHandler::describe_command_type(static_cast<int32_t>(failure.CommandType));
+
 	String message = "DirectStorage queue error (HRESULT 0x" +
 			String::num_uint64(static_cast<uint32_t>(failure.HResult), 16) +
-			", command type " + String::num_int64(static_cast<int64_t>(failure.CommandType)) + "): " +
-			DSErrorHandler::describe_hresult(static_cast<uint32_t>(failure.HResult));
-	if (message.ends_with("): ")) {
-		message += "No system message is available for this DirectStorage HRESULT.";
-	}
+			", command type " + command_type_str + "): " +
+			hresult_desc;
+
 	if (failure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST) {
 		message += " [File: " + String(failure.Request.Filename) + ", RequestName: " + String(failure.Request.RequestName) + "]";
 	}
@@ -400,24 +405,29 @@ static void complete_chunked_requests() {
 				state.parent->set_error_message("DirectStorage GDeflate chunk failed.");
 			}
 		} else {
-			PackedByteArray &destination = state.parent->get_destination_buffer_ref();
-			bool valid_destination = true;
-			for (int i = 0; i < state.children.size(); i++) {
-				PackedByteArray child_data = state.children[i]->get_destination_buffer();
-				uint64_t destination_offset = state.destination_offsets[i];
-				if (destination_offset + static_cast<uint64_t>(child_data.size()) > static_cast<uint64_t>(destination.size())) {
-					valid_destination = false;
-					break;
-				}
-				if (child_data.size() > 0) {
-					std::memcpy(destination.ptrw() + destination_offset, child_data.ptr(), child_data.size());
-				}
-			}
-			if (valid_destination) {
+			if (state.parent->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE ||
+					state.parent->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER) {
 				state.parent->set_status(DSRequest::STATUS_COMPLETED);
 			} else {
-				state.parent->set_status(DSRequest::STATUS_FAILED);
-				state.parent->set_error_message("DirectStorage GDeflate chunk output exceeded the parent destination buffer.");
+				PackedByteArray &destination = state.parent->get_destination_buffer_ref();
+				bool valid_destination = true;
+				for (int i = 0; i < state.children.size(); i++) {
+					PackedByteArray child_data = state.children[i]->get_destination_buffer();
+					uint64_t destination_offset = state.destination_offsets[i];
+					if (destination_offset + static_cast<uint64_t>(child_data.size()) > static_cast<uint64_t>(destination.size())) {
+						valid_destination = false;
+						break;
+					}
+					if (child_data.size() > 0) {
+						std::memcpy(destination.ptrw() + destination_offset, child_data.ptr(), child_data.size());
+					}
+				}
+				if (valid_destination) {
+					state.parent->set_status(DSRequest::STATUS_COMPLETED);
+				} else {
+					state.parent->set_status(DSRequest::STATUS_FAILED);
+					state.parent->set_error_message("DirectStorage GDeflate chunk output exceeded the parent destination buffer.");
+				}
 			}
 		}
 
@@ -1430,7 +1440,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	DSTORAGE_REQUEST request = {};
 	request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
 	request.Options.DestinationType = gpu_buffer_destination ? DSTORAGE_REQUEST_DESTINATION_BUFFER :
-				gpu_texture_destination ? (p_child->get_subresource_count() > 1 ? DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES_RANGE : DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION) :
+				gpu_texture_destination ? DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES_RANGE :
 				DSTORAGE_REQUEST_DESTINATION_MEMORY;
 	if (gpu_texture_destination) {
 		request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
@@ -1449,23 +1459,9 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		request.Destination.Buffer.Offset = p_destination_offset;
 		request.Destination.Buffer.Size = uncompressed_size;
 	} else if (gpu_texture_destination) {
-		D3D12_RESOURCE_DESC texture_desc = destination_texture->GetDesc();
-		uint64_t mip_levels = texture_desc.MipLevels > 0 ? texture_desc.MipLevels : 1;
-		uint32_t first_subresource = p_child->get_first_subresource();
-		uint32_t subresource_count = p_child->get_subresource_count();
-		if (subresource_count > 1) {
-			request.Destination.MultipleSubresourcesRange.Resource = destination_texture;
-			request.Destination.MultipleSubresourcesRange.FirstSubresource = first_subresource;
-			request.Destination.MultipleSubresourcesRange.NumSubresources = subresource_count;
-		} else {
-			uint64_t mip_level = first_subresource % mip_levels;
-			uint64_t width = MAX(static_cast<uint64_t>(1), texture_desc.Width >> mip_level);
-			uint64_t height = texture_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1 : MAX(static_cast<uint64_t>(1), static_cast<uint64_t>(texture_desc.Height) >> mip_level);
-			uint64_t depth = texture_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? MAX(static_cast<uint64_t>(1), static_cast<uint64_t>(texture_desc.DepthOrArraySize) >> mip_level) : 1;
-			request.Destination.Texture.Resource = destination_texture;
-			request.Destination.Texture.SubresourceIndex = first_subresource;
-			request.Destination.Texture.Region = { 0, 0, 0, static_cast<UINT>(width), static_cast<UINT>(height), static_cast<UINT>(depth) };
-		}
+		request.Destination.MultipleSubresourcesRange.Resource = destination_texture;
+		request.Destination.MultipleSubresourcesRange.FirstSubresource = p_child->get_first_subresource();
+		request.Destination.MultipleSubresourcesRange.NumSubresources = p_child->get_subresource_count();
 	} else {
 		PackedByteArray &dest = p_child->get_destination_buffer_ref();
 		if (dest.size() < static_cast<int64_t>(uncompressed_size)) {
@@ -1530,31 +1526,34 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 	}
 
-	if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE &&
-			p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE &&
-			has_texture_mip_entries && staging_size > 0 && texture_footprint > staging_size) {
-		if (staging_size < GDEFLATE_PAGE_SIZE) {
+	if (gpu_texture_gdeflate && has_texture_mip_entries && texture_subresource_count > 1) {
+		// Multi-mip .dstex files store each mip level as an independent GDeflate compressed stream.
+		// DirectStorage's MultipleSubresourcesRange destination for multiple subresources expects a single continuous stream,
+		// so multi-mip textures MUST be split into per-mip requests using DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES_RANGE with NumSubresources = 1.
+		if (staging_size > 0 && texture_footprint > staging_size && staging_size < GDEFLATE_PAGE_SIZE) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
 			p_request->set_error_message("DirectStorage cannot split a GDeflate texture with the configured staging buffer.");
 			return false;
 		}
 
-		std::string warning_key = p_request->get_file_path().utf8().get_data();
-		if (s_staging_buffer_warnings.find(warning_key) == s_staging_buffer_warnings.end()) {
-			s_staging_buffer_warnings.insert(warning_key);
-			UtilityFunctions::push_warning(
-					"[DirectStorage] Texture '", p_request->get_file_path(), "' uncompressed footprint (",
-					String::num_uint64(texture_footprint / (1024 * 1024)), " MiB) exceeds DirectStorage staging buffer size (",
-					String::num_uint64(staging_size / (1024 * 1024)), " MiB). Splitting into per-mip requests. "
-					"To eliminate per-mip request overhead, consider increasing Project Settings > DirectStorage > Staging Buffer Size.");
+		if (staging_size > 0 && texture_footprint > staging_size) {
+			std::string warning_key = p_request->get_file_path().utf8().get_data();
+			if (s_staging_buffer_warnings.find(warning_key) == s_staging_buffer_warnings.end()) {
+				s_staging_buffer_warnings.insert(warning_key);
+				UtilityFunctions::push_warning(
+						"[DirectStorage] Texture '", p_request->get_file_path(), "' uncompressed footprint (",
+						String::num_uint64(texture_footprint / (1024 * 1024)), " MiB) exceeds DirectStorage staging buffer size (",
+						String::num_uint64(staging_size / (1024 * 1024)), " MiB). Splitting into per-mip requests. "
+						"To eliminate per-mip request overhead, consider increasing Project Settings > DirectStorage > Staging Buffer Size.");
+			}
 		}
 
 		DSChunkedRequestState state;
 		state.parent = p_request;
 		for (uint32_t mip_index = 0; mip_index < texture_subresource_count; mip_index++) {
 			const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource + mip_index];
-			if (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size ||
-					mip_entry.offset > UINT64_MAX - mip_entry.compressed_size) {
+			if (staging_size > 0 && (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size ||
+					mip_entry.offset > UINT64_MAX - mip_entry.compressed_size)) {
 				p_request->set_status(DSRequest::STATUS_FAILED);
 				p_request->set_error_message("DirectStorage cannot fit a GDeflate texture mip in the configured staging buffer.");
 				return false;
@@ -1588,7 +1587,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		p_request->set_status(DSRequest::STATUS_SUBMITTED);
 		return true;
 	}
-	if (gpu_texture_gdeflate && has_texture_mip_entries && staging_size > 0 && texture_footprint <= staging_size) {
+	if (gpu_texture_gdeflate && has_texture_mip_entries && texture_subresource_count == 1) {
 		return enqueue_one(p_request, 0);
 	}
 

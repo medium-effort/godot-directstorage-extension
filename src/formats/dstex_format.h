@@ -62,7 +62,7 @@ public:
 	DSTex();
 	~DSTex();
 
-	Error write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count = 1, int p_compression_level = 1);
+	Error write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count = 1, int p_compression_level = 1, bool p_is_srgb = false);
 	Dictionary read_header(const String &p_path);
 	Dictionary read_from_file(const String &p_path);
 	Dictionary get_file_info(const String &p_path);
@@ -70,7 +70,7 @@ public:
 	static DSTexMipLayout get_mip_layout(uint32_t p_width, uint32_t p_height, int p_image_format);
 	static PackedByteArray unpad_footprint_mip(const PackedByteArray &p_footprint, uint32_t p_width, uint32_t p_height, int p_image_format);
 
-	static int godot_format_to_rd_format(int p_image_format);
+	static int godot_format_to_rd_format(int p_image_format, bool p_is_srgb = false);
 	static int rd_format_to_godot_format(int p_rd_format);
 };
 

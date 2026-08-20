@@ -145,12 +145,12 @@ PackedByteArray DSTex::unpad_footprint_mip(const PackedByteArray &p_footprint, u
 }
 
 void DSTex::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1));
+	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level", "is_srgb"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1), DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("read_header", "path"), &DSTex::read_header);
 	ClassDB::bind_method(D_METHOD("read_from_file", "path"), &DSTex::read_from_file);
 	ClassDB::bind_method(D_METHOD("get_file_info", "path"), &DSTex::get_file_info);
 
-	ClassDB::bind_static_method("DSTex", D_METHOD("godot_format_to_rd_format", "image_format"), &DSTex::godot_format_to_rd_format);
+	ClassDB::bind_static_method("DSTex", D_METHOD("godot_format_to_rd_format", "image_format", "is_srgb"), &DSTex::godot_format_to_rd_format, DEFVAL(false));
 	ClassDB::bind_static_method("DSTex", D_METHOD("rd_format_to_godot_format", "rd_format"), &DSTex::rd_format_to_godot_format);
 }
 
@@ -160,9 +160,34 @@ DSTex::DSTex() {
 DSTex::~DSTex() {
 }
 
-int DSTex::godot_format_to_rd_format(int p_image_format) {
+int DSTex::godot_format_to_rd_format(int p_image_format, bool p_is_srgb) {
 	if (p_image_format >= 48) {
 		return p_image_format;
+	}
+
+	if (p_is_srgb) {
+		switch (p_image_format) {
+			case Image::FORMAT_L8:
+			case Image::FORMAT_R8:
+				return RenderingDevice::DATA_FORMAT_R8_SRGB;
+			case Image::FORMAT_LA8:
+			case Image::FORMAT_RG8:
+				return RenderingDevice::DATA_FORMAT_R8G8_SRGB;
+			case Image::FORMAT_RGB8:
+				return RenderingDevice::DATA_FORMAT_R8G8B8_SRGB;
+			case Image::FORMAT_RGBA8:
+				return RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB;
+			case Image::FORMAT_DXT1:
+				return RenderingDevice::DATA_FORMAT_BC1_RGB_SRGB_BLOCK;
+			case Image::FORMAT_DXT3:
+				return RenderingDevice::DATA_FORMAT_BC2_SRGB_BLOCK;
+			case Image::FORMAT_DXT5:
+				return RenderingDevice::DATA_FORMAT_BC3_SRGB_BLOCK;
+			case Image::FORMAT_BPTC_RGBA:
+				return RenderingDevice::DATA_FORMAT_BC7_SRGB_BLOCK;
+			default:
+				break;
+		}
 	}
 
 	switch (p_image_format) {
@@ -224,12 +249,16 @@ int DSTex::godot_format_to_rd_format(int p_image_format) {
 int DSTex::rd_format_to_godot_format(int p_rd_format) {
 	switch (p_rd_format) {
 		case RenderingDevice::DATA_FORMAT_R8_UNORM:
+		case RenderingDevice::DATA_FORMAT_R8_SRGB:
 			return Image::FORMAT_R8;
 		case RenderingDevice::DATA_FORMAT_R8G8_UNORM:
+		case RenderingDevice::DATA_FORMAT_R8G8_SRGB:
 			return Image::FORMAT_RG8;
 		case RenderingDevice::DATA_FORMAT_R8G8B8_UNORM:
+		case RenderingDevice::DATA_FORMAT_R8G8B8_SRGB:
 			return Image::FORMAT_RGB8;
 		case RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM:
+		case RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB:
 			return Image::FORMAT_RGBA8;
 		case RenderingDevice::DATA_FORMAT_R32_SFLOAT:
 			return Image::FORMAT_RF;
@@ -248,16 +277,22 @@ int DSTex::rd_format_to_godot_format(int p_rd_format) {
 		case RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT:
 			return Image::FORMAT_RGBAH;
 		case RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC1_RGB_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC1_RGBA_UNORM_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC1_RGBA_SRGB_BLOCK:
 			return Image::FORMAT_DXT1;
 		case RenderingDevice::DATA_FORMAT_BC2_UNORM_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC2_SRGB_BLOCK:
 			return Image::FORMAT_DXT3;
 		case RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC3_SRGB_BLOCK:
 			return Image::FORMAT_DXT5;
 		case RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK:
 			return Image::FORMAT_RGTC_R;
 		case RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK:
 			return Image::FORMAT_RGTC_RG;
 		case RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC7_SRGB_BLOCK:
 			return Image::FORMAT_BPTC_RGBA;
 		case RenderingDevice::DATA_FORMAT_BC6H_SFLOAT_BLOCK:
 			return Image::FORMAT_BPTC_RGBF;
@@ -276,7 +311,7 @@ int DSTex::rd_format_to_godot_format(int p_rd_format) {
 	}
 }
 
-Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level) {
+Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level, bool p_is_srgb) {
 	if (p_raw_data.size() == 0 || p_width <= 0 || p_height <= 0) {
 		return ERR_INVALID_PARAMETER;
 	}
@@ -342,12 +377,12 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		source_offset += source_mip_size;
 	}
 
-	uint32_t rd_format = static_cast<uint32_t>(godot_format_to_rd_format(p_format));
+	uint32_t rd_format = static_cast<uint32_t>(godot_format_to_rd_format(p_format, p_is_srgb));
 
 	DSTexHeader header;
 	header.magic = 0x58455444; // "DTEX"
 	header.version = 2;
-	header.flags = 0;
+	header.flags = p_is_srgb ? 1 : 0;
 	header.width = static_cast<uint32_t>(p_width);
 	header.height = static_cast<uint32_t>(p_height);
 	header.pixel_format = rd_format;

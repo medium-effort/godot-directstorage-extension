@@ -8,35 +8,71 @@ extends EditorExportPlugin
 ## during project export and automatically deploys native GDExtension binaries
 ## to the required addons/directstorage_accelerator/bin subdirectory.
 
+const OPTION_BUNDLE_DSPKG: StringName = &"directstorage/bundle_textures_dspkg"
+
 var _dspkg: RefCounted = null
 var _temp_dspkg_path: String = "user://temp_textures.dspkg"
 var _has_textures: bool = false
 var _target_export_dir: String = ""
 var _export_features: PackedStringArray = []
 var _is_debug_export: bool = false
+var _bundle_dspkg_enabled: bool = false
 
 ## Returns the stable export plugin name shown to Godot.
 func _get_name() -> String:
 	return "DirectStorageExporter"
 
-## Starts a temporary DSPkg archive for the current export.
+## Declares whether this export plugin supports the target platform.
+func _supports_platform(platform: EditorExportPlatform) -> bool:
+	if platform is EditorExportPlatformWindows:
+		return true
+	if platform != null and platform.get_os_name() == "Windows":
+		return true
+	return false
+
+## Exposes custom export options for Windows Desktop in the Export dialog.
+func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
+	if not _supports_platform(platform):
+		return []
+	return [
+		{
+			"option": {
+				"name": OPTION_BUNDLE_DSPKG,
+				"type": TYPE_BOOL,
+				"hint": PROPERTY_HINT_NONE,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT
+			},
+			"default_value": true,
+		}
+	]
+
+## Starts a temporary DSPkg archive for the current export if bundling is enabled.
 func _export_begin(features: PackedStringArray, is_debug: bool, path: String, flags: int) -> void:
 	print("[DirectStorage Exporter] Export started for target: ", path)
 	_target_export_dir = path.get_base_dir()
 	_export_features = features
 	_is_debug_export = is_debug
+	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
+	_has_textures = false
+	_dspkg = null
+
+	if not _bundle_dspkg_enabled:
+		print("[DirectStorage Exporter] Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK.")
+		return
+
+	print("[DirectStorage Exporter] Standalone DSPkg bundling is ENABLED. Textures will be bundled into textures.dspkg.")
 
 	if not ClassDB.class_exists("DSPkg"):
 		push_warning("[DirectStorage Exporter] DSPkg class not found. Skipping archive bundling.")
-		_dspkg = null
 		return
 
 	_dspkg = ClassDB.instantiate("DSPkg")
-	_has_textures = false
 	if _dspkg != null:
 		var err: Error = _dspkg.create(_temp_dspkg_path)
 		if err != OK:
 			push_error("[DirectStorage Exporter] Failed to create temporary DSPkg archive at: " + _temp_dspkg_path)
+			_dspkg = null
 		else:
 			print("[DirectStorage Exporter] Initialized temporary DSPkg archive at: ", _temp_dspkg_path)
 
@@ -59,10 +95,14 @@ func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
 		return {}
 	return metadata
 
-## Adds an imported .dstex resource to the archive and prevents the individual
-## texture from being copied into the exported PCK.
+## Adds an imported .dstex resource to the archive when bundling is enabled.
 func _export_file(path: String, type: String, features: PackedStringArray) -> void:
-	if _dspkg == null:
+	if _dspkg == null or not _bundle_dspkg_enabled:
+		# When DSPkg bundling is disabled, let Godot export .dstex directly into PCK
+		return
+
+	# Never skip .import files so Godot preserves remap tables in PCK
+	if path.ends_with(".import"):
 		return
 
 	var dstex_path: String = ""
@@ -71,7 +111,7 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 	if path.ends_with(".dstex"):
 		dstex_path = path
 	else:
-		var import_path := path if path.ends_with(".import") else path + ".import"
+		var import_path := path + ".import"
 		if FileAccess.file_exists(import_path):
 			var config := ConfigFile.new()
 			if config.load(import_path) == OK:
@@ -79,35 +119,41 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 				var remap_path: String = config.get_value("remap", "path", "")
 				if importer == "directstorage_texture" or remap_path.ends_with(".dstex"):
 					dstex_path = remap_path
-					if resource_path.ends_with(".import"):
-						resource_path = resource_path.trim_suffix(".import")
 
 	if not dstex_path.is_empty() and FileAccess.file_exists(dstex_path):
 		var mip_metadata := _read_v2_footprint_metadata(dstex_path)
 		var add_err: Error = _dspkg.add_texture(resource_path, dstex_path, mip_metadata)
+		if dstex_path != resource_path:
+			_dspkg.add_texture(dstex_path, dstex_path, mip_metadata)
+
 		if add_err == OK:
 			_has_textures = true
 			print("[DirectStorage Exporter] Added texture to archive: ", resource_path, " (from ", dstex_path, ")")
-			skip() # Skip adding individual .dstex / texture file to PCK since it will be bundled into .dspkg
+			# Skip texture payload from PCK so it is only stored in textures.dspkg
+			skip()
 		else:
 			push_error("[DirectStorage Exporter] Failed to add texture to archive: " + dstex_path)
 
-## Finalizes the archive, adds it to the export, and removes the temporary file.
+## Finalizes the archive, writes textures.dspkg (if enabled), and deploys binaries.
 func _export_end() -> void:
-	if _dspkg != null:
+	if _dspkg != null and _bundle_dspkg_enabled:
 		if _has_textures:
 			var err: Error = _dspkg.finalize()
 			if err == OK:
-				var bytes := FileAccess.get_file_as_bytes(_temp_dspkg_path)
-				if bytes.size() > 0:
-					add_file("res://textures.dspkg", bytes, false)
-					print("[DirectStorage Exporter] Successfully bundled textures into res://textures.dspkg (", bytes.size(), " bytes)")
+				if not _target_export_dir.is_empty():
+					var target_dspkg_path := _target_export_dir.path_join("textures.dspkg")
+					var copy_err := DirAccess.copy_absolute(_temp_dspkg_path, target_dspkg_path)
+					if copy_err == OK:
+						print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", target_dspkg_path)
+					else:
+						push_error("[DirectStorage Exporter] Failed to copy textures.dspkg to export directory: " + error_string(copy_err))
 				else:
-					push_error("[DirectStorage Exporter] Generated .dspkg archive is empty.")
+					push_error("[DirectStorage Exporter] Target export directory is empty; could not deploy textures.dspkg.")
 			else:
 				push_error("[DirectStorage Exporter] Failed to finalize DSPkg archive.")
 		else:
 			print("[DirectStorage Exporter] Export finished. No DirectStorage (.dstex) textures were found to bundle.")
+
 	_dspkg = null
 	if FileAccess.file_exists(_temp_dspkg_path):
 		DirAccess.remove_absolute(_temp_dspkg_path)
@@ -152,3 +198,10 @@ func _deploy_windows_binaries(target_base_dir: String, is_debug: bool, features:
 				push_warning("[DirectStorage Exporter] Could not copy " + dll_name + " to export directory: " + error_string(copy_err))
 		else:
 			push_warning("[DirectStorage Exporter] Source binary missing at: " + src_path)
+
+		# Clean up redundant duplicate DLL from root export folder left by Godot's default exporter
+		var root_dll_path := target_base_dir.path_join(dll_name)
+		if FileAccess.file_exists(root_dll_path):
+			var remove_err := DirAccess.remove_absolute(root_dll_path)
+			if remove_err == OK:
+				print("[DirectStorage Exporter] Cleaned up redundant root binary: ", dll_name)

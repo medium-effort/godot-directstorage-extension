@@ -38,6 +38,7 @@ project/addons/directstorage_accelerator/bin/~*
 project/test_assets/*.glb
 project/test_assets/*.png
 /project/exports
+/__pycache__
 
 # ==============================================================================
 # Local Tooling & Agent Metadata

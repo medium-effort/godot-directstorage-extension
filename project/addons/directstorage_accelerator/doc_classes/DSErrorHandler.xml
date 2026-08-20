@@ -4,21 +4,26 @@
 		Asynchronous error bridge for DirectStorage kernel events.
 	</brief_description>
 	<description>
-		[DSErrorHandler] stores asynchronous DirectStorage diagnostics and routes native failures to Godot's Output panel. The extension registers it as the [Engine] singleton named [code]"DSErrorHandler"[/code]. Queue monitoring is available on Windows builds; [method describe_hresult] can also translate known DirectStorage HRESULT values on any build.
+		[DSErrorHandler] stores asynchronous DirectStorage diagnostics and routes native failures to Godot's Output panel. The extension registers it as the [Engine] singleton named [code]"DSErrorHandler"[/code]. Queue monitoring is available on Windows builds; [method describe_hresult] and [method describe_command_type] can also translate known DirectStorage HRESULT values and command types on any build.
 	</description>
 	<tutorials>
 	</tutorials>
 	<methods>
-		<method name="describe_hresult" qualifiers="static">
-			<return type="String" />
-			<param index="0" name="hresult" type="int" />
-			<description>Returns a readable description for a known DirectStorage HRESULT. Returns an empty string when the code is not recognized.</description>
-		</method>
 		<method name="clear_error">
 			<return type="void" />
 			<description>
 				Clears the last recorded error state.
 			</description>
+		</method>
+		<method name="describe_command_type" qualifiers="static">
+			<return type="String" />
+			<param index="0" name="command_type" type="int" />
+			<description>Returns a readable description for a DirectStorage failure command type (such as [code]"NONE"[/code], [code]"REQUEST"[/code], [code]"STATUS"[/code], [code]"SIGNAL"[/code], or [code]"EVENT"[/code]).</description>
+		</method>
+		<method name="describe_hresult" qualifiers="static">
+			<return type="String" />
+			<param index="0" name="hresult" type="int" />
+			<description>Returns a readable description for a known DirectStorage or system HRESULT. Returns an empty string when the code is not recognized.</description>
 		</method>
 		<method name="get_last_error" qualifiers="const">
 			<return type="String" />
@@ -32,16 +37,16 @@
 				Returns [code]true[/code] if an asynchronous error has been flagged.
 			</description>
 		</method>
+		<method name="process_queue_errors">
+			<return type="void" />
+			<description>Retrieves and reports pending DirectStorage queue failures. This method is available only on Windows builds and is normally called by the native backend.</description>
+		</method>
 		<method name="report_error">
 			<return type="void" />
 			<param index="0" name="msg" type="String" />
 			<description>
 				Manually flags and reports an error message to the error handler.
 			</description>
-		</method>
-		<method name="process_queue_errors">
-			<return type="void" />
-			<description>Retrieves and reports pending DirectStorage queue failures. This method is available only on Windows builds and is normally called by the native backend.</description>
 		</method>
 	</methods>
 </class>
