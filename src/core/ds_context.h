@@ -8,6 +8,7 @@
 #include <godot_cpp/variant/dictionary.hpp>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
 #include "ds_profiler.h"
 #include "ds_request.h"
 #include "../platform/platform_backend.h"
@@ -32,10 +33,14 @@ private:
 	mutable std::mutex context_mutex;
 	static constexpr size_t MAX_EXECUTION_REPORTS = 1024;
 	Dictionary request_execution_reports;
+	std::unordered_map<int64_t, Ref<DSRequest>> tracked_requests;
+	std::deque<int64_t> report_order;
 	int pending_request_count = 0;
 	std::deque<int> pending_batch_request_counts;
 
 	void evict_old_reports_if_needed_locked();
+	void remove_report_locked(int64_t p_request_id);
+	void finalize_completed_reports_locked();
 
 protected:
 	static void _bind_methods();

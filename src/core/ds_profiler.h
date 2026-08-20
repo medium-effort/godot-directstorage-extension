@@ -53,6 +53,7 @@ private:
 	static constexpr size_t MAX_RESULT_HISTORY = 1024;
 	Ref<DSProfilerResult> last_result;
 	Array result_history;
+	size_t history_head = 0;
 	double last_throughput_mbps = 0.0;
 	double last_requests_per_second = 0.0;
 	double last_average_latency_ms = 0.0;
@@ -78,6 +79,8 @@ public:
 	double get_last_throughput_mbps() const;
 	uint64_t get_last_bytes() const;
 	uint64_t get_last_duration_us() const;
+	void set_queue_depth(int p_depth);
+	int get_queue_depth() const;
 
 	void register_performance_monitors();
 	void unregister_performance_monitors();

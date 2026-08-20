@@ -4,7 +4,7 @@
 		Performance profiling and NVMe transfer throughput monitor for DirectStorage.
 	</brief_description>
 	<description>
-		[DSProfiler] tracks read workload durations and bytes transferred. The extension registers it as the [Engine] singleton named [code]"DSProfiler"[/code]. [method register_performance_monitors] adds [code]"directstorage/throughput_mbps"[/code] to Godot's [Performance] monitors.
+		[DSProfiler] tracks read workload durations and bytes transferred, storing recent workload history in a bounded ring buffer (up to 1024 entries). The extension registers it as the [Engine] singleton named [code]"DSProfiler"[/code]. [method register_performance_monitors] adds [code]"directstorage/throughput_mbps"[/code] and related queue depth monitors to Godot's [Performance] monitors.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -33,6 +33,12 @@
 				Returns the calculated transfer throughput in megabytes per second (MB/s).
 			</description>
 		</method>
+		<method name="get_queue_depth" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the current DirectStorage pending request queue depth.
+			</description>
+		</method>
 		<method name="get_result_history" qualifiers="const">
 			<return type="Array" />
 			<description>
@@ -58,6 +64,19 @@
 			<return type="void" />
 			<description>
 				Registers custom Performance monitors with Godot Engine's debugger system.
+			</description>
+		</method>
+		<method name="set_queue_depth">
+			<return type="void" />
+			<param index="0" name="depth" type="int" />
+			<description>
+				Sets the current queue depth metric recorded by the profiler.
+			</description>
+		</method>
+		<method name="unregister_performance_monitors">
+			<return type="void" />
+			<description>
+				Unregisters custom Performance monitors from Godot Engine's debugger system.
 			</description>
 		</method>
 	</methods>

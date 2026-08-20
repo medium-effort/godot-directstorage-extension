@@ -127,9 +127,13 @@ void DSProfiler::record_result(const Ref<DSProfilerResult> &p_result) {
 
 	std::lock_guard<std::mutex> lock(profiler_mutex);
 	last_result = p_result;
-	result_history.push_back(p_result);
-	if (result_history.size() > (int64_t)MAX_RESULT_HISTORY) {
-		result_history.remove_at(0);
+	if ((int64_t)result_history.size() < (int64_t)MAX_RESULT_HISTORY) {
+		result_history.push_back(p_result);
+	} else {
+		// Efficient O(1) ring buffer: overwrite oldest entry and advance head.
+		// No reallocation or O(N) shift; size remains capped at MAX_RESULT_HISTORY.
+		result_history[history_head] = p_result;
+		history_head = (history_head + 1) % MAX_RESULT_HISTORY;
 	}
 	last_bytes = p_result->compressed_bytes_read > 0 ? static_cast<uint64_t>(p_result->compressed_bytes_read) : 0;
 	last_duration_us = p_result->physical_read_duration_usec > 0 ? static_cast<uint64_t>(p_result->physical_read_duration_usec) : 0;
@@ -137,7 +141,9 @@ void DSProfiler::record_result(const Ref<DSProfilerResult> &p_result) {
 	const int request_count = p_result->request_count > 0 ? p_result->request_count : 0;
 	last_requests_per_second = last_duration_us > 0 ? static_cast<double>(request_count) * 1000000.0 / static_cast<double>(last_duration_us) : 0.0;
 	last_average_latency_ms = request_count > 0 ? static_cast<double>(last_duration_us) / static_cast<double>(request_count) / 1000.0 : 0.0;
-	last_queue_depth = 0;
+	// last_queue_depth is intentionally NOT reset here; it is maintained via
+	// set_queue_depth() so backend queues can feed pending depth and the
+	// Performance monitor returns the last fed value thread-safely.
 	last_gpu_decompression_active = p_result->decompression_duration_usec >= 0;
 }
 
@@ -148,7 +154,27 @@ Ref<DSProfilerResult> DSProfiler::get_last_result() const {
 
 Array DSProfiler::get_result_history() const {
 	std::lock_guard<std::mutex> lock(profiler_mutex);
-	return result_history;
+	if ((int64_t)result_history.size() < (int64_t)MAX_RESULT_HISTORY || history_head == 0) {
+		return result_history;
+	}
+	// Reorder ring buffer into chronological order (oldest -> newest) for callers.
+	Array ordered;
+	ordered.resize((int64_t)MAX_RESULT_HISTORY);
+	for (size_t i = 0; i < MAX_RESULT_HISTORY; ++i) {
+		size_t src_idx = (history_head + i) % MAX_RESULT_HISTORY;
+		ordered[(int64_t)i] = result_history[(int64_t)src_idx];
+	}
+	return ordered;
+}
+
+void DSProfiler::set_queue_depth(int p_depth) {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
+	last_queue_depth = p_depth < 0 ? 0 : p_depth;
+}
+
+int DSProfiler::get_queue_depth() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
+	return last_queue_depth;
 }
 
 double DSProfiler::get_last_throughput_mbps() const {
@@ -167,6 +193,7 @@ uint64_t DSProfiler::get_last_duration_us() const {
 }
 
 void DSProfiler::register_performance_monitors() {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	if (performance_monitors_registered) {
 		return;
 	}
@@ -185,6 +212,7 @@ void DSProfiler::register_performance_monitors() {
 }
 
 void DSProfiler::unregister_performance_monitors() {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	if (!performance_monitors_registered) {
 		return;
 	}
@@ -235,6 +263,8 @@ void DSProfiler::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_last_throughput_mbps"), &DSProfiler::get_last_throughput_mbps);
 	ClassDB::bind_method(D_METHOD("get_last_bytes"), &DSProfiler::get_last_bytes);
 	ClassDB::bind_method(D_METHOD("get_last_duration_us"), &DSProfiler::get_last_duration_us);
+	ClassDB::bind_method(D_METHOD("set_queue_depth", "depth"), &DSProfiler::set_queue_depth);
+	ClassDB::bind_method(D_METHOD("get_queue_depth"), &DSProfiler::get_queue_depth);
 	ClassDB::bind_method(D_METHOD("register_performance_monitors"), &DSProfiler::register_performance_monitors);
 	ClassDB::bind_method(D_METHOD("unregister_performance_monitors"), &DSProfiler::unregister_performance_monitors);
 	ClassDB::bind_method(D_METHOD("_get_throughput_monitor"), &DSProfiler::_get_throughput_monitor);

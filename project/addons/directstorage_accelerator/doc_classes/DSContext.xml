@@ -85,7 +85,7 @@
 		<method name="get_request_execution_report" qualifiers="const">
 			<return type="Dictionary" />
 			<param index="0" name="request" type="DSRequest" />
-			<description>Returns a telemetry [Dictionary] for [param request], containing [code]actual_destination_type[/code] ([int]), [code]actual_backend[/code] ([String]), and [code]was_gpu_decompression_used[/code] ([bool]).</description>
+			<description>Returns a telemetry [Dictionary] for [param request], containing [code]actual_destination_type[/code] ([int]), [code]actual_backend[/code] ([String]), [code]was_gpu_decompression_used[/code] ([bool]), and [code]gpu_decompression_pending[/code] ([bool]). Telemetry is finalized upon batch completion.</description>
 		</method>
 		<method name="get_staging_buffer_size_mb" qualifiers="const">
 			<return type="int" />
@@ -174,7 +174,7 @@
 		<method name="was_gpu_decompression_used" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="request" type="DSRequest" />
-			<description>Returns [code]true[/code] if hardware GPU decompression was used for decompressing [param request].</description>
+			<description>Returns [code]true[/code] if hardware GPU decompression was verified to have been used for decompressing [param request]. Verified on batch completion.</description>
 		</method>
 	</methods>
 	<members>

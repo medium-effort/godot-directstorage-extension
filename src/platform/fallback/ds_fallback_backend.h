@@ -27,7 +27,7 @@ private:
 
 public:
 	FallbackBackend();
-	~FallbackBackend() override = default;
+	~FallbackBackend() override;
 
 	bool is_available() const override;
 	String get_name() const override;

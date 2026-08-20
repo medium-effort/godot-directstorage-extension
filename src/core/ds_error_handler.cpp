@@ -270,54 +270,63 @@ bool DSErrorHandler::register_queue(IDStorageQueue *p_queue) {
 	if (!p_queue) {
 		return false;
 	}
-	unregister_queue();
-
-	observed_queue = p_queue;
+	std::lock_guard<std::mutex> lock(error_mutex);
+	for (IDStorageQueue *queue : observed_queues) {
+		if (queue == p_queue) {
+			return true;
+		}
+	}
+	p_queue->AddRef();
+	observed_queues.push_back(p_queue);
 	return true;
 }
 
 void DSErrorHandler::unregister_queue() {
-	if (registered_wait_handle != nullptr) {
-		UnregisterWait(registered_wait_handle);
-		registered_wait_handle = nullptr;
+	std::lock_guard<std::mutex> lock(error_mutex);
+	for (IDStorageQueue *queue : observed_queues) {
+		if (queue) {
+			queue->Release();
+		}
 	}
-	observed_queue = nullptr;
+	observed_queues.clear();
 }
 
-
 void DSErrorHandler::process_queue_errors() {
-	if (!observed_queue) {
-		return;
+	std::vector<IDStorageQueue *> queues_copy;
+	{
+		std::lock_guard<std::mutex> lock(error_mutex);
+		queues_copy.reserve(observed_queues.size());
+		for (IDStorageQueue *queue : observed_queues) {
+			if (queue) {
+				queue->AddRef();
+				queues_copy.push_back(queue);
+			}
+		}
 	}
-
-	DSTORAGE_ERROR_RECORD errorRecord{};
-	observed_queue->RetrieveErrorRecord(&errorRecord);
-
-	if (errorRecord.FailureCount > 0) {
-		const auto &failureRecord = errorRecord.FirstFailure;
-
-		String mapped_message = describe_hresult(static_cast<uint32_t>(failureRecord.HResult));
-		if (mapped_message.is_empty()) {
-			mapped_message = "No system message is available for this DirectStorage HRESULT.";
+	for (IDStorageQueue *queue : queues_copy) {
+		DSTORAGE_ERROR_RECORD errorRecord{};
+		queue->RetrieveErrorRecord(&errorRecord);
+		if (errorRecord.FailureCount > 0) {
+			const auto &failureRecord = errorRecord.FirstFailure;
+			String mapped_message = describe_hresult(static_cast<uint32_t>(failureRecord.HResult));
+			if (mapped_message.is_empty()) {
+				mapped_message = "No system message is available for this DirectStorage HRESULT.";
+			}
+			String command_type_str = describe_command_type(static_cast<int32_t>(failureRecord.CommandType));
+			String err_msg = String("DirectStorage Async Error (HRESULT 0x") +
+					String::num_uint64(static_cast<uint32_t>(failureRecord.HResult), 16) +
+					", command type " + command_type_str + "): " +
+					mapped_message;
+			if (failureRecord.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST) {
+				err_msg += " [File: " + String(failureRecord.Request.Filename) +
+						", RequestName: " + String(failureRecord.Request.RequestName) + "]";
+			}
+			UtilityFunctions::push_error(err_msg);
+			if (singleton) {
+				singleton->report_error(err_msg);
+			}
 		}
-
-		String command_type_str = describe_command_type(static_cast<int32_t>(failureRecord.CommandType));
-
-		String err_msg = String("DirectStorage Async Error (HRESULT 0x") +
-				String::num_uint64(static_cast<uint32_t>(failureRecord.HResult), 16) +
-				", command type " + command_type_str + "): " +
-				mapped_message;
-
-		if (failureRecord.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST) {
-			err_msg += " [File: " + String(failureRecord.Request.Filename) +
-					", RequestName: " + String(failureRecord.Request.RequestName) + "]";
-		}
-
-		UtilityFunctions::push_error(err_msg);
-
-		if (singleton) {
-			singleton->report_error(err_msg);
-		}
+		queue->Release();
 	}
 }
 #endif

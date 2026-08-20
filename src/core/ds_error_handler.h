@@ -6,6 +6,7 @@
 #include <godot_cpp/variant/string.hpp>
 #include <cstdint>
 #include <mutex>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -24,8 +25,7 @@ private:
 	bool error_flag = false;
 
 #ifdef _WIN32
-	HANDLE registered_wait_handle = nullptr;
-	IDStorageQueue *observed_queue = nullptr;
+	std::vector<IDStorageQueue *> observed_queues;
 #endif
 
 protected:

@@ -65,6 +65,7 @@ private:
 #endif
 	std::thread completion_thread;
 	std::atomic<bool> batch_in_flight{false};
+	std::atomic<bool> sync_batch_in_flight{false};
 	std::atomic<bool> completion_thread_stop{false};
 	std::atomic<int> active_batch_slot{0};
 	mutable std::mutex batch_mutex;
@@ -74,6 +75,7 @@ private:
 	void completion_thread_func();
 	void poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value);
 	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch);
+	void update_profiler_queue_depth_locked();
 	static void close_batch_files(Vector<IDStorageFile *> &p_files);
 	static int priority_to_queue_index(DSRequest::DSPriority p_priority);
 #endif

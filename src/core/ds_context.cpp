@@ -76,15 +76,46 @@ DSContext::~DSContext() {
 }
 
 void DSContext::evict_old_reports_if_needed_locked() {
-	// Bounded eviction to prevent unbounded growth and ObjectID reuse collisions (C6).
-	// Assumes context_mutex is already held by caller.
-	while (request_execution_reports.size() > (int)MAX_EXECUTION_REPORTS) {
-		Array keys = request_execution_reports.keys();
-		if (keys.size() == 0) {
-			break;
+	while (request_execution_reports.size() > (int)MAX_EXECUTION_REPORTS && !report_order.empty()) {
+		int64_t request_id = report_order.front();
+		report_order.pop_front();
+		request_execution_reports.erase(request_id);
+		tracked_requests.erase(request_id);
+	}
+}
+
+void DSContext::remove_report_locked(int64_t p_request_id) {
+	request_execution_reports.erase(p_request_id);
+	tracked_requests.erase(p_request_id);
+	for (std::deque<int64_t>::iterator it = report_order.begin(); it != report_order.end();) {
+		if (*it == p_request_id) {
+			it = report_order.erase(it);
+		} else {
+			++it;
 		}
-		Variant first_key = keys[0];
-		request_execution_reports.erase(first_key);
+	}
+}
+
+void DSContext::finalize_completed_reports_locked() {
+	for (std::unordered_map<int64_t, Ref<DSRequest>>::iterator it = tracked_requests.begin(); it != tracked_requests.end();) {
+		Ref<DSRequest> request = it->second;
+		DSRequest::Status status = request->get_status();
+		if (status != DSRequest::STATUS_COMPLETED && status != DSRequest::STATUS_FAILED) {
+			++it;
+			continue;
+		}
+
+		int64_t request_id = it->first;
+		Dictionary report = request_execution_reports.get(request_id, Dictionary());
+		if (report.size() > 0) {
+			bool gpu_decompression_pending = report.get("gpu_decompression_pending", false);
+			report["gpu_decompression_pending"] = false;
+			report["was_gpu_decompression_used"] = gpu_decompression_pending && status == DSRequest::STATUS_COMPLETED &&
+				String(report.get("actual_backend", "None")) == "Win32DirectStorage" && is_gpu_decompression_enabled();
+			request_execution_reports[request_id] = report;
+		}
+		remove_report_locked(request_id);
+		it = tracked_requests.begin();
 	}
 }
 
@@ -272,7 +303,10 @@ Dictionary DSContext::get_request_execution_report(Ref<DSRequest> p_request) con
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
 		if (request_execution_reports.has(request_id)) {
-			return request_execution_reports.get(request_id, report);
+			std::unordered_map<int64_t, Ref<DSRequest>>::const_iterator tracked = tracked_requests.find(request_id);
+			if (tracked != tracked_requests.end() && tracked->second.ptr() == p_request.ptr()) {
+				return request_execution_reports.get(request_id, report);
+			}
 		}
 	}
 	return report;
@@ -489,6 +523,8 @@ void DSContext::shutdown_ds() {
 		pending_request_count = 0;
 		pending_batch_request_counts.clear();
 		request_execution_reports.clear();
+		tracked_requests.clear();
+		report_order.clear();
 	}
 	initialized = false;
 	UtilityFunctions::print("[DirectStorage] DirectStorage Context shut down.");
@@ -548,18 +584,15 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request) {
 		Dictionary report;
 		report["actual_destination_type"] = static_cast<int>(p_request->get_destination_type());
 		report["actual_backend"] = active_backend->get_name();
-		// C3/C6: Avoid speculative misreporting of GPU decompression. Only report true
-		// if backend confirms hardware support (tier > 0) and it is enabled. At enqueue
-		// time this is still a prediction, but it is now gated on actual capability query
-		// rather than settings alone. Fallback backends will always report false.
-		bool was_gpu_decompression_used = false;
-		if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE) {
-			if (active_backend && active_backend->get_name() == "Win32DirectStorage" && is_gpu_decompression_available() && is_gpu_decompression_enabled()) {
-				was_gpu_decompression_used = true;
-			}
-		}
-		report["was_gpu_decompression_used"] = was_gpu_decompression_used;
-		request_execution_reports[static_cast<int64_t>(p_request->get_instance_id())] = report;
+		report["was_gpu_decompression_used"] = false;
+		report["gpu_decompression_pending"] = p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE &&
+				active_backend->get_name() == "Win32DirectStorage";
+		int64_t request_id = static_cast<int64_t>(p_request->get_instance_id());
+		remove_report_locked(request_id);
+		request_execution_reports[request_id] = report;
+		tracked_requests[request_id] = p_request;
+		report_order.push_back(request_id);
+		finalize_completed_reports_locked();
 		evict_old_reports_if_needed_locked();
 	}
 	return enqueued;
@@ -570,14 +603,25 @@ void DSContext::flush_batch() {
 		return;
 	}
 	bool had_gpu_requests = false;
+	int submitted_request_count = 0;
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
 		had_gpu_requests = gpu_requests_pending;
+		submitted_request_count = pending_request_count;
 	}
 	active_backend->submit_batch();
+	uint64_t backend_fence = 0;
+#ifdef _WIN32
+	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
+		backend_fence = ds_win32_get_completion_fence(active_backend);
+	}
+#endif
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
 		pending_request_count = 0;
+		if (submitted_request_count > 0) {
+			completion_fence = backend_fence != 0 ? backend_fence : completion_fence + 1;
+		}
 	}
 	if (had_gpu_requests) {
 		if (get_completion_fence() == 0 || !wait_for_completion(5000)) {
@@ -590,20 +634,8 @@ void DSContext::flush_batch() {
 
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
-#ifdef _WIN32
-		if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
-			uint64_t backend_fence = ds_win32_get_completion_fence(active_backend);
-			if (backend_fence != 0) {
-				completion_fence = backend_fence;
-			} else {
-				completion_fence++;
-			}
-		} else {
-			completion_fence++;
-		}
-#else
-		completion_fence++;
-#endif
+		finalize_completed_reports_locked();
+		evict_old_reports_if_needed_locked();
 	}
 }
 
@@ -619,30 +651,23 @@ void DSContext::flush_batch_async() {
 		submitted_request_count = pending_request_count;
 	}
 	active_backend->submit_async();
+	uint64_t backend_fence = 0;
+#ifdef _WIN32
+	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
+		backend_fence = ds_win32_get_completion_fence(active_backend);
+	}
+#endif
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
 		if (!is_win32_backend && backend_was_ready && submitted_request_count > 0) {
 			pending_batch_request_counts.push_back(submitted_request_count);
 		}
 		pending_request_count = 0;
-	}
-
-	{
-		std::lock_guard<std::mutex> lock(context_mutex);
-#ifdef _WIN32
-		if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
-			uint64_t backend_fence = ds_win32_get_completion_fence(active_backend);
-			if (backend_fence != 0) {
-				completion_fence = backend_fence;
-			} else {
-				completion_fence++;
-			}
-		} else {
-			completion_fence++;
+		if (submitted_request_count > 0) {
+			completion_fence = backend_fence != 0 ? backend_fence : completion_fence + 1;
 		}
-#else
-		completion_fence++;
-#endif
+		finalize_completed_reports_locked();
+		evict_old_reports_if_needed_locked();
 	}
 }
 
@@ -697,9 +722,7 @@ void DSContext::collect_completed_results() {
 		int completed_count = 0;
 		int error_code = 0;
 		String error_message;
-		int total_completed = 0;
 		while (backend->collect_completed_batch(fence_value, completed_count, error_code, error_message)) {
-			total_completed += completed_count;
 			if (error_code != 0) {
 				call_deferred("emit_signal", "batch_failed", error_code, error_message);
 			} else {
@@ -708,12 +731,7 @@ void DSContext::collect_completed_results() {
 		}
 		{
 			std::lock_guard<std::mutex> lock(context_mutex);
-			// C6: Bounded eviction on completion to prevent ObjectID reuse collisions.
-			for (int i = 0; i < total_completed && request_execution_reports.size() > 0; i++) {
-				Array keys = request_execution_reports.keys();
-				if (keys.size() == 0) break;
-				request_execution_reports.erase(keys[0]);
-			}
+			finalize_completed_reports_locked();
 			evict_old_reports_if_needed_locked();
 			if (gpu_requests_pending && backend->is_batch_complete()) {
 				gpu_requests_pending = false;
@@ -738,12 +756,7 @@ void DSContext::collect_completed_results() {
 		}
 		completed_count = pending_batch_request_counts.front();
 		pending_batch_request_counts.pop_front();
-		// C6: Evict completed reports to bound memory and avoid stale ObjectID mapping.
-		for (int i = 0; i < completed_count && request_execution_reports.size() > 0; i++) {
-			Array keys = request_execution_reports.keys();
-			if (keys.size() == 0) break;
-			request_execution_reports.erase(keys[0]);
-		}
+		finalize_completed_reports_locked();
 		evict_old_reports_if_needed_locked();
 	}
 	bool has_gpu_pending = false;
@@ -766,29 +779,13 @@ void DSContext::cancel_requests_with_tag(uint64_t p_tag) {
 		return;
 	}
 	active_backend->cancel_requests_with_tag(p_tag);
-	// C6: Synchronize access to shared dictionaries/lists. Backend has cancelled
-	// requests with this tag; mirror the cancellation in context state under lock.
 	std::lock_guard<std::mutex> lock(context_mutex);
-	// Pending enqueued-but-not-submitted count must be cleared after cancel.
 	pending_request_count = 0;
-	// For fallback backend, pending_batch_request_counts mirrors submitted batches.
-	// Since we don't track tag->count mapping, clear all pending to avoid stale counts
-	// now that backend cancelled. Win32 backend manages its own per-queue batches.
 	if (!pending_batch_request_counts.empty()) {
 		pending_batch_request_counts.clear();
 	}
-	// Bounded eviction for request_execution_reports: tag-based cancel leaves
-	// reports for cancelled IDs stale; evict oldest to bound growth.
+	finalize_completed_reports_locked();
 	evict_old_reports_if_needed_locked();
-	// Also opportunistically erase some oldest entries to reclaim cancelled reports.
-	// Without ID mapping, we cap size; if still large, erase a chunk.
-	if (request_execution_reports.size() > (int)MAX_EXECUTION_REPORTS / 2) {
-		for (int i = 0; i < 16 && request_execution_reports.size() > 0; i++) {
-			Array keys = request_execution_reports.keys();
-			if (keys.size() == 0) break;
-			request_execution_reports.erase(keys[0]);
-		}
-	}
 }
 
 void DSContext::set_staging_buffer_size_mb(uint32_t p_size_mb) {

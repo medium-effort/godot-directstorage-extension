@@ -39,7 +39,7 @@
 		</method>
 		<method name="process_queue_errors">
 			<return type="void" />
-			<description>Retrieves and reports pending DirectStorage queue failures. This method is available only on Windows builds and is normally called by the native backend.</description>
+			<description>Retrieves and reports pending DirectStorage queue failures across all registered priority queues. This method is available only on Windows builds and is normally called by the native backend.</description>
 		</method>
 		<method name="report_error">
 			<return type="void" />

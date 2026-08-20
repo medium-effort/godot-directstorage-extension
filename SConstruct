@@ -96,6 +96,8 @@ if sys.platform == "win32":
 BUILD_START_TIME = datetime.datetime.now().astimezone()
 
 TARGET_MACHINE_GUID = "4e2b44a0-d5af-4b59-aa22-7a24d8187a63"
+# Keep verification builds workspace-local unless an explicit sync is requested.
+ENABLE_EXTERNAL_SYNC = os.environ.get("DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC") == "1"
 
 def get_machine_guid():
     if sys.platform == "win32":
@@ -264,7 +266,7 @@ def write_build_manifest():
         }
     }
 
-    if status == "SUCCESS" and os.path.exists("D:\\") and get_machine_guid() == TARGET_MACHINE_GUID:
+    if status == "SUCCESS" and ENABLE_EXTERNAL_SYNC and os.path.exists("D:\\") and get_machine_guid() == TARGET_MACHINE_GUID:
         try:
             os.makedirs(target_sync_dir, exist_ok=True)
             copied = sync_changed_files(os.path.abspath("project"), target_sync_dir)
@@ -509,5 +511,4 @@ env.AlwaysBuild(alias_sync_test)
 
 alias_sync_all = env.Alias("sync-all", [], env.Action(run_sync_all, "[SCons] Syncing all targets..."))
 env.AlwaysBuild(alias_sync_all)
-
 
