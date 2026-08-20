@@ -44,6 +44,13 @@ struct DSTexMipEntryV2 {
 
 static_assert(sizeof(DSTexMipEntryV2) == 24, "DSTexMipEntryV2 must be 24 bytes");
 
+// Defensive parsing limits (C8 remediation):
+// - Maximum mip count is 16 (covers up to 64k texture resolution, prevents unbounded allocations).
+// - Mip table must satisfy: sizeof(DSTexHeader) + mip_count * entry_size <= file_length.
+// - For v1, data_offset + compressed_size <= file_length.
+// - For v2, each mip_offsets[i] + mip_sizes[i] <= file_length.
+static constexpr uint32_t DSTEX_MAX_MIP_COUNT = 16;
+
 struct DSTexMipLayout {
 	uint64_t source_row_bytes = 0;
 	uint64_t row_count = 0;

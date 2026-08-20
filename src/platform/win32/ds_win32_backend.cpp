@@ -98,19 +98,19 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 		return false;
 	}
 	file->seek(sizeof(DSTexHeader));
-	PackedByteArray raw_entries = file->get_buffer(static_cast<int64_t>(sizeof(DSTexMipEntry) * mip_count));
-	if (raw_entries.size() != static_cast<int64_t>(sizeof(DSTexMipEntry) * mip_count)) {
+	PackedByteArray raw_entries = file->get_buffer(static_cast<int64_t>(sizeof(DSTexMipEntryV2) * mip_count));
+	if (raw_entries.size() != static_cast<int64_t>(sizeof(DSTexMipEntryV2) * mip_count)) {
 		return false;
 	}
 
 	uint64_t destination_offset = 0;
 	for (uint32_t mip_index = 0; mip_index < mip_count; mip_index++) {
-		uint64_t values[3] = { 0, 0, 0 };
-		const uint8_t *entry_data = raw_entries.ptr() + sizeof(DSTexMipEntry) * mip_index;
-		std::memcpy(values, entry_data, MIN(sizeof(values), sizeof(DSTexMipEntry)));
-		uint64_t source_offset = values[0];
-		uint64_t source_size = values[1];
-		uint64_t destination_size = values[2];
+		DSTexMipEntryV2 mip_entry = {};
+		const uint8_t *entry_data = raw_entries.ptr() + sizeof(DSTexMipEntryV2) * mip_index;
+		std::memcpy(&mip_entry, entry_data, sizeof(DSTexMipEntryV2));
+		uint64_t source_offset = mip_entry.offset;
+		uint64_t source_size = mip_entry.compressed_size;
+		uint64_t destination_size = mip_entry.uncompressed_size;
 		bool relative_range = source_offset + source_size <= p_payload_size;
 		bool absolute_range = source_offset >= p_payload_offset && source_offset + source_size <= p_payload_offset + p_payload_size;
 		if (!relative_range && absolute_range) {
@@ -126,17 +126,7 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 		boundary.source_size = source_size;
 		boundary.destination_offset = destination_offset;
 		boundary.destination_size = destination_size;
-		if (!r_chunks.is_empty()) {
-			DSChunkBoundary &previous = r_chunks.write[r_chunks.size() - 1];
-			bool contiguous = previous.source_offset + previous.source_size == boundary.source_offset;
-			bool fits = previous.source_size + boundary.source_size <= p_capacity && previous.destination_size + boundary.destination_size <= p_capacity;
-			if (contiguous && fits) {
-				previous.source_size += boundary.source_size;
-				previous.destination_size += boundary.destination_size;
-				destination_offset += boundary.destination_size;
-				continue;
-			}
-		}
+		// Never merge consecutive mips: each mip is an independent GDeflate TileStream.
 		r_chunks.push_back(boundary);
 		destination_offset += destination_size;
 	}
@@ -716,13 +706,6 @@ ID3D12Device *ds_win32_get_d3d12_device() {
 		}
 	}
 
-	ID3D12Device *created_device = nullptr;
-	HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&created_device));
-	if (SUCCEEDED(hr) && created_device) {
-		s_d3d12_device = created_device;
-		return s_d3d12_device;
-	}
-
 	return nullptr;
 }
 
@@ -1081,6 +1064,7 @@ bool Win32Backend::initialize(const String &p_path) {
 		std::wstring w_core_path(reinterpret_cast<const wchar_t *>(dstoragecore_path.utf16().get_data()));
 		std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
 
+		DllDirectoryScope dll_scope;
 		SetDllDirectoryW(w_bin_dir.c_str());
 		dstoragecore_module = LoadLibraryW(w_core_path.c_str());
 		dstorage_module = LoadLibraryW(w_ds_path.c_str());
@@ -1215,12 +1199,32 @@ void Win32Backend::shutdown() {
 	if (err_handler) {
 		err_handler->unregister_queue();
 	}
-	release_all_resource_guards();
+
+	// C7: Drain GPU work - wait on completion fences with bounded timeout before closing handles.
+	for (QueueState &queue : priority_queues) {
+		if (queue.completion_fence && queue.completion_fence_value != 0) {
+			uint64_t completed = queue.completion_fence->GetCompletedValue();
+			if (completed != UINT64_MAX && completed < queue.completion_fence_value && queue.completion_event) {
+				if (SUCCEEDED(queue.completion_fence->SetEventOnCompletion(queue.completion_fence_value, queue.completion_event))) {
+					WaitForSingleObject(queue.completion_event, 2000);
+					queue.completed_fence_value = queue.completion_fence->GetCompletedValue();
+				}
+			}
+		}
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		release_all_resource_guards();
+	}
 
 	for (QueueState &queue : priority_queues) {
 		for (BatchSlot &slot : queue.batch_slots) {
 			close_batch_files(slot.files);
-			slot.requests.clear();
+			{
+				std::lock_guard<std::mutex> lock(batch_mutex);
+				slot.requests.clear();
+			}
 			slot.fence_value = 0;
 			slot.completed_count = 0;
 			slot.error_code = 0;
@@ -1265,6 +1269,10 @@ void Win32Backend::shutdown() {
 		s_chunked_requests.clear();
 		s_chunk_parents.clear();
 		s_staging_buffer_warnings.clear();
+	}
+	{
+		std::lock_guard<std::mutex> lock(s_device_mutex);
+		s_d3d12_device = nullptr;
 	}
 	active_batch_slot.store(0);
 	if (s_backend_instance == this) {
@@ -1440,15 +1448,11 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	DSTORAGE_REQUEST request = {};
 	request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
 	request.Options.DestinationType = gpu_buffer_destination ? DSTORAGE_REQUEST_DESTINATION_BUFFER :
-				gpu_texture_destination ? DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES_RANGE :
-				DSTORAGE_REQUEST_DESTINATION_MEMORY;
-	if (gpu_texture_destination) {
-		request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
-	} else {
-		request.Options.CompressionFormat = (p_child->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE)
-				? DSTORAGE_COMPRESSION_FORMAT_GDEFLATE
-				: DSTORAGE_COMPRESSION_FORMAT_NONE;
-	}
+			gpu_texture_destination ? DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES_RANGE :
+			DSTORAGE_REQUEST_DESTINATION_MEMORY;
+	request.Options.CompressionFormat = (p_child->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE)
+			? DSTORAGE_COMPRESSION_FORMAT_GDEFLATE
+			: DSTORAGE_COMPRESSION_FORMAT_NONE;
 
 	request.Source.File.Source = file;
 	request.Source.File.Offset = p_child->get_offset();
@@ -1555,7 +1559,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			if (staging_size > 0 && (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size ||
 					mip_entry.offset > UINT64_MAX - mip_entry.compressed_size)) {
 				p_request->set_status(DSRequest::STATUS_FAILED);
-				p_request->set_error_message("DirectStorage cannot fit a GDeflate texture mip in the configured staging buffer.");
+				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
 				return false;
 			}
 
@@ -1601,7 +1605,12 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		uint64_t chunk_capacity = staging_size - (staging_size % GDEFLATE_PAGE_SIZE);
 		Vector<DSChunkBoundary> dstex_chunks;
 		bool use_dstex_chunks = get_dstex_mip_chunks(p_request->get_file_path(), p_request->get_offset(), src_size, chunk_capacity, dstex_chunks);
-		uint64_t chunk_count = use_dstex_chunks ? dstex_chunks.size() : (request_size + chunk_capacity - 1) / chunk_capacity;
+		if (!use_dstex_chunks) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
+			return false;
+		}
+		uint64_t chunk_count = dstex_chunks.size();
 		DSChunkedRequestState state;
 		state.parent = p_request;
 		for (uint64_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
@@ -1609,29 +1618,14 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			uint64_t src_end = 0;
 			uint64_t destination_begin = 0;
 			uint64_t destination_end = 0;
-			if (use_dstex_chunks) {
-				const DSChunkBoundary &boundary = dstex_chunks[chunk_index];
-				src_begin = boundary.source_offset;
-				src_end = boundary.source_offset + boundary.source_size;
-				destination_begin = boundary.destination_offset;
-				destination_end = boundary.destination_offset + boundary.destination_size;
-			} else {
-				src_begin = (chunk_index * src_size) / chunk_count;
-				src_end = ((chunk_index + 1) * src_size) / chunk_count;
-				destination_begin = (chunk_index * uncompressed_size) / chunk_count;
-				destination_end = ((chunk_index + 1) * uncompressed_size) / chunk_count;
-				if (chunk_index > 0) {
-					src_begin -= src_begin % GDEFLATE_PAGE_SIZE;
-					destination_begin -= destination_begin % GDEFLATE_PAGE_SIZE;
-				}
-				if (chunk_index + 1 < chunk_count) {
-					src_end -= src_end % GDEFLATE_PAGE_SIZE;
-					destination_end -= destination_end % GDEFLATE_PAGE_SIZE;
-				}
-			}
+			const DSChunkBoundary &boundary = dstex_chunks[chunk_index];
+			src_begin = boundary.source_offset;
+			src_end = boundary.source_offset + boundary.source_size;
+			destination_begin = boundary.destination_offset;
+			destination_end = boundary.destination_offset + boundary.destination_size;
 			if (src_end <= src_begin || destination_end <= destination_begin || src_end - src_begin > chunk_capacity || destination_end - destination_begin > chunk_capacity) {
 				p_request->set_status(DSRequest::STATUS_FAILED);
-				p_request->set_error_message("DirectStorage could not find page-aligned GDeflate chunk boundaries for the oversized payload.");
+				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
 				return false;
 			}
 

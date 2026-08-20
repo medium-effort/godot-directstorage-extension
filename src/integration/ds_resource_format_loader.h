@@ -16,6 +16,19 @@ namespace godot {
 class DSResourceFormatLoader : public ResourceFormatLoader {
 	GDCLASS(DSResourceFormatLoader, ResourceFormatLoader);
 
+	// Thread affinity & GPU Direct alignment (C2):
+	// - Direct GPU decompression (DESTINATION_GPU_TEXTURE via DirectStorage)
+	//   requires the render thread because RenderingDevice::get_driver_resource()
+	//   and free_rid() assert is_on_render_thread(). Off-render-thread callers
+	//   (main thread, ResourceLoader worker threads / p_use_sub_threads) cleanly
+	//   fall back to memory destination + CPU GDeflate + ImageTexture without
+	//   asserting or spamming D3D12 mapping errors.
+	// - On the render thread with D3D12, the loader creates a Texture2DRD via
+	//   RenderingDevice::texture_create() and submits a GPU texture destination
+	//   request through DSContext.
+	// - v2 textures carry D3D12 footprint alignment (256-byte row pitch,
+	//   512-byte placement); the GPU path uploads padded footprints directly,
+	//   while the CPU fallback unpads via DSTex::get_mip_layout().
 private:
 	Variant _load_texture_payload(
 			const String &p_file_path,

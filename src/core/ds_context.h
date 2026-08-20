@@ -7,6 +7,7 @@
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <deque>
+#include <mutex>
 #include "ds_profiler.h"
 #include "ds_request.h"
 #include "../platform/platform_backend.h"
@@ -28,9 +29,13 @@ private:
 	String initialization_path;
 	bool gpu_requests_pending = false;
 	uint64_t completion_fence = 0;
+	mutable std::mutex context_mutex;
+	static constexpr size_t MAX_EXECUTION_REPORTS = 1024;
 	Dictionary request_execution_reports;
 	int pending_request_count = 0;
 	std::deque<int> pending_batch_request_counts;
+
+	void evict_old_reports_if_needed_locked();
 
 protected:
 	static void _bind_methods();

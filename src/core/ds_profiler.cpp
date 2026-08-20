@@ -125,8 +125,12 @@ void DSProfiler::record_result(const Ref<DSProfilerResult> &p_result) {
 		return;
 	}
 
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	last_result = p_result;
 	result_history.push_back(p_result);
+	if (result_history.size() > (int64_t)MAX_RESULT_HISTORY) {
+		result_history.remove_at(0);
+	}
 	last_bytes = p_result->compressed_bytes_read > 0 ? static_cast<uint64_t>(p_result->compressed_bytes_read) : 0;
 	last_duration_us = p_result->physical_read_duration_usec > 0 ? static_cast<uint64_t>(p_result->physical_read_duration_usec) : 0;
 	last_throughput_mbps = p_result->get_logical_throughput_mbps();
@@ -138,22 +142,27 @@ void DSProfiler::record_result(const Ref<DSProfilerResult> &p_result) {
 }
 
 Ref<DSProfilerResult> DSProfiler::get_last_result() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return last_result;
 }
 
 Array DSProfiler::get_result_history() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return result_history;
 }
 
 double DSProfiler::get_last_throughput_mbps() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return last_throughput_mbps;
 }
 
 uint64_t DSProfiler::get_last_bytes() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return last_bytes;
 }
 
 uint64_t DSProfiler::get_last_duration_us() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return last_duration_us;
 }
 
@@ -192,22 +201,27 @@ void DSProfiler::unregister_performance_monitors() {
 }
 
 double DSProfiler::_get_throughput_monitor() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return last_throughput_mbps;
 }
 
 double DSProfiler::_get_requests_per_second_monitor() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return last_requests_per_second;
 }
 
 double DSProfiler::_get_average_latency_monitor() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return last_average_latency_ms;
 }
 
 int DSProfiler::_get_queue_depth_monitor() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return last_queue_depth;
 }
 
 int DSProfiler::_get_gpu_decompression_active_monitor() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	return last_gpu_decompression_active ? 1 : 0;
 }
 

@@ -1,5 +1,6 @@
 #include "ds_error_handler.h"
 #include <godot_cpp/variant/utility_functions.hpp>
+#include <mutex>
 
 #ifdef _WIN32
 #include <strsafe.h>
@@ -322,19 +323,23 @@ void DSErrorHandler::process_queue_errors() {
 #endif
 
 bool DSErrorHandler::has_error() const {
+	std::lock_guard<std::mutex> lock(error_mutex);
 	return error_flag;
 }
 
 String DSErrorHandler::get_last_error() const {
+	std::lock_guard<std::mutex> lock(error_mutex);
 	return last_error;
 }
 
 void DSErrorHandler::clear_error() {
+	std::lock_guard<std::mutex> lock(error_mutex);
 	last_error = "";
 	error_flag = false;
 }
 
 void DSErrorHandler::report_error(const String &p_msg) {
+	std::lock_guard<std::mutex> lock(error_mutex);
 	last_error = p_msg;
 	error_flag = true;
 }

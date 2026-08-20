@@ -457,6 +457,25 @@ Dictionary DSTex::read_header(const String &p_path) {
 		return result;
 	}
 
+	if (header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT) {
+		UtilityFunctions::push_error("DSTex: Invalid mip count (must be 1..16).");
+		return Dictionary();
+	}
+	{
+		uint64_t entry_size = (header.version == 1) ? sizeof(DSTexMipEntry) : sizeof(DSTexMipEntryV2);
+		uint64_t file_len = file->get_length();
+		uint64_t mip_table_size = static_cast<uint64_t>(header.mip_count) * entry_size;
+		if (entry_size != 0 && mip_table_size / entry_size != static_cast<uint64_t>(header.mip_count)) {
+			UtilityFunctions::push_error("DSTex: Mip table size overflow.");
+			return Dictionary();
+		}
+		uint64_t required = sizeof(DSTexHeader) + mip_table_size;
+		if (required < sizeof(DSTexHeader) || required > file_len) {
+			UtilityFunctions::push_error("DSTex: Mip table exceeds file bounds.");
+			return Dictionary();
+		}
+	}
+
 	result["magic"] = header.magic;
 	result["version"] = header.version;
 	result["flags"] = header.flags;
@@ -541,6 +560,25 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 		return result;
 	}
 
+	if (header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT) {
+		UtilityFunctions::push_error("DSTex: Invalid mip count (must be 1..16).");
+		return Dictionary();
+	}
+	{
+		uint64_t entry_size = (header.version == 1) ? sizeof(DSTexMipEntry) : sizeof(DSTexMipEntryV2);
+		uint64_t file_len = file->get_length();
+		uint64_t mip_table_size = static_cast<uint64_t>(header.mip_count) * entry_size;
+		if (entry_size != 0 && mip_table_size / entry_size != static_cast<uint64_t>(header.mip_count)) {
+			UtilityFunctions::push_error("DSTex: Mip table size overflow.");
+			return Dictionary();
+		}
+		uint64_t required = sizeof(DSTexHeader) + mip_table_size;
+		if (required < sizeof(DSTexHeader) || required > file_len) {
+			UtilityFunctions::push_error("DSTex: Mip table exceeds file bounds.");
+			return Dictionary();
+		}
+	}
+
 	Dictionary header_dict;
 	header_dict["magic"] = header.magic;
 	header_dict["version"] = header.version;
@@ -598,11 +636,45 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	Array mip_data;
 	if (header.version == 1) {
 		uint64_t data_offset = sizeof(DSTexHeader) + (sizeof(DSTexMipEntry) * static_cast<uint64_t>(header.mip_count));
+		uint64_t file_len = file->get_length();
+		if (header.compressed_size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+			UtilityFunctions::push_error("DSTex: Compressed size exceeds maximum buffer size.");
+			file->close();
+			return Dictionary();
+		}
+		if (data_offset > file_len || header.compressed_size > file_len - data_offset) {
+			UtilityFunctions::push_error("DSTex: Compressed data exceeds file bounds.");
+			file->close();
+			return Dictionary();
+		}
+		if (header.compressed_size != 0 && data_offset + header.compressed_size < data_offset) {
+			UtilityFunctions::push_error("DSTex: Compressed data offset overflow.");
+			file->close();
+			return Dictionary();
+		}
 		file->seek(data_offset);
 		compressed_data = file->get_buffer(static_cast<int64_t>(header.compressed_size));
 	} else {
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
-			file->seek(static_cast<uint64_t>(mip_offsets[i]));
+			if (mip_offsets[i] < 0 || mip_sizes[i] < 0) {
+				UtilityFunctions::push_error("DSTex: Invalid mip offset/size (negative).");
+				file->close();
+				return Dictionary();
+			}
+			uint64_t offset = static_cast<uint64_t>(mip_offsets[i]);
+			uint64_t size = static_cast<uint64_t>(static_cast<uint32_t>(mip_sizes[i]));
+			uint64_t file_len = file->get_length();
+			if (offset > file_len || size > file_len - offset) {
+				UtilityFunctions::push_error("DSTex: Mip payload exceeds file bounds.");
+				file->close();
+				return Dictionary();
+			}
+			if (size != 0 && offset + size < offset) {
+				UtilityFunctions::push_error("DSTex: Mip payload offset overflow.");
+				file->close();
+				return Dictionary();
+			}
+			file->seek(offset);
 			PackedByteArray mip_payload = file->get_buffer(mip_sizes[i]);
 			if (mip_payload.size() != mip_sizes[i]) {
 				file->close();

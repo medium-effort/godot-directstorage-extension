@@ -112,10 +112,32 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
 	bool gpu_active = ds_ctx ? ds_ctx->is_gpu_decompression_enabled() : false;
 
-	// Only attempt Direct GPU decompression if we are ON the render thread and running D3D12!
-	// (Godot's get_driver_resource and free_rid assert ERR_FAIL_COND_V(!is_render_thread()) when called on worker threads).
-	if (gpu_active && p_is_v2 && rs && rs->is_on_render_thread() &&
-			rs->get_current_rendering_driver_name().to_lower() == "d3d12" && rd && p_mip_count > 0) {
+	// Thread-affinity gate for GPU DirectStorage decompression (C2).
+	// Direct GPU decompression requires the render thread because
+	// RenderingDevice::get_driver_resource() and free_rid() assert
+	// is_on_render_thread() and will fail or spam errors on workers.
+	// Off-render-thread (main thread, ResourceLoader worker threads)
+	// we fall back cleanly to memory destination + CPU GDeflate + ImageTexture.
+	// Alignment: v2 textures carry 256-byte row-pitch / 512-byte placement
+	// footprints; GPU path uploads the padded footprints directly while the
+	// CPU fallback below unpads rows to natural image data via DSTex::get_mip_layout().
+	bool can_attempt_gpu = false;
+	if (gpu_active && p_is_v2) {
+		if (!rs || !rs->is_on_render_thread()) {
+			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression unavailable off render thread for '" + p_cache_key + "' (thread affinity fallback); using CPU memory decompression.");
+		} else if (rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+			String driver_name = rs->get_current_rendering_driver_name();
+			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression requires D3D12 driver for '" + p_cache_key + "' (current: '" + driver_name + "'); using CPU memory decompression.");
+		} else if (!rd) {
+			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression unavailable (no RenderingDevice) for '" + p_cache_key + "'; using CPU memory decompression.");
+		} else if (p_mip_count == 0) {
+			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression requires at least one mip for '" + p_cache_key + "'; using CPU memory decompression.");
+		} else {
+			can_attempt_gpu = true;
+		}
+	}
+
+	if (can_attempt_gpu) {
 		Ref<RDTextureFormat> rd_fmt;
 		rd_fmt.instantiate();
 		rd_fmt->set_width(static_cast<int32_t>(p_width));

@@ -8,6 +8,7 @@
 #include <godot_cpp/variant/array.hpp>
 
 #include <cstdint>
+#include <mutex>
 
 namespace godot {
 
@@ -48,6 +49,8 @@ class DSProfiler : public Object {
 
 private:
 	static DSProfiler *singleton;
+	mutable std::mutex profiler_mutex;
+	static constexpr size_t MAX_RESULT_HISTORY = 1024;
 	Ref<DSProfilerResult> last_result;
 	Array result_history;
 	double last_throughput_mbps = 0.0;

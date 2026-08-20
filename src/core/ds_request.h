@@ -6,6 +6,8 @@
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/string.hpp>
+#include <atomic>
+#include <mutex>
 
 namespace godot {
 
@@ -52,7 +54,8 @@ private:
 	uint32_t texture_format = 0;
 	uint32_t texture_layout = 0;
 	DSPriority priority = PRIORITY_NORMAL;
-	Status status = STATUS_PENDING;
+	std::atomic<Status> status{ STATUS_PENDING };
+	mutable std::mutex error_mutex;
 	String error_message;
 
 protected:

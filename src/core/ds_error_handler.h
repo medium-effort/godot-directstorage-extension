@@ -5,6 +5,7 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <cstdint>
+#include <mutex>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -18,6 +19,7 @@ class DSErrorHandler : public Object {
 
 private:
 	static DSErrorHandler *singleton;
+	mutable std::mutex error_mutex;
 	String last_error;
 	bool error_flag = false;
 

@@ -127,18 +127,20 @@ uint32_t DSRequest::get_texture_layout() const {
 }
 
 void DSRequest::set_status(Status p_status) {
-	status = p_status;
+	status.store(p_status, std::memory_order_release);
 }
 
 DSRequest::Status DSRequest::get_status() const {
-	return status;
+	return status.load(std::memory_order_acquire);
 }
 
 void DSRequest::set_error_message(const String &p_msg) {
+	std::lock_guard<std::mutex> lock(error_mutex);
 	error_message = p_msg;
 }
 
 String DSRequest::get_error_message() const {
+	std::lock_guard<std::mutex> lock(error_mutex);
 	return error_message;
 }
 
