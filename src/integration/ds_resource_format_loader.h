@@ -38,6 +38,7 @@ private:
 			uint32_t p_width,
 			uint32_t p_height,
 			uint32_t p_pixel_format,
+			bool p_is_srgb,
 			uint32_t p_mip_count,
 			bool p_is_v2,
 			const PackedInt64Array &p_mip_offsets,
@@ -46,7 +47,8 @@ private:
 			const PackedInt32Array &p_mip_row_pitches,
 			const String &p_cache_key,
 			const String &p_original_cache_key,
-			int32_t p_cache_mode) const;
+			int32_t p_cache_mode,
+			bool p_use_sub_threads) const;
 
 protected:
 	static void _bind_methods();

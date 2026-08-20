@@ -18,7 +18,7 @@ namespace godot {
 struct DSTexHeader {
 	uint32_t magic;           // 0x58455444 ("DTEX" little-endian)
 	uint16_t version;         // 1
-	uint16_t flags;           // 0
+	uint16_t flags;           // bit 0: source data is sRGB
 	uint32_t width;
 	uint32_t height;
 	uint32_t pixel_format;    // RenderingDevice::DataFormat enum value
@@ -77,8 +77,11 @@ public:
 	static DSTexMipLayout get_mip_layout(uint32_t p_width, uint32_t p_height, int p_image_format);
 	static PackedByteArray unpad_footprint_mip(const PackedByteArray &p_footprint, uint32_t p_width, uint32_t p_height, int p_image_format);
 
+	static bool is_format_supported(int p_image_format);
 	static int godot_format_to_rd_format(int p_image_format, bool p_is_srgb = false);
 	static int rd_format_to_godot_format(int p_rd_format);
+	static bool is_rd_format_srgb(int p_rd_format);
+	static int get_srgb_rd_format(int p_rd_format);
 };
 
 } // namespace godot

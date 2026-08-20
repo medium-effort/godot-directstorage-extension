@@ -29,7 +29,11 @@ bool align_up(uint64_t p_value, uint64_t p_alignment, uint64_t &r_result) {
 } // namespace
 
 DSTexMipLayout DSTex::get_mip_layout(uint32_t p_width, uint32_t p_height, int p_format) {
-	uint64_t row_bytes = static_cast<uint64_t>(p_width) * 4;
+	if (p_width == 0 || p_height == 0) {
+		return DSTexMipLayout{};
+	}
+
+	uint64_t row_bytes = 0;
 	uint64_t row_count = p_height;
 	uint32_t block_bytes = 0;
 
@@ -97,7 +101,8 @@ DSTexMipLayout DSTex::get_mip_layout(uint32_t p_width, uint32_t p_height, int p_
 			block_bytes = 16;
 			break;
 		default:
-			break;
+			UtilityFunctions::push_warning("DSTex: Unsupported image format for mip layout: ", p_format);
+			return DSTexMipLayout{};
 	}
 
 	if (block_bytes != 0) {
@@ -150,8 +155,11 @@ void DSTex::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("read_from_file", "path"), &DSTex::read_from_file);
 	ClassDB::bind_method(D_METHOD("get_file_info", "path"), &DSTex::get_file_info);
 
+	ClassDB::bind_static_method("DSTex", D_METHOD("is_format_supported", "image_format"), &DSTex::is_format_supported);
 	ClassDB::bind_static_method("DSTex", D_METHOD("godot_format_to_rd_format", "image_format", "is_srgb"), &DSTex::godot_format_to_rd_format, DEFVAL(false));
 	ClassDB::bind_static_method("DSTex", D_METHOD("rd_format_to_godot_format", "rd_format"), &DSTex::rd_format_to_godot_format);
+	ClassDB::bind_static_method("DSTex", D_METHOD("is_rd_format_srgb", "rd_format"), &DSTex::is_rd_format_srgb);
+	ClassDB::bind_static_method("DSTex", D_METHOD("get_srgb_rd_format", "rd_format"), &DSTex::get_srgb_rd_format);
 }
 
 DSTex::DSTex() {
@@ -160,90 +168,123 @@ DSTex::DSTex() {
 DSTex::~DSTex() {
 }
 
-int DSTex::godot_format_to_rd_format(int p_image_format, bool p_is_srgb) {
-	if (p_image_format >= 48) {
-		return p_image_format;
-	}
-
-	if (p_is_srgb) {
-		switch (p_image_format) {
-			case Image::FORMAT_L8:
-			case Image::FORMAT_R8:
-				return RenderingDevice::DATA_FORMAT_R8_SRGB;
-			case Image::FORMAT_LA8:
-			case Image::FORMAT_RG8:
-				return RenderingDevice::DATA_FORMAT_R8G8_SRGB;
-			case Image::FORMAT_RGB8:
-				return RenderingDevice::DATA_FORMAT_R8G8B8_SRGB;
-			case Image::FORMAT_RGBA8:
-				return RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB;
-			case Image::FORMAT_DXT1:
-				return RenderingDevice::DATA_FORMAT_BC1_RGB_SRGB_BLOCK;
-			case Image::FORMAT_DXT3:
-				return RenderingDevice::DATA_FORMAT_BC2_SRGB_BLOCK;
-			case Image::FORMAT_DXT5:
-				return RenderingDevice::DATA_FORMAT_BC3_SRGB_BLOCK;
-			case Image::FORMAT_BPTC_RGBA:
-				return RenderingDevice::DATA_FORMAT_BC7_SRGB_BLOCK;
-			default:
-				break;
-		}
-	}
-
+bool DSTex::is_format_supported(int p_image_format) {
 	switch (p_image_format) {
 		case Image::FORMAT_L8:
 		case Image::FORMAT_R8:
-			return RenderingDevice::DATA_FORMAT_R8_UNORM;
 		case Image::FORMAT_LA8:
 		case Image::FORMAT_RG8:
-			return RenderingDevice::DATA_FORMAT_R8G8_UNORM;
 		case Image::FORMAT_RGB8:
-			return RenderingDevice::DATA_FORMAT_R8G8B8_UNORM;
 		case Image::FORMAT_RGBA8:
-			return RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM;
 		case Image::FORMAT_RF:
-			return RenderingDevice::DATA_FORMAT_R32_SFLOAT;
 		case Image::FORMAT_RGF:
-			return RenderingDevice::DATA_FORMAT_R32G32_SFLOAT;
 		case Image::FORMAT_RGBF:
-			return RenderingDevice::DATA_FORMAT_R32G32B32_SFLOAT;
 		case Image::FORMAT_RGBAF:
-			return RenderingDevice::DATA_FORMAT_R32G32B32A32_SFLOAT;
 		case Image::FORMAT_RH:
-			return RenderingDevice::DATA_FORMAT_R16_SFLOAT;
 		case Image::FORMAT_RGH:
-			return RenderingDevice::DATA_FORMAT_R16G16_SFLOAT;
 		case Image::FORMAT_RGBH:
-			return RenderingDevice::DATA_FORMAT_R16G16B16_SFLOAT;
 		case Image::FORMAT_RGBAH:
-			return RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT;
 		case Image::FORMAT_DXT1:
-			return RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK;
 		case Image::FORMAT_DXT3:
-			return RenderingDevice::DATA_FORMAT_BC2_UNORM_BLOCK;
 		case Image::FORMAT_DXT5:
-			return RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK;
 		case Image::FORMAT_RGTC_R:
-			return RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK;
 		case Image::FORMAT_RGTC_RG:
-			return RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK;
 		case Image::FORMAT_BPTC_RGBA:
-			return RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK;
 		case Image::FORMAT_BPTC_RGBF:
-			return RenderingDevice::DATA_FORMAT_BC6H_SFLOAT_BLOCK;
 		case Image::FORMAT_BPTC_RGBFU:
-			return RenderingDevice::DATA_FORMAT_BC6H_UFLOAT_BLOCK;
 		case Image::FORMAT_R16:
-			return RenderingDevice::DATA_FORMAT_R16_UNORM;
 		case Image::FORMAT_RG16:
-			return RenderingDevice::DATA_FORMAT_R16G16_UNORM;
 		case Image::FORMAT_RGB16:
-			return RenderingDevice::DATA_FORMAT_R16G16B16_UNORM;
 		case Image::FORMAT_RGBA16:
-			return RenderingDevice::DATA_FORMAT_R16G16B16A16_UNORM;
+			return true;
 		default:
-			return RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM;
+			return false;
 	}
+}
+
+int DSTex::godot_format_to_rd_format(int p_image_format, bool p_is_srgb) {
+	int rd_format = RenderingDevice::DATA_FORMAT_MAX;
+	switch (p_image_format) {
+		case Image::FORMAT_L8:
+		case Image::FORMAT_R8:
+			rd_format = RenderingDevice::DATA_FORMAT_R8_UNORM;
+			break;
+		case Image::FORMAT_LA8:
+		case Image::FORMAT_RG8:
+			rd_format = RenderingDevice::DATA_FORMAT_R8G8_UNORM;
+			break;
+		case Image::FORMAT_RGB8:
+			rd_format = RenderingDevice::DATA_FORMAT_R8G8B8_UNORM;
+			break;
+		case Image::FORMAT_RGBA8:
+			rd_format = RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM;
+			break;
+		case Image::FORMAT_RF:
+			rd_format = RenderingDevice::DATA_FORMAT_R32_SFLOAT;
+			break;
+		case Image::FORMAT_RGF:
+			rd_format = RenderingDevice::DATA_FORMAT_R32G32_SFLOAT;
+			break;
+		case Image::FORMAT_RGBF:
+			rd_format = RenderingDevice::DATA_FORMAT_R32G32B32_SFLOAT;
+			break;
+		case Image::FORMAT_RGBAF:
+			rd_format = RenderingDevice::DATA_FORMAT_R32G32B32A32_SFLOAT;
+			break;
+		case Image::FORMAT_RH:
+			rd_format = RenderingDevice::DATA_FORMAT_R16_SFLOAT;
+			break;
+		case Image::FORMAT_RGH:
+			rd_format = RenderingDevice::DATA_FORMAT_R16G16_SFLOAT;
+			break;
+		case Image::FORMAT_RGBH:
+			rd_format = RenderingDevice::DATA_FORMAT_R16G16B16_SFLOAT;
+			break;
+		case Image::FORMAT_RGBAH:
+			rd_format = RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT;
+			break;
+		case Image::FORMAT_DXT1:
+			rd_format = RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK;
+			break;
+		case Image::FORMAT_DXT3:
+			rd_format = RenderingDevice::DATA_FORMAT_BC2_UNORM_BLOCK;
+			break;
+		case Image::FORMAT_DXT5:
+			rd_format = RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK;
+			break;
+		case Image::FORMAT_RGTC_R:
+			rd_format = RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK;
+			break;
+		case Image::FORMAT_RGTC_RG:
+			rd_format = RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK;
+			break;
+		case Image::FORMAT_BPTC_RGBA:
+			rd_format = RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK;
+			break;
+		case Image::FORMAT_BPTC_RGBF:
+			rd_format = RenderingDevice::DATA_FORMAT_BC6H_SFLOAT_BLOCK;
+			break;
+		case Image::FORMAT_BPTC_RGBFU:
+			rd_format = RenderingDevice::DATA_FORMAT_BC6H_UFLOAT_BLOCK;
+			break;
+		case Image::FORMAT_R16:
+			rd_format = RenderingDevice::DATA_FORMAT_R16_UNORM;
+			break;
+		case Image::FORMAT_RG16:
+			rd_format = RenderingDevice::DATA_FORMAT_R16G16_UNORM;
+			break;
+		case Image::FORMAT_RGB16:
+			rd_format = RenderingDevice::DATA_FORMAT_R16G16B16_UNORM;
+			break;
+		case Image::FORMAT_RGBA16:
+			rd_format = RenderingDevice::DATA_FORMAT_R16G16B16A16_UNORM;
+			break;
+		default:
+			UtilityFunctions::push_error("DSTex: Unsupported Godot image format: ", p_image_format);
+			return RenderingDevice::DATA_FORMAT_MAX;
+	}
+
+	return p_is_srgb ? get_srgb_rd_format(rd_format) : rd_format;
 }
 
 int DSTex::rd_format_to_godot_format(int p_rd_format) {
@@ -307,16 +348,114 @@ int DSTex::rd_format_to_godot_format(int p_rd_format) {
 		case RenderingDevice::DATA_FORMAT_R16G16B16A16_UNORM:
 			return Image::FORMAT_RGBA16;
 		default:
-			return Image::FORMAT_RGBA8;
+			return Image::FORMAT_MAX;
+	}
+}
+
+bool DSTex::is_rd_format_srgb(int p_rd_format) {
+	switch (p_rd_format) {
+		case RenderingDevice::DATA_FORMAT_R8_SRGB:
+		case RenderingDevice::DATA_FORMAT_R8G8_SRGB:
+		case RenderingDevice::DATA_FORMAT_R8G8B8_SRGB:
+		case RenderingDevice::DATA_FORMAT_B8G8R8_SRGB:
+		case RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB:
+		case RenderingDevice::DATA_FORMAT_B8G8R8A8_SRGB:
+		case RenderingDevice::DATA_FORMAT_A8B8G8R8_SRGB_PACK32:
+		case RenderingDevice::DATA_FORMAT_BC1_RGB_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC1_RGBA_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC2_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC3_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC7_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
+			return true;
+		default:
+			return false;
+	}
+}
+
+int DSTex::get_srgb_rd_format(int p_rd_format) {
+	switch (p_rd_format) {
+		case RenderingDevice::DATA_FORMAT_R8_UNORM:
+			return RenderingDevice::DATA_FORMAT_R8_SRGB;
+		case RenderingDevice::DATA_FORMAT_R8G8_UNORM:
+			return RenderingDevice::DATA_FORMAT_R8G8_SRGB;
+		case RenderingDevice::DATA_FORMAT_R8G8B8_UNORM:
+			return RenderingDevice::DATA_FORMAT_R8G8B8_SRGB;
+		case RenderingDevice::DATA_FORMAT_B8G8R8_UNORM:
+			return RenderingDevice::DATA_FORMAT_B8G8R8_SRGB;
+		case RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM:
+			return RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB;
+		case RenderingDevice::DATA_FORMAT_B8G8R8A8_UNORM:
+			return RenderingDevice::DATA_FORMAT_B8G8R8A8_SRGB;
+		case RenderingDevice::DATA_FORMAT_A8B8G8R8_UNORM_PACK32:
+			return RenderingDevice::DATA_FORMAT_A8B8G8R8_SRGB_PACK32;
+		case RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK:
+			return RenderingDevice::DATA_FORMAT_BC1_RGB_SRGB_BLOCK;
+		case RenderingDevice::DATA_FORMAT_BC1_RGBA_UNORM_BLOCK:
+			return RenderingDevice::DATA_FORMAT_BC1_RGBA_SRGB_BLOCK;
+		case RenderingDevice::DATA_FORMAT_BC2_UNORM_BLOCK:
+			return RenderingDevice::DATA_FORMAT_BC2_SRGB_BLOCK;
+		case RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK:
+			return RenderingDevice::DATA_FORMAT_BC3_SRGB_BLOCK;
+		case RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK:
+			return RenderingDevice::DATA_FORMAT_BC7_SRGB_BLOCK;
+		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
+			return RenderingDevice::DATA_FORMAT_ETC2_R8G8B8_SRGB_BLOCK;
+		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
+			return RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK;
+		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
+			return RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK;
+		case RenderingDevice::DATA_FORMAT_R8_SRGB:
+		case RenderingDevice::DATA_FORMAT_R8G8_SRGB:
+		case RenderingDevice::DATA_FORMAT_R8G8B8_SRGB:
+		case RenderingDevice::DATA_FORMAT_B8G8R8_SRGB:
+		case RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB:
+		case RenderingDevice::DATA_FORMAT_B8G8R8A8_SRGB:
+		case RenderingDevice::DATA_FORMAT_A8B8G8R8_SRGB_PACK32:
+		case RenderingDevice::DATA_FORMAT_BC1_RGB_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC1_RGBA_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC2_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC3_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC7_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
+		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
+			return p_rd_format;
+		case RenderingDevice::DATA_FORMAT_R32_SFLOAT:
+		case RenderingDevice::DATA_FORMAT_R32G32_SFLOAT:
+		case RenderingDevice::DATA_FORMAT_R32G32B32_SFLOAT:
+		case RenderingDevice::DATA_FORMAT_R32G32B32A32_SFLOAT:
+		case RenderingDevice::DATA_FORMAT_R16_SFLOAT:
+		case RenderingDevice::DATA_FORMAT_R16G16_SFLOAT:
+		case RenderingDevice::DATA_FORMAT_R16G16B16_SFLOAT:
+		case RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT:
+		case RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC6H_SFLOAT_BLOCK:
+		case RenderingDevice::DATA_FORMAT_BC6H_UFLOAT_BLOCK:
+		case RenderingDevice::DATA_FORMAT_R16_UNORM:
+		case RenderingDevice::DATA_FORMAT_R16G16_UNORM:
+		case RenderingDevice::DATA_FORMAT_R16G16B16_UNORM:
+		case RenderingDevice::DATA_FORMAT_R16G16B16A16_UNORM:
+			return p_rd_format;
+		default:
+			return RenderingDevice::DATA_FORMAT_MAX;
 	}
 }
 
 Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level, bool p_is_srgb) {
-	if (p_raw_data.size() == 0 || p_width <= 0 || p_height <= 0) {
+	if (p_raw_data.size() == 0 || p_width <= 0 || p_height <= 0 || p_mip_count <= 0 || p_mip_count > static_cast<int>(DSTEX_MAX_MIP_COUNT)) {
 		return ERR_INVALID_PARAMETER;
 	}
 
-	const int mip_count = p_mip_count > 0 ? p_mip_count : 1;
+	const int rd_format = godot_format_to_rd_format(p_format, p_is_srgb);
+	if (rd_format == RenderingDevice::DATA_FORMAT_MAX) {
+		return ERR_UNAVAILABLE;
+	}
+
+	const int mip_count = p_mip_count;
 	std::vector<DSTexMipLayout> layouts;
 	layouts.reserve(mip_count);
 	uint64_t natural_size = 0;
@@ -377,15 +516,13 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		source_offset += source_mip_size;
 	}
 
-	uint32_t rd_format = static_cast<uint32_t>(godot_format_to_rd_format(p_format, p_is_srgb));
-
 	DSTexHeader header;
 	header.magic = 0x58455444; // "DTEX"
 	header.version = 2;
 	header.flags = p_is_srgb ? 1 : 0;
 	header.width = static_cast<uint32_t>(p_width);
 	header.height = static_cast<uint32_t>(p_height);
-	header.pixel_format = rd_format;
+	header.pixel_format = static_cast<uint32_t>(rd_format);
 	header.mip_count = static_cast<uint32_t>(mip_count);
 	header.original_size = footprint_size;
 	header.compressed_size = total_compressed_size;
@@ -457,6 +594,10 @@ Dictionary DSTex::read_header(const String &p_path) {
 		return result;
 	}
 
+	if (header.width == 0 || header.height == 0) {
+		UtilityFunctions::push_error("DSTex: Invalid texture dimensions.");
+		return Dictionary();
+	}
 	if (header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT) {
 		UtilityFunctions::push_error("DSTex: Invalid mip count (must be 1..16).");
 		return Dictionary();
@@ -486,6 +627,7 @@ Dictionary DSTex::read_header(const String &p_path) {
 	result["original_size"] = header.original_size;
 	result["compressed_size"] = header.compressed_size;
 	result["reserved"] = header.reserved;
+	result["is_srgb"] = (header.flags & 1) != 0 || is_rd_format_srgb(static_cast<int>(header.pixel_format));
 
 	PackedInt64Array mip_offsets;
 	PackedInt32Array mip_sizes;
@@ -560,6 +702,10 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 		return result;
 	}
 
+	if (header.width == 0 || header.height == 0) {
+		UtilityFunctions::push_error("DSTex: Invalid texture dimensions.");
+		return Dictionary();
+	}
 	if (header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT) {
 		UtilityFunctions::push_error("DSTex: Invalid mip count (must be 1..16).");
 		return Dictionary();
@@ -590,6 +736,7 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	header_dict["original_size"] = header.original_size;
 	header_dict["compressed_size"] = header.compressed_size;
 	header_dict["reserved"] = header.reserved;
+	header_dict["is_srgb"] = (header.flags & 1) != 0 || is_rd_format_srgb(static_cast<int>(header.pixel_format));
 
 	PackedInt64Array mip_offsets;
 	PackedInt32Array mip_sizes;

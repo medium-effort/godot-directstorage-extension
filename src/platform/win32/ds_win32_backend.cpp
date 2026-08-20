@@ -135,6 +135,7 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 }
 
 static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries) {
+	r_entries.clear();
 	String resolved_path = p_path;
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (ps && (resolved_path.begins_with("res://") || resolved_path.begins_with("user://"))) {
@@ -153,16 +154,21 @@ static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vec
 		}
 		DSTexHeader header = {};
 		std::memcpy(&header, header_data.ptr(), sizeof(header));
-		if (header.magic != 0x58455444 || header.version != 2 || header.mip_count == 0 ||
+		if (header.magic != 0x58455444 || header.version != 2 || header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT ||
+				header.compressed_size == 0 || header.original_size == 0 || header.reserved != 0 ||
 				header.mip_count > (std::numeric_limits<uint64_t>::max() - sizeof(DSTexHeader)) / sizeof(DSTexMipEntryV2)) {
 			return false;
 		}
 
 		uint64_t entries_end = sizeof(DSTexHeader) + static_cast<uint64_t>(header.mip_count) * sizeof(DSTexMipEntryV2);
-		if (entries_end > file->get_length()) {
+		uint64_t file_length = static_cast<uint64_t>(file->get_length());
+		if (entries_end > file_length || header.compressed_size > file_length - entries_end) {
 			return false;
 		}
 		r_entries.resize(header.mip_count);
+		uint64_t compressed_size = 0;
+		uint64_t uncompressed_size = 0;
+		uint64_t previous_end = entries_end;
 		for (uint32_t mip_index = 0; mip_index < header.mip_count; mip_index++) {
 			PackedByteArray entry_data = file->get_buffer(sizeof(DSTexMipEntryV2));
 			if (entry_data.size() != static_cast<int64_t>(sizeof(DSTexMipEntryV2))) {
@@ -171,75 +177,50 @@ static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vec
 			}
 			std::memcpy(&r_entries.write[mip_index], entry_data.ptr(), sizeof(DSTexMipEntryV2));
 			const DSTexMipEntryV2 &entry = r_entries[mip_index];
-			if (entry.offset > file->get_length() || entry.compressed_size > file->get_length() - entry.offset) {
+			uint64_t entry_end = 0;
+			if (entry.offset < previous_end || entry.offset > file_length || entry.compressed_size == 0 ||
+					entry.compressed_size > file_length - entry.offset || entry.offset > UINT64_MAX - entry.compressed_size ||
+					entry.reserved != 0 || entry.uncompressed_size == 0 || entry.row_pitch == 0 || entry.row_pitch % 256 != 0 ||
+					compressed_size > UINT64_MAX - entry.compressed_size || uncompressed_size > UINT64_MAX - entry.uncompressed_size) {
 				r_entries.clear();
 				return false;
 			}
+			entry_end = entry.offset + entry.compressed_size;
+			compressed_size += entry.compressed_size;
+			uncompressed_size += entry.uncompressed_size;
+			previous_end = entry_end;
+		}
+		if (compressed_size != header.compressed_size || uncompressed_size != header.original_size) {
+			r_entries.clear();
+			return false;
 		}
 		return true;
 	}
 
 	if (ext == "dspkg") {
-		Ref<FileAccess> file = FileAccess::open(resolved_path, FileAccess::READ);
-		if (file.is_null() || file->get_length() < sizeof(DSPkgHeader)) {
+		DSPkg package;
+		if (package.open(resolved_path) != OK) {
 			return false;
 		}
-
-		PackedByteArray header_data = file->get_buffer(sizeof(DSPkgHeader));
-		if (header_data.size() != static_cast<int64_t>(sizeof(DSPkgHeader))) {
-			return false;
-		}
-		DSPkgHeader header = {};
-		std::memcpy(&header, header_data.ptr(), sizeof(header));
-		if (header.magic != 0x474B5044 || header.version != 2 || (header.flags & 1) == 0 || header.entry_count == 0) {
-			return false;
-		}
-
-		uint64_t file_len = file->get_length();
-		for (uint32_t entry_idx = 0; entry_idx < header.entry_count; entry_idx++) {
-			if (file->get_position() + 10 > file_len) {
-				return false;
+		Array entry_paths = package.get_entries();
+		for (int entry_idx = 0; entry_idx < entry_paths.size(); entry_idx++) {
+			Vector<DSPkgMipEntry> package_entries;
+			String entry_path = entry_paths[entry_idx];
+			if (!package.get_mip_entries_for_path(entry_path, package_entries) || package_entries.is_empty() ||
+					package_entries[0].offset != p_offset) {
+				continue;
 			}
-			uint64_t hash = file->get_64();
-			uint16_t path_len = file->get_16();
-			if (file->get_position() + path_len + 40 > file_len) {
-				return false;
+			r_entries.resize(package_entries.size());
+			for (int mip_idx = 0; mip_idx < package_entries.size(); mip_idx++) {
+				const DSPkgMipEntry &package_entry = package_entries[mip_idx];
+				r_entries.write[mip_idx].offset = package_entry.offset;
+				r_entries.write[mip_idx].compressed_size = package_entry.compressed_size;
+				r_entries.write[mip_idx].uncompressed_size = package_entry.uncompressed_size;
+				r_entries.write[mip_idx].row_pitch = package_entry.row_pitch;
+				r_entries.write[mip_idx].reserved = package_entry.reserved;
 			}
-			file->seek(file->get_position() + path_len);
-			uint64_t entry_data_offset = file->get_64();
-			uint64_t comp_size = file->get_64();
-			uint64_t orig_size = file->get_64();
-			uint32_t width = file->get_32();
-			uint32_t height = file->get_32();
-			uint32_t pixel_format = file->get_32();
-			uint32_t mip_count = file->get_32();
-
-			uint64_t abs_entry_data_offset = header.data_offset + entry_data_offset;
-			if (abs_entry_data_offset == p_offset) {
-				if (mip_count == 0 || file->get_position() + mip_count * sizeof(DSPkgMipEntry) > file_len) {
-					return false;
-				}
-				r_entries.resize(mip_count);
-				for (uint32_t mip_idx = 0; mip_idx < mip_count; mip_idx++) {
-					DSPkgMipEntry pkg_mip = {};
-					PackedByteArray mip_data = file->get_buffer(sizeof(DSPkgMipEntry));
-					if (mip_data.size() != static_cast<int64_t>(sizeof(DSPkgMipEntry))) {
-						r_entries.clear();
-						return false;
-					}
-					std::memcpy(&pkg_mip, mip_data.ptr(), sizeof(DSPkgMipEntry));
-					r_entries.write[mip_idx].offset = pkg_mip.offset;
-					r_entries.write[mip_idx].compressed_size = pkg_mip.compressed_size;
-					r_entries.write[mip_idx].uncompressed_size = pkg_mip.uncompressed_size;
-					r_entries.write[mip_idx].row_pitch = pkg_mip.row_pitch;
-					r_entries.write[mip_idx].reserved = pkg_mip.reserved;
-				}
-				return true;
-			} else {
-				file->seek(file->get_position() + mip_count * sizeof(DSPkgMipEntry));
-			}
+			return true;
 		}
-		return false;
 	}
 
 	return false;
@@ -1591,6 +1572,12 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 	}
 
+	if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE && !has_texture_mip_entries) {
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message("Win32Backend: GPU texture destinations require v2 footprint-padded formats.");
+		return false;
+	}
+
 	if (gpu_texture_gdeflate && has_texture_mip_entries && texture_subresource_count > 1) {
 		// Multi-mip .dstex files store each mip level as an independent GDeflate compressed stream.
 		// DirectStorage's MultipleSubresourcesRange destination for multiple subresources expects a single continuous stream,
@@ -1653,6 +1640,12 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		return true;
 	}
 	if (gpu_texture_gdeflate && has_texture_mip_entries && texture_subresource_count == 1) {
+		const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource];
+		if (staging_size > 0 && (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size)) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
+			return false;
+		}
 		return enqueue_one(p_request, 0);
 	}
 

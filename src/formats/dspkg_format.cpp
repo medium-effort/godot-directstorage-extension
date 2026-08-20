@@ -15,6 +15,7 @@ constexpr uint16_t DSPKG_VERSION_LEGACY = 1;
 constexpr uint16_t DSPKG_VERSION_GPU_METADATA = 2;
 constexpr uint16_t DSPKG_FLAG_GPU_MIP_METADATA = 1;
 constexpr uint32_t D3D12_TEXTURE_DATA_PITCH_ALIGNMENT = 256;
+constexpr uint32_t D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT = 512;
 
 bool checked_add(uint64_t p_left, uint64_t p_right, uint64_t &r_result) {
 	if (p_right > UINT64_MAX - p_left) {
@@ -22,6 +23,14 @@ bool checked_add(uint64_t p_left, uint64_t p_right, uint64_t &r_result) {
 	}
 	r_result = p_left + p_right;
 	return true;
+}
+
+bool align_up(uint64_t p_value, uint64_t p_alignment, uint64_t &r_result) {
+	if (p_alignment == 0) {
+		return false;
+	}
+	uint64_t remainder = p_value % p_alignment;
+	return checked_add(p_value, remainder == 0 ? 0 : p_alignment - remainder, r_result);
 }
 
 bool checked_multiply(uint64_t p_left, uint64_t p_right, uint64_t &r_result) {
@@ -180,9 +189,14 @@ Error DSPkg::finalize() {
 		}
 	}
 
-	uint64_t total_data_offset = 0;
-	if (!checked_add(header_size, entry_table_size, total_data_offset)) {
+	uint64_t table_end_offset = 0;
+	if (!checked_add(header_size, entry_table_size, table_end_offset)) {
 		UtilityFunctions::push_error("DSPkg: Archive header and entry table size overflow.");
+		return ERR_INVALID_PARAMETER;
+	}
+	uint64_t total_data_offset = 0;
+	if (!align_up(table_end_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, total_data_offset)) {
+		UtilityFunctions::push_error("DSPkg: Archive data offset alignment overflow.");
 		return ERR_INVALID_PARAMETER;
 	}
 
@@ -219,6 +233,11 @@ Error DSPkg::finalize() {
 		uint32_t h = dstex_header.get("height", 0);
 		uint32_t fmt = dstex_header.get("pixel_format", 0);
 		uint32_t mips = dstex_header.get("mip_count", 0);
+		if (!align_up(running_data_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_data_offset)) {
+			UtilityFunctions::push_error("DSPkg: Payload data offset alignment overflow.");
+			file->close();
+			return ERR_INVALID_PARAMETER;
+		}
 		PackedInt32Array mip_sizes = item.get("mip_sizes", PackedInt32Array());
 		PackedInt32Array mip_uncompressed_sizes = item.get("mip_uncompressed_sizes", PackedInt32Array());
 		PackedInt32Array mip_row_pitches = item.get("mip_row_pitches", PackedInt32Array());
@@ -301,11 +320,27 @@ Error DSPkg::finalize() {
 		}
 	}
 
+	uint64_t payload_offset = table_end_offset;
 	for (int i = 0; i < count; ++i) {
 		Dictionary item = staging_entries[i];
 		PackedByteArray data = item["compressed_data"];
+		uint64_t aligned_payload_offset = 0;
+		if (!align_up(payload_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, aligned_payload_offset)) {
+			UtilityFunctions::push_error("DSPkg: Payload file offset alignment overflow.");
+			file->close();
+			return ERR_INVALID_PARAMETER;
+		}
+		for (uint64_t padding = payload_offset; padding < aligned_payload_offset; ++padding) {
+			file->store_8(0);
+		}
+		payload_offset = aligned_payload_offset;
 		if (data.size() > 0) {
 			file->store_buffer(data.ptr(), data.size());
+		}
+		if (!checked_add(payload_offset, static_cast<uint64_t>(data.size()), payload_offset)) {
+			UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
+			file->close();
+			return ERR_INVALID_PARAMETER;
 		}
 	}
 
@@ -489,7 +524,7 @@ Error DSPkg::open(const String &p_path) {
 		}
 
 		entries_by_path[entry.path] = entry;
-		entries_by_hash[entry.path_hash] = entry;
+		entries_by_hash[entry.path_hash].push_back(entry);
 	}
 
 	if (current_pos > loaded_header.data_offset) {
@@ -504,13 +539,7 @@ Error DSPkg::open(const String &p_path) {
 }
 
 bool DSPkg::has_texture(const String &p_resource_path) const {
-	if (!is_opened) {
-		return false;
-	}
-	if (entries_by_path.has(p_resource_path)) {
-		return true;
-	}
-	return entries_by_hash.has(p_resource_path.hash());
+	return is_opened && find_entry_for_path(p_resource_path) != nullptr;
 }
 
 Dictionary DSPkg::read_texture(const String &p_resource_path) const {
@@ -520,15 +549,12 @@ Dictionary DSPkg::read_texture(const String &p_resource_path) const {
 		return result;
 	}
 
-	DSPkgEntry entry;
-	if (entries_by_path.has(p_resource_path)) {
-		entry = entries_by_path[p_resource_path];
-	} else if (entries_by_hash.has(p_resource_path.hash())) {
-		entry = entries_by_hash[p_resource_path.hash()];
-	} else {
+	const DSPkgEntry *entry_ptr = find_entry_for_path(p_resource_path);
+	if (entry_ptr == nullptr) {
 		UtilityFunctions::push_error("DSPkg: Texture path not found in archive: ", p_resource_path);
 		return result;
 	}
+	const DSPkgEntry &entry = *entry_ptr;
 	if (!payload_sizes_are_supported(entry)) {
 		UtilityFunctions::push_error("DSPkg: Entry payload size is no longer supported.");
 		return result;
@@ -588,15 +614,12 @@ Dictionary DSPkg::get_entry_info(const String &p_resource_path) const {
 		return result;
 	}
 
-	DSPkgEntry entry;
-	if (entries_by_path.has(p_resource_path)) {
-		entry = entries_by_path[p_resource_path];
-	} else if (entries_by_hash.has(p_resource_path.hash())) {
-		entry = entries_by_hash[p_resource_path.hash()];
-	} else {
+	const DSPkgEntry *entry_ptr = find_entry_for_path(p_resource_path);
+	if (entry_ptr == nullptr) {
 		UtilityFunctions::push_error("DSPkg: Texture path not found in archive: ", p_resource_path);
 		return result;
 	}
+	const DSPkgEntry &entry = *entry_ptr;
 	if (!payload_sizes_are_supported(entry)) {
 		UtilityFunctions::push_error("DSPkg: Entry payload size is no longer supported.");
 		return result;
@@ -625,6 +648,51 @@ Dictionary DSPkg::get_entry_info(const String &p_resource_path) const {
 	result["mip_row_pitches"] = entry.mip_row_pitches;
 
 	return result;
+}
+
+const DSPkgEntry *DSPkg::find_entry_for_path(const String &p_resource_path) const {
+	const DSPkgEntry *entry = entries_by_path.getptr(p_resource_path);
+	if (entry != nullptr) {
+		return entry;
+	}
+
+	const Vector<DSPkgEntry> *hash_entries = entries_by_hash.getptr(p_resource_path.hash());
+	if (hash_entries == nullptr) {
+		return nullptr;
+	}
+	for (int i = 0; i < hash_entries->size(); ++i) {
+		if ((*hash_entries)[i].path == p_resource_path) {
+			return &(*hash_entries)[i];
+		}
+	}
+	return nullptr;
+}
+
+bool DSPkg::get_mip_entries_for_path(const String &p_path, Vector<DSPkgMipEntry> &r_entries) const {
+	r_entries.clear();
+	if (!is_opened) {
+		return false;
+	}
+
+	const DSPkgEntry *entry = find_entry_for_path(p_path);
+	if (entry == nullptr || !entry->has_gpu_metadata ||
+			entry->mip_offsets.size() != static_cast<int64_t>(entry->mip_count) ||
+			entry->mip_sizes.size() != static_cast<int64_t>(entry->mip_count) ||
+			entry->mip_uncompressed_sizes.size() != static_cast<int64_t>(entry->mip_count) ||
+			entry->mip_row_pitches.size() != static_cast<int64_t>(entry->mip_count)) {
+		return false;
+	}
+
+	r_entries.resize(entry->mip_count);
+	for (uint32_t mip = 0; mip < entry->mip_count; ++mip) {
+		DSPkgMipEntry &mip_entry = r_entries.write[mip];
+		mip_entry.offset = static_cast<uint64_t>(entry->mip_offsets[mip]);
+		mip_entry.compressed_size = static_cast<uint32_t>(entry->mip_sizes[mip]);
+		mip_entry.uncompressed_size = static_cast<uint32_t>(entry->mip_uncompressed_sizes[mip]);
+		mip_entry.row_pitch = static_cast<uint32_t>(entry->mip_row_pitches[mip]);
+		mip_entry.reserved = 0;
+	}
+	return true;
 }
 
 int DSPkg::get_entry_count() const {

@@ -5,6 +5,7 @@
 #include <godot_cpp/classes/resource.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/templates/hash_map.hpp>
+#include <godot_cpp/templates/vector.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
@@ -67,8 +68,10 @@ private:
 	String opened_path;
 	DSPkgHeader loaded_header;
 	HashMap<String, DSPkgEntry> entries_by_path;
-	HashMap<uint64_t, DSPkgEntry> entries_by_hash;
+	HashMap<uint64_t, Vector<DSPkgEntry>> entries_by_hash;
 	bool is_opened = false;
+
+	const DSPkgEntry *find_entry_for_path(const String &p_resource_path) const;
 
 protected:
 	static void _bind_methods();
@@ -87,6 +90,7 @@ public:
 	bool has_texture(const String &p_resource_path) const;
 	Dictionary read_texture(const String &p_resource_path) const;
 	Dictionary get_entry_info(const String &p_resource_path) const;
+	bool get_mip_entries_for_path(const String &p_path, Vector<DSPkgMipEntry> &r_entries) const;
 	int get_entry_count() const;
 	Array get_entries() const;
 };

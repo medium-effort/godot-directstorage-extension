@@ -14,11 +14,26 @@
 			<param index="0" name="path" type="String" />
 			<description>Returns the same header and mip metadata dictionary as [method read_header].</description>
 		</method>
+		<method name="get_srgb_rd_format" qualifiers="static">
+			<return type="int" />
+			<param index="0" name="rd_format" type="int" />
+			<description>Returns the corresponding sRGB [RenderingDevice] data format for the given format, or returns the original format if no sRGB variant exists.</description>
+		</method>
 		<method name="godot_format_to_rd_format" qualifiers="static">
 			<return type="int" />
 			<param index="0" name="image_format" type="int" />
 			<param index="1" name="is_srgb" type="bool" default="false" />
 			<description>Converts an [Image] format value to the corresponding [RenderingDevice] data format value. If [param is_srgb] is [code]true[/code], returns the corresponding sRGB format variant when supported.</description>
+		</method>
+		<method name="is_format_supported" qualifiers="static">
+			<return type="bool" />
+			<param index="0" name="image_format" type="int" />
+			<description>Returns whether the specified [Image] format is supported for [DSTex] storage and DirectStorage decompression.</description>
+		</method>
+		<method name="is_rd_format_srgb" qualifiers="static">
+			<return type="bool" />
+			<param index="0" name="rd_format" type="int" />
+			<description>Returns whether the given [RenderingDevice] data format represents an sRGB color space format.</description>
 		</method>
 		<method name="read_from_file">
 			<return type="Dictionary" />
