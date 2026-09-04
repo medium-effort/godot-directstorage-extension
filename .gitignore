@@ -39,6 +39,8 @@ project/test_assets/*.glb
 project/test_assets/*.png
 /project/exports
 /__pycache__
+/.git_backup_pre_rewrite
+.git_backup_pre_rewrite.bundle
 
 # ==============================================================================
 # Local Tooling & Agent Metadata
