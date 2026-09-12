@@ -1,0 +1,23 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build on Device B",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/.vscode/build_remote.ps1"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$msCompile"
+            ]
+        }
+    ]
+}
