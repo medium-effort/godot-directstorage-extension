@@ -103,13 +103,39 @@ import SCons.Script
 if sys.platform == "win32":
     import winreg
 
+# Load configuration from .env file if present
+def load_env_file(env_path=".env"):
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+        except Exception:
+            pass
+
+load_env_file()
+
 BUILD_START_TIME = datetime.datetime.now().astimezone()
 
-# Automatic external synchronization to D:\directstorage-test is opt-in via
-# ENABLE_EXTERNAL_SYNC and additionally requires this development machine GUID.
-TARGET_MACHINE_GUID = "4e2b44a0-d5af-4b59-aa22-7a24d8187a63"
-# Keep verification builds workspace-local unless an explicit sync is requested.
-ENABLE_EXTERNAL_SYNC = os.environ.get("DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC") == "1"
+# Machine GUIDs: Device B (remote build host) and Device A (local development workstation)
+DEVICE_B_GUID = "4e2b44a0-d5af-4b59-aa22-7a24d8187a63"
+DEVICE_A_GUID = os.environ.get("DEVICE_GUID") or os.environ.get("TARGET_MACHINE_GUID") or "300c220b-66de-4a10-b184-86a6211dfeb2"
+KNOWN_MACHINE_GUIDS = {DEVICE_B_GUID, DEVICE_A_GUID}
+
+# Post-build sync is enabled by default; can be disabled via ENABLE_POST_BUILD_ADDON_SYNC=0
+sync_toggle_str = os.environ.get(
+    "ENABLE_POST_BUILD_ADDON_SYNC",
+    os.environ.get("ENABLE_ADDON_SYNC", os.environ.get("DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC", "1"))
+).strip().lower()
+ENABLE_EXTERNAL_SYNC = sync_toggle_str not in ("0", "false", "no", "off")
+
+TPS_DEMO_ADDON_DIR = r"<WORKSPACE_ROOT>\godot-tps-directstorage-integration-test\tps-demo\addons\directstorage_accelerator"
 
 def get_machine_guid():
     if sys.platform == "win32":
@@ -121,10 +147,41 @@ def get_machine_guid():
             pass
     return None
 
+def safe_copy_file(src_file, dst_file):
+    """
+    Safely copy src_file to dst_file. If dst_file is an in-use Windows DLL locked by a running
+    Godot process, catch the PermissionError, rename dst_file to dst_file.old, and retry copy.
+    Cleans up unlocked .old files whenever possible.
+    """
+    if dst_file.lower().endswith(".dll"):
+        old_file = dst_file + ".old"
+        if os.path.exists(old_file):
+            try:
+                os.remove(old_file)
+            except Exception:
+                pass
+
+    try:
+        shutil.copy2(src_file, dst_file)
+    except (PermissionError, OSError):
+        if os.path.exists(dst_file) and dst_file.lower().endswith(".dll"):
+            old_file = dst_file + ".old"
+            if os.path.exists(old_file):
+                try:
+                    os.remove(old_file)
+                except Exception:
+                    old_file = f"{dst_file}.{int(datetime.datetime.now().timestamp())}.old"
+            try:
+                os.replace(dst_file, old_file)
+            except Exception:
+                pass
+            shutil.copy2(src_file, dst_file)
+        else:
+            raise
+
 # Automatic post-build synchronization uses this helper only after
 # ENABLE_EXTERNAL_SYNC is enabled and the host machine GUID matches
-# TARGET_MACHINE_GUID. Explicit sync aliases remain machine-GUID gated; the
-# destination may be D:\directstorage-test or another approved sync target.
+# TARGET_MACHINE_GUID. Explicit sync aliases remain machine-GUID gated.
 def sync_changed_files(src_dir, dst_dir, file_filter=None):
     copied_count = 0
     for root, dirs, files in os.walk(src_dir):
@@ -137,7 +194,7 @@ def sync_changed_files(src_dir, dst_dir, file_filter=None):
 
         for f in files:
             # Exclude temp files globally
-            if f.startswith("~") or f.lower().endswith(".tmp"):
+            if f.startswith("~") or f.lower().endswith((".tmp", ".old")):
                 continue
 
             rel_file_path = os.path.normpath(os.path.join(rel_path, f)) if rel_path != "." else f
@@ -161,15 +218,15 @@ def sync_changed_files(src_dir, dst_dir, file_filter=None):
 
             if should_copy:
                 try:
-                    shutil.copy2(src_file, dst_file)
+                    safe_copy_file(src_file, dst_file)
                     copied_count += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[SCons] Warning: Failed to copy {src_file} -> {dst_file}: {e}")
     return copied_count
 
 def addon_windows_filter(rel_path, filename):
     fname_lower = filename.lower()
-    if filename.startswith("~") or fname_lower.endswith(".tmp"):
+    if filename.startswith("~") or fname_lower.endswith((".tmp", ".old")):
         return False
 
     parts = os.path.normpath(rel_path).split(os.sep)
@@ -202,6 +259,9 @@ def clean_excluded_files(dst_dir, file_filter):
             fname_lower = f.lower()
             should_remove = False
             if f.startswith("~") or fname_lower.endswith(".tmp"):
+                should_remove = True
+            elif fname_lower.endswith(".old"):
+                # Clean stale renamed DLL if not in use
                 should_remove = True
             elif file_filter and not file_filter(rel_file_path, f):
                 should_remove = True
@@ -265,10 +325,17 @@ def write_build_manifest():
 
     status = "FAILED" if failures else "SUCCESS"
 
+    curr_guid = get_machine_guid()
+
+    # Device B sync targets
     target_sync_dir = r"D:\directstorage-test"
     addon_base_dir = r"D:\directstorage-addon-copyable-windows"
     addon_sync_dir = os.path.join(addon_base_dir, "directstorage_accelerator")
     addon_src_sync_dir = os.path.join(addon_base_dir, "src")
+
+    # Device A sync target (TPS demo integration test)
+    tps_addon_sync_dir = os.environ.get("SYNC_ADDON_DIR", TPS_DEMO_ADDON_DIR)
+
     sync_info = {
         "target_path": target_sync_dir,
         "synced": False,
@@ -279,48 +346,93 @@ def write_build_manifest():
             "copied_files_count": 0,
             "src_target_path": addon_src_sync_dir,
             "src_copied_files_count": 0
+        },
+        "tps_demo_addon": {
+            "target_path": tps_addon_sync_dir,
+            "synced": False,
+            "copied_files_count": 0
         }
     }
 
-    if status == "SUCCESS" and ENABLE_EXTERNAL_SYNC and os.path.exists("D:\\") and get_machine_guid() == TARGET_MACHINE_GUID:
-        try:
-            os.makedirs(target_sync_dir, exist_ok=True)
-            copied = sync_changed_files(os.path.abspath("project"), target_sync_dir)
-            sync_info["synced"] = True
-            sync_info["copied_files_count"] = copied
-            if copied > 0:
-                print(f"[SCons] Post-build sync: Copied/Updated {copied} file(s) -> {target_sync_dir}")
-            else:
-                print(f"[SCons] Post-build sync: Target {target_sync_dir} is up to date.")
-        except Exception as e:
-            sync_info["error"] = str(e)
-            print(f"[SCons] Post-build sync error: {e}")
+    # If a development editor build succeeded, alias/copy it to the canonical editor binary
+    # so official (non-dev) Godot editor releases can load the extension out of the box.
+    if status == "SUCCESS" and env.get("target") == "editor" and env.get("dev_build", False):
+        canonical_name = target_name.replace(".dev.", ".")
+        if canonical_name != target_name:
+            src_dll = os.path.join(output_dir, target_name)
+            dst_dll = os.path.join(output_dir, canonical_name)
+            if os.path.isfile(src_dll):
+                try:
+                    safe_copy_file(src_dll, dst_dll)
+                    print(f"[SCons] Created canonical editor alias: {canonical_name} <- {target_name}")
+                except Exception as e:
+                    print(f"[SCons] Warning: Failed to create canonical editor alias {canonical_name}: {e}")
+            # Also copy PDB if present so debuggers can resolve symbols immediately
+            src_pdb = os.path.splitext(src_dll)[0] + ".pdb"
+            dst_pdb = os.path.splitext(dst_dll)[0] + ".pdb"
+            if os.path.isfile(src_pdb):
+                try:
+                    safe_copy_file(src_pdb, dst_pdb)
+                except Exception:
+                    pass
 
-        try:
-            os.makedirs(addon_sync_dir, exist_ok=True)
-            # clean_stale_parent_addon_files(addon_base_dir)
-            clean_excluded_files(addon_sync_dir, addon_windows_filter)
-            addon_src_dir = os.path.abspath("project/addons/directstorage_accelerator")
-            addon_copied = sync_changed_files(addon_src_dir, addon_sync_dir, addon_windows_filter)
-            sync_info["addon_copyable"]["synced"] = True
-            sync_info["addon_copyable"]["copied_files_count"] = addon_copied
-            if addon_copied > 0:
-                print(f"[SCons] Post-build sync: Copied/Updated {addon_copied} file(s) -> {addon_sync_dir}")
-            else:
-                print(f"[SCons] Post-build sync: Target {addon_sync_dir} is up to date.")
+    if status == "SUCCESS" and ENABLE_EXTERNAL_SYNC and os.path.exists("D:\\"):
+        # 1. Device B synchronization (to D:\directstorage-test and D:\directstorage-addon-copyable-windows)
+        if curr_guid == DEVICE_B_GUID:
+            try:
+                os.makedirs(target_sync_dir, exist_ok=True)
+                copied = sync_changed_files(os.path.abspath("project"), target_sync_dir)
+                sync_info["synced"] = True
+                sync_info["copied_files_count"] = copied
+                if copied > 0:
+                    print(f"[SCons] Post-build sync: Copied/Updated {copied} file(s) -> {target_sync_dir}")
+                else:
+                    print(f"[SCons] Post-build sync: Target {target_sync_dir} is up to date.")
+            except Exception as e:
+                sync_info["error"] = str(e)
+                print(f"[SCons] Post-build sync error: {e}")
 
-            os.makedirs(addon_src_sync_dir, exist_ok=True)
-            clean_excluded_files(addon_src_sync_dir, src_filter)
-            src_project_dir = os.path.abspath("src")
-            src_copied = sync_changed_files(src_project_dir, addon_src_sync_dir, src_filter)
-            sync_info["addon_copyable"]["src_copied_files_count"] = src_copied
-            if src_copied > 0:
-                print(f"[SCons] Post-build sync: Copied/Updated {src_copied} file(s) -> {addon_src_sync_dir}")
-            else:
-                print(f"[SCons] Post-build sync: Target {addon_src_sync_dir} is up to date.")
-        except Exception as e:
-            sync_info["addon_copyable"]["error"] = str(e)
-            print(f"[SCons] Post-build sync error ({addon_base_dir}): {e}")
+            try:
+                os.makedirs(addon_sync_dir, exist_ok=True)
+                clean_excluded_files(addon_sync_dir, addon_windows_filter)
+                addon_src_dir = os.path.abspath("project/addons/directstorage_accelerator")
+                addon_copied = sync_changed_files(addon_src_dir, addon_sync_dir, addon_windows_filter)
+                sync_info["addon_copyable"]["synced"] = True
+                sync_info["addon_copyable"]["copied_files_count"] = addon_copied
+                if addon_copied > 0:
+                    print(f"[SCons] Post-build sync: Copied/Updated {addon_copied} file(s) -> {addon_sync_dir}")
+                else:
+                    print(f"[SCons] Post-build sync: Target {addon_sync_dir} is up to date.")
+
+                os.makedirs(addon_src_sync_dir, exist_ok=True)
+                clean_excluded_files(addon_src_sync_dir, src_filter)
+                src_project_dir = os.path.abspath("src")
+                src_copied = sync_changed_files(src_project_dir, addon_src_sync_dir, src_filter)
+                sync_info["addon_copyable"]["src_copied_files_count"] = src_copied
+                if src_copied > 0:
+                    print(f"[SCons] Post-build sync: Copied/Updated {src_copied} file(s) -> {addon_src_sync_dir}")
+                else:
+                    print(f"[SCons] Post-build sync: Target {addon_src_sync_dir} is up to date.")
+            except Exception as e:
+                sync_info["addon_copyable"]["error"] = str(e)
+                print(f"[SCons] Post-build sync error ({addon_base_dir}): {e}")
+
+        # 2. Device A synchronization (to TPS demo test project)
+        if curr_guid == DEVICE_A_GUID:
+            try:
+                os.makedirs(tps_addon_sync_dir, exist_ok=True)
+                clean_excluded_files(tps_addon_sync_dir, addon_windows_filter)
+                addon_src_dir = os.path.abspath("project/addons/directstorage_accelerator")
+                tps_copied = sync_changed_files(addon_src_dir, tps_addon_sync_dir, addon_windows_filter)
+                sync_info["tps_demo_addon"]["synced"] = True
+                sync_info["tps_demo_addon"]["copied_files_count"] = tps_copied
+                if tps_copied > 0:
+                    print(f"[SCons] Post-build sync: Copied/Updated {tps_copied} file(s) -> {tps_addon_sync_dir}")
+                else:
+                    print(f"[SCons] Post-build sync: Target {tps_addon_sync_dir} is up to date.")
+            except Exception as e:
+                sync_info["tps_demo_addon"]["error"] = str(e)
+                print(f"[SCons] Post-build sync error ({tps_addon_sync_dir}): {e}")
 
     # Load existing manifest to preserve historical metadata for other targets
     targets_dict = {}
@@ -377,6 +489,8 @@ def write_build_manifest():
 
     curr_entry = targets_dict.setdefault(target_name, {})
     curr_entry["target_type"] = curr_target_type
+    curr_entry["is_dev_build"] = bool(env.get("dev_build", False))
+    curr_entry.pop("aliased_from", None)
     curr_fpath = os.path.join(output_dir, target_name)
     if os.path.isfile(curr_fpath):
         try:
@@ -394,6 +508,31 @@ def write_build_manifest():
     curr_entry["last_commit"] = commit_short
     curr_entry["last_built_at"] = build_finish_time.isoformat()
     curr_entry["last_build_duration_seconds"] = duration_seconds
+
+    # If canonical alias was generated for this dev editor build, record its explicit metadata
+    if env.get("target") == "editor" and env.get("dev_build", False):
+        canonical_name = target_name.replace(".dev.", ".")
+        if canonical_name != target_name:
+            can_entry = targets_dict.setdefault(canonical_name, {})
+            can_entry["target_type"] = "editor"
+            can_entry["aliased_from"] = target_name
+            can_entry["is_dev_build"] = True
+            can_fpath = os.path.join(output_dir, canonical_name)
+            if os.path.isfile(can_fpath):
+                try:
+                    st_can = os.stat(can_fpath)
+                    mtime_can = datetime.datetime.fromtimestamp(st_can.st_mtime, tz=datetime.timezone.utc).astimezone()
+                    can_entry["exists"] = True
+                    can_entry["size_bytes"] = st_can.st_size
+                    can_entry["last_modified"] = mtime_can.isoformat()
+                except Exception:
+                    can_entry["exists"] = True
+            else:
+                can_entry["exists"] = False
+            can_entry["last_build_status"] = status
+            can_entry["last_commit"] = commit_short
+            can_entry["last_built_at"] = build_finish_time.isoformat()
+            can_entry["last_build_duration_seconds"] = duration_seconds
 
     manifest_data = {
         "status": status,
@@ -428,7 +567,7 @@ def write_build_manifest():
         if sync_info["synced"]:
             dst_manifest = os.path.join(target_sync_dir, os.path.relpath(manifest_path, os.path.abspath("project")))
             os.makedirs(os.path.dirname(dst_manifest), exist_ok=True)
-            shutil.copy2(manifest_path, dst_manifest)
+            safe_copy_file(manifest_path, dst_manifest)
 
         if sync_info.get("addon_copyable", {}).get("synced", False):
             dst_addon_manifest = os.path.join(
@@ -436,7 +575,15 @@ def write_build_manifest():
                 os.path.relpath(manifest_path, os.path.abspath("project/addons/directstorage_accelerator"))
             )
             os.makedirs(os.path.dirname(dst_addon_manifest), exist_ok=True)
-            shutil.copy2(manifest_path, dst_addon_manifest)
+            safe_copy_file(manifest_path, dst_addon_manifest)
+
+        if sync_info.get("tps_demo_addon", {}).get("synced", False):
+            dst_tps_manifest = os.path.join(
+                tps_addon_sync_dir,
+                os.path.relpath(manifest_path, os.path.abspath("project/addons/directstorage_accelerator"))
+            )
+            os.makedirs(os.path.dirname(dst_tps_manifest), exist_ok=True)
+            safe_copy_file(manifest_path, dst_tps_manifest)
     except Exception as e:
         print(f"[SCons] Failed to write build manifest: {e}")
 
@@ -446,13 +593,16 @@ atexit.register(write_build_manifest)
 Default(targets)
 
 # Standalone sync targets (no compilation needed):
-#   scons sync        -> Syncs both project to directstorage-test and addon to directstorage-addon-copyable-windows
-#   scons sync-addon  -> Syncs directstorage_accelerator addon to directstorage-addon-copyable-windows
-#   scons sync-test   -> Syncs project to directstorage-test
-#   scons sync-all    -> Same as scons sync
+#   scons sync          -> Syncs all targets applicable for the current host
+#   scons sync-addon    -> Syncs addon to active environment (Device A: TPS demo, Device B: copyable windows)
+#   scons sync-test     -> Syncs project to directstorage-test (Device B)
+#   scons sync-copyable -> Syncs directstorage-addon-copyable-windows (Device B)
+#   scons sync-tps      -> Syncs addon to TPS demo (Device A)
+#   scons sync-all      -> Same as scons sync
 def run_sync_test(target, source, env):
-    if not os.path.exists("D:\\") or get_machine_guid() != TARGET_MACHINE_GUID:
-        print("[SCons] Sync skipped: Machine GUID or D:\\ drive does not match target environment.")
+    curr_guid = get_machine_guid()
+    if not os.path.exists("D:\\") or (curr_guid != DEVICE_B_GUID and not os.path.exists(r"D:\directstorage-test")):
+        print("[SCons] Sync skipped: Machine GUID or D:\\ drive does not match Device B environment.")
         return 0
     target_sync_dir = r"D:\directstorage-test"
     try:
@@ -466,22 +616,22 @@ def run_sync_test(target, source, env):
         if os.path.exists(manifest_src):
             dst_manifest = os.path.join(target_sync_dir, os.path.relpath(manifest_src, os.path.abspath("project")))
             os.makedirs(os.path.dirname(dst_manifest), exist_ok=True)
-            shutil.copy2(manifest_src, dst_manifest)
+            safe_copy_file(manifest_src, dst_manifest)
     except Exception as e:
         print(f"[SCons] Sync error ({target_sync_dir}): {e}")
         return 1
     return 0
 
-def run_sync_addon(target, source, env):
-    if not os.path.exists("D:\\") or get_machine_guid() != TARGET_MACHINE_GUID:
-        print("[SCons] Sync skipped: Machine GUID or D:\\ drive does not match target environment.")
+def run_sync_copyable(target, source, env):
+    curr_guid = get_machine_guid()
+    if not os.path.exists("D:\\") or (curr_guid != DEVICE_B_GUID and not os.path.exists(r"D:\directstorage-addon-copyable-windows")):
+        print("[SCons] Sync skipped: Machine GUID or D:\\ drive does not match Device B environment.")
         return 0
     addon_base_dir = r"D:\directstorage-addon-copyable-windows"
     addon_sync_dir = os.path.join(addon_base_dir, "directstorage_accelerator")
     addon_src_sync_dir = os.path.join(addon_base_dir, "src")
     try:
         os.makedirs(addon_sync_dir, exist_ok=True)
-        # clean_stale_parent_addon_files(addon_base_dir)
         clean_excluded_files(addon_sync_dir, addon_windows_filter)
         addon_src_dir = os.path.abspath("project/addons/directstorage_accelerator")
         addon_copied = sync_changed_files(addon_src_dir, addon_sync_dir, addon_windows_filter)
@@ -496,7 +646,7 @@ def run_sync_addon(target, source, env):
                 os.path.relpath(manifest_src, os.path.abspath("project/addons/directstorage_accelerator"))
             )
             os.makedirs(os.path.dirname(dst_addon_manifest), exist_ok=True)
-            shutil.copy2(manifest_src, dst_addon_manifest)
+            safe_copy_file(manifest_src, dst_addon_manifest)
 
         os.makedirs(addon_src_sync_dir, exist_ok=True)
         clean_excluded_files(addon_src_sync_dir, src_filter)
@@ -511,19 +661,61 @@ def run_sync_addon(target, source, env):
         return 1
     return 0
 
-def run_sync_all(target, source, env):
-    r1 = run_sync_test(target, source, env)
-    r2 = run_sync_addon(target, source, env)
-    return max(r1, r2)
+def run_sync_tps(target, source, env):
+    if not os.path.exists("D:\\"):
+        print("[SCons] Sync skipped: D:\\ drive not found.")
+        return 0
+    tps_addon_sync_dir = os.environ.get("SYNC_ADDON_DIR", TPS_DEMO_ADDON_DIR)
+    try:
+        os.makedirs(tps_addon_sync_dir, exist_ok=True)
+        clean_excluded_files(tps_addon_sync_dir, addon_windows_filter)
+        addon_src_dir = os.path.abspath("project/addons/directstorage_accelerator")
+        copied = sync_changed_files(addon_src_dir, tps_addon_sync_dir, addon_windows_filter)
+        if copied > 0:
+            print(f"[SCons] Sync: Copied/Updated {copied} file(s) -> {tps_addon_sync_dir}")
+        else:
+            print(f"[SCons] Sync: Target {tps_addon_sync_dir} is up to date.")
+        manifest_src = os.path.join(output_dir, "build_manifest.json")
+        if os.path.exists(manifest_src):
+            dst_manifest = os.path.join(
+                tps_addon_sync_dir,
+                os.path.relpath(manifest_src, os.path.abspath("project/addons/directstorage_accelerator"))
+            )
+            os.makedirs(os.path.dirname(dst_manifest), exist_ok=True)
+            safe_copy_file(manifest_src, dst_manifest)
+    except Exception as e:
+        print(f"[SCons] Sync error ({tps_addon_sync_dir}): {e}")
+        return 1
+    return 0
 
-alias_sync = env.Alias("sync", [], env.Action(run_sync_all, "[SCons] Syncing all targets..."))
+def run_sync_addon(target, source, env):
+    curr_guid = get_machine_guid()
+    if curr_guid == DEVICE_B_GUID:
+        return run_sync_copyable(target, source, env)
+    return run_sync_tps(target, source, env)
+
+def run_sync_all(target, source, env):
+    curr_guid = get_machine_guid()
+    if curr_guid == DEVICE_B_GUID:
+        r1 = run_sync_test(target, source, env)
+        r2 = run_sync_copyable(target, source, env)
+        return max(r1, r2)
+    return run_sync_tps(target, source, env)
+
+alias_sync = env.Alias("sync", [], env.Action(run_sync_all, "[SCons] Syncing targets for active host..."))
 env.AlwaysBuild(alias_sync)
 
-alias_sync_addon = env.Alias("sync-addon", [], env.Action(run_sync_addon, "[SCons] Syncing directstorage-addon-copyable-windows..."))
+alias_sync_addon = env.Alias("sync-addon", [], env.Action(run_sync_addon, "[SCons] Syncing addon for active host..."))
 env.AlwaysBuild(alias_sync_addon)
 
 alias_sync_test = env.Alias("sync-test", [], env.Action(run_sync_test, "[SCons] Syncing directstorage-test..."))
 env.AlwaysBuild(alias_sync_test)
+
+alias_sync_copyable = env.Alias("sync-copyable", [], env.Action(run_sync_copyable, "[SCons] Syncing directstorage-addon-copyable-windows..."))
+env.AlwaysBuild(alias_sync_copyable)
+
+alias_sync_tps = env.Alias("sync-tps", [], env.Action(run_sync_tps, "[SCons] Syncing TPS demo addon..."))
+env.AlwaysBuild(alias_sync_tps)
 
 alias_sync_all = env.Alias("sync-all", [], env.Action(run_sync_all, "[SCons] Syncing all targets..."))
 env.AlwaysBuild(alias_sync_all)
