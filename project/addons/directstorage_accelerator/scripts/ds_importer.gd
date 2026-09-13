@@ -76,6 +76,12 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 			"default_value": 1,
 			"property_hint": PROPERTY_HINT_RANGE,
 			"hint_string": "1,12,1,prefer_slider",
+		},
+		{
+			"name": "compatibility/as_image_texture",
+			"default_value": false,
+			"property_hint": PROPERTY_HINT_NONE,
+			"hint_string": "Loads texture into CPU memory as an ImageTexture instead of Texture2DRD. Required for Light3D projectors and Decals.",
 		}
 	]
 
@@ -216,12 +222,13 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		return ERR_CANT_CREATE
 
 	var is_srgb: bool = (compression_source == Image.COMPRESS_SOURCE_SRGB)
+	var as_image_texture: bool = bool(options.get("compatibility/as_image_texture", false))
 	var out_file_path := save_path + "." + _get_save_extension()
-	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level, is_srgb)
+	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level, is_srgb, as_image_texture)
 	if write_err != OK:
 		push_error("[DirectStorage Importer] Failed to write .dstex file to: " + out_file_path)
 		return write_err
 
 	gen_files.append(out_file_path)
-	print("[DirectStorage Importer] Imported ", source_file, " -> ", out_file_path, " (Mode: ", "S3TC" if compression_mode == 0 else "GDeflate", ", GDeflate Level: ", gdeflate_level, ")")
+	print("[DirectStorage Importer] Imported ", source_file, " -> ", out_file_path, " (Mode: ", "S3TC" if compression_mode == 0 else "GDeflate", ", GDeflate Level: ", gdeflate_level, ", As ImageTexture: ", as_image_texture, ")")
 	return OK

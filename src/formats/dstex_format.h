@@ -14,11 +14,16 @@
 
 namespace godot {
 
+enum DSTexFlags {
+	DSTEX_FLAG_SRGB = 1 << 0,
+	DSTEX_FLAG_AS_IMAGE_TEXTURE = 1 << 1,
+};
+
 #pragma pack(push, 1)
 struct DSTexHeader {
 	uint32_t magic;           // 0x58455444 ("DTEX" little-endian)
 	uint16_t version;         // 1
-	uint16_t flags;           // bit 0: source data is sRGB
+	uint16_t flags;           // bit 0: sRGB, bit 1: as ImageTexture (projector/decal compatible)
 	uint32_t width;
 	uint32_t height;
 	uint32_t pixel_format;    // RenderingDevice::DataFormat enum value
@@ -69,7 +74,7 @@ public:
 	DSTex();
 	~DSTex();
 
-	Error write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count = 1, int p_compression_level = 1, bool p_is_srgb = false);
+	Error write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count = 1, int p_compression_level = 1, bool p_is_srgb = false, bool p_as_image_texture = false);
 	Dictionary read_header(const String &p_path);
 	Dictionary read_from_file(const String &p_path);
 	/// Convenience alias for read_header; returns the same header metadata dictionary.

@@ -61,7 +61,8 @@ private:
 			const String &p_cache_key,
 			const String &p_original_cache_key,
 			int32_t p_cache_mode,
-			bool p_use_sub_threads) const;
+			bool p_use_sub_threads,
+			bool p_as_image_texture = false) const;
 
 protected:
 	static void _bind_methods();

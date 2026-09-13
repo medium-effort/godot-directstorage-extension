@@ -150,7 +150,7 @@ PackedByteArray DSTex::unpad_footprint_mip(const PackedByteArray &p_footprint, u
 }
 
 void DSTex::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level", "is_srgb"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1), DEFVAL(false));
+	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level", "is_srgb", "as_image_texture"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1), DEFVAL(false), DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("read_header", "path"), &DSTex::read_header);
 	ClassDB::bind_method(D_METHOD("read_from_file", "path"), &DSTex::read_from_file);
 	ClassDB::bind_method(D_METHOD("get_file_info", "path"), &DSTex::get_file_info);
@@ -445,7 +445,7 @@ int DSTex::get_srgb_rd_format(int p_rd_format) {
 	}
 }
 
-Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level, bool p_is_srgb) {
+Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level, bool p_is_srgb, bool p_as_image_texture) {
 	if (p_raw_data.size() == 0 || p_width <= 0 || p_height <= 0 || p_mip_count <= 0 || p_mip_count > static_cast<int>(DSTEX_MAX_MIP_COUNT)) {
 		return ERR_INVALID_PARAMETER;
 	}
@@ -519,7 +519,7 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	DSTexHeader header;
 	header.magic = 0x58455444; // "DTEX"
 	header.version = 2;
-	header.flags = p_is_srgb ? 1 : 0;
+	header.flags = (p_is_srgb ? DSTEX_FLAG_SRGB : 0) | (p_as_image_texture ? DSTEX_FLAG_AS_IMAGE_TEXTURE : 0);
 	header.width = static_cast<uint32_t>(p_width);
 	header.height = static_cast<uint32_t>(p_height);
 	header.pixel_format = static_cast<uint32_t>(rd_format);
@@ -627,7 +627,8 @@ Dictionary DSTex::read_header(const String &p_path) {
 	result["original_size"] = header.original_size;
 	result["compressed_size"] = header.compressed_size;
 	result["reserved"] = header.reserved;
-	result["is_srgb"] = (header.flags & 1) != 0 || is_rd_format_srgb(static_cast<int>(header.pixel_format));
+	result["is_srgb"] = (header.flags & DSTEX_FLAG_SRGB) != 0 || is_rd_format_srgb(static_cast<int>(header.pixel_format));
+	result["as_image_texture"] = (header.flags & DSTEX_FLAG_AS_IMAGE_TEXTURE) != 0;
 
 	PackedInt64Array mip_offsets;
 	PackedInt32Array mip_sizes;
@@ -736,7 +737,8 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	header_dict["original_size"] = header.original_size;
 	header_dict["compressed_size"] = header.compressed_size;
 	header_dict["reserved"] = header.reserved;
-	header_dict["is_srgb"] = (header.flags & 1) != 0 || is_rd_format_srgb(static_cast<int>(header.pixel_format));
+	header_dict["is_srgb"] = (header.flags & DSTEX_FLAG_SRGB) != 0 || is_rd_format_srgb(static_cast<int>(header.pixel_format));
+	header_dict["as_image_texture"] = (header.flags & DSTEX_FLAG_AS_IMAGE_TEXTURE) != 0;
 
 	PackedInt64Array mip_offsets;
 	PackedInt32Array mip_sizes;

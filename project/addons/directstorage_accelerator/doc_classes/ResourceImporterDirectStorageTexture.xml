@@ -28,6 +28,9 @@
 			[b]Generic:[/b] Generic linear data texture (such as roughness, metallic, masks, or lookup tables). Color channel distances are evaluated linearly without assuming sRGB gamma encoding.
 			[b]sRGB:[/b] Standard color texture (such as albedo or diffuse maps). Color distances are weighted according to perceptual human vision in sRGB space.
 			[b]Normal Map:[/b] Tangent-space normal map. Red and green channels are prioritized to minimize normal vector distortion and lighting artifacts.
+		<member name="compatibility/as_image_texture" type="bool" setter="" getter="" default="false">
+			When enabled, the texture will be loaded into CPU memory as an [ImageTexture] via DirectStorage's memory streaming path instead of direct-to-GPU [Texture2DRD] VRAM allocation.
+			This is required when the texture is assigned to a [Light3D] projector ([member Light3D.light_projector]) or [Decal] textures, as Godot's internal decal and projector atlas requires standard [ImageTexture] resources and rejects [Texture2DRD] with engine warnings.
 		</member>
 	</members>
 </class>

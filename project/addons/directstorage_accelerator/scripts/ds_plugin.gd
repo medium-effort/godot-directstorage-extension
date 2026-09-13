@@ -13,6 +13,7 @@ const AUTOLOAD_PATH: String = "res://addons/directstorage_accelerator/scripts/ds
 
 var _importer: EditorImportPlugin = null
 var _export_plugin: EditorExportPlugin = null
+var _checked_scenes: Dictionary = {}
 
 
 ## Registers the autoload, import plugin, export plugin, and DirectStorage
@@ -42,6 +43,11 @@ func _enter_tree() -> void:
 			_export_plugin = exporter_script.new()
 			add_export_plugin(_export_plugin)
 
+	if not scene_changed.is_connected(_on_scene_changed):
+		scene_changed.connect(_on_scene_changed)
+	if not scene_closed.is_connected(_on_scene_closed):
+		scene_closed.connect(_on_scene_closed)
+
 	var ds_context = Engine.get_singleton("DSContext")
 	if ds_context:
 		ds_context.initialize_ds()
@@ -57,6 +63,12 @@ func _exit_tree() -> void:
 		remove_export_plugin(_export_plugin)
 		_export_plugin = null
 
+	if scene_changed.is_connected(_on_scene_changed):
+		scene_changed.disconnect(_on_scene_changed)
+	if scene_closed.is_connected(_on_scene_closed):
+		scene_closed.disconnect(_on_scene_closed)
+	_checked_scenes.clear()
+
 	if ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
 		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
 			remove_autoload_singleton(AUTOLOAD_NAME)
@@ -64,3 +76,73 @@ func _exit_tree() -> void:
 			ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, null)
 
 	print("[DirectStorage] Plugin disabled. Autoload, Importer, and Exporter unregistered.")
+
+
+func _on_scene_closed(filepath: String) -> void:
+	_checked_scenes.erase(filepath)
+
+
+func _on_scene_changed(root: Node) -> void:
+	if root == null:
+		return
+	var scene_path := root.scene_file_path
+	if scene_path.is_empty() or _checked_scenes.has(scene_path):
+		return
+
+	_checked_scenes[scene_path] = true
+	_check_scene_compatibility.call_deferred(root, scene_path)
+
+
+func _check_scene_compatibility(root: Node, scene_path: String) -> void:
+	if not is_instance_valid(root):
+		return
+
+	var lights: Array[Node] = []
+	if root is Light3D:
+		lights.append(root)
+	lights.append_array(root.find_children("*", "Light3D", true, false))
+
+	var decals: Array[Node] = []
+	if root is Decal:
+		decals.append(root)
+	decals.append_array(root.find_children("*", "Decal", true, false))
+
+	if lights.is_empty() and decals.is_empty():
+		return
+
+	var invalid_assets: Dictionary = {}
+	var light_count := 0
+	var decal_count := 0
+
+	for node in lights:
+		var light := node as Light3D
+		if light and light.light_projector and light.light_projector is Texture2DRD:
+			var path := light.light_projector.resource_path
+			invalid_assets[path if not path.is_empty() else "(unnamed Texture2DRD)"] = true
+			light_count += 1
+
+	for node in decals:
+		var decal := node as Decal
+		if decal:
+			for i in 4:
+				var tex := decal.get_texture(i)
+				if tex and tex is Texture2DRD:
+					var path := tex.resource_path
+					invalid_assets[path if not path.is_empty() else "(unnamed Texture2DRD)"] = true
+					decal_count += 1
+
+	if invalid_assets.is_empty():
+		return
+
+	var msg := "[color=yellow][DirectStorage][/color] Scene [b]%s[/b] has " % scene_path.get_file()
+	var parts: Array[String] = []
+	if light_count > 0:
+		parts.append("%d Light3D projector(s)" % light_count)
+	if decal_count > 0:
+		parts.append("%d Decal texture(s)" % decal_count)
+	msg += " and ".join(parts) + " using [b]Texture2DRD[/b].\n"
+	msg += "To eliminate atlas engine warnings, re-import the following texture(s) with [b]compatibility/as_image_texture[/b] enabled in the Import dock:\n"
+	for asset_path in invalid_assets:
+		msg += "  • %s\n" % asset_path
+
+	print_rich(msg)

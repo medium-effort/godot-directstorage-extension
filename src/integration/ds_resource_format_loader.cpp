@@ -161,7 +161,8 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		const String &p_cache_key,
 		const String &p_original_cache_key,
 		int32_t p_cache_mode,
-		bool p_use_sub_threads) const {
+		bool p_use_sub_threads,
+		bool p_as_image_texture) const {
 	if (p_width == 0 || p_height == 0 || p_mip_count == 0) {
 		UtilityFunctions::push_error("DSResourceFormatLoader: Invalid 2D texture dimensions or mip count for '", p_cache_key, "' (width=", p_width, ", height=", p_height, ", mips=", p_mip_count, ").");
 		return Variant();
@@ -206,7 +207,9 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	// ResourceLoader sub-thread loads stay on the CPU path because GPU texture
 	// resources are render-thread-affine.
 	bool can_attempt_gpu = false;
-	if (gpu_active && p_is_v2 && !p_use_sub_threads) {
+	if (p_as_image_texture) {
+		UtilityFunctions::print_verbose("DSResourceFormatLoader: Texture requested as ImageTexture for '" + p_cache_key + "'; bypassing GPU direct upload.");
+	} else if (gpu_active && p_is_v2 && !p_use_sub_threads) {
 		if (!rs || !rs->is_on_render_thread()) {
 			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression unavailable off render thread for '" + p_cache_key + "' (thread affinity fallback); using CPU memory decompression.");
 		} else if (rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
@@ -545,7 +548,9 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			PackedInt32Array mip_uncompressed_sizes = entry_info.has("mip_uncompressed_sizes") ? (PackedInt32Array)entry_info["mip_uncompressed_sizes"] : PackedInt32Array();
 			PackedInt32Array mip_row_pitches = entry_info.has("mip_row_pitches") ? (PackedInt32Array)entry_info["mip_row_pitches"] : PackedInt32Array();
 
-			return _load_texture_payload(archive_path, data_offset, comp_size, orig_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads);
+			bool as_image_texture = entry_info.has("as_image_texture") ? (bool)entry_info["as_image_texture"] : false;
+
+			return _load_texture_payload(archive_path, data_offset, comp_size, orig_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, as_image_texture);
 		}
 		UtilityFunctions::push_error("DSResourceFormatLoader: Failed to get entry info from res://textures.dspkg for ", target_path);
 		return Variant();
@@ -563,6 +568,7 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		uint32_t height = header["height"];
 		uint32_t pixel_format = header["pixel_format"];
 		bool is_srgb = (header.has("flags") && (static_cast<uint32_t>(header["flags"]) & 1U) != 0) || DSTex::is_rd_format_srgb(pixel_format);
+		bool as_image_texture = (header.has("flags") && (static_cast<uint32_t>(header["flags"]) & 2U) != 0) || (header.has("as_image_texture") && (bool)header["as_image_texture"]);
 		uint32_t mip_count = header["mip_count"];
 		uint64_t original_size = header["original_size"];
 		uint64_t compressed_size = header["compressed_size"];
@@ -577,7 +583,7 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			data_offset = (data_offset + 511) & ~uint64_t(511);
 		}
 
-		return _load_texture_payload(p_path, data_offset, compressed_size, original_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads);
+		return _load_texture_payload(p_path, data_offset, compressed_size, original_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, as_image_texture);
 	}
 
 	if (ext == "dspkg") {
