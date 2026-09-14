@@ -66,7 +66,7 @@ private:
 
 	// Reader state
 	String opened_path;
-	DSPkgHeader loaded_header;
+	DSPkgHeader loaded_header{};
 	HashMap<String, DSPkgEntry> entries_by_path;
 	HashMap<uint64_t, Vector<DSPkgEntry>> entries_by_hash;
 	bool is_opened = false;

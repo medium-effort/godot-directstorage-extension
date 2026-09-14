@@ -179,9 +179,8 @@ Error DSPkg::finalize() {
 			UtilityFunctions::push_error("DSPkg: Mip metadata table size overflow.");
 			return ERR_INVALID_PARAMETER;
 		}
-		if (!write_gpu_metadata && !checked_add(DSPKG_FIXED_ENTRY_SIZE, 0, entry_size)) {
-			UtilityFunctions::push_error("DSPkg: Entry table size overflow.");
-			return ERR_INVALID_PARAMETER;
+		if (!write_gpu_metadata) {
+			entry_size = DSPKG_FIXED_ENTRY_SIZE;
 		}
 		if (!checked_add(entry_size, path_len, entry_size) || !checked_add(entry_table_size, entry_size, entry_table_size)) {
 			UtilityFunctions::push_error("DSPkg: Entry table size overflow.");
@@ -282,7 +281,7 @@ Error DSPkg::finalize() {
 					return ERR_INVALID_DATA;
 				}
 				uint32_t mip_size = static_cast<uint32_t>(mip_sizes[mip]);
-				if (mip_size == 0 || !checked_add(mip_offset, mip_size, mip_offset) || mip_offset > comp_size) {
+				if (!checked_add(mip_offset, mip_size, mip_offset) || mip_offset > comp_size) {
 					UtilityFunctions::push_error("DSPkg: Invalid compressed mip metadata.");
 					file->close();
 					return ERR_INVALID_DATA;

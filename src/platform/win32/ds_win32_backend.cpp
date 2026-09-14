@@ -465,7 +465,6 @@ bool Win32Backend::wait_for_completion(uint64_t p_fence_value, uint32_t p_timeou
 		return true;
 	}
 	ID3D12Fence *completion_fence = nullptr;
-	uint64_t selected_fence_value = UINT64_MAX;
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		for (const QueueState &queue : priority_queues) {
@@ -475,6 +474,7 @@ bool Win32Backend::wait_for_completion(uint64_t p_fence_value, uint32_t p_timeou
 			}
 		}
 		if (!completion_fence) {
+			uint64_t selected_fence_value = UINT64_MAX;
 			for (const QueueState &queue : priority_queues) {
 				if (queue.completion_fence && queue.completion_fence_value >= p_fence_value &&
 						queue.completion_fence_value < selected_fence_value) {
@@ -1092,7 +1092,6 @@ bool Win32Backend::initialize(const String &p_path) {
 	}
 	{
 		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
-		uint16_t capacity = ctx->get_queue_capacity();
 		String dstoragecore_path = bin_dir + "/dstoragecore.dll";
 		String dstorage_path = bin_dir + "/dstorage.dll";
 
@@ -1601,8 +1600,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 
 		if (staging_size > 0 && texture_footprint > staging_size) {
 			std::string warning_key = p_request->get_file_path().utf8().get_data();
-			if (s_staging_buffer_warnings.find(warning_key) == s_staging_buffer_warnings.end()) {
-				s_staging_buffer_warnings.insert(warning_key);
+			if (s_staging_buffer_warnings.insert(warning_key).second) {
 				UtilityFunctions::push_warning(
 						"[DirectStorage] Texture '", p_request->get_file_path(), "' uncompressed footprint (",
 						String::num_uint64(texture_footprint / (1024 * 1024)), " MiB) exceeds DirectStorage staging buffer size (",
@@ -1896,7 +1894,6 @@ void Win32Backend::submit_batch() {
 	bool submitted_any = false;
 	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
 		BatchMetadata batch;
-		bool batch_prepared = false;
 		uint64_t start_time = 0;
 		uint64_t total_compressed_bytes = 0;
 		uint64_t total_uncompressed_bytes = 0;
@@ -1943,12 +1940,8 @@ void Win32Backend::submit_batch() {
 			queue.queue->EnqueueSignal(queue.completion_fence, completion_value);
 			queue.queue->EnqueueSetEvent(slot.event);
 			queue.queue->Submit();
-			batch_prepared = true;
 			submitted_any = true;
 			update_profiler_queue_depth_locked();
-		}
-		if (!batch_prepared) {
-			continue;
 		}
 
 		DWORD wait_result = WaitForSingleObject(batch_event, 5000);
