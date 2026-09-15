@@ -1351,7 +1351,35 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		p_request->set_error_message("Win32Backend synchronous batch submission is in progress.");
 		return false;
 	}
-	BatchSlot &slot = queue.batch_slots[active_batch_slot.load()];
+	int current_slot = active_batch_slot.load();
+	BatchSlot *slot_ptr = &queue.batch_slots[current_slot];
+	if (!slot_ptr->submitted && slot_ptr->completion_ready) {
+		close_batch_files(slot_ptr->files);
+		slot_ptr->requests.clear();
+		slot_ptr->fence_value = 0;
+		slot_ptr->completed_count = 0;
+		slot_ptr->error_code = 0;
+		slot_ptr->error_message = String();
+		slot_ptr->completion_ready = false;
+	} else if (slot_ptr->submitted) {
+		int alternate_slot = 1 - current_slot;
+		BatchSlot &alt_slot = queue.batch_slots[alternate_slot];
+		if (!alt_slot.submitted && alt_slot.completion_ready) {
+			close_batch_files(alt_slot.files);
+			alt_slot.requests.clear();
+			alt_slot.fence_value = 0;
+			alt_slot.completed_count = 0;
+			alt_slot.error_code = 0;
+			alt_slot.error_message = String();
+			alt_slot.completion_ready = false;
+		}
+		if (!alt_slot.submitted && !alt_slot.completion_ready) {
+			active_batch_slot.store(alternate_slot);
+			current_slot = alternate_slot;
+			slot_ptr = &queue.batch_slots[current_slot];
+		}
+	}
+	BatchSlot &slot = *slot_ptr;
 	if (slot.submitted || slot.completion_ready) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("Win32Backend batch slot is not available; collect completed results before enqueueing more requests.");
@@ -1878,9 +1906,27 @@ void Win32Backend::submit_batch() {
 			}
 			return true;
 		};
-		if (!slot_is_available(submit_slot_index) && slot_is_available(1 - submit_slot_index)) {
-			submit_slot_index = 1 - submit_slot_index;
-			active_batch_slot.store(submit_slot_index);
+		auto reclaim_slot_if_completed = [this](int p_slot_index) {
+			for (QueueState &queue : priority_queues) {
+				BatchSlot &slot = queue.batch_slots[p_slot_index];
+				if (!slot.submitted && slot.completion_ready) {
+					close_batch_files(slot.files);
+					slot.requests.clear();
+					slot.fence_value = 0;
+					slot.completed_count = 0;
+					slot.error_code = 0;
+					slot.error_message = String();
+					slot.completion_ready = false;
+				}
+			}
+		};
+		reclaim_slot_if_completed(submit_slot_index);
+		if (!slot_is_available(submit_slot_index)) {
+			reclaim_slot_if_completed(1 - submit_slot_index);
+			if (slot_is_available(1 - submit_slot_index)) {
+				submit_slot_index = 1 - submit_slot_index;
+				active_batch_slot.store(submit_slot_index);
+			}
 		}
 		if (!slot_is_available(submit_slot_index)) {
 			sync_batch_in_flight.store(false);

@@ -3,6 +3,37 @@ param(
     [switch]$IncludePdb
 )
 
+function Show-BuildFailure {
+    param(
+        [string]$Step,
+        [string]$Message,
+        [int]$Code = 1
+    )
+    Write-Host ""
+    Write-Host "================================================================================" -ForegroundColor Red
+    Write-Host " [BUILD FAILED] $Step " -ForegroundColor White -BackgroundColor DarkRed
+    Write-Host "================================================================================" -ForegroundColor Red
+    Write-Host " Reason: $Message" -ForegroundColor Red
+    if ($Code -ne 0) {
+        Write-Host " Exit Code: $Code" -ForegroundColor Yellow
+    }
+    Write-Host " Check the compiler/terminal output above for details." -ForegroundColor DarkGray
+    Write-Host "================================================================================" -ForegroundColor Red
+    Write-Host ""
+    exit $Code
+}
+
+function Show-BuildSuccess {
+    param(
+        [string]$Message = "All steps completed successfully!"
+    )
+    Write-Host ""
+    Write-Host "================================================================================" -ForegroundColor Green
+    Write-Host " [BUILD SUCCESS] $Message " -ForegroundColor White -BackgroundColor DarkGreen
+    Write-Host "================================================================================" -ForegroundColor Green
+    Write-Host ""
+}
+
 # Load configuration from .env file
 $EnvFileCandidates = @(
     (Join-Path $PSScriptRoot "..\.env"),
@@ -19,9 +50,7 @@ foreach ($path in $EnvFileCandidates) {
 }
 
 if (-not $EnvFilePath) {
-    Write-Host "[ERROR] Configuration file '.env' not found!" -ForegroundColor Red
-    Write-Host "Please copy '.env.example' to '.env' and configure REMOTE_HOST and REMOTE_DIR." -ForegroundColor Yellow
-    exit 1
+    Show-BuildFailure -Step "Configuration Error" -Message "Configuration file '.env' not found! Please copy '.env.example' to '.env' and configure REMOTE_HOST and REMOTE_DIR." -Code 1
 }
 
 # Parse .env file
@@ -40,8 +69,7 @@ $RemoteHostFallback = $env:REMOTE_HOST_FALLBACK
 $RemoteDir          = $env:REMOTE_DIR
 
 if (-not $RemoteHost -or -not $RemoteDir) {
-    Write-Host "[ERROR] REMOTE_HOST or REMOTE_DIR is missing in $EnvFilePath" -ForegroundColor Red
-    exit 1
+    Show-BuildFailure -Step "Configuration Error" -Message "REMOTE_HOST or REMOTE_DIR is missing in $EnvFilePath" -Code 1
 }
 
 $ArtifactRemoteDir = "$RemoteDir/project/addons/directstorage_accelerator/bin"
@@ -62,17 +90,18 @@ if ($LASTEXITCODE -eq 0) {
         $ActiveHost = $RemoteHostFallback
         Write-Host "Connected via Tailscale ($ActiveHost)." -ForegroundColor Green
     } else {
-        Write-Host "[ERROR] Neither primary host ($RemoteHost) nor fallback ($RemoteHostFallback) could be reached!" -ForegroundColor Red
-        exit 1
+        Show-BuildFailure -Step "Step [1/6] Connectivity" -Message "Neither primary host ($RemoteHost) nor fallback ($RemoteHostFallback) could be reached!" -Code 1
     }
 } else {
-    Write-Host "[ERROR] Cannot reach primary host ($RemoteHost) and no fallback is configured!" -ForegroundColor Red
-    exit 1
+    Show-BuildFailure -Step "Step [1/6] Connectivity" -Message "Cannot reach primary host ($RemoteHost) and no fallback is configured!" -Code 1
 }
 
 # 2. Ensure target directory exists on Device B
 Write-Host "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
 ssh $ActiveHost "if not exist `"$RemoteDir`" mkdir `"$RemoteDir`""
+if ($LASTEXITCODE -ne 0) {
+    Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to ensure remote build directory exists on $ActiveHost." -Code $LASTEXITCODE
+}
 
 # 3. Stream source files via native tar over SSH (using cmd.exe for raw binary piping)
 Write-Host "[3/6] Syncing source files to Device B..." -ForegroundColor Cyan
@@ -94,8 +123,7 @@ $tarExcludes = @(
 cmd.exe /c "tar -czf - $tarExcludes . | ssh $ActiveHost ""tar -xzf - -C $RemoteDir"""
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "Sync to Device B failed!" -ForegroundColor Red
-    exit $LASTEXITCODE
+    Show-BuildFailure -Step "Step [3/6] Source Sync" -Message "Failed to sync source files to Device B ($ActiveHost)." -Code $LASTEXITCODE
 }
 
 # 4. Trigger SCons build on Device B
@@ -103,8 +131,7 @@ Write-Host "[4/6] Compiling target=$Target on Device B..." -ForegroundColor Cyan
 ssh $ActiveHost "cd /d $RemoteDir && call scons platform=windows target=$Target dev_build=yes & exit /b %ERRORLEVEL%"
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "Build failed on Device B!" -ForegroundColor Red
-    exit $LASTEXITCODE
+    Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost)." -Code $LASTEXITCODE
 }
 
 # 5. Pull back compiled binary and debug symbols to Device A
@@ -115,12 +142,18 @@ if (!(Test-Path $ArtifactLocalDir)) {
 
 # Pull runtime DLLs and manifest with on-the-fly compression (-C)
 scp -C "$ActiveHost`:$ArtifactRemoteDir/*.dll" "$ArtifactLocalDir/"
+if ($LASTEXITCODE -ne 0) {
+    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy compiled .dll files from Device B ($ActiveHost)." -Code $LASTEXITCODE
+}
 scp -C "$ActiveHost`:$ArtifactRemoteDir/build_manifest.json" "$ArtifactLocalDir/" 2>$null
 
 # Pull large PDB debug symbols only when explicitly requested
 if ($IncludePdb) {
     Write-Host "Pulling debug symbols (.pdb) with compression..." -ForegroundColor Cyan
     scp -C "$ActiveHost`:$ArtifactRemoteDir/*.pdb" "$ArtifactLocalDir/" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Warning: Failed to download .pdb debug symbols." -ForegroundColor Yellow
+    }
 } else {
     Write-Host "Skipping .pdb download (use -IncludePdb if attaching a C++ debugger)." -ForegroundColor DarkGray
 }
@@ -276,6 +309,6 @@ if ($ShouldSync) {
     Write-Host "Post-build addon sync is disabled (ENABLE_POST_BUILD_ADDON_SYNC=0)." -ForegroundColor DarkGray
 }
 
-Write-Host "All steps completed successfully!" -ForegroundColor Green
+Show-BuildSuccess -Message "All build and sync steps completed successfully!"
 
 

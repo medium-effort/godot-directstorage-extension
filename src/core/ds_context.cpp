@@ -579,6 +579,10 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request) {
 		return false;
 	}
 
+	if (has_pending_results()) {
+		collect_completed_results();
+	}
+
 	bool enqueued = active_backend->enqueue_request(p_request);
 	if (enqueued) {
 		std::lock_guard<std::mutex> lock(context_mutex);
@@ -613,6 +617,7 @@ void DSContext::flush_batch() {
 	if (!initialized || !active_backend) {
 		return;
 	}
+	collect_completed_results();
 	bool had_gpu_requests = false;
 	int submitted_request_count = 0;
 	{
