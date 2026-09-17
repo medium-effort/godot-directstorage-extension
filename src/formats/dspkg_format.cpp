@@ -80,6 +80,7 @@ void DSPkg::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_entry_info", "resource_path"), &DSPkg::get_entry_info);
 	ClassDB::bind_method(D_METHOD("get_entry_count"), &DSPkg::get_entry_count);
 	ClassDB::bind_method(D_METHOD("get_entries"), &DSPkg::get_entries);
+	ClassDB::bind_method(D_METHOD("get_mip_entries_for_offset", "offset"), static_cast<Array (DSPkg::*)(uint64_t) const>(&DSPkg::get_mip_entries_for_offset));
 }
 
 DSPkg::DSPkg() {
@@ -226,31 +227,52 @@ Error DSPkg::finalize() {
 		Dictionary dstex_header = item["header"];
 		PackedByteArray data = item["compressed_data"];
 
-		uint64_t comp_size = static_cast<uint64_t>(data.size());
 		uint64_t orig_size = dstex_header.get("original_size", 0);
 		uint32_t w = dstex_header.get("width", 0);
 		uint32_t h = dstex_header.get("height", 0);
 		uint32_t fmt = dstex_header.get("pixel_format", 0);
-		uint32_t mips = dstex_header.get("mip_count", 0);
+		uint32_t mips_count = dstex_header.get("mip_count", 0);
 		if (!align_up(running_data_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_data_offset)) {
 			UtilityFunctions::push_error("DSPkg: Payload data offset alignment overflow.");
 			file->close();
 			return ERR_INVALID_PARAMETER;
 		}
-		PackedInt32Array mip_sizes = item.get("mip_sizes", PackedInt32Array());
+		PackedInt32Array mip_sizes_entry = item.get("mip_sizes", PackedInt32Array());
 		PackedInt32Array mip_uncompressed_sizes = item.get("mip_uncompressed_sizes", PackedInt32Array());
 		PackedInt32Array mip_row_pitches = item.get("mip_row_pitches", PackedInt32Array());
-		if (write_gpu_metadata && mip_sizes.size() != static_cast<int64_t>(mips)) {
+		if (write_gpu_metadata && mip_sizes_entry.size() != static_cast<int64_t>(mips_count)) {
 			UtilityFunctions::push_error("DSPkg: Texture mip metadata does not match the declared mip count.");
 			file->close();
 			return ERR_INVALID_DATA;
 		}
 		if (write_gpu_metadata && item.get("gpu_metadata", false) &&
-				(mip_uncompressed_sizes.size() != static_cast<int64_t>(mips) ||
-					mip_row_pitches.size() != static_cast<int64_t>(mips))) {
+				(mip_uncompressed_sizes.size() != static_cast<int64_t>(mips_count) ||
+					mip_row_pitches.size() != static_cast<int64_t>(mips_count))) {
 			UtilityFunctions::push_error("DSPkg: Incomplete GPU footprint metadata.");
 			file->close();
 			return ERR_INVALID_DATA;
+		}
+
+		uint64_t comp_size = 0;
+		if (write_gpu_metadata && item.get("gpu_metadata", false) && mips_count > 1) {
+			uint64_t running_mip_span = 0;
+			for (uint32_t mip = 0; mip < mips_count; ++mip) {
+				if (mip > 0) {
+					if (!align_up(running_mip_span, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_mip_span)) {
+						UtilityFunctions::push_error("DSPkg: Mip span alignment overflow.");
+						file->close();
+						return ERR_INVALID_PARAMETER;
+					}
+				}
+				if (!checked_add(running_mip_span, static_cast<uint64_t>(mip_sizes_entry[mip]), running_mip_span)) {
+					UtilityFunctions::push_error("DSPkg: Mip span overflow.");
+					file->close();
+					return ERR_INVALID_PARAMETER;
+				}
+			}
+			comp_size = running_mip_span;
+		} else {
+			comp_size = static_cast<uint64_t>(data.size());
 		}
 
 		file->store_64(hash);
@@ -264,7 +286,7 @@ Error DSPkg::finalize() {
 		file->store_32(w);
 		file->store_32(h);
 		file->store_32(fmt);
-		file->store_32(mips);
+		file->store_32(mips_count);
 
 		if (write_gpu_metadata) {
 			uint64_t mip_data_offset = 0;
@@ -273,30 +295,40 @@ Error DSPkg::finalize() {
 				file->close();
 				return ERR_INVALID_PARAMETER;
 			}
-			uint64_t mip_offset = 0;
-			for (uint32_t mip = 0; mip < mips; ++mip) {
-				if (mip_sizes[mip] <= 0) {
+			uint64_t running_mip_offset = 0;
+			for (uint32_t mip = 0; mip < mips_count; ++mip) {
+				if (mip_sizes_entry[mip] <= 0) {
 					UtilityFunctions::push_error("DSPkg: Invalid compressed mip metadata.");
 					file->close();
 					return ERR_INVALID_DATA;
 				}
-				uint32_t mip_size = static_cast<uint32_t>(mip_sizes[mip]);
-				if (!checked_add(mip_offset, mip_size, mip_offset) || mip_offset > comp_size) {
+				if (item.get("gpu_metadata", false) && mips_count > 1 && mip > 0) {
+					if (!align_up(running_mip_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_mip_offset)) {
+						UtilityFunctions::push_error("DSPkg: Invalid compressed mip metadata offset alignment.");
+						file->close();
+						return ERR_INVALID_DATA;
+					}
+				}
+				uint32_t mip_size = static_cast<uint32_t>(mip_sizes_entry[mip]);
+				if (!checked_add(running_mip_offset, mip_size, running_mip_offset) || running_mip_offset > comp_size) {
 					UtilityFunctions::push_error("DSPkg: Invalid compressed mip metadata.");
 					file->close();
 					return ERR_INVALID_DATA;
 				}
 			}
-			if (mip_offset != comp_size) {
+			if (running_mip_offset != comp_size) {
 				UtilityFunctions::push_error("DSPkg: Compressed mip sizes do not match the payload size.");
 				file->close();
 				return ERR_INVALID_DATA;
 			}
-			mip_offset = 0;
-			for (uint32_t mip = 0; mip < mips; ++mip) {
+			uint64_t mip_offset = 0;
+			for (uint32_t mip = 0; mip < mips_count; ++mip) {
+				if (item.get("gpu_metadata", false) && mips_count > 1 && mip > 0) {
+					align_up(mip_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, mip_offset);
+				}
 				DSPkgMipEntry mip_entry{};
 				mip_entry.offset = mip_data_offset + mip_offset;
-				mip_entry.compressed_size = mip_sizes[mip];
+				mip_entry.compressed_size = mip_sizes_entry[mip];
 				if (item.get("gpu_metadata", false)) {
 					mip_entry.uncompressed_size = mip_uncompressed_sizes[mip];
 					mip_entry.row_pitch = mip_row_pitches[mip];
@@ -333,13 +365,47 @@ Error DSPkg::finalize() {
 			file->store_8(0);
 		}
 		payload_offset = aligned_payload_offset;
-		if (data.size() > 0) {
-			file->store_buffer(data.ptr(), data.size());
-		}
-		if (!checked_add(payload_offset, static_cast<uint64_t>(data.size()), payload_offset)) {
-			UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
-			file->close();
-			return ERR_INVALID_PARAMETER;
+
+		Dictionary dstex_header = item["header"];
+		uint32_t mips = dstex_header.get("mip_count", 0);
+		bool has_gpu = write_gpu_metadata && item.get("gpu_metadata", false) && mips > 1;
+
+		if (has_gpu) {
+			PackedInt32Array mip_sizes = item.get("mip_sizes", PackedInt32Array());
+			int64_t slice_offset = 0;
+			for (uint32_t mip = 0; mip < mips; ++mip) {
+				int32_t mip_size = mip_sizes[mip];
+				if (mip > 0) {
+					uint64_t aligned_mip_offset = 0;
+					if (!align_up(payload_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, aligned_mip_offset)) {
+						UtilityFunctions::push_error("DSPkg: Payload mip file offset alignment overflow.");
+						file->close();
+						return ERR_INVALID_PARAMETER;
+					}
+					for (uint64_t padding = payload_offset; padding < aligned_mip_offset; ++padding) {
+						file->store_8(0);
+					}
+					payload_offset = aligned_mip_offset;
+				}
+				if (mip_size > 0) {
+					file->store_buffer(data.ptr() + slice_offset, mip_size);
+					slice_offset += mip_size;
+				}
+				if (!checked_add(payload_offset, static_cast<uint64_t>(mip_size), payload_offset)) {
+					UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
+					file->close();
+					return ERR_INVALID_PARAMETER;
+				}
+			}
+		} else {
+			if (data.size() > 0) {
+				file->store_buffer(data.ptr(), data.size());
+			}
+			if (!checked_add(payload_offset, static_cast<uint64_t>(data.size()), payload_offset)) {
+				UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
+				file->close();
+				return ERR_INVALID_PARAMETER;
+			}
 		}
 	}
 
@@ -353,6 +419,7 @@ Error DSPkg::finalize() {
 Error DSPkg::open(const String &p_path) {
 	entries_by_path.clear();
 	entries_by_hash.clear();
+	entries_by_offset.clear();
 	is_opened = false;
 	opened_path = "";
 	loaded_header = DSPkgHeader{};
@@ -366,6 +433,7 @@ Error DSPkg::open(const String &p_path) {
 	auto fail = [&](Error p_error, const String &p_message) -> Error {
 		entries_by_path.clear();
 		entries_by_hash.clear();
+		entries_by_offset.clear();
 		is_opened = false;
 		opened_path = "";
 		loaded_header = DSPkgHeader{};
@@ -486,6 +554,7 @@ Error DSPkg::open(const String &p_path) {
 			entry.mip_row_pitches.resize(entry.mip_count);
 			uint64_t footprint_size = 0;
 			uint64_t compressed_mip_size = 0;
+			uint64_t previous_mip_end = abs_payload_offset;
 			for (uint32_t mip = 0; mip < entry.mip_count; ++mip) {
 				DSPkgMipEntry mip_entry{};
 				mip_entry.offset = file->get_64();
@@ -501,7 +570,7 @@ Error DSPkg::open(const String &p_path) {
 				if (mip_entry.compressed_size == 0 ||
 						mip_entry.reserved != 0 ||
 						!checked_add(mip_entry.offset, mip_entry.compressed_size, mip_end) ||
-						mip_entry.offset < abs_payload_offset || mip_end > abs_payload_end ||
+						mip_entry.offset < previous_mip_end || mip_end > abs_payload_end ||
 						!checked_add(compressed_mip_size, mip_entry.compressed_size, compressed_mip_size) ||
 						(mip_entry.uncompressed_size > 0 &&
 							(mip_entry.row_pitch == 0 || mip_entry.row_pitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT != 0)) ||
@@ -509,14 +578,40 @@ Error DSPkg::open(const String &p_path) {
 							!checked_add(footprint_size, mip_entry.uncompressed_size, footprint_size))) {
 					return fail(ERR_FILE_CORRUPT, "Invalid entry mip metadata.");
 				}
+				if (mip == 0 && mip_entry.offset != abs_payload_offset) {
+					return fail(ERR_FILE_CORRUPT, "First mip offset must match entry payload start.");
+				}
+				if (mip_entry.uncompressed_size > 0 && mip_entry.offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT != 0) {
+					return fail(ERR_FILE_CORRUPT, "Mip offset must be aligned to 512 bytes for GPU footprint.");
+				}
+				previous_mip_end = mip_end;
 			}
-			if (compressed_mip_size != entry.compressed_size) {
-				return fail(ERR_FILE_CORRUPT, "Entry mip sizes do not match compressed size.");
+			if (compressed_mip_size > entry.compressed_size) {
+				return fail(ERR_FILE_CORRUPT, "Entry mip sizes exceed compressed size.");
 			}
-			entry.has_gpu_metadata = footprint_size > 0;
-			if (entry.has_gpu_metadata && footprint_size != entry.original_size) {
-				return fail(ERR_FILE_CORRUPT, "Entry footprint metadata does not match original size.");
+			if (entry.mip_count == 1 && compressed_mip_size != entry.compressed_size) {
+				return fail(ERR_FILE_CORRUPT, "Entry mip size does not match compressed size.");
 			}
+			if (entry.mip_count > 1 && previous_mip_end != abs_payload_end) {
+				return fail(ERR_FILE_CORRUPT, "Last mip does not end at entry compressed payload boundary.");
+			}
+		entry.has_gpu_metadata = footprint_size > 0;
+		if (entry.has_gpu_metadata && footprint_size != entry.original_size) {
+			return fail(ERR_FILE_CORRUPT, "Entry footprint metadata does not match original size.");
+		}
+		if (entry.has_gpu_metadata) {
+			Vector<DSPkgMipEntry> mip_vector;
+			mip_vector.resize(entry.mip_count);
+			for (uint32_t mip = 0; mip < entry.mip_count; ++mip) {
+				DSPkgMipEntry &mip_entry = mip_vector.write[mip];
+				mip_entry.offset = static_cast<uint64_t>(entry.mip_offsets[mip]);
+				mip_entry.compressed_size = static_cast<uint32_t>(entry.mip_sizes[mip]);
+				mip_entry.uncompressed_size = static_cast<uint32_t>(entry.mip_uncompressed_sizes[mip]);
+				mip_entry.row_pitch = static_cast<uint32_t>(entry.mip_row_pitches[mip]);
+				mip_entry.reserved = 0;
+			}
+			entries_by_offset[abs_payload_offset] = mip_vector;
+		}
 			if (!checked_add(current_pos, metadata_size, current_pos)) {
 				return fail(ERR_FILE_CORRUPT, "Entry mip metadata offset overflow.");
 			}
@@ -602,6 +697,15 @@ Dictionary DSPkg::read_texture(const String &p_resource_path) const {
 	result["mip_sizes"] = entry.mip_sizes;
 	result["mip_uncompressed_sizes"] = entry.mip_uncompressed_sizes;
 	result["mip_row_pitches"] = entry.mip_row_pitches;
+	if (entry.has_gpu_metadata) {
+		Array mip_data;
+		for (uint32_t mip = 0; mip < entry.mip_count; ++mip) {
+			uint64_t rel_offset = static_cast<uint64_t>(entry.mip_offsets[mip]) - target_offset;
+			uint64_t mip_size = static_cast<uint64_t>(entry.mip_sizes[mip]);
+			mip_data.push_back(compressed_data.slice(static_cast<int64_t>(rel_offset), static_cast<int64_t>(rel_offset + mip_size)));
+		}
+		result["mip_data"] = mip_data;
+	}
 
 	return result;
 }
@@ -692,6 +796,37 @@ bool DSPkg::get_mip_entries_for_path(const String &p_path, Vector<DSPkgMipEntry>
 		mip_entry.reserved = 0;
 	}
 	return true;
+}
+
+bool DSPkg::get_mip_entries_for_offset(uint64_t p_offset, Vector<DSPkgMipEntry> &r_entries) const {
+	r_entries.clear();
+	if (!is_opened) {
+		return false;
+	}
+	const Vector<DSPkgMipEntry> *found = entries_by_offset.getptr(p_offset);
+	if (found == nullptr) {
+		return false;
+	}
+	r_entries = *found;
+	return true;
+}
+
+Array DSPkg::get_mip_entries_for_offset(uint64_t p_offset) const {
+	Array result;
+	Vector<DSPkgMipEntry> entries;
+	if (!get_mip_entries_for_offset(p_offset, entries)) {
+		return result;
+	}
+	for (int i = 0; i < entries.size(); ++i) {
+		const DSPkgMipEntry &mip_entry = entries[i];
+		Dictionary mip_dict;
+		mip_dict["offset"] = static_cast<int64_t>(mip_entry.offset);
+		mip_dict["compressed_size"] = static_cast<int64_t>(mip_entry.compressed_size);
+		mip_dict["uncompressed_size"] = static_cast<int64_t>(mip_entry.uncompressed_size);
+		mip_dict["row_pitch"] = static_cast<int64_t>(mip_entry.row_pitch);
+		result.append(mip_dict);
+	}
+	return result;
 }
 
 int DSPkg::get_entry_count() const {

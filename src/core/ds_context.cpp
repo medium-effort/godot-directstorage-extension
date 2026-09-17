@@ -34,21 +34,34 @@ static bool synchronize_rendering_device(const String &p_phase) {
 		return false;
 	}
 
-	// DirectStorage GPU synchronization contract (C3):
+	// DirectStorage GPU synchronization contract (enforced, not advisory):
 	// - Transfers write directly into D3D12 resources on the DirectStorage queue and are
 	//   synchronized via ID3D12Fence / IDStorageQueue completion fences.
 	// - Godot's main RenderingDevice submits command buffers per-frame; manual submit()/sync()
 	//   on the main instance is prohibited (Condition "is_main_instance" is true).
 	// - DirectStorage SDK requirement: destination resources for GPU decompression
-	//   (DSTORAGE_DESTINATION_MULTIPLE_SUBRESOURCES / DSTORAGE_DESTINATION_TEXTURE_REGION etc.)
-	//   MUST be in D3D12_RESOURCE_STATE_COMMON. Godot RD textures are generally in COMMON,
-	//   but may transition after render-target use. Callers must ensure COMMON state before
-	//   enqueue and must not sample the resource until batch_completed / fence wait confirms
-	//   visibility. This is enforced by rejecting GPU requests when D3D12 is not active and by
-	//   requiring fence wait (wait_for_completion) before RenderingDevice use.
-	// - Hazard: async path must wait for batch_completed before sampling; CPU fence wait
-	//   orders the DS copy before subsequently submitted Godot command lists (safe for sync
-	//   flush_batch, exposed for async flush_batch_async until collect_completed_results).
+	//   (DSTORAGE_DESTINATION_MULTIPLE_SUBRESOURCES / buffer destinations)
+	//   MUST be in D3D12_RESOURCE_STATE_COMMON. Enforcement (Win32Backend::enqueue_request):
+	//   (1) ID3D12Resource exposes no current-state query, so COMMON can only be
+	//       guaranteed by the barrier owner - Godot's RenderingDevice. This extension
+	//       therefore never records its own ResourceBarrier: a foreign barrier would
+	//       race Godot's per-frame command lists and corrupt RD state tracking.
+	//       Reject-with-clear-error is the safer option, documented here.
+	//   (2) A destination owned by an in-flight DirectStorage batch (possibly
+	//       mid-decompression, post-render-target use, state unknowable) fails GPU
+	//       enqueue loudly instead of proceeding. No silent CPU fallback: re-targeting
+	//       to memory behind the caller's back would leave the GPU texture unwritten
+	//       while the caller samples it as success.
+	// - Async no-sample-before-batch_completed is enforced the same way: destinations
+	//   stay flagged in-flight until the completion fence confirms and results are
+	//   collected, so any sample/reuse-before-complete surfaces as a loud enqueue
+	//   error pointing at batch_completed / wait_for_completion, and batch_completed
+	//   itself only fires after fence-confirmed collection. This gate below (reject
+	//   GPU work when D3D12 is not active) plus the fence wait in wait_for_completion
+	//   are the context-level halves of that contract.
+	// - Hazard note: CPU fence wait orders the DS copy before subsequently submitted
+	//   Godot command lists (safe for sync flush_batch, exposed for async
+	//   flush_batch_async until collect_completed_results).
 	return true;
 #else
 	UtilityFunctions::push_error("[DirectStorage] RenderingDevice synchronization unavailable during " + p_phase + ": platform is not Windows.");
@@ -154,6 +167,10 @@ bool DSContext::is_d3d12_backend() const {
 
 bool DSContext::is_initialized() const {
 	return initialized;
+}
+
+DSContext::InitStatus DSContext::get_init_status() const {
+	return init_status;
 }
 
 namespace {
@@ -492,6 +509,7 @@ bool DSContext::initialize_ds() {
 	bool backend_initialized = initialization_path.is_empty() ? backend->initialize() : backend->initialize(initialization_path);
 	if (backend_initialized) {
 		initialized = true;
+		init_status = INIT_STATUS_DIRECTSTORAGE_D3D12;
 		UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with Win32Backend.");
 		return true;
 	} else {
@@ -503,13 +521,21 @@ bool DSContext::initialize_ds() {
 
 	// Fallback backend for non-Windows or if Win32 DirectStorage initialization failed
 	active_backend = memnew(FallbackBackend);
-	active_backend->initialize();
+	if (!active_backend->initialize()) {
+		memdelete(active_backend);
+		active_backend = nullptr;
+		init_status = INIT_STATUS_FAILED;
+		UtilityFunctions::push_error("[DirectStorage] DirectStorage Context initialization failed: FallbackBackend could not start.");
+		return false;
+	}
 	initialized = true;
+	init_status = INIT_STATUS_SOFTWARE_FALLBACK;
 	UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with FallbackBackend.");
 	return true;
 }
 
 void DSContext::shutdown_ds() {
+	init_status = INIT_STATUS_UNINITIALIZED;
 	if (!initialized) {
 		return;
 	}
@@ -652,9 +678,9 @@ void DSContext::flush_batch() {
 	}
 }
 
-void DSContext::flush_batch_async() {
+Error DSContext::flush_batch_async() {
 	if (!initialized || !active_backend) {
-		return;
+		return ERR_UNCONFIGURED;
 	}
 	int submitted_request_count = 0;
 	{
@@ -662,10 +688,15 @@ void DSContext::flush_batch_async() {
 		submitted_request_count = pending_request_count;
 	}
 	if (submitted_request_count == 0) {
-		return;
+		return OK;
+	}
+	if (!active_backend->is_batch_complete()) {
+		// All batch slots are occupied: the caller must wait/poll
+		// (is_batch_complete / batch_completed) before flushing again.
+		// Non-silent busy feedback instead of silently dropping the batch.
+		return ERR_BUSY;
 	}
 	bool is_win32_backend = active_backend->get_name() == "Win32DirectStorage";
-	bool backend_was_ready = is_win32_backend || active_backend->is_batch_complete();
 	active_backend->submit_async();
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
@@ -675,7 +706,7 @@ void DSContext::flush_batch_async() {
 #endif
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
-		if (!is_win32_backend && backend_was_ready && submitted_request_count > 0) {
+		if (!is_win32_backend && submitted_request_count > 0) {
 			pending_batch_request_counts.push_back(submitted_request_count);
 		}
 		pending_request_count = 0;
@@ -686,6 +717,7 @@ void DSContext::flush_batch_async() {
 		finalize_completed_reports_locked();
 		evict_old_reports_if_needed_locked();
 	}
+	return OK;
 }
 
 bool DSContext::is_batch_complete() const {
@@ -770,8 +802,17 @@ void DSContext::collect_completed_results() {
 		if (pending_batch_request_counts.empty()) {
 			return;
 		}
-		completed_count = pending_batch_request_counts.front();
+		int submitted_count = pending_batch_request_counts.front();
 		pending_batch_request_counts.pop_front();
+		// Report actual succeeded requests, not merely submitted ones:
+		// failed requests carry STATUS_FAILED and must not inflate the count.
+		int succeeded_count = 0;
+		for (std::unordered_map<int64_t, Ref<DSRequest>>::const_iterator it = tracked_requests.begin(); it != tracked_requests.end(); ++it) {
+			if (it->second.is_valid() && it->second->get_status() == DSRequest::STATUS_COMPLETED) {
+				succeeded_count++;
+			}
+		}
+		completed_count = succeeded_count <= submitted_count ? succeeded_count : submitted_count;
 		finalize_completed_reports_locked();
 		evict_old_reports_if_needed_locked();
 	}
@@ -850,6 +891,7 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_supported"), &DSContext::is_supported);
 	ClassDB::bind_method(D_METHOD("is_d3d12_backend"), &DSContext::is_d3d12_backend);
 	ClassDB::bind_method(D_METHOD("is_initialized"), &DSContext::is_initialized);
+	ClassDB::bind_method(D_METHOD("get_init_status"), &DSContext::get_init_status);
 	ClassDB::bind_method(D_METHOD("get_active_backend_name"), &DSContext::get_active_backend_name);
 	ClassDB::bind_method(D_METHOD("is_gpu_decompression_available"), &DSContext::is_gpu_decompression_available);
 	ClassDB::bind_method(D_METHOD("is_gpu_decompression_enabled"), &DSContext::is_gpu_decompression_enabled);
@@ -889,6 +931,11 @@ void DSContext::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "staging_buffer_size_mb"), "set_staging_buffer_size_mb", "get_staging_buffer_size_mb");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disable_gpu_decompression"), "set_disable_gpu_decompression", "get_disable_gpu_decompression");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "queue_capacity"), "set_queue_capacity", "get_queue_capacity");
+
+	BIND_ENUM_CONSTANT(INIT_STATUS_UNINITIALIZED);
+	BIND_ENUM_CONSTANT(INIT_STATUS_DIRECTSTORAGE_D3D12);
+	BIND_ENUM_CONSTANT(INIT_STATUS_SOFTWARE_FALLBACK);
+	BIND_ENUM_CONSTANT(INIT_STATUS_FAILED);
 
 	ADD_SIGNAL(MethodInfo("batch_completed",
 		PropertyInfo(Variant::INT, "fence_value"),

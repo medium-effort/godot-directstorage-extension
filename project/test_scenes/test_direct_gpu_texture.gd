@@ -108,8 +108,35 @@ func _run_spike() -> void:
 	var fence_complete: bool = ctx.wait_for_completion(5000)
 	var succeeded := fence_complete and request.status == DSRequest.STATUS_COMPLETED
 	if succeeded:
-		status_label.text = "PASS: fence signaled; texture written. Inspect D3D12 debug output for state warnings."
-		print("[GPU Texture Spike] PASS status=", request.status, " fence=", ctx.get_completion_fence(), " backend=", ctx.get_active_backend_name())
+		# Verify texel readback byte-for-byte against source payload
+		var mip0_data: PackedByteArray = rd.texture_get_data(texture_rid, 0)
+		if mip0_data.size() < TEXTURE_WIDTH * TEXTURE_HEIGHT * 4:
+			_fail("Readback of mip 0 returned insufficient bytes: " + str(mip0_data.size()))
+			return
+		for y in range(TEXTURE_HEIGHT):
+			for x in range(TEXTURE_WIDTH):
+				var read_off := (y * TEXTURE_WIDTH + x) * 4
+				var src_off := y * ROW_PITCH + x * 4
+				for c in range(4):
+					if mip0_data[read_off + c] != payload[src_off + c]:
+						_fail("Texel mismatch at mip 0 (%d, %d) channel %d: got %d, expected %d" % [x, y, c, mip0_data[read_off + c], payload[src_off + c]])
+						return
+
+		var mip1_data: PackedByteArray = rd.texture_get_data(texture_rid, 1)
+		if mip1_data.size() < MIP1_WIDTH * MIP1_HEIGHT * 4:
+			_fail("Readback of mip 1 returned insufficient bytes: " + str(mip1_data.size()))
+			return
+		for y in range(MIP1_HEIGHT):
+			for x in range(MIP1_WIDTH):
+				var read_off := (y * MIP1_WIDTH + x) * 4
+				var src_off := MIP1_OFFSET + y * ROW_PITCH + x * 4
+				for c in range(4):
+					if mip1_data[read_off + c] != payload[src_off + c]:
+						_fail("Texel mismatch at mip 1 (%d, %d) channel %d: got %d, expected %d" % [x, y, c, mip1_data[read_off + c], payload[src_off + c]])
+						return
+
+		status_label.text = "PASS: fence signaled; texture written; texels verified identical."
+		print("[GPU Texture Spike] PASS status=", request.status, " fence=", ctx.get_completion_fence(), " backend=", ctx.get_active_backend_name(), " texels=VERIFIED_IDENTICAL")
 	else:
 		_fail("GPU texture request failed: " + request.error_message)
 

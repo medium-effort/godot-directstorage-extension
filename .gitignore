@@ -47,6 +47,7 @@ project/test_assets/*.png
 .env
 .env.local
 *.env
+src/cppcheck_result.xml
 
 # ==============================================================================
 # Local Tooling & Agent Metadata

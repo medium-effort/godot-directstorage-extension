@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Filter cppcheck XML to the important part: defects located in src/.
+
+Replicates the xmlq exploration used last session:
+  xmlq stat / tags / schema / attrs + json pipe + grouping,
+but skips the noise (godot-cpp/*, thirdparty/*).
+
+Usage:
+  python filter_cppcheck.py [xml_file] [--all] [--json] [--severity error,warning]
+                           [--verbose] [--max-examples N] [--max-msgs N]
+
+  [xml_file]   default: src/cppcheck_result.xml (relative to project root)
+  --all        include godot-cpp/* and thirdparty/* locations too
+  --json       machine-readable output of the filtered set (grouped too)
+  --severity   comma list to keep, e.g. --severity error,warning,portability
+  --verbose    expand every occurrence (default is grouped to save tokens)
+  --max-examples N  example locations shown per distinct message (default 3)
+  --max-msgs N      distinct messages shown per id (default 5)
+
+Grouped view (default) collapses identical (severity, id, msg) so a
+31x repeat like "Potentially invalid type conversion..." costs one block.
+"""
+import json
+import sys
+import xml.etree.ElementTree as ET
+from collections import Counter
+from pathlib import Path
+
+
+NOISE_PREFIXES = ("godot-cpp/", "thirdparty/")
+
+
+def primary_location(err):
+    locs = err.findall("location")
+    if not locs:
+        return {}, []
+    first = locs[0].attrib
+    all_files = [l.attrib.get("file", "?") for l in locs]
+    return first, all_files
+
+
+def is_noise(file_path: str) -> bool:
+    f = (file_path or "").replace("\\", "/")
+    return f.startswith(NOISE_PREFIXES)
+
+
+def main(argv):
+    args = [a for a in argv if not a.startswith("--")]
+    flags = [a for a in argv if a.startswith("--")]
+    xml_file = Path(args[0]) if args else Path("src/cppcheck_result.xml")
+    show_all = "--all" in flags
+    as_json = "--json" in flags
+    verbose = "--verbose" in flags or "--no-group" in flags
+    max_examples = 3
+    max_msgs = 5
+    for f in flags:
+        if f.startswith("--max-examples="):
+            try:
+                max_examples = max(1, int(f.split("=", 1)[1]))
+            except ValueError:
+                pass
+        if f.startswith("--max-msgs="):
+            try:
+                max_msgs = max(1, int(f.split("=", 1)[1]))
+            except ValueError:
+                pass
+    sev_filter = None
+    for f in flags:
+        if f.startswith("--severity="):
+            sev_filter = set(f.split("=", 1)[1].split(","))
+        elif f == "--severity":
+            idx = flags.index(f)
+            # --severity error,warning form handled via = above; bare flag ignored
+            _ = idx
+
+    # also support: --severity error,warning as two tokens
+    if "--severity" in flags:
+        i = flags.index("--severity")
+        # next argv token after --severity if it is not a flag
+        try:
+            raw = argv[argv.index("--severity") + 1]
+            if not raw.startswith("--"):
+                sev_filter = set(raw.split(","))
+        except IndexError:
+            pass
+
+    try:
+        tree = ET.parse(xml_file)
+    except FileNotFoundError:
+        print(f"not found: {xml_file}", file=sys.stderr)
+        return 2
+    except ET.ParseError as e:
+        print(f"invalid XML: {e}", file=sys.stderr)
+        return 1
+
+    root = tree.getroot()
+    errors = root.findall(".//error")
+    total = len(errors)
+
+    kept = []
+    skipped = 0
+    for e in errors:
+        loc, _ = primary_location(e)
+        f = (loc.get("file", "?") or "?").replace("\\", "/")
+        sev = e.attrib.get("severity", "?")
+        if sev_filter and sev not in sev_filter:
+            continue
+        if not show_all and is_noise(f):
+            skipped += 1
+            continue
+        kept.append(e)
+
+    if as_json:
+        # Grouped JSON: one entry per distinct (severity, id, msg) with
+        # count + example locations, so repeats don't waste tokens.
+        groups = {}
+        for e in kept:
+            loc, _ = primary_location(e)
+            key = (e.attrib.get("severity"), e.attrib.get("id"),
+                   e.attrib.get("msg"))
+            g = groups.setdefault(key, {"count": 0, "cwe": e.attrib.get("cwe"),
+                                        "examples": []})
+            g["count"] += 1
+            if len(g["examples"]) < max_examples:
+                g["examples"].append({"file": loc.get("file"),
+                                      "line": loc.get("line"),
+                                      "column": loc.get("column")})
+        out = [{"severity": k[0], "id": k[1], "msg": k[2],
+                "count": v["count"], "cwe": v["cwe"],
+                "examples": v["examples"]} for k, v in groups.items()]
+        out.sort(key=lambda g: (-g["count"], g["severity"] or "", g["id"] or ""))
+        json.dump({"total": total, "kept": len(kept), "skipped_noise": skipped,
+                   "groups": out}, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+    sev_counts = Counter(e.attrib.get("severity", "?") for e in kept)
+    id_counts = Counter(e.attrib.get("id", "?") for e in kept)
+    file_counts = Counter(
+        ((primary_location(e)[0].get("file", "?") or "?").replace("\\", "/")) for e in kept
+    )
+
+    print(f"file: {xml_file}  total={total}  kept={len(kept)}  skipped_noise={skipped}")
+    print(f"severity: {dict(sev_counts)}")
+    print(f"top ids: {id_counts.most_common(15)}")
+    print(f"by file: {dict(file_counts)}")
+    print("-" * 80)
+    # Actionable first: error > warning > portability > performance > style
+    rank = {"error": 0, "warning": 1, "portability": 2, "performance": 3, "style": 4}
+    if verbose:
+        kept.sort(key=lambda e: (rank.get(e.attrib.get("severity", "?"), 9),
+                                 e.attrib.get("id", "")))
+        for e in kept:
+            loc, _ = primary_location(e)
+            where = f"{loc.get('file', '?')}:{loc.get('line', '?')}"
+            print(f"{e.attrib.get('severity')} {e.attrib.get('id')} | {where} | "
+                  f"{(e.attrib.get('msg', '') or '')[:160]}")
+        return 0
+    # Grouped: collapse exact same (severity, id, msg) into one block.
+    by_id = {}
+    for e in kept:
+        by_id.setdefault((e.attrib.get("severity"), e.attrib.get("id")), []).append(e)
+    for (sev, cid) in sorted(by_id, key=lambda k: (-len(by_id[k]),
+                                                  rank.get(k[0], 9), k[1] or "")):
+        items = by_id[(sev, cid)]
+        msgs = {}
+        for e in items:
+            msgs.setdefault(e.attrib.get("msg", ""), []).append(e)
+        print(f"{sev} {cid} x{len(items)} ({len(msgs)} distinct msg)")
+        for msg, occ in sorted(msgs.items(), key=lambda kv: -len(kv[1]))[:max_msgs]:
+            files = Counter(
+                ((primary_location(e)[0].get("file", "?") or "?")) for e in occ)
+            top = ", ".join(f"{f}({c})" for f, c in files.most_common(3))
+            print(f"  x{len(occ)} | {(msg or '')[:150]}")
+            print(f"    in: {top}")
+            for e in occ[:max_examples]:
+                loc, _ = primary_location(e)
+                print(f"    e.g. {loc.get('file', '?')}:{loc.get('line', '?')}")
+        if len(msgs) > max_msgs:
+            print(f"  ... +{len(msgs) - max_msgs} more distinct msgs")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -69,6 +69,7 @@ private:
 	DSPkgHeader loaded_header{};
 	HashMap<String, DSPkgEntry> entries_by_path;
 	HashMap<uint64_t, Vector<DSPkgEntry>> entries_by_hash;
+	HashMap<uint64_t, Vector<DSPkgMipEntry>> entries_by_offset;
 	bool is_opened = false;
 
 	const DSPkgEntry *find_entry_for_path(const String &p_resource_path) const;
@@ -91,6 +92,8 @@ public:
 	Dictionary read_texture(const String &p_resource_path) const;
 	Dictionary get_entry_info(const String &p_resource_path) const;
 	bool get_mip_entries_for_path(const String &p_path, Vector<DSPkgMipEntry> &r_entries) const;
+	bool get_mip_entries_for_offset(uint64_t p_offset, Vector<DSPkgMipEntry> &r_entries) const;
+	Array get_mip_entries_for_offset(uint64_t p_offset) const;
 	int get_entry_count() const;
 	Array get_entries() const;
 };

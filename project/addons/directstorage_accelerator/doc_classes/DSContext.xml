@@ -36,9 +36,9 @@
 			</description>
 		</method>
 		<method name="flush_batch_async">
-			<return type="void" />
+			<return type="Error" />
 			<description>
-				Submits all requests currently queued to the DirectStorage runtime asynchronously without blocking the calling thread. Completion is signaled via [signal batch_completed] or [signal batch_failed].
+				Submits all requests currently queued to the DirectStorage runtime asynchronously without blocking the calling thread. Returns [constant OK] if the batch was submitted, [constant ERR_UNCONFIGURED] if the context is uninitialized or has no active backend, or [constant ERR_BUSY] if all backend batch slots are occupied. Completion is signaled via [signal batch_completed] or [signal batch_failed].
 			</description>
 		</method>
 		<method name="get_active_backend_name" qualifiers="const">
@@ -77,6 +77,12 @@
 		<method name="get_gpu_decompression_support_tier" qualifiers="const">
 			<return type="int" />
 			<description>Returns the GPU decompression support tier reported by DirectStorage ([code]0[/code] for unsupported or software-only, [code]1[/code] or higher for hardware GPU decompression support).</description>
+		</method>
+		<method name="get_init_status" qualifiers="const">
+			<return type="int" enum="DSContext.InitStatus" />
+			<description>
+				Returns the initialization status of the DirectStorage context as an [enum DSContext.InitStatus] constant.
+			</description>
 		</method>
 		<method name="get_pending_request_count" qualifiers="const">
 			<return type="int" />
@@ -208,4 +214,18 @@
 			</description>
 		</signal>
 	</signals>
+	<constants>
+		<constant name="INIT_STATUS_UNINITIALIZED" value="0" enum="InitStatus">
+			The DirectStorage context has not been initialized.
+		</constant>
+		<constant name="INIT_STATUS_DIRECTSTORAGE_D3D12" value="1" enum="InitStatus">
+			DirectStorage runtime initialized successfully with the native Win32 D3D12 backend.
+		</constant>
+		<constant name="INIT_STATUS_SOFTWARE_FALLBACK" value="2" enum="InitStatus">
+			DirectStorage native runtime was unavailable; initialized with the CPU software fallback backend.
+		</constant>
+		<constant name="INIT_STATUS_FAILED" value="3" enum="InitStatus">
+			Context initialization failed completely (neither DirectStorage nor software fallback could start).
+		</constant>
+	</constants>
 </class>

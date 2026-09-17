@@ -109,6 +109,11 @@ $tarExcludes = @(
     "--exclude=.git",
     "--exclude=.vscode",
     "--exclude=.codegraph",
+    "--exclude=.opencode",
+    "--exclude=.agents",
+    "--exclude=.crewmate",
+    "--exclude=.godot",
+    "--exclude=godot-cpp",
     "--exclude=.env*",
     "--exclude=.sconsign*",
     "--exclude=*.obj",
@@ -208,7 +213,7 @@ if ($ShouldSync) {
                     }
                 }
                 try {
-                    Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
+                    Copy-Item -Path $SourcePath -Destination $DestinationPath -Force -ErrorAction Stop
                 } catch {
                     if ((Test-Path $DestinationPath) -and $DestinationPath.ToLower().EndsWith(".dll")) {
                         $oldPath = "$DestinationPath.old"
@@ -222,7 +227,7 @@ if ($ShouldSync) {
                         try {
                             Move-Item -Path $DestinationPath -Destination $oldPath -Force -ErrorAction SilentlyContinue
                         } catch { $null = $_ }
-                        Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
+                        Copy-Item -Path $SourcePath -Destination $DestinationPath -Force -ErrorAction SilentlyContinue
                     } else {
                         throw $_
                     }

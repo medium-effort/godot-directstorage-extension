@@ -11,12 +11,15 @@
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #ifdef _WIN32
 #include <winioctl.h>
+#include <dxgi.h>
 #endif
 
+#include <cstdio>
 #include <string>
 #include <chrono>
 #include <cstring>
@@ -77,6 +80,19 @@ struct DSChunkBoundary {
 	uint64_t destination_offset = 0;
 	uint64_t destination_size = 0;
 };
+
+// Cached DSPkg for the active .dspkg archive path. get_texture_mip_entries()
+// runs on every texture enqueue; reopening/reparsing the archive per enqueue
+// costs disk I/O plus full entry-table validation. The cache holds the last
+// successfully opened package keyed by resolved path. A path switch frees the
+// old package and opens the new one; an open failure clears the cache and
+// returns empty (no crash). All access happens under Win32Backend::batch_mutex
+// (enqueue_request holds it across the get_texture_mip_entries call), so no
+// additional locking is needed here.
+static struct DSPkgCache {
+	String path;
+	Ref<DSPkg> package;
+} *s_dspkg_cache = nullptr;
 
 static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t p_capacity, Vector<DSChunkBoundary> &r_chunks) {
 	if (p_path.get_extension().to_lower() != "dstex") {
@@ -198,29 +214,41 @@ static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vec
 	}
 
 	if (ext == "dspkg") {
-		DSPkg package;
-		if (package.open(resolved_path) != OK) {
+		// Reuse the cached package for the active archive path instead of
+		// reopening/reparsing the .dspkg on every enqueue. Path switch drops
+		// the old package; open failure clears the cache and returns false.
+		if (!s_dspkg_cache) {
+			s_dspkg_cache = memnew(DSPkgCache);
+		}
+		if (s_dspkg_cache->package.is_null() || s_dspkg_cache->path != resolved_path) {
+			Ref<DSPkg> fresh;
+			fresh.instantiate();
+			if (fresh.is_null() || fresh->open(resolved_path) != OK) {
+				s_dspkg_cache->package.unref();
+				s_dspkg_cache->path = String();
+				return false;
+			}
+			s_dspkg_cache->package = fresh;
+			s_dspkg_cache->path = resolved_path;
+		}
+		// O(1) direct lookup by absolute payload offset
+		// (header.data_offset + entry.data_offset). Miss (false) means a
+		// legacy entry without GPU mip metadata or an unknown offset — fall
+		// back to the safe error path in enqueue_request, no crash.
+		Vector<DSPkgMipEntry> package_entries;
+		if (!s_dspkg_cache->package->get_mip_entries_for_offset(p_offset, package_entries) || package_entries.is_empty()) {
 			return false;
 		}
-		Array entry_paths = package.get_entries();
-		for (int entry_idx = 0; entry_idx < entry_paths.size(); entry_idx++) {
-			Vector<DSPkgMipEntry> package_entries;
-			String entry_path = entry_paths[entry_idx];
-			if (!package.get_mip_entries_for_path(entry_path, package_entries) || package_entries.is_empty() ||
-					package_entries[0].offset != p_offset) {
-				continue;
-			}
-			r_entries.resize(package_entries.size());
-			for (int mip_idx = 0; mip_idx < package_entries.size(); mip_idx++) {
-				const DSPkgMipEntry &package_entry = package_entries[mip_idx];
-				r_entries.write[mip_idx].offset = package_entry.offset;
-				r_entries.write[mip_idx].compressed_size = package_entry.compressed_size;
-				r_entries.write[mip_idx].uncompressed_size = package_entry.uncompressed_size;
-				r_entries.write[mip_idx].row_pitch = package_entry.row_pitch;
-				r_entries.write[mip_idx].reserved = package_entry.reserved;
-			}
-			return true;
+		r_entries.resize(package_entries.size());
+		for (int mip_idx = 0; mip_idx < package_entries.size(); mip_idx++) {
+			const DSPkgMipEntry &package_entry = package_entries[mip_idx];
+			r_entries.write[mip_idx].offset = package_entry.offset;
+			r_entries.write[mip_idx].compressed_size = package_entry.compressed_size;
+			r_entries.write[mip_idx].uncompressed_size = package_entry.uncompressed_size;
+			r_entries.write[mip_idx].row_pitch = package_entry.row_pitch;
+			r_entries.write[mip_idx].reserved = package_entry.reserved;
 		}
+		return true;
 	}
 
 	return false;
@@ -297,7 +325,225 @@ static void release_all_resource_guards() {
 	s_resource_guards.clear();
 }
 
-static bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_error) {
+// One-shot guard re-query context. validate_resource_guard() runs on the
+// completion thread (or the polling thread via poll_batch_status()), but
+// RenderingDevice::get_driver_resource() is render-thread-affine, so the live
+// re-query is marshalled to the render thread with
+// RenderingServer::call_on_render_thread(). The waiting thread allocates the
+// context on its stack and publishes it via s_guard_validate_ctx; the
+// render-thread worker consumes it and signals completion. Completion-path
+// validation is serialized by batch_mutex, so a single atomic handoff slot is
+// sufficient (same pattern as the device-acquisition context below).
+struct DSGuardValidateContext {
+	std::mutex mutex;
+	std::condition_variable cv;
+	bool completed = false;
+	// Inputs set by the waiting thread before posting the worker.
+	bool is_buffer_request = false;
+	RID destination_rid;
+	// Outputs set by the render-thread worker.
+	uint64_t resource_handle = 0;
+	bool rd_available = false;
+};
+static std::atomic<DSGuardValidateContext *> s_guard_validate_ctx{ nullptr };
+
+// Render-thread worker posted via RenderingServer::call_on_render_thread().
+// Must be a file-static function: the completion path has no Godot Object to
+// bind, so callable_mp_static is required (same constraint as the device-acquisition worker).
+static void ds_win32_fetch_guard_resource_on_render_thread() {
+	DSGuardValidateContext *ctx = s_guard_validate_ctx.exchange(nullptr);
+	if (!ctx) {
+		return;
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	uint64_t handle = 0;
+	bool rd_available = false;
+	if (rd) {
+		rd_available = true;
+		auto resource_type = ctx->is_buffer_request
+				? RenderingDevice::DRIVER_RESOURCE_BUFFER
+				: RenderingDevice::DRIVER_RESOURCE_TEXTURE;
+		handle = rd->get_driver_resource(resource_type, ctx->destination_rid, 0);
+	}
+	{
+		std::lock_guard<std::mutex> lock(ctx->mutex);
+		ctx->resource_handle = handle;
+		ctx->rd_available = rd_available;
+		ctx->completed = true;
+	}
+	ctx->cv.notify_one();
+}
+
+// Render-thread-affine guard re-query used by validate_resource_guard().
+// Returns true and fills r_resource when the query ran against a live
+// RenderingDevice (inline when already on the render thread, otherwise via a
+// marshalled worker). Returns false when the render thread could not answer:
+// the bounded wait elapsed (render thread stalled or engine shutting down) or
+// the device was gone by the time the worker ran. In that case the caller
+// must fall back to the cached guard only and treat the RID-replacement check
+// as unverifiable. The wait is bounded so the completion thread can never
+// block shutdown unboundedly; the handoff-reclaim pattern keeps
+// a late worker from ever touching the stack context.
+static bool ds_win32_query_guard_resource_on_render_thread(bool p_is_buffer_request, const RID &p_destination_rid, ID3D12Resource *&r_resource) {
+	r_resource = nullptr;
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (!rs) {
+		return false;
+	}
+	if (rs->is_on_render_thread()) {
+		RenderingDevice *rd = rs->get_rendering_device();
+		if (!rd) {
+			return false;
+		}
+		auto resource_type = p_is_buffer_request
+				? RenderingDevice::DRIVER_RESOURCE_BUFFER
+				: RenderingDevice::DRIVER_RESOURCE_TEXTURE;
+		r_resource = reinterpret_cast<ID3D12Resource *>(rd->get_driver_resource(resource_type, p_destination_rid, 0));
+		return true;
+	}
+	DSGuardValidateContext ctx;
+	ctx.is_buffer_request = p_is_buffer_request;
+	ctx.destination_rid = p_destination_rid;
+	s_guard_validate_ctx.store(&ctx);
+	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_guard_resource_on_render_thread));
+	{
+		std::unique_lock<std::mutex> lock(ctx.mutex);
+		// 250 ms >> one render frame (~16 ms at 60 fps), so a healthy render
+		// thread answers in time; a stalled or torn-down render thread delays
+		// completion-path validation by at most this bound, never shutdown.
+		constexpr std::chrono::milliseconds kGuardValidateTimeout(250);
+		bool signaled = ctx.cv.wait_for(lock, kGuardValidateTimeout, [&ctx] { return ctx.completed; });
+		if (!signaled) {
+			// Bounded degradation: if the worker has not picked
+			// up the handoff yet, reclaim it so a late worker cannot touch
+			// this stack context. If the worker already picked it up, it is
+			// about to signal, so wait for that signal instead.
+			if (s_guard_validate_ctx.exchange(nullptr) == &ctx) {
+				return false;
+			}
+			ctx.cv.wait(lock, [&ctx] { return ctx.completed; });
+		}
+		if (!ctx.rd_available) {
+			return false;
+		}
+		r_resource = reinterpret_cast<ID3D12Resource *>(ctx.resource_handle);
+		return true;
+	}
+}
+
+// Render-thread destination query context for enqueue_request().
+// Marshals RenderingDevice::get_driver_resource() and ID3D12Resource::GetDesc()
+// to the render thread when called from main/worker threads.
+struct DSGPUDestinationContext {
+	std::mutex mutex;
+	std::condition_variable cv;
+	bool completed = false;
+	bool is_buffer_request = false;
+	RID destination_rid;
+	ID3D12Resource *resource = nullptr;
+	D3D12_RESOURCE_DESC desc = {};
+	uint64_t native_format = 0;
+	bool rd_available = false;
+};
+static std::atomic<DSGPUDestinationContext *> s_gpu_dest_query_ctx{ nullptr };
+
+static void ds_win32_fetch_destination_resource_on_render_thread() {
+	DSGPUDestinationContext *ctx = s_gpu_dest_query_ctx.exchange(nullptr);
+	if (!ctx) {
+		return;
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	ID3D12Resource *resource = nullptr;
+	D3D12_RESOURCE_DESC desc = {};
+	uint64_t native_format = 0;
+	bool rd_available = false;
+	if (rd) {
+		rd_available = true;
+		auto resource_type = ctx->is_buffer_request
+				? RenderingDevice::DRIVER_RESOURCE_BUFFER
+				: RenderingDevice::DRIVER_RESOURCE_TEXTURE;
+		uint64_t handle = rd->get_driver_resource(resource_type, ctx->destination_rid, 0);
+		resource = reinterpret_cast<ID3D12Resource *>(handle);
+		if (resource) {
+			desc = resource->GetDesc();
+			if (!ctx->is_buffer_request) {
+				native_format = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, ctx->destination_rid, 0);
+			}
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(ctx->mutex);
+		ctx->resource = resource;
+		ctx->desc = desc;
+		ctx->native_format = native_format;
+		ctx->rd_available = rd_available;
+		ctx->completed = true;
+	}
+	ctx->cv.notify_one();
+}
+
+static bool ds_win32_query_destination_resource_on_render_thread(
+		bool p_is_buffer_request,
+		const RID &p_destination_rid,
+		ID3D12Resource *&r_resource,
+		D3D12_RESOURCE_DESC &r_desc,
+		uint64_t &r_native_format,
+		bool &r_rd_available) {
+	r_resource = nullptr;
+	r_desc = {};
+	r_native_format = 0;
+	r_rd_available = false;
+
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+		return false;
+	}
+	if (rs->is_on_render_thread()) {
+		RenderingDevice *rd = rs->get_rendering_device();
+		if (!rd) {
+			return false;
+		}
+		r_rd_available = true;
+		auto resource_type = p_is_buffer_request
+				? RenderingDevice::DRIVER_RESOURCE_BUFFER
+				: RenderingDevice::DRIVER_RESOURCE_TEXTURE;
+		uint64_t handle = rd->get_driver_resource(resource_type, p_destination_rid, 0);
+		r_resource = reinterpret_cast<ID3D12Resource *>(handle);
+		if (r_resource) {
+			r_desc = r_resource->GetDesc();
+			if (!p_is_buffer_request) {
+				r_native_format = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, p_destination_rid, 0);
+			}
+		}
+		return true;
+	}
+
+	DSGPUDestinationContext ctx;
+	ctx.is_buffer_request = p_is_buffer_request;
+	ctx.destination_rid = p_destination_rid;
+	s_gpu_dest_query_ctx.store(&ctx);
+	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_destination_resource_on_render_thread));
+	{
+		std::unique_lock<std::mutex> lock(ctx.mutex);
+		constexpr std::chrono::milliseconds kDestQueryTimeout(250);
+		bool signaled = ctx.cv.wait_for(lock, kDestQueryTimeout, [&ctx] { return ctx.completed; });
+		if (!signaled) {
+			if (s_gpu_dest_query_ctx.exchange(nullptr) == &ctx) {
+				return false;
+			}
+			ctx.cv.wait(lock, [&ctx] { return ctx.completed; });
+		}
+		r_rd_available = ctx.rd_available;
+		r_resource = ctx.resource;
+		r_desc = ctx.desc;
+		r_native_format = ctx.native_format;
+		return true;
+	}
+}
+
+static bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_error, std::unordered_map<int64_t, ID3D12Resource *> *p_rid_cache = nullptr) {
 	if (p_request.is_null() || (p_request->get_destination_type() != DSRequest::DESTINATION_GPU_BUFFER &&
 			p_request->get_destination_type() != DSRequest::DESTINATION_GPU_TEXTURE)) {
 		return true;
@@ -317,10 +563,34 @@ static bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_e
 		return false;
 	}
 
-	auto resource_type = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER
-			? RenderingDevice::DRIVER_RESOURCE_BUFFER
-			: RenderingDevice::DRIVER_RESOURCE_TEXTURE;
-	ID3D12Resource *current_resource = reinterpret_cast<ID3D12Resource *>(rd->get_driver_resource(resource_type, destination_rid, 0));
+	// get_driver_resource() is render-thread-affine but this runs on the
+	// completion (or polling) thread, so the re-query is marshalled above.
+	// When the render thread cannot answer, fall back to the cached guard
+	// only: the AddRef'd ID3D12Resource captured at enqueue time is still
+	// alive, so the DirectStorage write landed in the right memory and only
+	// the RID-replacement check is skipped as unverifiable.
+	bool is_buffer_request = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER;
+	ID3D12Resource *current_resource = nullptr;
+	bool has_cached = false;
+	int64_t rid_id = destination_rid.get_id();
+	if (p_rid_cache) {
+		std::unordered_map<int64_t, ID3D12Resource *>::const_iterator cache_it = p_rid_cache->find(rid_id);
+		if (cache_it != p_rid_cache->end()) {
+			current_resource = cache_it->second;
+			has_cached = true;
+		}
+	}
+	if (!has_cached) {
+		if (!ds_win32_query_guard_resource_on_render_thread(is_buffer_request, destination_rid, current_resource)) {
+			if (p_rid_cache) {
+				(*p_rid_cache)[rid_id] = guard->second;
+			}
+			return true;
+		}
+		if (p_rid_cache) {
+			(*p_rid_cache)[rid_id] = current_resource;
+		}
+	}
 	if (!current_resource || current_resource != guard->second) {
 		r_error = "DirectStorage GPU resource RID was freed or replaced before batch completion.";
 		return false;
@@ -561,10 +831,11 @@ void Win32Backend::poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>>
 	p_queue.completed_fence_value = p_queue.completion_fence->GetCompletedValue();
 	String queue_error = retrieve_queue_error(p_queue.queue);
 
+	std::unordered_map<int64_t, ID3D12Resource *> rid_cache;
 	for (int i = 0; i < p_requests.size(); i++) {
 		if (p_requests[i].is_valid()) {
 			String resource_error;
-			if (!validate_resource_guard(p_requests[i], resource_error)) {
+			if (!validate_resource_guard(p_requests[i], resource_error, &rid_cache)) {
 				UtilityFunctions::push_warning(resource_error);
 				p_requests[i]->set_status(DSRequest::STATUS_FAILED);
 				p_requests[i]->set_error_message(resource_error);
@@ -728,25 +999,158 @@ void Win32Backend::completion_thread_func() {
 static ID3D12Device *s_d3d12_device = nullptr;
 static std::mutex s_device_mutex;
 
+// One-shot render-thread acquisition context. The waiting thread allocates
+// a context on its stack and publishes it via s_device_acquire_ctx; the
+// render-thread worker consumes it and signals completion. initialize() is
+// single-shot so a single atomic handoff slot is sufficient.
+struct DSDeviceAcquireContext {
+	std::mutex mutex;
+	std::condition_variable cv;
+	bool completed = false;
+};
+static std::atomic<DSDeviceAcquireContext *> s_device_acquire_ctx{ nullptr };
+
+// Log-only adapter identity. Compares Godot's D3D12 adapter LUID against
+// the default DXGI adapter; a mismatch is informational only (multi-GPU)
+// and never fails acquisition.
+static void ds_win32_log_d3d12_adapter_identity(ID3D12Device *p_device) {
+	if (!p_device) {
+		return;
+	}
+	LUID luid = p_device->GetAdapterLuid();
+	char luid_buf[64];
+	snprintf(luid_buf, sizeof(luid_buf), "%08X-%08X", (unsigned int)luid.HighPart, (unsigned int)luid.LowPart);
+	UtilityFunctions::print_verbose(String("[DirectStorage] D3D12 device adapter LUID: ") + String(luid_buf) + ".");
+	IDXGIFactory1 *factory = nullptr;
+	if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && factory) {
+		IDXGIAdapter1 *default_adapter = nullptr;
+		if (SUCCEEDED(factory->EnumAdapters1(0, &default_adapter)) && default_adapter) {
+			DXGI_ADAPTER_DESC1 desc = {};
+			if (SUCCEEDED(default_adapter->GetDesc1(&desc))) {
+				bool match = (desc.AdapterLuid.HighPart == luid.HighPart && desc.AdapterLuid.LowPart == luid.LowPart);
+				if (match) {
+					UtilityFunctions::print_verbose("[DirectStorage] D3D12 adapter is the default DXGI adapter.");
+				} else {
+					UtilityFunctions::print_verbose("[DirectStorage] D3D12 adapter is NOT the default DXGI adapter (multi-GPU system; informational only).");
+				}
+			}
+			default_adapter->Release();
+		}
+		factory->Release();
+	}
+}
+
+// Direct fetch; the caller must already be on the render thread.
+static ID3D12Device *ds_win32_fetch_d3d12_device_direct() {
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+		return nullptr;
+	}
+	RenderingDevice *rd = rs->get_rendering_device();
+	if (!rd) {
+		return nullptr;
+	}
+	uint64_t handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0);
+	if (handle == 0) {
+		return nullptr;
+	}
+	ID3D12Device *device = reinterpret_cast<ID3D12Device *>(handle);
+	{
+		std::lock_guard<std::mutex> lock(s_device_mutex);
+		s_d3d12_device = device;
+	}
+	ds_win32_log_d3d12_adapter_identity(device);
+	return device;
+}
+
+// Render-thread worker posted via RenderingServer::call_on_render_thread().
+// Must be a file-static function: PlatformBackend is not a Godot Object, so
+// callable_mp on `this` is impossible and callable_mp_static is required.
+static void ds_win32_fetch_d3d12_device_on_render_thread() {
+	ds_win32_fetch_d3d12_device_direct();
+	DSDeviceAcquireContext *ctx = s_device_acquire_ctx.exchange(nullptr);
+	if (ctx) {
+		{
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			ctx->completed = true;
+		}
+		ctx->cv.notify_one();
+	}
+}
+
 ID3D12Device *ds_win32_get_d3d12_device() {
-	std::lock_guard<std::mutex> lock(s_device_mutex);
-	if (s_d3d12_device) {
-		return s_d3d12_device;
+	{
+		std::lock_guard<std::mutex> lock(s_device_mutex);
+		if (s_d3d12_device) {
+			return s_d3d12_device;
+		}
 	}
 
 	RenderingServer *rs = RenderingServer::get_singleton();
-	if (rs && rs->get_current_rendering_driver_name().to_lower() == "d3d12") {
-		RenderingDevice *rd = rs->get_rendering_device();
-		if (rd && rs->is_on_render_thread()) {
-			uint64_t handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0);
-			if (handle != 0) {
-				s_d3d12_device = reinterpret_cast<ID3D12Device *>(handle);
-				return s_d3d12_device;
+	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+		return nullptr;
+	}
+
+	// Fast path: already on the render thread, fetch directly (also avoids
+	// posting a callable to ourselves and self-deadlocking below).
+	if (rs->is_on_render_thread()) {
+		return ds_win32_fetch_d3d12_device_direct();
+	}
+
+	// Marshal acquisition to the render thread with a bounded wait.
+	// s_device_mutex is NOT held across the blocking wait; the worker takes
+	// it when caching the device.
+	DSDeviceAcquireContext ctx;
+	s_device_acquire_ctx.store(&ctx);
+	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_d3d12_device_on_render_thread));
+	{
+		std::unique_lock<std::mutex> lock(ctx.mutex);
+		if (!ctx.cv.wait_for(lock, std::chrono::seconds(5), [&ctx] { return ctx.completed; })) {
+			// Bounded degradation: if the worker has not picked up the
+			// handoff yet, reclaim it so a late worker cannot touch this
+			// stack context; the nullptr return below preserves the existing
+			// "Could not acquire a usable D3D12 device." behavior. If the
+			// worker already picked it up, it is about to signal, so wait
+			// for that signal instead of destroying the context.
+			if (s_device_acquire_ctx.exchange(nullptr) == &ctx) {
+				UtilityFunctions::print("[DirectStorage] D3D12 device acquisition timed out waiting for the render thread; continuing without a device.");
+			} else {
+				ctx.cv.wait(lock, [&ctx] { return ctx.completed; });
 			}
 		}
 	}
 
-	return nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_device_mutex);
+		return s_d3d12_device;
+	}
+}
+
+// Shared DirectStorage runtime probe state. `is_available()` loads the
+// runtime DLLs to verify factory/queue creation, then stashes the still-loaded
+// modules here instead of unloading them. `initialize()` claims them for the
+// same bin directory, so each process performs a single LoadLibrary pair.
+// Guarded by s_probe_mutex; `shutdown()` releases any modules the probe
+// stashed but `initialize()` never claimed.
+static std::mutex s_probe_mutex;
+static HMODULE s_probed_core_module = nullptr;
+static HMODULE s_probed_dstorage_module = nullptr;
+static std::wstring s_probed_bin_dir;
+
+// Returns true and fills r_core/r_dstorage when a previous successful probe
+// stashed loaded modules for the same bin directory. Caller takes ownership.
+static bool claim_probed_runtime_modules(const String &p_bin_dir, HMODULE &r_core, HMODULE &r_dstorage) {
+	std::lock_guard<std::mutex> lock(s_probe_mutex);
+	std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(p_bin_dir.utf16().get_data()));
+	if (!s_probed_core_module || !s_probed_dstorage_module || s_probed_bin_dir != w_bin_dir) {
+		return false;
+	}
+	r_core = s_probed_core_module;
+	r_dstorage = s_probed_dstorage_module;
+	s_probed_core_module = nullptr;
+	s_probed_dstorage_module = nullptr;
+	s_probed_bin_dir.clear();
+	return true;
 }
 
 static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_capacity) {
@@ -814,7 +1218,15 @@ static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_ca
 	probe_queue->Close();
 	probe_queue->Release();
 	probe_factory->Release();
-	unload_runtime_modules(core, dstorage);
+	{
+		// Hand the still-loaded modules to initialize() instead of
+		// unloading them; a newer probe replaces (and unloads) the old stash.
+		std::lock_guard<std::mutex> lock(s_probe_mutex);
+		unload_runtime_modules(s_probed_core_module, s_probed_dstorage_module);
+		s_probed_core_module = core;
+		s_probed_dstorage_module = dstorage;
+		s_probed_bin_dir = reinterpret_cast<const wchar_t *>(p_bin_dir.utf16().get_data());
+	}
 	result.available = true;
 	result.reason = "DirectStorage runtime, D3D12 driver, factory, and queue are available.";
 	return result;
@@ -1092,27 +1504,36 @@ bool Win32Backend::initialize(const String &p_path) {
 	}
 	{
 		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
-		String dstoragecore_path = bin_dir + "/dstoragecore.dll";
-		String dstorage_path = bin_dir + "/dstorage.dll";
+		HMODULE claimed_core = nullptr;
+		HMODULE claimed_dstorage = nullptr;
+		if (claim_probed_runtime_modules(bin_dir, claimed_core, claimed_dstorage)) {
+			// Reuse the modules is_available() already loaded and verified;
+			// this is the single LoadLibrary pair for the process.
+			dstoragecore_module = claimed_core;
+			dstorage_module = claimed_dstorage;
+		} else {
+			String dstoragecore_path = bin_dir + "/dstoragecore.dll";
+			String dstorage_path = bin_dir + "/dstorage.dll";
 
-		std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(bin_dir.utf16().get_data()));
-		std::wstring w_core_path(reinterpret_cast<const wchar_t *>(dstoragecore_path.utf16().get_data()));
-		std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
+			std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(bin_dir.utf16().get_data()));
+			std::wstring w_core_path(reinterpret_cast<const wchar_t *>(dstoragecore_path.utf16().get_data()));
+			std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
 
-		DllDirectoryScope dll_scope;
-		SetDllDirectoryW(w_bin_dir.c_str());
-		dstoragecore_module = LoadLibraryW(w_core_path.c_str());
-		if (!dstoragecore_module) {
-			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstoragecore.dll' could not be loaded from '" + bin_dir + "'.");
-			return false;
-		}
-		dstorage_module = LoadLibraryW(w_ds_path.c_str());
-		if (!dstorage_module) {
-			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstorage.dll' could not be loaded from '" + bin_dir + "'.");
-			unload_runtime_modules(dstoragecore_module, dstorage_module);
-			dstoragecore_module = nullptr;
-			dstorage_module = nullptr;
-			return false;
+			DllDirectoryScope dll_scope;
+			SetDllDirectoryW(w_bin_dir.c_str());
+			dstoragecore_module = LoadLibraryW(w_core_path.c_str());
+			if (!dstoragecore_module) {
+				UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstoragecore.dll' could not be loaded from '" + bin_dir + "'.");
+				return false;
+			}
+			dstorage_module = LoadLibraryW(w_ds_path.c_str());
+			if (!dstorage_module) {
+				UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstorage.dll' could not be loaded from '" + bin_dir + "'.");
+				unload_runtime_modules(dstoragecore_module, dstorage_module);
+				dstoragecore_module = nullptr;
+				dstorage_module = nullptr;
+				return false;
+			}
 		}
 	}
 
@@ -1240,7 +1661,7 @@ void Win32Backend::shutdown() {
 		err_handler->unregister_queue();
 	}
 
-	// C7: Drain GPU work - wait on completion fences with bounded timeout before closing handles.
+	// Drain GPU work - wait on completion fences with bounded timeout before closing handles.
 	for (QueueState &queue : priority_queues) {
 		if (queue.completion_fence && queue.completion_fence_value != 0) {
 			uint64_t completed = queue.completion_fence->GetCompletedValue();
@@ -1309,6 +1730,10 @@ void Win32Backend::shutdown() {
 		s_chunked_requests.clear();
 		s_chunk_parents.clear();
 		s_staging_buffer_warnings.clear();
+		if (s_dspkg_cache) {
+			memdelete(s_dspkg_cache);
+			s_dspkg_cache = nullptr;
+		}
 	}
 	{
 		std::lock_guard<std::mutex> lock(s_device_mutex);
@@ -1321,6 +1746,15 @@ void Win32Backend::shutdown() {
 	unload_runtime_modules(dstoragecore_module, dstorage_module);
 	dstoragecore_module = nullptr;
 	dstorage_module = nullptr;
+	{
+		// Release any probe-stashed modules initialize() never claimed
+		// (probe succeeded but init never ran) so they cannot leak.
+		std::lock_guard<std::mutex> lock(s_probe_mutex);
+		unload_runtime_modules(s_probed_core_module, s_probed_dstorage_module);
+		s_probed_core_module = nullptr;
+		s_probed_dstorage_module = nullptr;
+		s_probed_bin_dir.clear();
+	}
 #endif
 }
 
@@ -1386,6 +1820,75 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		return false;
 	}
 
+	// GPU synchronization contract - in-flight destination scan. A destination
+	// ID3D12Resource (AddRef'd in s_resource_guards at enqueue time, so the pointer
+	// is stable while DirectStorage may own it) is in flight while it appears under
+	// guard in any slot with submitted && !completion_ready. That is exactly the
+	// window where D3D12_RESOURCE_STATE_COMMON cannot be established by anyone but
+	// the barrier owner (Godot RD) and where sampling/reuse is undefined, so a new
+	// GPU enqueue against it is rejected loudly instead of proceeding silently.
+	// Design notes (why reject, not restore/fallback):
+	// - ID3D12Resource exposes no current-state query; only Godot's RenderingDevice
+	//   (the barrier owner) can guarantee COMMON. Recording our own ResourceBarrier
+	//   from this extension would race Godot's per-frame command lists and corrupt
+	//   RD state tracking, so the extension never transitions destination state.
+	// - No silent CPU fallback: re-targeting to a memory destination behind the
+	//   caller's back would leave the GPU texture unwritten while the caller samples
+	//   it as if DirectStorage had filled it. The request fails with an error that
+	//   names the CPU-memory alternative instead.
+	// - Duplicates inside the slot currently being filled are exempt by construction
+	//   (the filling slot is never submitted - see the guard above): multi-mip
+	//   GDeflate splits enqueue several children against one texture into a single
+	//   slot that submits/completes atomically. Same-submit aliases in one batch rely
+	//   on non-overlapping ranges plus fence gating, unchanged.
+	// - Slots with completion_ready (results collected or awaiting collection) are
+	//   exempt: DirectStorage has finished writing, so the resource is Godot-owned
+	//   again; batch_completed / wait_for_completion remains the sanctioned gate for
+	//   sampling. Must be called with batch_mutex held (enqueue_request holds it
+	//   here; every site flipping submitted/completion_ready holds it too).
+	auto gpu_destination_in_flight = [&](ID3D12Resource *p_resource) -> bool {
+		if (!p_resource) {
+			return false;
+		}
+		for (int check_queue = 0; check_queue < QUEUE_COUNT; check_queue++) {
+			const QueueState &check_state = priority_queues[check_queue];
+			for (int check_slot = 0; check_slot < BATCH_SLOT_COUNT; check_slot++) {
+				const BatchSlot &check = check_state.batch_slots[check_slot];
+				if (!check.submitted || check.completion_ready) {
+					continue;
+				}
+				for (int check_request = 0; check_request < check.requests.size(); check_request++) {
+					if (check.requests[check_request].is_null()) {
+						continue;
+					}
+					std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard_it = s_resource_guards.find(check.requests[check_request].ptr());
+					if (guard_it != s_resource_guards.end() && guard_it->second == p_resource) {
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	};
+
+	// Query GPU destination resource info once on the render thread.
+	// This covers single requests and multi-subresource/chunk splits without
+	// issuing redundant cross-thread round-trips for each mip/chunk.
+	bool is_gpu_buffer = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER;
+	bool is_gpu_texture = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE;
+	ID3D12Resource *cached_dest_resource = nullptr;
+	D3D12_RESOURCE_DESC cached_dest_desc = {};
+	uint64_t cached_dest_native_format = 0;
+	bool cached_rd_available = false;
+	bool cached_dest_resolved = false;
+	if (is_gpu_buffer || is_gpu_texture) {
+		RID dest_rid = p_request->get_destination_resource();
+		if (dest_rid.is_valid()) {
+			cached_dest_resolved = ds_win32_query_destination_resource_on_render_thread(
+					is_gpu_buffer, dest_rid, cached_dest_resource, cached_dest_desc, cached_dest_native_format, cached_rd_available);
+		}
+	}
+
 	auto enqueue_one = [&](const Ref<DSRequest> &p_child, uint64_t p_destination_offset) -> bool {
 		String path = p_child->get_file_path();
 		ProjectSettings *ps = ProjectSettings::get_singleton();
@@ -1421,33 +1924,40 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	bool gpu_texture_destination = p_child->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE;
 	ID3D12Resource *destination_buffer = nullptr;
 	ID3D12Resource *destination_texture = nullptr;
+
+	// Resolve destination resource info via render-thread marshaling.
+	ID3D12Resource *dest_res = cached_dest_resource;
+	D3D12_RESOURCE_DESC dest_desc = cached_dest_desc;
+	uint64_t dest_native_format = cached_dest_native_format;
+	bool dest_rd_avail = cached_rd_available;
+	bool dest_res_ok = cached_dest_resolved;
+	if ((gpu_buffer_destination || gpu_texture_destination) &&
+			p_child->get_destination_resource() != p_request->get_destination_resource()) {
+		dest_res_ok = ds_win32_query_destination_resource_on_render_thread(
+				gpu_buffer_destination, p_child->get_destination_resource(), dest_res, dest_desc, dest_native_format, dest_rd_avail);
+	}
+
 	if (gpu_buffer_destination) {
 		String destination_error;
 		RenderingServer *rs = RenderingServer::get_singleton();
 		if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 			destination_error = "Win32Backend: GPU buffer destination requires the D3D12 rendering driver.";
+		} else if (!dest_rd_avail) {
+			destination_error = "Win32Backend: No D3D12 RenderingDevice is active for the GPU buffer destination.";
+		} else if (!p_child->get_destination_resource().is_valid()) {
+			destination_error = "Win32Backend: GPU buffer destination resource RID is invalid.";
+		} else if (!dest_res_ok || !dest_res) {
+			destination_error = "Win32Backend: GPU buffer RID could not be mapped to an ID3D12Resource.";
 		} else {
-			RenderingDevice *rd = rs->get_rendering_device();
-			RID destination_rid = p_child->get_destination_resource();
-			if (!rd) {
-				destination_error = "Win32Backend: No D3D12 RenderingDevice is active for the GPU buffer destination.";
-			} else if (!destination_rid.is_valid()) {
-				destination_error = "Win32Backend: GPU buffer destination resource RID is invalid.";
-			} else {
-				// Godot exposes the backend resource through its public driver-resource API.
-				// The returned pointer is owned by RenderingDevice; the caller must keep the
-					// RID alive until the synchronously flushed DirectStorage batch completes.
-						uint64_t resource_handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_BUFFER, destination_rid, 0);
-					destination_buffer = reinterpret_cast<ID3D12Resource *>(resource_handle);
-					if (!destination_buffer) {
-						destination_error = "Win32Backend: GPU buffer RID could not be mapped to an ID3D12Resource.";
-					} else {
-						D3D12_RESOURCE_DESC buffer_desc = destination_buffer->GetDesc();
-						if (buffer_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || p_destination_offset + uncompressed_size > buffer_desc.Width) {
-							destination_error = "Win32Backend: GPU buffer destination size exceeds the mapped D3D12 buffer resource.";
-						}
-					}
-				}
+			destination_buffer = dest_res;
+			const D3D12_RESOURCE_DESC &buffer_desc = dest_desc;
+			if (buffer_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || p_destination_offset + uncompressed_size > buffer_desc.Width) {
+				destination_error = "Win32Backend: GPU buffer destination size exceeds the mapped D3D12 buffer resource.";
+			} else if (gpu_destination_in_flight(destination_buffer)) {
+				// COMMON cannot be established while DirectStorage owns this
+				// buffer - reject loudly, do not fall back silently (see above).
+				destination_error = "Win32Backend: GPU buffer destination is owned by an in-flight DirectStorage batch; wait for batch_completed / wait_for_completion (or collect_completed_results) before reusing it. For CPU-side access use a DESTINATION_MEMORY request instead.";
+			}
 		}
 
 		if (!destination_error.is_empty()) {
@@ -1467,45 +1977,46 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		RenderingServer *rs = RenderingServer::get_singleton();
 		if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 			destination_error = "Win32Backend: GPU texture destination requires the D3D12 rendering driver.";
+		} else if (!dest_rd_avail) {
+			destination_error = "Win32Backend: No D3D12 RenderingDevice is active for the GPU texture destination.";
+		} else if (!p_child->get_destination_resource().is_valid()) {
+			destination_error = "Win32Backend: GPU texture destination resource RID is invalid.";
+		} else if (!dest_res_ok || !dest_res) {
+			destination_error = "Win32Backend: GPU texture RID could not be mapped to an ID3D12Resource.";
 		} else {
-			RenderingDevice *rd = rs->get_rendering_device();
-			RID destination_rid = p_child->get_destination_resource();
-			if (!rd) {
-				destination_error = "Win32Backend: No D3D12 RenderingDevice is active for the GPU texture destination.";
-			} else if (!destination_rid.is_valid()) {
-				destination_error = "Win32Backend: GPU texture destination resource RID is invalid.";
+			destination_texture = dest_res;
+			const D3D12_RESOURCE_DESC &texture_desc = dest_desc;
+			if (texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+					texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+					texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+				destination_error = "Win32Backend: GPU texture destination RID does not reference a texture resource.";
 			} else {
-				uint64_t resource_handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE, destination_rid, 0);
-				destination_texture = reinterpret_cast<ID3D12Resource *>(resource_handle);
-				if (!destination_texture) {
-					destination_error = "Win32Backend: GPU texture RID could not be mapped to an ID3D12Resource.";
-				} else {
-					D3D12_RESOURCE_DESC texture_desc = destination_texture->GetDesc();
-					if (texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
-							texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-							texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
-						destination_error = "Win32Backend: GPU texture destination RID does not reference a texture resource.";
-					} else {
-						uint64_t mip_levels = texture_desc.MipLevels > 0 ? texture_desc.MipLevels : 1;
-						uint64_t array_size = texture_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : texture_desc.DepthOrArraySize;
-						uint64_t subresource_total = mip_levels * array_size;
-						uint32_t first_subresource = p_child->get_first_subresource();
-						uint32_t subresource_count = p_child->get_subresource_count();
-						if (subresource_count == 0 || first_subresource >= subresource_total ||
-								subresource_count > subresource_total - first_subresource) {
-							destination_error = "Win32Backend: GPU texture subresource range is out of bounds (first=" +
-									String::num_uint64(first_subresource) + ", count=" + String::num_uint64(subresource_count) +
-									", available=" + String::num_uint64(subresource_total) + ").";
-						} else if (p_child->get_texture_layout() != 0 &&
-								p_child->get_texture_layout() != static_cast<uint32_t>(texture_desc.Layout)) {
-							destination_error = "Win32Backend: GPU texture layout metadata does not match the destination resource.";
-						} else if (p_child->get_texture_format() != 0) {
-							uint64_t native_format = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, destination_rid, 0);
-							if (native_format == 0 || p_child->get_texture_format() != native_format) {
-								destination_error = "Win32Backend: GPU texture format metadata does not match the destination resource.";
-							}
-						}
+				uint64_t mip_levels = texture_desc.MipLevels > 0 ? texture_desc.MipLevels : 1;
+				uint64_t array_size = texture_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : texture_desc.DepthOrArraySize;
+				uint64_t subresource_total = mip_levels * array_size;
+				uint32_t first_subresource = p_child->get_first_subresource();
+				uint32_t subresource_count = p_child->get_subresource_count();
+				if (subresource_count == 0 || first_subresource >= subresource_total ||
+						subresource_count > subresource_total - first_subresource) {
+					destination_error = "Win32Backend: GPU texture subresource range is out of bounds (first=" +
+							String::num_uint64(first_subresource) + ", count=" + String::num_uint64(subresource_count) +
+							", available=" + String::num_uint64(subresource_total) + ").";
+				} else if (p_child->get_texture_layout() != 0 &&
+						p_child->get_texture_layout() != static_cast<uint32_t>(texture_desc.Layout)) {
+					destination_error = "Win32Backend: GPU texture layout metadata does not match the destination resource.";
+				} else if (p_child->get_texture_format() != 0) {
+					if (dest_native_format == 0 || p_child->get_texture_format() != dest_native_format) {
+						destination_error = "Win32Backend: GPU texture format metadata does not match the destination resource.";
+					} else if (gpu_destination_in_flight(destination_texture)) {
+						// MULTIPLE_SUBRESOURCES_RANGE destinations must be in COMMON;
+						// state is unknowable while DirectStorage owns this texture -
+						// reject loudly, do not fall back silently (see above).
+						destination_error = "Win32Backend: GPU texture destination is owned by an in-flight DirectStorage batch; wait for batch_completed / wait_for_completion (or collect_completed_results) before sampling or reusing it. For CPU-side access use a DESTINATION_MEMORY request instead.";
 					}
+				} else if (gpu_destination_in_flight(destination_texture)) {
+					// Same in-flight rejection when no format metadata was supplied
+					// (the format check above is skipped, the contract still applies).
+					destination_error = "Win32Backend: GPU texture destination is owned by an in-flight DirectStorage batch; wait for batch_completed / wait_for_completion (or collect_completed_results) before sampling or reusing it. For CPU-side access use a DESTINATION_MEMORY request instead.";
 				}
 			}
 		}
@@ -1620,6 +2131,11 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		// Multi-mip .dstex files store each mip level as an independent GDeflate compressed stream.
 		// DirectStorage's MultipleSubresourcesRange destination for multiple subresources expects a single continuous stream,
 		// so multi-mip textures MUST be split into per-mip requests using DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES_RANGE with NumSubresources = 1.
+		// STAGING INVARIANT (multi-mip): textures split per-mip, so the whole-texture
+		// footprint MAY exceed staging_size, but EACH mip must independently satisfy
+		// MAX(compressed_size, uncompressed_size) <= staging_size (enforced per-mip
+		// in the loop below). A mip larger than staging cannot be split further
+		// without corrupting its GDeflate tile stream, so it fails loudly here.
 		if (staging_size > 0 && texture_footprint > staging_size && staging_size < GDEFLATE_PAGE_SIZE) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
 			p_request->set_error_message("DirectStorage cannot split a GDeflate texture with the configured staging buffer.");
@@ -1677,6 +2193,11 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		return true;
 	}
 	if (gpu_texture_gdeflate && has_texture_mip_entries && texture_subresource_count == 1) {
+		// STAGING INVARIANT (single-mip): a single mip is one indivisible GDeflate
+		// tile stream and cannot be split across chunks by DirectStorage without
+		// corrupting it, so it requires MAX(compressed_size, uncompressed_size)
+		// <= staging_size (enforced below). Oversize single-mip payloads fail
+		// loudly instead of being chunked.
 		const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource];
 		if (staging_size > 0 && (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size)) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
@@ -1687,6 +2208,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	}
 
 	if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE && staging_size > 0 && request_size > staging_size) {
+		// Non-texture (or non-GPU-texture) GDeflate payloads larger than staging may
+		// be page-chunked below; GPU-texture destinations never reach here chunked —
+		// they are governed by the single- vs multi-mip staging invariant above
+		// (single-mip no-split, multi-mip per-mip limit) and fail loudly instead.
 		if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE || staging_size < GDEFLATE_PAGE_SIZE) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
 			p_request->set_error_message("DirectStorage cannot split this oversized GDeflate destination with the configured staging buffer.");

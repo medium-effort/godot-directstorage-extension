@@ -21,7 +21,7 @@ class DSPkg;
 class DSResourceFormatLoader : public ResourceFormatLoader {
 	GDCLASS(DSResourceFormatLoader, ResourceFormatLoader);
 
-	// Thread affinity & GPU Direct alignment (C2):
+	// Thread affinity & GPU Direct alignment:
 	// - Direct GPU decompression (DESTINATION_GPU_TEXTURE via DirectStorage)
 	//   requires the render thread because RenderingDevice::get_driver_resource()
 	//   and free_rid() assert is_on_render_thread(). Off-render-thread callers

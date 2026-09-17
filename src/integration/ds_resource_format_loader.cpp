@@ -236,6 +236,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 
 		Ref<RDTextureView> rd_view;
 		rd_view.instantiate();
+
 		RID tex_rid = rd->texture_create(rd_fmt, rd_view, TypedArray<PackedByteArray>());
 		if (tex_rid.is_valid()) {
 			uint64_t native_format = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, tex_rid, 0);

@@ -38,6 +38,11 @@
 			<param index="0" name="resource_path" type="String" />
 			<description>Returns metadata for an entry, including [code]archive_path[/code] ([String]), [code]path[/code] ([String]), [code]data_offset[/code] ([int]), [code]compressed_size[/code] ([int]), [code]original_size[/code] ([int]), [code]width[/code] ([int]), [code]height[/code] ([int]), [code]pixel_format[/code] ([int]), [code]mip_count[/code] ([int]), [code]has_gpu_metadata[/code] ([bool]), [code]mip_offsets[/code] ([PackedInt64Array]), [code]mip_sizes[/code] ([PackedInt32Array]), [code]mip_uncompressed_sizes[/code] ([PackedInt32Array]), and [code]mip_row_pitches[/code] ([PackedInt32Array]).</description>
 		</method>
+		<method name="get_mip_entries_for_offset" qualifiers="const">
+			<return type="Array" />
+			<param index="0" name="offset" type="int" />
+			<description>Returns an array of [Dictionary] records representing the GPU mip entries located at absolute payload [param offset]. Each dictionary contains [code]offset[/code] ([int]), [code]compressed_size[/code] ([int]), [code]uncompressed_size[/code] ([int]), and [code]row_pitch[/code] ([int]). Returns an empty array if no mip entries match the offset or if no archive is open.</description>
+		</method>
 		<method name="has_texture" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="resource_path" type="String" />
@@ -51,7 +56,7 @@
 		<method name="read_texture" qualifiers="const">
 			<return type="Dictionary" />
 			<param index="0" name="resource_path" type="String" />
-			<description>Reads an entry's compressed payload and metadata. The result contains [code]path[/code] ([String]), [code]compressed_data[/code] ([PackedByteArray]), [code]width[/code] ([int]), [code]height[/code] ([int]), [code]pixel_format[/code] ([int]), [code]mip_count[/code] ([int]), [code]original_size[/code] ([int]), [code]compressed_size[/code] ([int]), [code]has_gpu_metadata[/code] ([bool]), [code]mip_offsets[/code] ([PackedInt64Array]), [code]mip_sizes[/code] ([PackedInt32Array]), [code]mip_uncompressed_sizes[/code] ([PackedInt32Array]), and [code]mip_row_pitches[/code] ([PackedInt32Array]).</description>
+			<description>Reads an entry's compressed payload and metadata. The result contains [code]path[/code] ([String]), [code]compressed_data[/code] ([PackedByteArray]), [code]width[/code] ([int]), [code]height[/code] ([int]), [code]pixel_format[/code] ([int]), [code]mip_count[/code] ([int]), [code]original_size[/code] ([int]), [code]compressed_size[/code] ([int]), [code]has_gpu_metadata[/code] ([bool]), [code]mip_offsets[/code] ([PackedInt64Array]), [code]mip_sizes[/code] ([PackedInt32Array]), [code]mip_uncompressed_sizes[/code] ([PackedInt32Array]), and [code]mip_row_pitches[/code] ([PackedInt32Array]). When [code]has_gpu_metadata[/code] is [code]true[/code], [code]mip_data[/code] ([Array] of [PackedByteArray]) is also provided containing individual mip slices.</description>
 		</method>
 	</methods>
 </class>

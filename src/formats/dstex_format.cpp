@@ -639,6 +639,7 @@ Dictionary DSTex::read_header(const String &p_path) {
 	mip_uncompressed_sizes.resize(header.mip_count);
 	mip_row_pitches.resize(header.mip_count);
 	if (header.version == 1) {
+		uint64_t file_len = file->get_length();
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntry mip_entry;
 			PackedByteArray mip_bytes = file->get_buffer(sizeof(DSTexMipEntry));
@@ -647,10 +648,17 @@ Dictionary DSTex::read_header(const String &p_path) {
 				return Dictionary();
 			}
 			memcpy(&mip_entry, mip_bytes.ptr(), sizeof(DSTexMipEntry));
+			if (mip_entry.offset > file_len || mip_entry.size > file_len - mip_entry.offset ||
+					(mip_entry.size != 0 && mip_entry.offset + mip_entry.size < mip_entry.offset)) {
+				UtilityFunctions::push_error("DSTex: Mip entry exceeds file bounds or overflows.");
+				file->close();
+				return Dictionary();
+			}
 			mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			mip_sizes[i] = static_cast<int32_t>(mip_entry.size);
 		}
 	} else if (header.version == 2) {
+		uint64_t file_len = file->get_length();
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntryV2 mip_entry;
 			PackedByteArray mip_bytes = file->get_buffer(sizeof(DSTexMipEntryV2));
@@ -659,6 +667,12 @@ Dictionary DSTex::read_header(const String &p_path) {
 				return Dictionary();
 			}
 			memcpy(&mip_entry, mip_bytes.ptr(), sizeof(DSTexMipEntryV2));
+			if (mip_entry.offset > file_len || mip_entry.compressed_size > file_len - mip_entry.offset ||
+					(mip_entry.compressed_size != 0 && mip_entry.offset + mip_entry.compressed_size < mip_entry.offset)) {
+				UtilityFunctions::push_error("DSTex: Mip entry exceeds file bounds or overflows.");
+				file->close();
+				return Dictionary();
+			}
 			mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			mip_sizes[i] = static_cast<int32_t>(mip_entry.compressed_size);
 			mip_uncompressed_sizes[i] = static_cast<int32_t>(mip_entry.uncompressed_size);

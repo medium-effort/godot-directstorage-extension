@@ -4,17 +4,15 @@ importer="directstorage_texture"
 importer_version=4
 type="Texture2D"
 uid="uid://cx22typkah3gh"
-path="res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dstex"
+valid=false
 
 [deps]
 
-files=["res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dstex"]
-
 source_file="res://test_assets/test.png"
-dest_files=["res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dstex", "res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dstex"]
 
 [params]
 
 compression/mode=0
 compression/source=1
 compression/gdeflate_level=1
+compatibility/as_image_texture=false

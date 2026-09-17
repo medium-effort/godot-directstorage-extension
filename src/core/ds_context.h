@@ -19,11 +19,20 @@ namespace godot {
 class DSContext : public Object {
 	GDCLASS(DSContext, Object);
 
+public:
+	enum InitStatus {
+		INIT_STATUS_UNINITIALIZED = 0,
+		INIT_STATUS_DIRECTSTORAGE_D3D12 = 1,
+		INIT_STATUS_SOFTWARE_FALLBACK = 2,
+		INIT_STATUS_FAILED = 3,
+	};
+
 private:
 	static DSContext *singleton;
 	static std::once_flag support_probe_once;
 	static bool supported_probe_result;
 	bool initialized = false;
+	InitStatus init_status = INIT_STATUS_UNINITIALIZED;
 
 	uint32_t staging_buffer_size_mb = 128;
 	bool disable_gpu_decompression = false;
@@ -60,6 +69,7 @@ public:
 	bool is_supported() const;
 	bool is_d3d12_backend() const;
 	bool is_initialized() const;
+	InitStatus get_init_status() const;
 	String get_active_backend_name() const;
 	bool is_gpu_decompression_available() const;
 	bool is_gpu_decompression_enabled() const;
@@ -81,7 +91,7 @@ public:
 	bool enqueue_request(Ref<DSRequest> p_request);
 	int get_pending_request_count() const;
 	void flush_batch();
-	void flush_batch_async();
+	Error flush_batch_async();
 	bool is_batch_complete() const;
 	bool has_pending_results() const;
 	void collect_completed_results();
@@ -101,5 +111,7 @@ public:
 };
 
 } // namespace godot
+
+VARIANT_ENUM_CAST(DSContext::InitStatus);
 
 #endif // DS_CONTEXT_H
