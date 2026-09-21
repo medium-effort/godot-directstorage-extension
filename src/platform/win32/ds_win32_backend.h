@@ -59,6 +59,20 @@ private:
 		uint64_t uncompressed_bytes = 0;
 		int request_count = 0;
 		uint64_t start_time = 0;
+		// Per-batch tag accounting for the async prewarm path. Filled by
+		// submit_async() only; the sync submit_batch() path leaves this
+		// empty. Each entry groups logical requests (chunk children resolve
+		// to their parent and count once) by cancellation_tag so
+		// get_prewarm_progress(tag) and prewarm_progress signals can
+		// attribute batch completion per tag.
+		// Carried through completion_queue to the completion thread with the
+		// rest of the batch record; one Submit per queue per frame still
+		// covers all N textures in the slot.
+		struct BatchTagCount {
+			uint64_t tag = 0;
+			int request_count = 0;
+		};
+		Vector<BatchTagCount> tag_counts;
 	};
 	std::deque<BatchMetadata> completion_queue;
 	HANDLE completion_stop_event = nullptr;

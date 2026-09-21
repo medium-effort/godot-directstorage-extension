@@ -111,6 +111,20 @@ void DSContext::remove_report_locked(int64_t p_request_id) {
 	}
 }
 
+void DSContext::count_stream_request_terminal(const Ref<DSRequest> &p_request) {
+	// Takes stream_mutex only; safe both inside finalize_completed_reports_locked
+	// (context_mutex held, order context -> stream) and on its own.
+	if (p_request.is_null()) {
+		return;
+	}
+	uint64_t tag = p_request->get_cancellation_tag();
+	std::lock_guard<std::mutex> stream_lock(stream_mutex);
+	std::unordered_map<uint64_t, StreamTagInfo>::iterator it = stream_tags.find(tag);
+	if (it != stream_tags.end()) {
+		it->second.completed++;
+	}
+}
+
 void DSContext::finalize_completed_reports_locked() {
 	for (std::unordered_map<int64_t, Ref<DSRequest>>::iterator it = tracked_requests.begin(); it != tracked_requests.end();) {
 		Ref<DSRequest> request = it->second;
@@ -129,6 +143,7 @@ void DSContext::finalize_completed_reports_locked() {
 				String(report.get("actual_backend", "None")) == "Win32DirectStorage" && is_gpu_decompression_enabled();
 			request_execution_reports[request_id] = report;
 		}
+		count_stream_request_terminal(request);
 		remove_report_locked(request_id);
 		it = tracked_requests.begin();
 	}
@@ -350,6 +365,34 @@ bool DSContext::was_gpu_decompression_used(Ref<DSRequest> p_request) const {
 	return get_request_execution_report(p_request).get("was_gpu_decompression_used", false);
 }
 
+uint64_t DSContext::get_async_batches_submitted() const {
+	// Counts submitted batches so callers can verify batching efficiency
+	// (many textures per submit). No queue merge; the sync and async
+	// queues stay separate.
+	if (!initialized || !active_backend) {
+		return 0;
+	}
+	if (active_backend->get_name() != "Win32DirectStorage") {
+		const FallbackBackend *fallback = static_cast<const FallbackBackend *>(active_backend);
+		return fallback->get_async_batches_submitted();
+	}
+	std::lock_guard<std::mutex> lock(context_mutex);
+	return async_batches_submitted_cache;
+}
+
+uint64_t DSContext::get_in_flight_async_batch_count() const {
+	if (!initialized || !active_backend) {
+		return 0;
+	}
+	if (active_backend->get_name() != "Win32DirectStorage") {
+		const FallbackBackend *fallback = static_cast<const FallbackBackend *>(active_backend);
+		return static_cast<uint64_t>(fallback->get_in_flight_async_batch_count());
+	}
+	// Win32 exposes no per-slot counter; the completion gate is the only
+	// observable in-flight state (0 or 1 from the caller's viewpoint).
+	return active_backend->is_batch_complete() ? 0 : 1;
+}
+
 uint64_t DSContext::get_completion_fence() const {
 #ifdef _WIN32
 	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
@@ -551,17 +594,58 @@ void DSContext::shutdown_ds() {
 		gpu_requests_pending = false;
 		completion_fence = 0;
 		pending_request_count = 0;
+		async_batches_submitted_cache = 0;
 		pending_batch_request_counts.clear();
 		request_execution_reports.clear();
 		tracked_requests.clear();
 		pending_request_ids.clear();
 		report_order.clear();
 	}
+	{
+		// Stream state: drop queued Refs, freeze tags as cancelled so any
+		// late-arriving stream request with a stale tag is marked finished
+		// instead of queueing against a dead backend.
+		std::lock_guard<std::mutex> stream_lock(stream_mutex);
+		stream_queue.clear();
+		for (std::unordered_map<uint64_t, StreamTagInfo>::iterator it = stream_tags.begin(); it != stream_tags.end(); ++it) {
+			it->second.cancel_requested = true;
+		}
+	}
 	initialized = false;
 	UtilityFunctions::print("[DirectStorage] DirectStorage Context shut down.");
 }
 
-bool DSContext::enqueue_request(Ref<DSRequest> p_request) {
+bool DSContext::enqueue_request(Ref<DSRequest> p_request, bool p_from_stream) {
+	if (p_from_stream) {
+		// Async prewarm path: queue only, never touch the sync loader path
+		// (pending_request_count / pending_request_ids / gpu flags), so the
+		// batch manager's stream flush cannot steal sync _load requests.
+		// The Ref held in stream_queue keeps the request alive until
+		// flush_stream_async() drains it or cancel_prewarm() cancels it.
+		// Backend init is deferred to flush time to keep the enqueue call
+		// non-blocking on the calling thread.
+		if (p_request.is_null()) {
+			return false;
+		}
+		uint64_t tag = p_request->get_cancellation_tag();
+		std::lock_guard<std::mutex> lock(stream_mutex);
+		StreamTagInfo &info = stream_tags[tag]; // auto-create ad-hoc tags
+		info.tag = tag;
+		if (info.cancel_requested) {
+			info.cancelled++;
+			info.completed++;
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("Prewarm cancelled before enqueue.");
+			return false;
+		}
+		stream_queue.push_back(p_request);
+		info.total++;
+		return true;
+	}
+	return enqueue_request_internal(p_request);
+}
+
+bool DSContext::enqueue_request_internal(Ref<DSRequest> p_request) {
 	if (p_request.is_null()) {
 		return false;
 	}
@@ -709,6 +793,9 @@ Error DSContext::flush_batch_async() {
 		if (!is_win32_backend && submitted_request_count > 0) {
 			pending_batch_request_counts.push_back(submitted_request_count);
 		}
+		if (is_win32_backend && submitted_request_count > 0) {
+			async_batches_submitted_cache++;
+		}
 		pending_request_count = 0;
 		if (submitted_request_count > 0) {
 			completion_fence = backend_fence != 0 ? backend_fence : completion_fence + 1;
@@ -718,6 +805,179 @@ Error DSContext::flush_batch_async() {
 		evict_old_reports_if_needed_locked();
 	}
 	return OK;
+}
+
+Error DSContext::flush_stream_async() {
+	// Batch-manager-only entry point for the async prewarm queue.
+	// Never routes through sync flush_batch(): sync pending counts, pending id
+	// sets and gpu flags are untouched. Drains stream_queue into the backend
+	// via the shared internal enqueue (validation + tracking + Ref holding),
+	// then submits non-blocking via submit_async().
+	if (!initialized || !active_backend) {
+		return ERR_UNCONFIGURED;
+	}
+	std::deque<Ref<DSRequest>> to_submit;
+	{
+		std::lock_guard<std::mutex> lock(stream_mutex);
+		if (stream_queue.empty()) {
+			return OK;
+		}
+		if (!active_backend->is_batch_complete()) {
+			// All batch slots occupied: keep the queue intact so the batch
+			// manager can retry next frame instead of losing requests.
+			return ERR_BUSY;
+		}
+		to_submit.swap(stream_queue);
+	}
+	int submitted_request_count = 0;
+	for (std::deque<Ref<DSRequest>>::iterator it = to_submit.begin(); it != to_submit.end(); ++it) {
+		Ref<DSRequest> request = *it;
+		if (!request.is_valid()) {
+			continue;
+		}
+		if (request->get_status() == DSRequest::STATUS_FAILED) {
+			// Cancelled while queued (terminal already counted by cancel_prewarm).
+			continue;
+		}
+		if (enqueue_request_internal(request)) {
+			submitted_request_count++;
+		} else {
+			// Backend rejected: request is terminal (FAILED); count it so tag
+			// progress cannot stall waiting for a request that will never run.
+			count_stream_request_terminal(request);
+		}
+	}
+	if (submitted_request_count == 0) {
+		return OK;
+	}
+	bool is_win32_backend = active_backend->get_name() == "Win32DirectStorage";
+	active_backend->submit_async();
+	uint64_t backend_fence = 0;
+#ifdef _WIN32
+	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
+		backend_fence = ds_win32_get_completion_fence(active_backend);
+	}
+#endif
+	{
+		std::lock_guard<std::mutex> lock(context_mutex);
+		if (!is_win32_backend && submitted_request_count > 0) {
+			pending_batch_request_counts.push_back(submitted_request_count);
+		}
+		if (is_win32_backend && submitted_request_count > 0) {
+			async_batches_submitted_cache++;
+		}
+		if (submitted_request_count > 0) {
+			completion_fence = backend_fence != 0 ? backend_fence : completion_fence + 1;
+		}
+		finalize_completed_reports_locked();
+		evict_old_reports_if_needed_locked();
+	}
+	return OK;
+}
+
+bool DSContext::has_stream_pending() const {
+	std::lock_guard<std::mutex> lock(stream_mutex);
+	return !stream_queue.empty();
+}
+
+int DSContext::get_stream_pending_count() const {
+	std::lock_guard<std::mutex> lock(stream_mutex);
+	return static_cast<int>(stream_queue.size());
+}
+
+uint64_t DSContext::prewarm_async(const PackedStringArray &p_paths) {
+	// Tag issuance: allocates a fresh tag and registers the expected request
+	// total for progress queries. Path remapping, dedup and actual DSRequest
+	// creation/enqueue belong to the preloader, which fills this tag via
+	// enqueue_request(req, true) with a matching cancellation_tag.
+	std::lock_guard<std::mutex> lock(stream_mutex);
+	uint64_t tag = next_stream_tag++;
+	if (next_stream_tag == 0) {
+		next_stream_tag = 1; // wrap guard: tag 0 stays reserved for untagged
+	}
+	StreamTagInfo info;
+	info.tag = tag;
+	info.total = p_paths.size();
+	stream_tags[tag] = info;
+	return tag;
+}
+
+bool DSContext::is_prewarm_complete(uint64_t p_tag) const {
+	std::lock_guard<std::mutex> lock(stream_mutex);
+	std::unordered_map<uint64_t, StreamTagInfo>::const_iterator it = stream_tags.find(p_tag);
+	if (it == stream_tags.end()) {
+		return true; // unknown tag: nothing pending
+	}
+	const StreamTagInfo &info = it->second;
+	if (info.completed < info.total) {
+		return false;
+	}
+	for (std::deque<Ref<DSRequest>>::const_iterator qit = stream_queue.begin(); qit != stream_queue.end(); ++qit) {
+		if (qit->is_valid() && (*qit)->get_cancellation_tag() == p_tag) {
+			return false;
+		}
+	}
+	return true;
+}
+
+Vector2i DSContext::get_prewarm_progress(uint64_t p_tag) const {
+	std::lock_guard<std::mutex> lock(stream_mutex);
+	std::unordered_map<uint64_t, StreamTagInfo>::const_iterator it = stream_tags.find(p_tag);
+	if (it == stream_tags.end()) {
+		return Vector2i(0, 0);
+	}
+	int done = MIN(it->second.completed, it->second.total);
+	return Vector2i(done, it->second.total);
+}
+
+void DSContext::cancel_prewarm(uint64_t p_tag) {
+	// Cancel semantics: DSRequest has no cancelled status value, so cancelled
+	// requests are marked finished FAILED with a "cancelled" message.
+	// Completion threads treat non-pending requests as dropped: buffers are
+	// released and freed RIDs are never written. Refs stay held
+	// (stream_queue until drained here, tracked_requests until finalize)
+	// so there is no use-after-free.
+	const String cancel_message = "Prewarm cancelled (tag " + String::num_uint64(p_tag) + ").";
+	{
+		std::lock_guard<std::mutex> lock(stream_mutex);
+		StreamTagInfo &info = stream_tags[p_tag];
+		info.tag = p_tag;
+		info.cancel_requested = true;
+		std::deque<Ref<DSRequest>> remaining;
+		for (std::deque<Ref<DSRequest>>::iterator it = stream_queue.begin(); it != stream_queue.end(); ++it) {
+			Ref<DSRequest> request = *it;
+			if (request.is_valid() && request->get_cancellation_tag() == p_tag &&
+					request->get_status() != DSRequest::STATUS_COMPLETED &&
+					request->get_status() != DSRequest::STATUS_FAILED) {
+				request->set_status(DSRequest::STATUS_FAILED);
+				request->set_error_message(cancel_message);
+				info.cancelled++;
+				info.completed++;
+			} else {
+				remaining.push_back(request);
+			}
+		}
+		stream_queue.swap(remaining);
+	}
+	if (!initialized || !active_backend) {
+		return;
+	}
+	active_backend->cancel_requests_with_tag(p_tag);
+	{
+		std::lock_guard<std::mutex> lock(context_mutex);
+		for (std::unordered_map<int64_t, Ref<DSRequest>>::iterator it = tracked_requests.begin(); it != tracked_requests.end(); ++it) {
+			Ref<DSRequest> request = it->second;
+			if (request.is_valid() && request->get_cancellation_tag() == p_tag) {
+				DSRequest::Status status = request->get_status();
+				if (status != DSRequest::STATUS_COMPLETED && status != DSRequest::STATUS_FAILED) {
+					request->set_status(DSRequest::STATUS_FAILED);
+					request->set_error_message(cancel_message);
+				}
+			}
+		}
+		finalize_completed_reports_locked(); // releases terminal Refs; hook bumps per-tag completed
+		evict_old_reports_if_needed_locked();
+	}
 }
 
 bool DSContext::is_batch_complete() const {
@@ -850,6 +1110,18 @@ void DSContext::cancel_requests_with_tag(uint64_t p_tag) {
 	std::lock_guard<std::mutex> lock(context_mutex);
 	for (std::unordered_set<int64_t>::const_iterator it = cancelled_pending_request_ids.begin(); it != cancelled_pending_request_ids.end(); ++it) {
 		pending_request_ids.erase(*it);
+		// Mark finished (FAILED + message) so completion threads drop buffers
+		// and never write freed RIDs. There is no cancelled status on
+		// DSRequest; FAILED is the finished-dropped state. Refs stay held
+		// in tracked_requests until finalize below: no use-after-free.
+		std::unordered_map<int64_t, Ref<DSRequest>>::const_iterator request_it = tracked_requests.find(*it);
+		if (request_it != tracked_requests.end() && request_it->second.is_valid()) {
+			DSRequest::Status status = request_it->second->get_status();
+			if (status != DSRequest::STATUS_COMPLETED && status != DSRequest::STATUS_FAILED) {
+				request_it->second->set_status(DSRequest::STATUS_FAILED);
+				request_it->second->set_error_message("Request cancelled (tag " + String::num_uint64(p_tag) + ").");
+			}
+		}
 	}
 	if (cancelled_pending_request_ids.size() >= static_cast<size_t>(pending_request_count)) {
 		pending_request_count = 0;
@@ -904,16 +1176,25 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("initialize_ds_for_path", "path"), &DSContext::initialize_ds_for_path);
 	ClassDB::bind_method(D_METHOD("shutdown_ds"), &DSContext::shutdown_ds);
 
-	ClassDB::bind_method(D_METHOD("enqueue_request", "request"), &DSContext::enqueue_request);
+	ClassDB::bind_method(D_METHOD("enqueue_request", "request", "from_stream"), &DSContext::enqueue_request, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("get_pending_request_count"), &DSContext::get_pending_request_count);
 	ClassDB::bind_method(D_METHOD("flush_batch"), &DSContext::flush_batch);
 	ClassDB::bind_method(D_METHOD("flush_batch_async"), &DSContext::flush_batch_async);
+	ClassDB::bind_method(D_METHOD("flush_stream_async"), &DSContext::flush_stream_async);
+	ClassDB::bind_method(D_METHOD("has_stream_pending"), &DSContext::has_stream_pending);
+	ClassDB::bind_method(D_METHOD("get_stream_pending_count"), &DSContext::get_stream_pending_count);
+	ClassDB::bind_method(D_METHOD("prewarm_async", "paths"), &DSContext::prewarm_async);
+	ClassDB::bind_method(D_METHOD("is_prewarm_complete", "tag"), &DSContext::is_prewarm_complete);
+	ClassDB::bind_method(D_METHOD("get_prewarm_progress", "tag"), &DSContext::get_prewarm_progress);
+	ClassDB::bind_method(D_METHOD("cancel_prewarm", "tag"), &DSContext::cancel_prewarm);
 	ClassDB::bind_method(D_METHOD("is_batch_complete"), &DSContext::is_batch_complete);
 	ClassDB::bind_method(D_METHOD("has_pending_results"), &DSContext::has_pending_results);
 	ClassDB::bind_method(D_METHOD("collect_completed_results"), &DSContext::collect_completed_results);
 	ClassDB::bind_method(D_METHOD("get_completion_fence"), &DSContext::get_completion_fence);
 	ClassDB::bind_method(D_METHOD("wait_for_completion", "timeout_msec"), &DSContext::wait_for_completion);
 	ClassDB::bind_method(D_METHOD("cancel_requests_with_tag", "tag"), &DSContext::cancel_requests_with_tag);
+	ClassDB::bind_method(D_METHOD("get_async_batches_submitted"), &DSContext::get_async_batches_submitted);
+	ClassDB::bind_method(D_METHOD("get_in_flight_async_batch_count"), &DSContext::get_in_flight_async_batch_count);
 	ClassDB::bind_method(D_METHOD("get_request_execution_report", "request"), &DSContext::get_request_execution_report);
 	ClassDB::bind_method(D_METHOD("get_actual_destination_type", "request"), &DSContext::get_actual_destination_type);
 	ClassDB::bind_method(D_METHOD("get_actual_backend", "request"), &DSContext::get_actual_backend);

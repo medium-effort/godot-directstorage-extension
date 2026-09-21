@@ -2310,6 +2310,30 @@ void Win32Backend::submit_async() {
 		batch.slot_index = submit_slot_index;
 		batch.start_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
 		batch.request_count = count_logical_requests(slot.requests);
+		// Per-batch tag accounting: group logical requests by
+		// cancellation_tag. Chunk children resolve to their logical parent
+		// via get_logical_request (same tag) and count once, matching
+		// count_logical_requests(). Untagged sync requests land under tag 0.
+		{
+			std::unordered_map<uint64_t, int> tag_totals;
+			std::unordered_set<DSRequest *> seen_logical;
+			for (int i = 0; i < slot.requests.size(); i++) {
+				if (slot.requests[i].is_null()) {
+					continue;
+				}
+				DSRequest *logical = get_logical_request(slot.requests[i].ptr());
+				if (!logical || !seen_logical.insert(logical).second) {
+					continue;
+				}
+				tag_totals[slot.requests[i]->get_cancellation_tag()]++;
+			}
+			for (std::unordered_map<uint64_t, int>::const_iterator tag_it = tag_totals.begin(); tag_it != tag_totals.end(); ++tag_it) {
+				BatchMetadata::BatchTagCount tag_count;
+				tag_count.tag = tag_it->first;
+				tag_count.request_count = tag_it->second;
+				batch.tag_counts.push_back(tag_count);
+			}
+		}
 		for (int i = 0; i < slot.requests.size(); i++) {
 			if (slot.requests[i].is_valid()) {
 				uint32_t request_size = slot.requests[i]->get_size();
@@ -2580,20 +2604,49 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 		}
 		for (BatchSlot &slot : queue.batch_slots) {
 			Vector<Ref<DSRequest>> remaining;
+			Vector<Ref<DSRequest>> dropped;
 			for (int i = 0; i < slot.requests.size(); i++) {
 				if (slot.requests[i].is_valid() && slot.requests[i]->get_cancellation_tag() == p_tag) {
 					slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
 					slot.requests[i]->set_error_message("Request cancelled by tag.");
 					if (slot.submitted) {
+						// In-flight batch: keep the request in the slot so the
+						// completion thread tears it down uniformly (guard
+						// release, file close, counts). It is already terminal
+						// FAILED, so poll_batch_status() leaves it dropped and
+						// never promotes it to COMPLETED.
 						remaining.push_back(slot.requests[i]);
+					} else {
+						// Never submitted: drop from the slot so a later
+						// Submit() cannot pick up a cancelled request. The
+						// DirectStorage-level request was already cancelled
+						// above, so the GPU will never write the destination:
+						// release the AddRef'd guard (no leak, freed RIDs stay
+						// unwritten) and detach chunk tracking. Parent
+						// reconciliation runs below via complete_chunked_requests().
+						dropped.push_back(slot.requests[i]);
 					}
 				} else {
 					remaining.push_back(slot.requests[i]);
 				}
 			}
 			slot.requests = remaining;
+			if (!dropped.is_empty()) {
+				release_resource_guards(dropped);
+				for (int i = 0; i < dropped.size(); i++) {
+					if (dropped[i].is_valid()) {
+						s_chunk_parents.erase(dropped[i].ptr());
+					}
+				}
+			}
 		}
 	}
+	// Reconcile chunked parents whose children all went terminal via the
+	// drops above (parent marked FAILED with the child cancel message; maps
+	// released). Touches only Ref statuses and memcpys for memory
+	// destinations — no render/scene APIs, safe on the calling thread under
+	// batch_mutex (same discipline as every other call site).
+	complete_chunked_requests();
 #endif
 }
 

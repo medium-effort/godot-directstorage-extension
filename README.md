@@ -45,3 +45,22 @@ At runtime, the extension handles texture resolution transparently via [`DSResou
   The loader checks `res://textures.dspkg` and falls back to inspecting the directory containing the running executable (`OS.get_executable_path().get_base_dir().path_join("textures.dspkg")`).
 - **Seamless Engine Integration**:
   Standard Godot resource loading calls—such as `ResourceLoader.load("res://characters/hero.png")` or scene dependencies instantiated via `ResourceLoader.load_threaded_request("res://level/level.tscn")`—automatically pull and decompress their texture payloads directly from `textures.dspkg` through DirectStorage without requiring manual package opening or custom batch streaming scripts.
+
+---
+
+## 3. Async Texture Prewarm (True Streaming)
+
+For level transitions, textures can be streamed ahead of the scene bind with zero main-thread waits. Helpers live in [`ds_preloader.gd`](project/addons/directstorage_accelerator/scripts/ds_preloader.gd) (`DSPreloader`); the per-frame drain lives in the `DSBatchManager` autoload (collect → `flush_stream_async()` → `poll_completed()` → progress).
+
+1. **Collect** prewarmable engine paths (recursive `ResourceLoader.get_dependencies()` + `DirAccess` sweep, projector/EXR filtered):
+   ```gdscript
+   var deps: PackedStringArray = DSPreloader.collect_scene_textures("res://levels/level1.tscn")
+   ```
+2. **Prewarm** (non-blocking, returns a stream tag; progress tracking is opt-in via `track_prewarm`), then **bind with `CACHE_MODE_REUSE`** so the scene resolver reuses the resident textures with zero disk re-reads:
+   ```gdscript
+   var tag: int = DSPreloader.prewarm_async(deps)
+   await DSPreloader.await_prewarm_finished(tag) # or poll DSPreloader.get_prewarm_progress(tag) for a bar
+   var packed := ResourceLoader.load("res://levels/level1.tscn", "PackedScene", ResourceLoader.CACHE_MODE_REUSE) as PackedScene
+   ```
+   `CACHE_MODE_IGNORE` / `CACHE_MODE_REPLACE` bypass the cache and waste the prewarm — always use `CACHE_MODE_REUSE` for the post-prewarm scene load.
+3. **Loading screen over PSO**: keep the overlay visible across `instantiate()` + `add_child()` + one drawn frame (see `DSPreloader.load_scene_with_loading_screen()`), so scene-graph build and driver PSO/shader compilation finish before gameplay is revealed. When extension async is unavailable, the same helper falls back to a frame-budgeted sync `ResourceLoader.load()` loop that holds 60 FPS.

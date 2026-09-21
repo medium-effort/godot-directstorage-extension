@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 18 September 2026
+Last updated: 21 September 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -613,5 +613,65 @@ As detailed in Section 2, `Texture2DRD` cannot be constructed on background work
 
 ### The Rule
 Constructing and populating `Image` and `ImageTexture` on background worker threads is completely free of thread-affinity hazards, justifying its use as the authoritative, stall-free fallback pathway during threaded scene loads.
+
+---
+
+## 26. `RenderingDevice::texture_create` Demands a Single Packed Blob for 2D
+
+### The Engine Reality
+When creating a 2D texture through [RenderingDevice.texture_create()](https://docs.godotengine.org/en/stable/classes/class_renderingdevice.html#class-renderingdevice-method-texture-create), Godot requires the `data` array to contain **exactly one** `PackedByteArray** holding all mip levels concatenated into a single continuous buffer (`servers/rendering/renderer_rd/rendering_device.cpp:1636-1638`):
+```cpp
+ERR_FAIL_COND_V_MSG(p_format.mipmaps <= 1 && data.size() != 1, RID(), ...);
+ERR_FAIL_COND_V_MSG(data.size() != 1, RID(), "Invalid length (" + itos(data.size()) + ")");
+```
+
+### The Trap: One Array Per Mip
+A natural implementation passes one array element per mip level (8 mips -> 8 array entries), mirroring how the container stores independently compressed mip streams. The driver rejects this outright with `invalid length (8)`, and the texture silently falls back to the CPU `ImageTexture` path—leaving GPU decompression permanently unproven with zero in-run errors pointing at the real cause.
+
+### The Invariant Rule
+Concatenate all mip payloads into one tight `packed_init` blob (bounds-checked, overflow-checked) and call `texture_create(fmt, view, { packed_init })` exactly once for 2D textures. The per-mip splitting required by DirectStorage destinations (Section 8) applies to *requests*, never to the `texture_create` data array.
+
+---
+
+## 27. `Texture2DRD` Is a Non-Owning View: Dropping the Last `Ref` Leaks the RID
+
+### The Engine Reality
+[Texture2DRD](https://docs.godotengine.org/en/stable/classes/class_texture2drd.html) is a thin wrapper around a raw `RenderingDevice` texture RID. Its destructor **never** frees the underlying device texture. Consequently, every cache-side owner-loss—evict, `clear()`, capacity replacement, disable, shutdown—must explicitly release the RID or it leaks until device teardown. In production profiling this scaled with GPU-resolve count (hundreds of RIDs held at shutdown) with zero in-run errors and flat memory deltas, making it invisible to every probe except a shutdown census.
+
+### The Release Discipline
+As implemented in `src/integration/ds_texture_cache.cpp`:
+1. Hold the evicted `Ref` locally until its RID is freed inline or queued— the RID value itself survives `Texture2DRD` death, so the handle stays valid after the wrapper dies.
+2. `RenderingDevice::free_rid()` asserts the render thread (`ERR_RENDER_THREAD_GUARD`, see Section 2), so off-render-thread callers must queue the RID and post a drain worker via `RenderingServer::call_on_render_thread()`. Missing or dead singletons (headless Dummy driver, module teardown) skip the free—no live device means no live GPU resource.
+3. Remove the map entry *before* freeing (idempotent: a repeat evict finds nothing and frees nothing), and gate every free with `texture_is_valid()`—a re-stored evicted texture still carries its stale handle, and a second free spams `Attempted to free invalid ID`.
+4. Perform all of the above **outside** the cache mutex (`free_rid` takes `RenderingDevice` locks; the deferred path crosses threads).
+
+### Upstream: Engine-Side Survivors Still Leak (godotengine/godot#116815, open)
+`Texture2DRD` scope-exit never frees the RID even outside any cache: a tool-script repro (`texture_create` + `set_texture_rd_rid`, texture dropped at function end) exits with `WARNING: 1 RID of type "Texture" was leaked` on D3D12 Forward+ (4.5.1/4.6/master, `needs testing`, no fix). Our game-run D3D12 proof shows the same mechanism from the other side — cache fully cleared (`cached_count=0`), scene instance freed, threaded texture released, 10-frame drain, yet exactly 2 RIDs leak with a clean ObjectDB. Those survivors are engine-held (`ResourceCache` residents via `take_over_path`, scene subresources, thread-load results): no owner remains to `free_rid` them, and the wrapper will not do it. Treat small-count exit residuals with empty caches as this upstream behavior, not as evict-path regressions; only a scaling-with-resolve-count census indicates our bug.
+
+---
+
+## 28. Per-Path I/O Cost Reality: `exists()` Probes and Cold Opens
+
+### The Engine Reality
+Two measured costs on Windows (Godot 4.7.2, NVMe, ~100-path microbenches) dominate texture hand-off time far beyond parsing or allocation:
+1. **`ResourceLoader.exists()` averages ~85 usec per call.** Each invocation performs a full loader iteration over every registered `ResourceFormatLoader`. A first-draft gate calling it once per path held warm enqueue at ~9 ms for 100 textures—worse than the ~40 usec `.import` parse it was meant to skip.
+2. **First-touch `FileAccess::open()` variance spans 67–640 usec per path.** On a cold OS disk cache, merely *opening* 100 files costs 8–87 ms before a single byte is parsed, while the same set served warm costs a fraction of that.
+
+### The Rules
+- Never call `ResourceLoader.exists()` per path inside a hot loop. Probing the `.import` file directly with `FileAccess::file_exists()` measured ~7 usec with outcome-identical results and replaced the gate.
+- Budget cold-start I/O, not just parsing: 100 textures cost 1 bulk read instead of 100 cold opens only when their headers ride along in a combined sidecar index (`textures.headers.idx`) next to the archive. Cache both outcomes (found path *and* miss) so repeat prewarms serve failures with one stat and zero opens.
+
+---
+
+## 29. Autoloads Initialize Under `-s` Custom-`SceneTree` Runs
+
+### The Engine Reality
+The common belief is that running `godot -s headless_tests/test_foo.gd` with a script extending `SceneTree` bypasses project autoloads, since the script replaces the main loop. Empirically (Godot 4.7.2, `--headless --path project -s ...`), **autoload singletons still initialize**: both the `DSBatchManager` autoload (`[DirectStorage] Autoload initialized...`) and unrelated autoloads fired `_ready()` and entered the tree before the test script's `_initialize()` ran.
+
+### The Consequence for Tests
+A headless streaming test cannot assume it owns the flush/collect pipeline exclusively—the autoload's `_process()` concurrently calls `flush_stream_async()` / `collect_completed_results()` / `poll_completed()` on the same singletons. This is safe *only* because every step of the frame driver is idempotent (busy flush keeps the queue, harvest collects finished batches, progress polls pure state). Test harnesses must be written against concurrent driving, and must still drive the pipeline manually frame-by-frame for determinism rather than assuming quiescence.
+
+### The Rule
+Design autoload frame drivers so that double-driving (autoload `_process` plus manual test pumping) is harmless, and never assert exact submit/flush counts that a concurrent driver could perturb—assert bounds (`1 <= submits <= slack`) instead.
 
 

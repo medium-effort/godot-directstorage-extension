@@ -32,6 +32,11 @@
 			<return type="int" />
 			<description>Returns the maximum number of entries retained by the cache.</description>
 		</method>
+		<method name="get_pending_prewarm_count" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="tag" type="int" default="0" />
+			<description>Returns the number of prewarm textures for [param tag] that have not finished yet. Pass [code]0[/code] (the default) to count every tag.</description>
+		</method>
 		<method name="is_cache_mode_ignored" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="cache_mode" type="int" enum="DSTextureCache.CacheMode" />
@@ -40,6 +45,16 @@
 		<method name="is_enabled" qualifiers="const">
 			<return type="bool" />
 			<description>Returns whether the texture cache is actively enabled.</description>
+		</method>
+		<method name="poll_completed">
+			<return type="int" />
+			<param index="0" name="tag" type="int" default="0" />
+			<description>Builds finished prewarm textures and stores them in the cache under their engine path. Only requests matching [param tag] are processed; pass [code]0[/code] (the default) to poll every tag. Returns the number of textures stored by this call. Failed or cancelled requests are skipped here and load normally later through the regular loader.</description>
+		</method>
+		<method name="prewarm_async">
+			<return type="int" />
+			<param index="0" name="paths" type="PackedStringArray" />
+			<description>Enqueues engine texture paths for asynchronous streaming prewarm and returns the stream tag. File remapping is resolved internally, and paths already in the cache are skipped without enqueueing. Track the tag with [method DSContext.is_prewarm_complete] and [method DSContext.get_prewarm_progress], or stop it early with [method DSContext.cancel_prewarm]. Returns [code]0[/code] when the extension is unavailable.</description>
 		</method>
 		<method name="set_enabled">
 			<return type="void" />

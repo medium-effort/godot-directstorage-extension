@@ -6,6 +6,9 @@
 #include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_string_array.hpp>
+#include <godot_cpp/variant/vector2i.hpp>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -51,9 +54,42 @@ private:
 	int pending_request_count = 0;
 	std::deque<int> pending_batch_request_counts;
 
+	// Async-submit counter cache for the Win32 backend, which exposes no
+	// batch counter of its own. Incremented exactly once per successful
+	// submit_async() drain on Win32; the fallback path delegates to
+	// FallbackBackend::get_async_batches_submitted() directly and never
+	// reads this. Guarded by context_mutex. No queue merge; the sync and
+	// async queues stay separate.
+
+	uint64_t async_batches_submitted_cache = 0;
+
+	// Async prewarm stream queue. Kept separate from the sync loader path
+	// above: sync _load requests must never be stolen by the batch
+	// manager's stream flush, and stream requests must never flow through
+	// sync flush_batch().
+	// Lock discipline: stream_mutex guards stream_queue, stream_tags and
+	// next_stream_tag only. It is never held while acquiring context_mutex.
+	// The single exception is count_stream_request_terminal(), which runs both
+	// inside finalize_completed_reports_locked() (context_mutex held) and
+	// standalone; it takes stream_mutex only, so the order is always
+	// context_mutex -> stream_mutex, never reversed.
+	struct StreamTagInfo {
+		uint64_t tag = 0;
+		int total = 0; // requests enqueued under this tag
+		int completed = 0; // terminal (COMPLETED/FAILED, incl. cancelled)
+		int cancelled = 0;
+		bool cancel_requested = false;
+	};
+	mutable std::mutex stream_mutex;
+	std::deque<Ref<DSRequest>> stream_queue; // pending, not yet submitted
+	std::unordered_map<uint64_t, StreamTagInfo> stream_tags;
+	uint64_t next_stream_tag = 1;
+
 	void evict_old_reports_if_needed_locked();
 	void remove_report_locked(int64_t p_request_id);
 	void finalize_completed_reports_locked();
+	void count_stream_request_terminal(const Ref<DSRequest> &p_request);
+	bool enqueue_request_internal(Ref<DSRequest> p_request);
 
 protected:
 	static void _bind_methods();
@@ -88,16 +124,27 @@ public:
 	Error initialize_ds_for_path(const String &p_path);
 	void shutdown_ds();
 
-	bool enqueue_request(Ref<DSRequest> p_request);
+	bool enqueue_request(Ref<DSRequest> p_request, bool p_from_stream = false);
 	int get_pending_request_count() const;
 	void flush_batch();
 	Error flush_batch_async();
+	Error flush_stream_async();
+	bool has_stream_pending() const;
+	int get_stream_pending_count() const;
+	uint64_t prewarm_async(const PackedStringArray &p_paths);
+	bool is_prewarm_complete(uint64_t p_tag) const;
+	Vector2i get_prewarm_progress(uint64_t p_tag) const;
+	void cancel_prewarm(uint64_t p_tag);
 	bool is_batch_complete() const;
 	bool has_pending_results() const;
 	void collect_completed_results();
 	uint64_t get_completion_fence() const;
 	bool wait_for_completion(int p_timeout_msec);
 	void cancel_requests_with_tag(uint64_t p_tag);
+	// GDScript-visible batching counters. No queue merge; the sync and async
+	// queues stay separate.
+	uint64_t get_async_batches_submitted() const;
+	uint64_t get_in_flight_async_batch_count() const;
 
 	// Settings getters/setters
 	void set_staging_buffer_size_mb(uint32_t p_size_mb);

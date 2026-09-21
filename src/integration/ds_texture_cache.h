@@ -7,9 +7,12 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/templates/hash_map.hpp>
 #include <godot_cpp/templates/list.hpp>
+#include <godot_cpp/variant/packed_string_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 
 #include <mutex>
+
+#include <cstdint>
 
 namespace godot {
 
@@ -56,6 +59,20 @@ public:
 	void store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode = CACHE_MODE_REUSE);
 	void evict(const String &p_path);
 	void clear();
+
+	// Async prewarm entry points. DSPreloader does the work; these thin
+	// delegates are the GDScript-visible surface (this class is already
+	// registered, DSPreloader is not).
+	// prewarm_async() accepts engine texture paths (.png/.jpg/.webp),
+	// resolves .import/package remaps internally, skips paths already held
+	// in the caches, enqueues the DSContext stream queue and returns the
+	// stream tag for DSContext::is_prewarm_complete/get_prewarm_progress/
+	// cancel_prewarm. poll_completed() builds textures for finished
+	// requests (GPU texture on the render thread, ImageTexture elsewhere)
+	// and stores them; returns textures stored by this call.
+	uint64_t prewarm_async(const PackedStringArray &p_paths);
+	int poll_completed(uint64_t p_tag = 0);
+	int get_pending_prewarm_count(uint64_t p_tag = 0) const;
 
 	void set_enabled(bool p_enabled);
 	bool is_enabled() const;

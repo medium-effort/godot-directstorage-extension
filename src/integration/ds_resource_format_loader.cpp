@@ -18,9 +18,36 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <chrono>
+#include <mutex>
 #include <thread>
 
 namespace godot {
+
+// Loader-local archive-path cache. Has its own guard and generation and
+// shares no state with the preloader, so the sync and async queues stay
+// separate. Caches BOTH outcomes of the "res://textures.dspkg" probe
+// (project path + executable-directory join + globalized path): a hit
+// serves the found path, a miss serves empty with zero
+// FileAccess::file_exists probes (false-fast). Staleness contract (mirrors
+// DSPreloader::rescan_archive): a textures.dspkg created after a miss was
+// cached is picked up on the next loader teardown (destructor invalidates
+// + bumps generation); the positive open-handle cache in
+// _get_or_open_archive is untouched.
+namespace {
+
+struct LoaderArchiveResolution {
+	std::mutex mutex;
+	String resolved_path;
+	bool probed = false;
+	uint64_t generation = 0;
+};
+
+LoaderArchiveResolution &loader_archive_resolution() {
+	static LoaderArchiveResolution s;
+	return s;
+}
+
+} // namespace
 
 void DSResourceFormatLoader::_bind_methods() {
 }
@@ -32,6 +59,15 @@ DSResourceFormatLoader::~DSResourceFormatLoader() {
 	std::lock_guard<std::mutex> lock(archive_mutex);
 	cached_dspkg.unref();
 	cached_archive_path = String();
+	// Rescan-on-shutdown: drop the cached triple-probe resolution so a
+	// textures.dspkg created/imported during this session resolves fresh
+	// after teardown/reload. Lock order (archive_mutex -> resolution
+	// mutex) is the only nesting site; no inversion possible.
+	LoaderArchiveResolution &res = loader_archive_resolution();
+	std::lock_guard<std::mutex> res_lock(res.mutex);
+	res.resolved_path = String();
+	res.probed = false;
+	res.generation++;
 }
 
 PackedStringArray DSResourceFormatLoader::_get_recognized_extensions() const {
@@ -91,23 +127,50 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 		return String();
 	}
 
+	// Cached resolution: the candidate probe below used to run on EVERY
+	// miss — per _load, _exists, _recognize_path and _get_resource_type
+	// call. A cached miss returns empty with zero probes (false-fast);
+	// a cached hit skips straight to the caller.
+	{
+		std::lock_guard<std::mutex> lock(loader_archive_resolution().mutex);
+		if (loader_archive_resolution().probed) {
+			return loader_archive_resolution().resolved_path;
+		}
+	}
+
+	String found;
 	OS *os = OS::get_singleton();
 	if (os) {
 		String executable_archive = os->get_executable_path().get_base_dir().path_join("textures.dspkg");
 		if (FileAccess::file_exists(executable_archive)) {
-			return executable_archive;
+			found = executable_archive;
 		}
 	}
 
-	ProjectSettings *project_settings = ProjectSettings::get_singleton();
-	if (project_settings) {
-		String globalized_archive = project_settings->globalize_path(p_logical_path);
-		if (FileAccess::file_exists(globalized_archive)) {
-			return globalized_archive;
+	if (found.is_empty()) {
+		ProjectSettings *project_settings = ProjectSettings::get_singleton();
+		if (project_settings) {
+			String globalized_archive = project_settings->globalize_path(p_logical_path);
+			if (FileAccess::file_exists(globalized_archive)) {
+				found = globalized_archive;
+			}
 		}
 	}
 
-	return String();
+	{
+		std::lock_guard<std::mutex> lock(loader_archive_resolution().mutex);
+		LoaderArchiveResolution &res = loader_archive_resolution();
+		if (!res.probed) {
+			// First publisher wins; callers in this generation agree.
+			res.resolved_path = found;
+			res.probed = true;
+		} else {
+			// Lost a probe race while unlocked: honor the winner.
+			found = res.resolved_path;
+		}
+	}
+
+	return found;
 }
 
 Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_path) const {
@@ -260,7 +323,10 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				req->set_texture_format(static_cast<uint32_t>(native_format));
 				req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
 
-				bool enqueued = ds_ctx->enqueue_request(req);
+				// Sync _load path: explicit from_stream=false so the batch
+				// manager's stream flush can never steal a sync request.
+				// Stays fully synchronous: enqueue + flush_batch + status poll.
+				bool enqueued = ds_ctx->enqueue_request(req, false);
 				if (enqueued) {
 					ds_ctx->flush_batch();
 				}
@@ -347,7 +413,8 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					req->set_uncompressed_size(uncomp_size);
 					req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
 					req->get_destination_buffer_ref().resize(static_cast<int64_t>(uncomp_size));
-					if (ds_ctx->enqueue_request(req)) {
+					// Sync path: from_stream=false; stream queue untouched.
+					if (ds_ctx->enqueue_request(req, false)) {
 						mip_requests.write[i] = req;
 						queued_requests.push_back(req);
 					}
@@ -431,7 +498,8 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
 				req->get_destination_buffer_ref().resize(static_cast<int64_t>(p_original_size));
 
-				if (ds_ctx->enqueue_request(req)) {
+				// Sync path: from_stream=false; stream queue untouched.
+				if (ds_ctx->enqueue_request(req, false)) {
 					queued_requests.push_back(req);
 					if (!submit_memory_requests(queued_requests) && p_use_sub_threads) {
 						UtilityFunctions::push_warning("DSResourceFormatLoader: Asynchronous DirectStorage memory load timed out for ", p_cache_key, "; using CPU decompression fallback.");

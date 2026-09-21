@@ -5,6 +5,7 @@
 	</brief_description>
 	<description>
 		[DSContext] manages the lifecycle of the DirectStorage runtime, memory queues, staging buffers, and software fallback backend. The extension registers it as the [Engine] singleton named [code]"DSContext"[/code]. Use [method initialize_ds] before submitting requests, then call [method flush_batch] after enqueuing requests. The addon autoload normally performs this per-frame flush automatically.
+		Async texture prewarm flow: collect engine texture paths ([code].png/.jpg/.webp[/code], never [code].dstex[/code]) with [code]DSPreloader.collect_scene_textures()[/code], enqueue them with [method prewarm_async] (or [code]DSTextureCache.prewarm_async()[/code]) and track the returned tag via the [code]DSBatchManager[/code] autoload's [code]track_prewarm(tag)[/code] so per-tag progress signals emit. The batch manager drains the stream queue each frame with [method flush_stream_async], then bind the scene with [code]ResourceLoader.load(level.tscn, "PackedScene", CACHE_MODE_REUSE)[/code]: [constant CACHE_MODE_REUSE] is required so the scene binds the prewarmed textures without reading the disk again. Keep the loading screen visible across [code]instantiate()[/code] + [code]add_child()[/code] + one drawn frame so shader compilation finishes before gameplay is revealed.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -14,6 +15,13 @@
 			<param index="0" name="tag" type="int" />
 			<description>
 				Cancels all enqueued read requests whose cancellation tag matches [param tag].
+			</description>
+		</method>
+		<method name="cancel_prewarm">
+			<return type="void" />
+			<param index="0" name="tag" type="int" />
+			<description>
+				Marks the prewarm for [param tag] as cancelled (queued requests fail with a "cancelled" message) so [method is_prewarm_complete] returns [code]true[/code].
 			</description>
 		</method>
 		<method name="collect_completed_results">
@@ -41,6 +49,12 @@
 				Submits all requests currently queued to the DirectStorage runtime asynchronously without blocking the calling thread. Returns [constant OK] if the batch was submitted, [constant ERR_UNCONFIGURED] if the context is uninitialized or has no active backend, or [constant ERR_BUSY] if all backend batch slots are occupied. Completion is signaled via [signal batch_completed] or [signal batch_failed].
 			</description>
 		</method>
+		<method name="flush_stream_async">
+			<return type="int" enum="@GlobalScope.Error" />
+			<description>
+				Submits all requests currently in the async stream (prewarm) queue without blocking the calling thread. Called once per frame by the [code]DSBatchManager[/code] autoload. Regular synchronous loads use a separate queue drained by [method flush_batch] / [method flush_batch_async] and are unaffected. Returns [constant OK] on submit, or [constant ERR_BUSY] when the backend is busy (the queue is kept for retry next frame).
+			</description>
+		</method>
 		<method name="get_active_backend_name" qualifiers="const">
 			<return type="String" />
 			<description>
@@ -56,6 +70,10 @@
 			<return type="int" enum="DSRequest.DSDestinationType" />
 			<param index="0" name="request" type="DSRequest" />
 			<description>Returns the actual destination type used to process [param request].</description>
+		</method>
+		<method name="get_async_batches_submitted" qualifiers="const">
+			<return type="int" />
+			<description>Returns the total number of asynchronous batches submitted via [method flush_batch_async] / [method flush_stream_async] since initialization. Because many textures share one batch, this number is normally far below the texture count. Returns [code]0[/code] before initialization.</description>
 		</method>
 		<method name="get_capability_report" qualifiers="const">
 			<return type="Dictionary" />
@@ -78,6 +96,10 @@
 			<return type="int" />
 			<description>Returns the GPU decompression support tier reported by DirectStorage ([code]0[/code] for unsupported or software-only, [code]1[/code] or higher for hardware GPU decompression support).</description>
 		</method>
+		<method name="get_in_flight_async_batch_count" qualifiers="const">
+			<return type="int" />
+			<description>Returns the number of asynchronous batches currently in flight (submitted but not yet collected via [method collect_completed_results]). Returns [code]0[/code] when no batch is running.</description>
+		</method>
 		<method name="get_init_status" qualifiers="const">
 			<return type="int" enum="DSContext.InitStatus" />
 			<description>
@@ -87,6 +109,13 @@
 		<method name="get_pending_request_count" qualifiers="const">
 			<return type="int" />
 			<description>Returns the number of requests currently enqueued in [DSContext] awaiting synchronous ([method flush_batch]) or asynchronous ([method flush_batch_async]) submission.</description>
+		</method>
+		<method name="get_prewarm_progress" qualifiers="const">
+			<return type="Vector2i" />
+			<param index="0" name="tag" type="int" />
+			<description>
+				Returns prewarm progress for [param tag] as [code]Vector2i(done, total)[/code] for progress-bar display. Unknown tags return [code](0, 0)[/code]. Poll this or await the [code]DSBatchManager[/code] autoload's [code]prewarm_finished[/code] signal (tags are tracked opt-in via [code]track_prewarm(tag)[/code]).
+			</description>
 		</method>
 		<method name="get_queue_capacity" qualifiers="const">
 			<return type="int" />
@@ -101,9 +130,17 @@
 			<return type="int" />
 			<description>Returns the configured staging buffer size in MiB. The default is [code]128[/code].</description>
 		</method>
+		<method name="get_stream_pending_count" qualifiers="const">
+			<return type="int" />
+			<description>Returns the number of requests currently waiting in the async stream (prewarm) queue.</description>
+		</method>
 		<method name="has_pending_results" qualifiers="const">
 			<return type="bool" />
 			<description>Returns [code]true[/code] if there are pending asynchronous batch results waiting to be collected via [method collect_completed_results].</description>
+		</method>
+		<method name="has_stream_pending" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if the async stream (prewarm) queue holds requests awaiting [method flush_stream_async].</description>
 		</method>
 		<method name="initialize_ds">
 			<return type="bool" />
@@ -149,10 +186,24 @@
 			<param index="0" name="path" type="String" />
 			<description>Returns whether the drive containing [param path] supports DirectStorage. This does not initialize the runtime.</description>
 		</method>
+		<method name="is_prewarm_complete" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="tag" type="int" />
+			<description>
+				Returns [code]true[/code] when every request for [param tag] has finished (completed, failed, or cancelled) and none remain queued. Unknown tags report [code]true[/code] (nothing pending).
+			</description>
+		</method>
 		<method name="is_supported" qualifiers="const">
 			<return type="bool" />
 			<description>
 				Returns [code]true[/code] when the native Windows DirectStorage backend is available. A software fallback can still initialize on unsupported platforms, but this method remains [code]false[/code].
+			</description>
+		</method>
+		<method name="prewarm_async">
+			<return type="int" />
+			<param index="0" name="paths" type="PackedStringArray" />
+			<description>
+				Issues a fresh stream tag and registers its expected request total for progress queries. Accepts engine texture paths ([code].png/.jpg/.webp[/code]); file remapping is resolved internally. Non-blocking: call [code]track_prewarm(tag)[/code] on the [code]DSBatchManager[/code] autoload for per-tag progress signals, then bind with [code]CACHE_MODE_REUSE[/code] once [method is_prewarm_complete] holds.
 			</description>
 		</method>
 		<method name="set_disable_gpu_decompression">

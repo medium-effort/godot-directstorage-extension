@@ -10,9 +10,20 @@ extends EditorExportPlugin
 
 const OPTION_BUNDLE_DSPKG: StringName = &"directstorage/bundle_textures_dspkg"
 
+## During export a combined header index (textures.headers.idx) is written
+## next to textures.dspkg so the runtime can look up bundled texture headers
+## without opening every file.
+const COMBINED_INDEX_MAGIC: int = 0x58444948
+const COMBINED_INDEX_VERSION: int = 1
+const COMBINED_INDEX_MAX_ENTRIES: int = 8192
+const COMBINED_INDEX_MAX_KEY_BYTES: int = 1024
+const COMBINED_INDEX_MIP_SLOTS: int = 16
+
 var _dspkg: RefCounted = null
 var _temp_dspkg_path: String = "user://temp_textures.dspkg"
 var _has_textures: bool = false
+## Texture paths bundled by this export run.
+var _bundled_entries: Array[Dictionary] = []
 var _archive_failed: bool = false
 var _target_export_dir: String = ""
 var _export_features: PackedStringArray = []
@@ -74,6 +85,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_is_debug_export = is_debug
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
 	_has_textures = false
+	_bundled_entries.clear()
 	_archive_failed = false
 	_dspkg = null
 
@@ -160,6 +172,7 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 			return
 
 		_has_textures = true
+		_track_bundled_entry(dstex_path)
 		print("[DirectStorage Exporter] Added texture to archive: ", resource_path, " (from ", dstex_path, ")")
 		# Skip texture payload from PCK so it is only stored in textures.dspkg.
 		skip()
@@ -182,6 +195,7 @@ func _export_end() -> void:
 						var copy_err := DirAccess.copy_absolute(temp_dspkg_path, target_dspkg_path)
 						if copy_err == OK:
 							print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", target_dspkg_path)
+							_write_combined_header_index(target_dspkg_path.get_basename() + ".headers.idx")
 						else:
 							push_error("[DirectStorage Exporter] Failed to copy textures.dspkg to '" + target_dspkg_path + "': " + error_string(copy_err) + ". Verify the export directory is writable and not locked by another process.")
 				else:
@@ -250,3 +264,146 @@ func _deploy_windows_binaries(target_base_dir: String, is_debug: bool, features:
 			var remove_err := DirAccess.remove_absolute(root_dll_path)
 			if remove_err == OK:
 				print("[DirectStorage Exporter] Cleaned up redundant root binary: ", dll_name)
+
+## Records a bundled dstex res path for the combined header index (deduped).
+func _track_bundled_entry(dstex_path: String) -> void:
+	for existing in _bundled_entries:
+		if String(existing.get("dstex_path", "")) == dstex_path:
+			return
+	_bundled_entries.append({"dstex_path": dstex_path})
+
+## Writes the combined header index (e.g. textures.headers.idx) next
+## to the deployed textures.dspkg. Best-effort: any failure only
+## warns and never affects the deployed archive.
+func _write_combined_header_index(target_index_path: String) -> void:
+	if _bundled_entries.is_empty():
+		return
+	if _bundled_entries.size() > COMBINED_INDEX_MAX_ENTRIES:
+		push_warning("[DirectStorage Exporter] Too many bundled textures for the combined header index (" + str(_bundled_entries.size()) + " > " + str(COMBINED_INDEX_MAX_ENTRIES) + "); skipping textures.headers.idx.")
+		return
+	if not ClassDB.class_exists("DSTex"):
+		push_warning("[DirectStorage Exporter] DSTex class not found; skipping combined header index.")
+		return
+	var payload := PackedByteArray()
+	var entry_count := 0
+	for entry in _bundled_entries:
+		var entry_bytes := _build_combined_index_entry(String(entry.get("dstex_path", "")))
+		if entry_bytes.is_empty():
+			continue
+		payload.append_array(entry_bytes)
+		entry_count += 1
+	if entry_count == 0:
+		push_warning("[DirectStorage Exporter] No valid texture headers for the combined header index; skipping textures.headers.idx.")
+		return
+	var blob := PackedByteArray()
+	blob.append_array(_idx_u32(COMBINED_INDEX_MAGIC))
+	blob.append_array(_idx_u16(COMBINED_INDEX_VERSION))
+	blob.append_array(_idx_u16(0))
+	blob.append_array(_idx_u32(entry_count))
+	blob.append_array(_idx_u32(_idx_crc32_ieee(payload)))
+	blob.append_array(payload)
+	var file := FileAccess.open(target_index_path, FileAccess.WRITE)
+	if file == null or not file.is_open():
+		push_warning("[DirectStorage Exporter] Could not write combined header index to '" + target_index_path + "'. The textures.dspkg archive is unaffected.")
+		return
+	file.store_buffer(blob)
+	file.close()
+	print("[DirectStorage Exporter] Wrote combined header index (", entry_count, " entries) to: ", target_index_path)
+
+## Serializes one combined-index entry for a bundled dstex path. Returns an
+## empty array when the header is missing/invalid (caller skips it).
+func _build_combined_index_entry(dstex_path: String) -> PackedByteArray:
+	var key_bytes := dstex_path.to_utf8_buffer()
+	if key_bytes.size() < 1 or key_bytes.size() > COMBINED_INDEX_MAX_KEY_BYTES:
+		push_warning("[DirectStorage Exporter] Skipping index entry with invalid key length: " + dstex_path)
+		return PackedByteArray()
+	var dstex: RefCounted = ClassDB.instantiate("DSTex")
+	if dstex == null:
+		return PackedByteArray()
+	var header: Dictionary = dstex.read_header(dstex_path)
+	var width := int(header.get("width", 0))
+	var height := int(header.get("height", 0))
+	var dstex_version := int(header.get("version", 0))
+	var mip_count := int(header.get("mip_count", 0))
+	if width <= 0 or height <= 0 or mip_count < 1 or mip_count > COMBINED_INDEX_MIP_SLOTS or (dstex_version != 1 and dstex_version != 2):
+		push_warning("[DirectStorage Exporter] Skipping index entry with invalid header: " + dstex_path)
+		return PackedByteArray()
+	var pixel_format := int(header.get("pixel_format", 0))
+	var flags := int(header.get("flags", 0))
+	var original_size := int(header.get("original_size", 0))
+	var compressed_size := int(header.get("compressed_size", 0))
+	var mtime := int(FileAccess.get_modified_time(dstex_path))
+	var file_len := 0
+	var probe := FileAccess.open(dstex_path, FileAccess.READ)
+	if probe != null and probe.is_open():
+		file_len = int(probe.get_length())
+		probe.close()
+	var mip_offsets: PackedInt64Array = header.get("mip_offsets", PackedInt64Array())
+	var mip_sizes: PackedInt32Array = header.get("mip_sizes", PackedInt32Array())
+	var mip_uncompressed: PackedInt32Array = header.get("mip_uncompressed_sizes", PackedInt32Array())
+	var row_pitches: PackedInt32Array = header.get("mip_row_pitches", PackedInt32Array())
+	if mip_offsets.size() < mip_count or mip_sizes.size() < mip_count or mip_uncompressed.size() < mip_count or row_pitches.size() < mip_count:
+		push_warning("[DirectStorage Exporter] Skipping index entry with incomplete mip tables: " + dstex_path)
+		return PackedByteArray()
+	var out := PackedByteArray()
+	out.append_array(_idx_u32(key_bytes.size()))
+	out.append_array(key_bytes)
+	out.append_array(_idx_u32(width))
+	out.append_array(_idx_u32(height))
+	out.append_array(_idx_u32(pixel_format))
+	out.append_array(_idx_u32(flags))
+	out.append_array(_idx_u16(dstex_version))
+	out.append_array(_idx_u16(mip_count))
+	out.append_array(_idx_u64(original_size))
+	out.append_array(_idx_u64(compressed_size))
+	out.append_array(_idx_u64(mtime))
+	out.append_array(_idx_u64(file_len))
+	for i in range(COMBINED_INDEX_MIP_SLOTS):
+		var off := 0
+		if i < mip_count:
+			off = int(mip_offsets[i])
+		out.append_array(_idx_i64(off))
+	for i in range(COMBINED_INDEX_MIP_SLOTS):
+		var sz := 0
+		if i < mip_count:
+			sz = int(mip_sizes[i])
+		out.append_array(_idx_i32(sz))
+	for i in range(COMBINED_INDEX_MIP_SLOTS):
+		var uncomp := 0
+		if i < mip_count:
+			uncomp = int(mip_uncompressed[i])
+		out.append_array(_idx_i32(uncomp))
+	for i in range(COMBINED_INDEX_MIP_SLOTS):
+		var pitch := 0
+		if i < mip_count:
+			pitch = int(row_pitches[i])
+		out.append_array(_idx_i32(pitch))
+	return out
+
+## IEEE CRC32 (poly 0xEDB88320, init/xorout 0xFFFFFFFF), bitwise to mirror
+## DSPreloader::crc32_ieee exactly.
+static func _idx_crc32_ieee(data: PackedByteArray) -> int:
+	var crc: int = 0xFFFFFFFF
+	for b in data:
+		crc ^= b
+		for i in range(8):
+			if (crc & 1) != 0:
+				crc = (0xEDB88320 ^ (crc >> 1)) & 0xFFFFFFFF
+			else:
+				crc = (crc >> 1) & 0xFFFFFFFF
+	return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+static func _idx_u16(v: int) -> PackedByteArray:
+	return PackedByteArray([v & 0xFF, (v >> 8) & 0xFF])
+
+static func _idx_u32(v: int) -> PackedByteArray:
+	return PackedByteArray([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
+
+static func _idx_u64(v: int) -> PackedByteArray:
+	return PackedByteArray([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF, (v >> 32) & 0xFF, (v >> 40) & 0xFF, (v >> 48) & 0xFF, (v >> 56) & 0xFF])
+
+static func _idx_i32(v: int) -> PackedByteArray:
+	return _idx_u32(v & 0xFFFFFFFF)
+
+static func _idx_i64(v: int) -> PackedByteArray:
+	return _idx_u64(v)
