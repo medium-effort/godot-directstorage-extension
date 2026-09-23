@@ -1,6 +1,7 @@
 param(
     [string]$Target = "editor",
-    [switch]$IncludePdb
+    [switch]$IncludePdb,
+    [switch]$IncludeTests
 )
 
 function Show-BuildFailure {
@@ -122,7 +123,14 @@ $tarExcludes = @(
     "--exclude=*.lib",
     "--exclude=*.ilk",
     "--exclude=*.idb",
-    "--exclude=project/addons/directstorage_accelerator/bin/directstorage_accelerator*"
+    "--exclude=project/addons/directstorage_accelerator/bin/directstorage_accelerator*",
+    # NOTE: do NOT exclude anything matching gdextest here. Windows bsdtar
+    # matches --exclude patterns against every path component, so even an
+    # anchored-looking "--exclude=./gdextest" strips extern/gdextest/ from the
+    # Device B sync and breaks `scons tests=true` (spike defect #1). The
+    # repo-root review clone this was meant for does not exist; if one is
+    # ever created, syncing it to B is harmless bulk, never a break.
+    "--exclude=./wavexecute_tasks"
 ) -join " "
 
 cmd.exe /c "tar -czf - $tarExcludes . | ssh $ActiveHost ""tar -xzf - -C $RemoteDir"""
@@ -133,10 +141,16 @@ if ($LASTEXITCODE -ne 0) {
 
 # 4. Trigger SCons build on Device B
 Write-Host "[4/6] Compiling target=$Target on Device B..." -ForegroundColor Cyan
-ssh $ActiveHost "cd /d $RemoteDir && call scons platform=windows target=$Target dev_build=yes & exit /b %ERRORLEVEL%"
-
+$TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
+# Exit status cannot ride the ssh code: OpenSSH's cmd shell returns 0 even
+# when SCons fails, and %ERRORLEVEL% expands before SCons runs. A marker
+# file written only after a successful scons is the reliable signal.
+$RemoteMarker = "$RemoteDir\gdextest_scons.ok"
+ssh $ActiveHost "if exist `"$RemoteMarker`" del /q `"$RemoteMarker`""
+ssh $ActiveHost "cd /d $RemoteDir && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarker`""
+ssh $ActiveHost "if exist `"$RemoteMarker`" (exit /b 0) else (exit /b 1)"
 if ($LASTEXITCODE -ne 0) {
-    Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost)." -Code $LASTEXITCODE
+    Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost). Detected via missing success marker (ssh does not propagate the SCons exit code)." -Code 1
 }
 
 # 5. Pull back compiled binary and debug symbols to Device A
@@ -149,6 +163,15 @@ if (!(Test-Path $ArtifactLocalDir)) {
 scp -C "$ActiveHost`:$ArtifactRemoteDir/*.dll" "$ArtifactLocalDir/"
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy compiled .dll files from Device B ($ActiveHost)." -Code $LASTEXITCODE
+}
+if ($IncludeTests) {
+    if (!(Test-Path "./bin")) {
+        New-Item -ItemType Directory -Force -Path "./bin" | Out-Null
+    }
+    scp -C "$ActiveHost`:$RemoteDir/bin/libdirectstorage_tests*.dll" "./bin/"
+    if ($LASTEXITCODE -ne 0) {
+        Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll (libdirectstorage_tests*.dll) from Device B ($ActiveHost). The remote test build likely failed." -Code $LASTEXITCODE
+    }
 }
 scp -C "$ActiveHost`:$ArtifactRemoteDir/build_manifest.json" "$ArtifactLocalDir/" 2>$null
 

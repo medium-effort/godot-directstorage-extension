@@ -1,0 +1,46 @@
+[gdextest]
+version = "1"
+minimum_required_godot_version = "4.5"
+
+[gdextest.tests]
+sources = ["tests/**/*.cpp", "src/register_types.cpp", "src/formats/*.cpp", "src/compression/*.cpp", "src/core/*.cpp", "src/integration/*.cpp", "src/platform/win32/*.cpp", "src/platform/fallback/*.cpp", "thirdparty/gdeflate/*.cpp", "thirdparty/libdeflate/lib/*.c", "thirdparty/libdeflate/lib/x86/*.c"]
+exclude = ["tests/helpers/**"]
+# NOTE: code under test must compile INTO the test library.
+# Closure (verified by include-scan): formats -> compression -> ds_error_handler;
+# integration (cache/loader/preloader) -> core (context/request/profiler) ->
+# platform backends (win32 + fallback). register_types.cpp IS included: the
+# DS classes (DSContext/DSTextureCache/DSResourceFormatLoader/...) must be
+# registered in ClassDB, and the test adapter forwards the module
+# initialize/uninitialize lifecycle to it (engine-coupled suites otherwise
+# crash with "Cannot get class 'DSTextureCache'"). The test DLL still exports
+# only gdextest_library_init (register_types' own entry symbol is unused).
+
+[gdextest.test]
+timeout_ms = 30000
+isolate_timeout_sec = 120        # higher for D3D12 fence waits
+flaky_retries = 2
+
+[gdextest.host]
+mode = "editor"
+entry_symbol = "gdextest_library_init"
+plugin_class = "GdextestPlugin"
+
+[gdextest.fixture]
+directory = "build/gdextest/project"
+project_name = "directstorage-accelerator-tests"
+assets = ["project/test_assets/**"]
+scan_timeout_ms = 30000
+
+[gdextest.output]
+directory = "bin"
+name = "libdirectstorage_tests"
+
+[gdextest.build]
+args = ["target=editor"]
+# SCons-only. Never Godot runtime flags.
+
+[gdextest.consumer_extension]
+# Uncomment when a suite needs the REAL built extension (registered
+# classes, DSContext singletons, editor plugin) loaded in the fixture.
+# Only one of library/manifest is required; the other is derived.
+# library = "project/addons/directstorage_accelerator/bin/directstorage_accelerator.windows.editor.x86_64.dll"

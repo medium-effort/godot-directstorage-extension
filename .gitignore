@@ -49,6 +49,14 @@ project/test_assets/*.png
 *.env
 src/cppcheck_result.xml
 
+# gdextest
+build/gdextest/
+bin/libdirectstorage_tests*
+
+# others
+.vscode/*.log
+test-results.xml
+
 # ==============================================================================
 # Local Tooling & Agent Metadata
 # ==============================================================================

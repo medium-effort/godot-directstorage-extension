@@ -1,0 +1,93 @@
+# CI job for gdextest framework
+# Runs after native build on Linux/macOS runners (no Device A/B split needed)
+
+name: Run gdextest
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  run-gdextest:
+    name: Run gdextest ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Configure C++ compiler (Linux/Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make python3-pip
+          
+      - name: Configure C++ compiler (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install scons cmake
+          
+      - name: Configure Python and SCons
+        run: |
+          python -m pip install --upgrade pip setuptools wheel scons
+
+      - name: Download Godot 4.7.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux)
+              FILE="Godot_v4.7.2-stable_linux.x86_64.zip"
+              BIN="Godot_v4.7.2-stable_linux.x86_64"
+              ;;
+            macOS)
+              FILE="Godot_v4.7.2-stable_macos.universal.zip"
+              BIN="Godot.app/Contents/MacOS/Godot"
+              ;;
+            Windows)
+              FILE="Godot_v4.7.2-stable_win64.exe.zip"
+              BIN="Godot_v4.7.2-stable_win64_console.exe"
+              ;;
+          esac
+          curl -fsSL -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/4.7.2-stable/${FILE}"
+          unzip -o godot.zip
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            chmod +x "$BIN"
+          fi
+          echo "GODOT=${GITHUB_WORKSPACE}/${BIN}" >> "$GITHUB_ENV"
+          
+      - name: Build extension and tests
+        run: scons target=editor tests=true arch=x86_64
+        env:
+          GODOT: ${{ env.GODOT }}
+          
+      - name: Run gdextest
+        shell: bash
+        run: |
+          python extern/gdextest/tools/gdextest.py test \
+            --json=test-results.json \
+            --junit=test-results.xml
+        env:
+          GODOT: ${{ env.GODOT }}
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gdextest-results-${{ matrix.os }}
+          path: |
+            test-results.json
+            test-results.xml
+            
+      - name: Publish test report (GitHub Annotations)
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          junit_files: test-results.xml

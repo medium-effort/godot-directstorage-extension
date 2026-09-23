@@ -92,6 +92,35 @@ if env["platform"] == "windows":
     installed_dlls = env.Install(output_dir, ds_dlls)
     targets.append(installed_dlls)
 
+# --- gdextest integration (test-only build target) ---
+# Build with: scons tests=true
+# Run with:   ./extern/gdextest/gdextest test
+# Gated on tests flag so normal builds never require extern/gdextest.
+if ARGUMENTS.get("tests", 0):
+    if os.path.isfile("extern/gdextest/SConscript"):
+        # The test library now compiles in the Win32 backend, so it DOES
+        # import dstorage.dll. Keep the main env's /DELAYLOAD:dstorage.dll +
+        # delayimp.lib: without them the fixture fails to load the test DLL
+        # ("Error 126: module could not be found") because dstorage.dll is not
+        # shipped beside the fixture. Delay-load makes it resolve lazily, so
+        # non-D3D12 suites run without the DirectStorage runtime present.
+        # /ignore:4199 keeps the no-op delay-load warning non-fatal if a
+        # future source set stops importing dstorage.dll (spike defect #3).
+        _gdex_env = env.Clone()
+        if "msvc" in _gdex_env.get("TOOLS", []):
+            _gdex_env.Append(LINKFLAGS=["/ignore:4199"])
+        gdextest_lib = _gdex_env.SConscript(
+            "extern/gdextest/SConscript",
+            variant_dir="build/gdextest", duplicate=0,
+            exports={"env": _gdex_env, "gdextest": {
+                "suites": Glob("tests/**/*.cpp"),
+            }},
+        )
+        if gdextest_lib:
+            Default(gdextest_lib)
+    else:
+        print("[SCons] Warning: tests=true requested but extern/gdextest/SConscript is missing; skipping test target.")
+
 # Post-build action: generate build status manifest artifact and incremental project sync
 import json
 import datetime
