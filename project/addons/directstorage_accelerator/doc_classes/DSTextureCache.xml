@@ -9,20 +9,31 @@
 	<tutorials>
 	</tutorials>
 	<methods>
+		<method name="add_alias">
+			<return type="void" />
+			<param index="0" name="canonical_path" type="String" />
+			<param index="1" name="alias_path" type="String" />
+			<description>Binds [param alias_path] as an alias pointing to the canonical cached entry for [param canonical_path] without consuming an additional cache slot.</description>
+		</method>
 		<method name="clear">
 			<return type="void" />
-			<description>Removes every cached texture.</description>
+			<description>Removes every cached texture and unbinds all aliases.</description>
 		</method>
 		<method name="evict">
 			<return type="void" />
 			<param index="0" name="path" type="String" />
-			<description>Removes the cached texture stored under [param path], if present.</description>
+			<description>Removes the cached texture stored under [param path] (or its canonical entry if [param path] is an alias) and unbinds associated aliases.</description>
 		</method>
 		<method name="get_cached">
 			<return type="Texture2D" />
 			<param index="0" name="path" type="String" />
 			<param index="1" name="cache_mode" type="int" enum="DSTextureCache.CacheMode" default="1" />
-			<description>Returns the cached texture for [param path] and marks it as recently used unless [param cache_mode] ignores or replaces caching. Returns [code]null[/code] when no entry exists or caching is disabled.</description>
+			<description>Returns the cached texture for [param path] (resolving any alias to its canonical entry) and marks it as recently used unless [param cache_mode] ignores or replaces caching. Returns [code]null[/code] when no entry exists or caching is disabled.</description>
+		</method>
+		<method name="get_canonical_path" qualifiers="const">
+			<return type="String" />
+			<param index="0" name="path" type="String" />
+			<description>Returns the canonical path for [param path]. If [param path] is an alias, returns the canonical primary path it points to; if it is already canonical, returns [param path]; otherwise returns an empty string.</description>
 		</method>
 		<method name="get_cached_count" qualifiers="const">
 			<return type="int" />
@@ -56,6 +67,16 @@
 			<param index="0" name="paths" type="PackedStringArray" />
 			<description>Enqueues engine texture paths for asynchronous streaming prewarm and returns the stream tag. File remapping is resolved internally, and paths already in the cache are skipped without enqueueing. Track the tag with [method DSContext.is_prewarm_complete] and [method DSContext.get_prewarm_progress], or stop it early with [method DSContext.cancel_prewarm]. Returns [code]0[/code] when the extension is unavailable.</description>
 		</method>
+		<method name="has_alias" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="alias_path" type="String" />
+			<description>Returns whether [param alias_path] is currently registered as an alias in the cache.</description>
+		</method>
+		<method name="remove_alias">
+			<return type="void" />
+			<param index="0" name="alias_path" type="String" />
+			<description>Unbinds [param alias_path] from its canonical cached entry without removing the canonical texture itself.</description>
+		</method>
 		<method name="set_enabled">
 			<return type="void" />
 			<param index="0" name="enabled" type="bool" />
@@ -71,7 +92,8 @@
 			<param index="0" name="path" type="String" />
 			<param index="1" name="texture" type="Texture2D" />
 			<param index="2" name="cache_mode" type="int" enum="DSTextureCache.CacheMode" default="1" />
-			<description>Stores [param texture] under [param path] and marks it as recently used if caching is enabled and [param cache_mode] is not ignored. Null textures are ignored.</description>
+			<param index="3" name="alias_path" type="String" default="&quot;&quot;" />
+			<description>Stores [param texture] under [param path] (optionally registering [param alias_path] as a shared secondary key without consuming extra capacity) and marks it as recently used if caching is enabled and [param cache_mode] is not ignored. Null textures are ignored.</description>
 		</method>
 	</methods>
 	<members>

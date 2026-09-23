@@ -48,6 +48,41 @@ const TRAVERSABLE_EXTENSIONS: PackedStringArray = ["tscn", "scn", "tres", "res",
 const FALLBACK_FRAME_BUDGET_USEC: int = 8000
 
 
+## Normalizes a raw dependency entry returned by [code]ResourceLoader.get_dependencies()[/code]
+## into a clean [code]res://[/code] or [code]user://[/code] engine path.
+##
+## In Godot 4.x, dependencies are formatted as:
+##   "uid://<id>::<type>::<fallback_path>"
+##   "uid://<id>::::<fallback_path>"
+##   "<path>::<type>"
+##   "<path>"
+##   "uid://<id>"
+## If a raw UID is passed, it is resolved safely through [ResourceUID].
+static func _resolve_dependency_path(raw_dep: String) -> String:
+	var path: String = raw_dep.strip_edges()
+	if path.is_empty():
+		return ""
+
+	if path.contains("::"):
+		# Section 3 is fallback path per ResourceFormatLoader spec: uid::type::path or uid::::path
+		var fallback: String = path.get_slice("::", 2).strip_edges()
+		if not fallback.is_empty() and (fallback.begins_with("res://") or fallback.begins_with("user://")):
+			return fallback
+		# Section 1 if no valid fallback path in section 3 (e.g. "res://script.gd::Script")
+		var first: String = path.get_slice("::", 0).strip_edges()
+		path = first
+
+	# If the path is a UID, safely resolve it via ResourceUID
+	if path.begins_with("uid://"):
+		var id: int = ResourceUID.text_to_id(path)
+		if id != ResourceUID.INVALID_ID and ResourceUID.has_id(id):
+			var resolved: String = ResourceUID.get_id_path(id)
+			if not resolved.is_empty():
+				return resolved
+
+	return path
+
+
 ## Collects prewarmable texture paths for a scene: recursive
 ## [code]ResourceLoader.get_dependencies()[/code] walk plus a [code]DirAccess[/code]
 ## sweep of the scene's own directory and [param extra_scan_dirs] (catches
@@ -60,7 +95,10 @@ const FALLBACK_FRAME_BUDGET_USEC: int = 8000
 static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedStringArray = PackedStringArray()) -> PackedStringArray:
 	var found: Dictionary = {}
 	var visited: Dictionary = {}
-	var stack: Array[String] = [scene_path]
+	var root_scene: String = _resolve_dependency_path(scene_path)
+	var stack: Array[String] = []
+	if not root_scene.is_empty():
+		stack.push_back(root_scene)
 	while not stack.is_empty():
 		var current: String = stack.pop_back()
 		if current.is_empty() or visited.has(current):
@@ -70,7 +108,7 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 			continue
 		var deps: PackedStringArray = ResourceLoader.get_dependencies(current)
 		for dep in deps:
-			var dep_path: String = dep.strip_edges()
+			var dep_path: String = _resolve_dependency_path(dep)
 			if dep_path.is_empty() or visited.has(dep_path):
 				continue
 			if _is_prewarmable_texture(dep_path):
@@ -80,8 +118,8 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 				stack.push_back(dep_path)
 	# DirAccess sweep: scene directory (dynamic-load catch-all) + caller dirs.
 	var dirs: Dictionary = {}
-	if not scene_path.is_empty():
-		dirs[scene_path.get_base_dir()] = true
+	if not root_scene.is_empty():
+		dirs[root_scene.get_base_dir()] = true
 	for extra_dir in extra_scan_dirs:
 		var normalized: String = extra_dir.strip_edges()
 		if not normalized.is_empty():

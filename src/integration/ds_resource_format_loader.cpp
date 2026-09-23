@@ -535,10 +535,8 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		if (p_cache_mode == ResourceFormatLoader::CACHE_MODE_REUSE || p_cache_mode == ResourceFormatLoader::CACHE_MODE_REPLACE) {
 			DSTextureCache *cache = DSTextureCache::get_singleton();
 			if (cache) {
-				cache->store(p_cache_key, result_texture, p_cache_mode);
-				if (!p_original_cache_key.is_empty() && p_original_cache_key != p_cache_key) {
-					cache->store(p_original_cache_key, result_texture, p_cache_mode);
-				}
+				String alias = (!p_original_cache_key.is_empty() && p_original_cache_key != p_cache_key) ? p_original_cache_key : String();
+				cache->store(p_cache_key, result_texture, p_cache_mode, alias);
 			}
 		}
 		return result_texture;
@@ -609,7 +607,9 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			uint32_t width = entry_info["width"];
 			uint32_t height = entry_info["height"];
 			uint32_t pixel_format = entry_info["pixel_format"];
-			bool is_srgb = DSTex::is_rd_format_srgb(pixel_format);
+			bool is_srgb = (entry_info.has("flags") && (static_cast<uint32_t>(entry_info["flags"]) & 1U) != 0) ||
+					(entry_info.has("is_srgb") && (bool)entry_info["is_srgb"]) ||
+					DSTex::is_rd_format_srgb(pixel_format);
 			uint32_t mip_count = entry_info["mip_count"];
 			bool is_v2 = entry_info.has("has_gpu_metadata") ? (bool)entry_info["has_gpu_metadata"] : false;
 			PackedInt64Array mip_offsets = entry_info.has("mip_offsets") ? (PackedInt64Array)entry_info["mip_offsets"] : PackedInt64Array();
@@ -617,7 +617,8 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			PackedInt32Array mip_uncompressed_sizes = entry_info.has("mip_uncompressed_sizes") ? (PackedInt32Array)entry_info["mip_uncompressed_sizes"] : PackedInt32Array();
 			PackedInt32Array mip_row_pitches = entry_info.has("mip_row_pitches") ? (PackedInt32Array)entry_info["mip_row_pitches"] : PackedInt32Array();
 
-			bool as_image_texture = entry_info.has("as_image_texture") ? (bool)entry_info["as_image_texture"] : false;
+			bool as_image_texture = (entry_info.has("flags") && (static_cast<uint32_t>(entry_info["flags"]) & 2U) != 0) ||
+					(entry_info.has("as_image_texture") && (bool)entry_info["as_image_texture"]);
 
 			return _load_texture_payload(archive_path, data_offset, comp_size, orig_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, as_image_texture);
 		}

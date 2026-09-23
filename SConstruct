@@ -383,9 +383,9 @@ def write_build_manifest():
         }
     }
 
-    # If a development editor build succeeded, alias/copy it to the canonical editor binary
-    # so official (non-dev) Godot editor releases can load the extension out of the box.
-    if status == "SUCCESS" and env.get("target") == "editor" and env.get("dev_build", False):
+    # If a development build succeeded, alias/copy it to the canonical binary
+    # so official (non-dev) Godot releases/editor can load the extension out of the box.
+    if status == "SUCCESS" and env.get("target") in ["editor", "template_debug", "template_release"] and env.get("dev_build", False):
         canonical_name = target_name.replace(".dev.", ".")
         if canonical_name != target_name:
             src_dll = os.path.join(output_dir, target_name)
@@ -393,9 +393,9 @@ def write_build_manifest():
             if os.path.isfile(src_dll):
                 try:
                     safe_copy_file(src_dll, dst_dll)
-                    print(f"[SCons] Created canonical editor alias: {canonical_name} <- {target_name}")
+                    print(f"[SCons] Created canonical alias: {canonical_name} <- {target_name}")
                 except Exception as e:
-                    print(f"[SCons] Warning: Failed to create canonical editor alias {canonical_name}: {e}")
+                    print(f"[SCons] Warning: Failed to create canonical alias {canonical_name}: {e}")
             # Also copy PDB if present so debuggers can resolve symbols immediately
             src_pdb = os.path.splitext(src_dll)[0] + ".pdb"
             dst_pdb = os.path.splitext(dst_dll)[0] + ".pdb"
@@ -538,12 +538,12 @@ def write_build_manifest():
     curr_entry["last_built_at"] = build_finish_time.isoformat()
     curr_entry["last_build_duration_seconds"] = duration_seconds
 
-    # If canonical alias was generated for this dev editor build, record its explicit metadata
-    if env.get("target") == "editor" and env.get("dev_build", False):
+    # If canonical alias was generated for this dev build, record its explicit metadata
+    if env.get("target") in ["editor", "template_debug", "template_release"] and env.get("dev_build", False):
         canonical_name = target_name.replace(".dev.", ".")
         if canonical_name != target_name:
             can_entry = targets_dict.setdefault(canonical_name, {})
-            can_entry["target_type"] = "editor"
+            can_entry["target_type"] = env.get("target")
             can_entry["aliased_from"] = target_name
             can_entry["is_dev_build"] = True
             can_fpath = os.path.join(output_dir, canonical_name)

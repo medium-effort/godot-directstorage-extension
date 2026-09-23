@@ -171,7 +171,11 @@ void DSTextureCache::_bind_methods() {
 	BIND_ENUM_CONSTANT(CACHE_MODE_IGNORE_DEEP);
 
 	ClassDB::bind_method(D_METHOD("get_cached", "path", "cache_mode"), &DSTextureCache::get_cached, DEFVAL(static_cast<int>(CACHE_MODE_REUSE)));
-	ClassDB::bind_method(D_METHOD("store", "path", "texture", "cache_mode"), &DSTextureCache::store, DEFVAL(static_cast<int>(CACHE_MODE_REUSE)));
+	ClassDB::bind_method(D_METHOD("store", "path", "texture", "cache_mode", "alias_path"), &DSTextureCache::store, DEFVAL(static_cast<int>(CACHE_MODE_REUSE)), DEFVAL(String()));
+	ClassDB::bind_method(D_METHOD("add_alias", "canonical_path", "alias_path"), &DSTextureCache::add_alias);
+	ClassDB::bind_method(D_METHOD("remove_alias", "alias_path"), &DSTextureCache::remove_alias);
+	ClassDB::bind_method(D_METHOD("has_alias", "alias_path"), &DSTextureCache::has_alias);
+	ClassDB::bind_method(D_METHOD("get_canonical_path", "path"), &DSTextureCache::get_canonical_path);
 	ClassDB::bind_method(D_METHOD("evict", "path"), &DSTextureCache::evict);
 	ClassDB::bind_method(D_METHOD("clear"), &DSTextureCache::clear);
 
@@ -229,21 +233,73 @@ bool DSTextureCache::_evict_oldest() {
 
 	List<String>::Element *oldest = lru_list.back();
 	const String oldest_path = oldest->get();
-	lru_list.erase(oldest);
-	cache_map.erase(oldest_path);
+	_remove_entry(oldest_path);
 	return true;
 }
 
-void DSTextureCache::_remove_entry(const String &p_path) {
-	if (!cache_map.has(p_path)) {
+void DSTextureCache::_remove_entry(const String &p_canonical_path) {
+	if (!cache_map.has(p_canonical_path)) {
 		return;
 	}
 
-	CacheEntry entry = cache_map[p_path];
+	CacheEntry entry = cache_map[p_canonical_path];
+	for (int i = 0; i < entry.aliases.size(); ++i) {
+		alias_map.erase(entry.aliases[i]);
+	}
 	if (entry.lru_element) {
 		lru_list.erase(entry.lru_element);
 	}
-	cache_map.erase(p_path);
+	cache_map.erase(p_canonical_path);
+}
+
+String DSTextureCache::_resolve_canonical_locked(const String &p_path) const {
+	if (cache_map.has(p_path)) {
+		return p_path;
+	}
+	if (alias_map.has(p_path)) {
+		return alias_map[p_path];
+	}
+	return String();
+}
+
+void DSTextureCache::_unbind_alias_locked(const String &p_alias_path) {
+	if (!alias_map.has(p_alias_path)) {
+		return;
+	}
+	String canonical = alias_map[p_alias_path];
+	alias_map.erase(p_alias_path);
+	if (cache_map.has(canonical)) {
+		CacheEntry &entry = cache_map[canonical];
+		for (int i = 0; i < entry.aliases.size(); ++i) {
+			if (entry.aliases[i] == p_alias_path) {
+				entry.aliases.remove_at(i);
+				break;
+			}
+		}
+	}
+}
+
+void DSTextureCache::_bind_alias_locked(const String &p_canonical_path, const String &p_alias_path) {
+	if (p_alias_path.is_empty() || p_alias_path == p_canonical_path) {
+		return;
+	}
+	if (!cache_map.has(p_canonical_path)) {
+		return;
+	}
+	if (alias_map.has(p_alias_path)) {
+		if (alias_map[p_alias_path] == p_canonical_path) {
+			return;
+		}
+		_unbind_alias_locked(p_alias_path);
+	}
+	if (cache_map.has(p_alias_path)) {
+		return;
+	}
+	alias_map[p_alias_path] = p_canonical_path;
+	CacheEntry &entry = cache_map[p_canonical_path];
+	if (!entry.aliases.has(p_alias_path)) {
+		entry.aliases.push_back(p_alias_path);
+	}
 }
 
 bool DSTextureCache::_is_cache_mode_ignored(int p_cache_mode) {
@@ -260,14 +316,19 @@ Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode
 	{
 		std::lock_guard<std::mutex> lock(cache_mutex);
 
-		if (!enabled || _is_cache_mode_ignored(p_cache_mode) || _is_cache_mode_replace(p_cache_mode) || !cache_map.has(p_path)) {
+		if (!enabled || _is_cache_mode_ignored(p_cache_mode) || _is_cache_mode_replace(p_cache_mode)) {
 			return Ref<Texture2D>();
 		}
 
-		CacheEntry &entry = cache_map[p_path];
+		String canonical = _resolve_canonical_locked(p_path);
+		if (canonical.is_empty() || !cache_map.has(canonical)) {
+			return Ref<Texture2D>();
+		}
+
+		CacheEntry &entry = cache_map[canonical];
 		if (entry.texture.is_null() || !entry.texture.is_valid()) {
 			evicted.push_back(entry.texture);
-			_remove_entry(p_path);
+			_remove_entry(canonical);
 		} else {
 			if (entry.lru_element && entry.lru_element != lru_list.front()) {
 				lru_list.move_to_front(entry.lru_element);
@@ -289,7 +350,7 @@ Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode
 	return result;
 }
 
-void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode) {
+void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode, const String &p_alias_path) {
 	Ref<Texture2D> resident;
 	bool make_resident = false;
 	// Refs of replaced/evicted textures: held until their owned RIDs are
@@ -298,8 +359,13 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 	{
 		std::lock_guard<std::mutex> lock(cache_mutex);
 
-		if (!enabled || _is_cache_mode_ignored(p_cache_mode) || p_texture.is_null() || !p_texture.is_valid()) {
+		if (!enabled || _is_cache_mode_ignored(p_cache_mode) || p_texture.is_null() || !p_texture.is_valid() || p_path.is_empty()) {
 			return;
+		}
+
+		// If p_path was previously an alias, unbind it so it becomes its own canonical entry.
+		if (alias_map.has(p_path)) {
+			_unbind_alias_locked(p_path);
 		}
 
 		if (cache_map.has(p_path)) {
@@ -321,6 +387,7 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 						evicted.push_back(kv.value.texture);
 					}
 					cache_map.clear();
+					alias_map.clear();
 					break;
 				}
 				const String oldest_path = lru_list.back()->get();
@@ -332,6 +399,7 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 						evicted.push_back(kv.value.texture);
 					}
 					cache_map.clear();
+					alias_map.clear();
 					break;
 				}
 			}
@@ -341,6 +409,10 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 			new_entry.texture = p_texture;
 			new_entry.lru_element = lru_list.front();
 			cache_map[p_path] = new_entry;
+		}
+
+		if (!p_alias_path.is_empty() && p_alias_path != p_path) {
+			_bind_alias_locked(p_path, p_alias_path);
 		}
 
 		// Engine ResourceCache residency (#14): make the stored texture
@@ -378,6 +450,32 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 	ds_texture_cache_release_evicted(evicted);
 }
 
+void DSTextureCache::add_alias(const String &p_canonical_path, const String &p_alias_path) {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	if (!enabled || p_canonical_path.is_empty() || p_alias_path.is_empty() || p_canonical_path == p_alias_path) {
+		return;
+	}
+	String canonical = _resolve_canonical_locked(p_canonical_path);
+	if (!canonical.is_empty() && cache_map.has(canonical)) {
+		_bind_alias_locked(canonical, p_alias_path);
+	}
+}
+
+void DSTextureCache::remove_alias(const String &p_alias_path) {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	_unbind_alias_locked(p_alias_path);
+}
+
+bool DSTextureCache::has_alias(const String &p_alias_path) const {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	return alias_map.has(p_alias_path);
+}
+
+String DSTextureCache::get_canonical_path(const String &p_path) const {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	return _resolve_canonical_locked(p_path);
+}
+
 uint64_t DSTextureCache::prewarm_async(const PackedStringArray &p_paths) {
 	return DSPreloader::prewarm_async(p_paths);
 }
@@ -396,12 +494,13 @@ void DSTextureCache::evict(const String &p_path) {
 	{
 		std::lock_guard<std::mutex> lock(cache_mutex);
 
-		if (!cache_map.has(p_path)) {
+		String canonical = _resolve_canonical_locked(p_path);
+		if (canonical.is_empty() || !cache_map.has(canonical)) {
 			return;
 		}
 
-		evicted.push_back(cache_map[p_path].texture);
-		_remove_entry(p_path);
+		evicted.push_back(cache_map[canonical].texture);
+		_remove_entry(canonical);
 
 		std::vector<const Texture2D *> live_refs;
 		live_refs.reserve(cache_map.size());
@@ -424,6 +523,7 @@ void DSTextureCache::clear() {
 			evicted.push_back(kv.value.texture);
 		}
 		cache_map.clear();
+		alias_map.clear();
 		lru_list.clear();
 		// Map is empty: no twin can remain; filter is a no-op kept for
 		// symmetry with the other owner-loss paths.
@@ -448,6 +548,7 @@ void DSTextureCache::set_enabled(bool p_enabled) {
 				evicted.push_back(kv.value.texture);
 			}
 			cache_map.clear();
+			alias_map.clear();
 			lru_list.clear();
 			std::vector<const Texture2D *> live_refs;
 			ds_texture_cache_drop_live_refs(evicted, live_refs);
@@ -478,6 +579,7 @@ void DSTextureCache::set_max_entries(int p_max) {
 					evicted.push_back(kv.value.texture);
 				}
 				cache_map.clear();
+				alias_map.clear();
 				break;
 			}
 			const String oldest_path = lru_list.back()->get();
@@ -489,6 +591,7 @@ void DSTextureCache::set_max_entries(int p_max) {
 					evicted.push_back(kv.value.texture);
 				}
 				cache_map.clear();
+				alias_map.clear();
 				break;
 			}
 		}

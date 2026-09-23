@@ -163,13 +163,10 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 	r_out.width = info["width"];
 	r_out.height = info["height"];
 	r_out.pixel_format = info["pixel_format"];
-	r_out.is_srgb = DSTex::is_rd_format_srgb((int)r_out.pixel_format);
+	r_out.is_srgb = (bool)info.get("is_srgb", false) || DSTex::is_rd_format_srgb((int)r_out.pixel_format);
 	r_out.mip_count = info["mip_count"];
 	r_out.is_v2 = (bool)info.get("has_gpu_metadata", false);
-	// DSPkg entries carry no as_image_texture marker (get_entry_info has no
-	// such key); projector/decal filtering happens in the scene-texture
-	// collector via the .import option, never here.
-	r_out.as_image_texture = false;
+	r_out.as_image_texture = (bool)info.get("as_image_texture", false);
 	r_out.data_offset = (uint64_t)info.get("data_offset", 0);
 	r_out.compressed_size = (uint64_t)info.get("compressed_size", 0);
 	r_out.original_size = (uint64_t)info.get("original_size", 0);
@@ -912,7 +909,7 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 		if (cache && payload.payload_key != payload.engine_path) {
 			Ref<Texture2D> payload_hit = cache->get_cached(payload.payload_key, DSTextureCache::CACHE_MODE_REUSE);
 			if (payload_hit.is_valid()) {
-				cache->store(payload.engine_path, payload_hit, DSTextureCache::CACHE_MODE_REUSE);
+				cache->add_alias(payload.payload_key, payload.engine_path);
 				skipped_cached++;
 				continue;
 			}
@@ -1212,16 +1209,13 @@ int DSPreloader::poll_completed(uint64_t p_tag) {
 			UtilityFunctions::push_warning("DSPreloader: Failed to build prewarmed texture for ", t.meta.engine_path, ".");
 			continue;
 		}
-		// Store under BOTH keys so the later sync scene load binds
-		// pointer-identical textures whether the engine queries the public
-		// engine path or the remapped payload path (#14). Engine
-		// ResourceCache residency is handled inside store() via
+		// Store canonical engine path with remapped payload key as alias so
+		// both keys resolve pointer-identical textures with 1:1 LRU capacity.
+		// Engine ResourceCache residency is handled inside store() via
 		// take_over_path, so ResourceLoader.load(..., CACHE_MODE_REUSE)
 		// binds without a disk re-read.
-		cache->store(t.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE);
-		if (t.meta.payload_key != t.meta.engine_path) {
-			cache->store(t.meta.payload_key, tex, DSTextureCache::CACHE_MODE_REUSE);
-		}
+		String alias = (t.meta.payload_key != t.meta.engine_path) ? t.meta.payload_key : String();
+		cache->store(t.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias);
 		stored++;
 	}
 	return stored;

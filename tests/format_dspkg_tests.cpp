@@ -56,7 +56,7 @@ godot::PackedByteArray make_pattern_payload(int64_t p_size) {
 }
 
 // Writes a temp .dstex fixture via the real DSTex writer. Returns false on failure.
-bool write_temp_dstex(const char *p_path, int p_width, int p_height, int p_mip_count, int64_t p_payload_size) {
+bool write_temp_dstex(const char *p_path, int p_width, int p_height, int p_mip_count, int64_t p_payload_size, bool p_is_srgb = false, bool p_as_image_texture = false) {
 	godot::Ref<godot::DSTex> dstex;
 	dstex.instantiate();
 	if (dstex.is_null()) {
@@ -64,7 +64,7 @@ bool write_temp_dstex(const char *p_path, int p_width, int p_height, int p_mip_c
 	}
 	godot::Error err = dstex->write_to_file(
 			godot::String(p_path), make_pattern_payload(p_payload_size),
-			p_width, p_height, godot::Image::FORMAT_RGBA8, p_mip_count, 1);
+			p_width, p_height, godot::Image::FORMAT_RGBA8, p_mip_count, 1, p_is_srgb, p_as_image_texture);
 	return err == godot::OK;
 }
 
@@ -314,6 +314,43 @@ GDEX_TEST_T(dspkg, gpu_mip_metadata_512_placement, TAG_INTEGRATION | TAG_SLOW) {
 	godot::Dictionary payload = reader->read_texture(godot::String(virtual_path));
 	GDEX_EXPECT_TRUE(payload.has("mip_data"));
 	GDEX_EXPECT_EQ(static_cast<godot::Array>(payload.get("mip_data", godot::Array())).size(), 2);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, v3_entry_flags_as_image_texture_roundtrip, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_007_v3_flags.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_007_v3_flags.dspkg";
+	const char *virtual_path = "res://textures/test_v3_flags.dstex";
+
+	// Write fixture with as_image_texture=true and is_srgb=true (flags = 3).
+	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024, true, true)) {
+		GDEX_ABORT_TEST("fixture v3 DSTex write failed");
+	}
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_ASSERT_TRUE(reader->open(godot::String(dspkg_path)) == godot::OK);
+
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_TRUE(reader->has_texture(godot::String(virtual_path)));
+
+	godot::Dictionary info = reader->get_entry_info(godot::String(virtual_path));
+	GDEX_EXPECT_FALSE(info.is_empty());
+	GDEX_EXPECT_TRUE(static_cast<bool>(info.get("as_image_texture", false)));
+	GDEX_EXPECT_TRUE(static_cast<bool>(info.get("is_srgb", false)));
+	uint32_t flags = static_cast<uint32_t>(info.get("flags", 0));
+	GDEX_EXPECT_TRUE((flags & 2U) != 0); // DSTEX_FLAG_AS_IMAGE_TEXTURE
+	GDEX_EXPECT_TRUE((flags & 1U) != 0); // DSTEX_FLAG_SRGB
 
 	remove_temp_file(dstex_path);
 	remove_temp_file(dspkg_path);

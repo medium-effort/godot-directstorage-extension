@@ -52,6 +52,66 @@
             ]
         },
         {
+            "label": "Build Templates (Debug + Release) on Device B",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build Template (Debug) on Device B",
+                "Build Template (Release) on Device B"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Build Template (Debug) on Device B",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/.vscode/build_remote.ps1",
+                "-Target",
+                "template_debug"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": false
+            },
+            "problemMatcher": [
+                "$msCompile"
+            ]
+        },
+        {
+            "label": "Build Template (Release) on Device B",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/.vscode/build_remote.ps1",
+                "-Target",
+                "template_release"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": false
+            },
+            "problemMatcher": [
+                "$msCompile"
+            ]
+        },
+        {
             "label": "Run gdextest (headless)",
             "type": "shell",
             "command": "powershell",

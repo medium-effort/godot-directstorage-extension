@@ -56,6 +56,7 @@ bin/libdirectstorage_tests*
 # others
 .vscode/*.log
 test-results.xml
+gdextest_matrix.json
 
 # ==============================================================================
 # Local Tooling & Agent Metadata

@@ -7,12 +7,15 @@ namespace godot {
 
 namespace {
 
-constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE = 50;
 constexpr uint64_t DSPKG_ENTRY_PREFIX_SIZE = 10;
-constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE = 40;
+constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE_LEGACY = 40;
+constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE_V3 = 44;
+constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE_LEGACY = 50;
+constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE_V3 = 54;
 constexpr uint64_t DSPKG_MAX_PAYLOAD_SIZE = static_cast<uint64_t>(INT32_MAX);
 constexpr uint16_t DSPKG_VERSION_LEGACY = 1;
 constexpr uint16_t DSPKG_VERSION_GPU_METADATA = 2;
+constexpr uint16_t DSPKG_VERSION_ENTRY_FLAGS = 3;
 constexpr uint16_t DSPKG_FLAG_GPU_MIP_METADATA = 1;
 constexpr uint32_t D3D12_TEXTURE_DATA_PITCH_ALIGNMENT = 256;
 constexpr uint32_t D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT = 512;
@@ -117,6 +120,8 @@ Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_pa
 	entry_item["compressed_data"] = dstex_data["compressed_data"];
 	Dictionary dstex_header = dstex_data["header"];
 	uint32_t mip_count = dstex_header.get("mip_count", 0);
+	uint32_t flags = dstex_header.get("flags", 0);
+	entry_item["flags"] = flags;
 	Dictionary source_metadata = p_mip_metadata.is_empty() ? dstex_data : p_mip_metadata;
 	int dstex_version = dstex_header.get("version", 0);
 	if (p_mip_metadata.is_empty() && dstex_version == 2) {
@@ -176,12 +181,12 @@ Error DSPkg::finalize() {
 		uint64_t metadata_size = 0;
 		if (write_gpu_metadata &&
 				(!checked_multiply(mip_count, sizeof(DSPkgMipEntry), metadata_size) ||
-					!checked_add(DSPKG_FIXED_ENTRY_SIZE, metadata_size, entry_size))) {
+					!checked_add(DSPKG_FIXED_ENTRY_SIZE_V3, metadata_size, entry_size))) {
 			UtilityFunctions::push_error("DSPkg: Mip metadata table size overflow.");
 			return ERR_INVALID_PARAMETER;
 		}
 		if (!write_gpu_metadata) {
-			entry_size = DSPKG_FIXED_ENTRY_SIZE;
+			entry_size = DSPKG_FIXED_ENTRY_SIZE_V3;
 		}
 		if (!checked_add(entry_size, path_len, entry_size) || !checked_add(entry_table_size, entry_size, entry_table_size)) {
 			UtilityFunctions::push_error("DSPkg: Entry table size overflow.");
@@ -208,7 +213,7 @@ Error DSPkg::finalize() {
 
 	DSPkgHeader header;
 	header.magic = 0x474B5044; // "DPKG"
-	header.version = write_gpu_metadata ? DSPKG_VERSION_GPU_METADATA : DSPKG_VERSION_LEGACY;
+	header.version = DSPKG_VERSION_ENTRY_FLAGS;
 	header.flags = write_gpu_metadata ? DSPKG_FLAG_GPU_MIP_METADATA : 0;
 	header.entry_count = count;
 	header.data_offset = total_data_offset;
@@ -287,6 +292,8 @@ Error DSPkg::finalize() {
 		file->store_32(h);
 		file->store_32(fmt);
 		file->store_32(mips_count);
+		uint32_t entry_flags = item.get("flags", 0);
+		file->store_32(entry_flags);
 
 		if (write_gpu_metadata) {
 			uint64_t mip_data_offset = 0;
@@ -458,20 +465,29 @@ Error DSPkg::open(const String &p_path) {
 		return fail(ERR_FILE_UNRECOGNIZED, "Invalid magic number in archive.");
 	}
 
-	if (loaded_header.version != DSPKG_VERSION_LEGACY && loaded_header.version != DSPKG_VERSION_GPU_METADATA) {
+	if (loaded_header.version != DSPKG_VERSION_LEGACY &&
+			loaded_header.version != DSPKG_VERSION_GPU_METADATA &&
+			loaded_header.version != DSPKG_VERSION_ENTRY_FLAGS) {
 		return fail(ERR_FILE_UNRECOGNIZED, "Unsupported archive version.");
 	}
 
-	const bool has_gpu_metadata = loaded_header.version == DSPKG_VERSION_GPU_METADATA;
-	if ((has_gpu_metadata && loaded_header.flags != DSPKG_FLAG_GPU_MIP_METADATA) ||
-			(!has_gpu_metadata && loaded_header.flags != 0) || loaded_header.reserved != 0) {
+	const bool is_v3 = loaded_header.version == DSPKG_VERSION_ENTRY_FLAGS;
+	const bool has_gpu_metadata = (loaded_header.version == DSPKG_VERSION_GPU_METADATA || is_v3) &&
+			(loaded_header.flags & DSPKG_FLAG_GPU_MIP_METADATA) != 0;
+	if ((loaded_header.version == DSPKG_VERSION_GPU_METADATA && loaded_header.flags != DSPKG_FLAG_GPU_MIP_METADATA) ||
+			(loaded_header.version == DSPKG_VERSION_LEGACY && loaded_header.flags != 0) ||
+			(is_v3 && (loaded_header.flags & ~DSPKG_FLAG_GPU_MIP_METADATA) != 0) ||
+			loaded_header.reserved != 0) {
 		return fail(ERR_FILE_CORRUPT, "Invalid flags or reserved fields in header.");
 	}
+
+	const uint64_t entry_fields_size = is_v3 ? DSPKG_ENTRY_FIELDS_SIZE_V3 : DSPKG_ENTRY_FIELDS_SIZE_LEGACY;
+	const uint64_t fixed_entry_size = is_v3 ? DSPKG_FIXED_ENTRY_SIZE_V3 : DSPKG_FIXED_ENTRY_SIZE_LEGACY;
 
 	uint64_t entry_count = loaded_header.entry_count;
 	uint64_t min_table_size = 0;
 	uint64_t min_data_offset = 0;
-	if (!checked_multiply(entry_count, DSPKG_FIXED_ENTRY_SIZE, min_table_size) ||
+	if (!checked_multiply(entry_count, fixed_entry_size, min_table_size) ||
 			!checked_add(sizeof(DSPkgHeader), min_table_size, min_data_offset)) {
 		return fail(ERR_FILE_CORRUPT, "Entry table size overflow.");
 	}
@@ -503,7 +519,7 @@ Error DSPkg::open(const String &p_path) {
 		}
 
 		uint64_t path_end = 0;
-		if (!checked_add(current_pos, path_len, path_end) || !range_is_within(path_end, DSPKG_ENTRY_FIELDS_SIZE, loaded_header.data_offset)) {
+		if (!checked_add(current_pos, path_len, path_end) || !range_is_within(path_end, entry_fields_size, loaded_header.data_offset)) {
 			return fail(ERR_FILE_CORRUPT, "Entry path or fixed fields extend past archive data_offset.");
 		}
 
@@ -521,7 +537,8 @@ Error DSPkg::open(const String &p_path) {
 		entry.height = file->get_32();
 		entry.pixel_format = file->get_32();
 		entry.mip_count = file->get_32();
-		if (!checked_add(current_pos, DSPKG_ENTRY_FIELDS_SIZE, current_pos)) {
+		entry.flags = is_v3 ? file->get_32() : 0;
+		if (!checked_add(current_pos, entry_fields_size, current_pos)) {
 			return fail(ERR_FILE_CORRUPT, "Entry fixed fields offset overflow.");
 		}
 
@@ -744,7 +761,10 @@ Dictionary DSPkg::get_entry_info(const String &p_resource_path) const {
 	result["height"] = entry.height;
 	result["pixel_format"] = entry.pixel_format;
 	result["mip_count"] = entry.mip_count;
+	result["flags"] = entry.flags;
 	result["has_gpu_metadata"] = entry.has_gpu_metadata;
+	result["is_srgb"] = ((entry.flags & 1U) != 0) || DSTex::is_rd_format_srgb(entry.pixel_format);
+	result["as_image_texture"] = (entry.flags & 2U) != 0;
 	result["mip_offsets"] = entry.mip_offsets;
 	result["mip_sizes"] = entry.mip_sizes;
 	result["mip_uncompressed_sizes"] = entry.mip_uncompressed_sizes;

@@ -454,11 +454,22 @@ It does **not** reliably discover:
 - Sub-resources embedded within imported 3D glTF/GLB models or external material libraries that haven't been opened yet.
 - Secondary effect textures loaded conditionally (e.g., muzzle flashes, blood decals, UI icons).
 
-### The Solution: Hybrid Traversal
+### The Solution: Hybrid Traversal & UID Normalization
 A robust prewarming routine should combine recursive dependency traversal with directory scanning:
-1. Recursively walk `ResourceLoader.get_dependencies()` for `.tscn`, `.tres`, and `.material` files to capture explicit tree dependencies.
-2. Use [DirAccess](https://docs.godotengine.org/en/stable/classes/class_diraccess.html) to scan known level asset directories (e.g. `res://level/textures`, `res://player/textures`) to catch orphaned or dynamic assets.
-3. Filter out format-incompatible textures before prewarming—specifically:
+1. **Normalize Dependency Strings**: In Godot 4.x, `ResourceLoader.get_dependencies()` returns compound entries:
+   - `uid://<id>::<type>::<fallback_path>`
+   - `uid://<id>::::<fallback_path>`
+   - `<path>::<type>`
+   - `uid://<id>`
+   Passing these raw compound strings to `ResourceLoader.exists()`, `FileAccess.file_exists()`, or custom filters treats the string as a UID (due to `uid://` prefix) but fails UID integer parsing due to `::` delimiters, causing Godot C++ to log:
+   ```text
+   Condition "p_id == INVALID_ID" is true. Returning: String()
+   core/io/resource_uid.cpp:196 @ get_id_path()
+   ```
+   Furthermore, `ResourceLoader.exists()` returns `false`, causing traversal loops to prematurely prune nested subscenes. Callers must extract the fallback path (section 3 via `.get_slice("::", 2)`) or safely resolve `uid://` via `ResourceUID.has_id()` / `ResourceUID.get_id_path()` before testing existence or recursing into subscenes.
+2. Recursively walk `ResourceLoader.get_dependencies()` for `.tscn`, `.tres`, and `.material` files to capture explicit tree dependencies.
+3. Use [DirAccess](https://docs.godotengine.org/en/stable/classes/class_diraccess.html) to scan known level asset directories (e.g. `res://level/textures`, `res://player/textures`) to catch orphaned or dynamic assets.
+4. Filter out format-incompatible textures before prewarming—specifically:
    - Light projector textures (`spotlight_projector`) which require CPU `ImageTexture` (Section 5).
    - EXR radiance maps or HDR environment textures requiring specific float formats.
 

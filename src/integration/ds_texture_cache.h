@@ -7,6 +7,7 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/templates/hash_map.hpp>
 #include <godot_cpp/templates/list.hpp>
+#include <godot_cpp/templates/vector.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 
@@ -29,13 +30,18 @@ private:
 	struct CacheEntry {
 		Ref<Texture2D> texture;
 		List<String>::Element *lru_element = nullptr;
+		Vector<String> aliases;
 	};
 
 	HashMap<String, CacheEntry> cache_map;
+	HashMap<String, String> alias_map;
 	List<String> lru_list;
 
 	bool _evict_oldest();
-	void _remove_entry(const String &p_path);
+	void _remove_entry(const String &p_canonical_path);
+	void _bind_alias_locked(const String &p_canonical_path, const String &p_alias_path);
+	void _unbind_alias_locked(const String &p_alias_path);
+	String _resolve_canonical_locked(const String &p_path) const;
 	static bool _is_cache_mode_ignored(int p_cache_mode);
 	static bool _is_cache_mode_replace(int p_cache_mode);
 
@@ -56,7 +62,11 @@ public:
 	~DSTextureCache();
 
 	Ref<Texture2D> get_cached(const String &p_path, int p_cache_mode = CACHE_MODE_REUSE);
-	void store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode = CACHE_MODE_REUSE);
+	void store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode = CACHE_MODE_REUSE, const String &p_alias_path = String());
+	void add_alias(const String &p_canonical_path, const String &p_alias_path);
+	void remove_alias(const String &p_alias_path);
+	bool has_alias(const String &p_alias_path) const;
+	String get_canonical_path(const String &p_path) const;
 	void evict(const String &p_path);
 	void clear();
 

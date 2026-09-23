@@ -262,3 +262,68 @@ GDEX_TEST_T(cache, thread_safety_smoke_concurrent_access, TAG_INTEGRATION) {
     cache->clear();
     GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
 }
+
+GDEX_TEST_T(cache, alias_storage_shares_single_lru_slot, TAG_INTEGRATION) {
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+
+    godot::Ref<godot::Texture2D> tex = make_test_texture(0.7f);
+    cache->store("res://gdextest_canonical.png", tex, godot::DSTextureCache::CACHE_MODE_REUSE, "res://.godot/imported/canonical.dstex");
+
+    // Only 1 slot counted in cache_map/lru_list
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 1);
+    GDEX_EXPECT_TRUE(cache->has_alias("res://.godot/imported/canonical.dstex"));
+    GDEX_EXPECT_TRUE(cache->get_canonical_path("res://.godot/imported/canonical.dstex") == "res://gdextest_canonical.png");
+
+    // Both canonical and alias paths return the exact same resident texture pointer
+    godot::Ref<godot::Texture2D> from_canonical = cache->get_cached("res://gdextest_canonical.png");
+    godot::Ref<godot::Texture2D> from_alias = cache->get_cached("res://.godot/imported/canonical.dstex");
+    GDEX_EXPECT_TRUE(from_canonical.is_valid());
+    GDEX_EXPECT_TRUE(from_alias.is_valid());
+    GDEX_EXPECT_TRUE(from_canonical.ptr() == from_alias.ptr());
+
+    // Explicit add_alias / remove_alias
+    cache->add_alias("res://gdextest_canonical.png", "res://second_alias.png");
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 1);
+    GDEX_EXPECT_TRUE(cache->has_alias("res://second_alias.png"));
+    GDEX_EXPECT_TRUE(cache->get_cached("res://second_alias.png").ptr() == tex.ptr());
+
+    cache->remove_alias("res://second_alias.png");
+    GDEX_EXPECT_FALSE(cache->has_alias("res://second_alias.png"));
+    GDEX_EXPECT_TRUE(cache->get_cached("res://second_alias.png").is_null());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_canonical.png").is_valid());
+}
+
+GDEX_TEST_T(cache, evict_via_alias_removes_canonical_and_all_aliases, TAG_INTEGRATION) {
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+
+    godot::Ref<godot::Texture2D> tex = make_test_texture(0.4f);
+    cache->store("res://gdextest_evict_canon.png", tex, godot::DSTextureCache::CACHE_MODE_REUSE, "res://.godot/imported/evict.dstex");
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 1);
+
+    // Evicting via the alias cleans up both canonical and alias
+    cache->evict("res://.godot/imported/evict.dstex");
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+    GDEX_EXPECT_FALSE(cache->has_alias("res://.godot/imported/evict.dstex"));
+    GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_evict_canon.png").is_null());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://.godot/imported/evict.dstex").is_null());
+}
+
+GDEX_TEST_T(cache, lru_eviction_purges_canonical_and_aliases, TAG_INTEGRATION) {
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+    cache->set_max_entries(2);
+
+    cache->store("res://t0.png", make_test_texture(0.1f), godot::DSTextureCache::CACHE_MODE_REUSE, "res://t0.dstex");
+    cache->store("res://t1.png", make_test_texture(0.2f), godot::DSTextureCache::CACHE_MODE_REUSE, "res://t1.dstex");
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 2);
+
+    // Store a 3rd texture -> must evict t0 (canonical and its alias)
+    cache->store("res://t2.png", make_test_texture(0.3f), godot::DSTextureCache::CACHE_MODE_REUSE, "res://t2.dstex");
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 2);
+    GDEX_EXPECT_TRUE(cache->get_cached("res://t0.png").is_null());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://t0.dstex").is_null());
+    GDEX_EXPECT_FALSE(cache->has_alias("res://t0.dstex"));
+    GDEX_EXPECT_TRUE(cache->get_cached("res://t1.png").is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://t1.dstex").is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://t2.png").is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://t2.dstex").is_valid());
+}

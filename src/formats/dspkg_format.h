@@ -18,8 +18,8 @@ namespace godot {
 #pragma pack(push, 1)
 struct DSPkgHeader {
 	uint32_t magic;       // 0x474B5044 ("DPKG" little-endian)
-	uint16_t version;     // 1 for legacy archives, 2 for GPU mip metadata
-	uint16_t flags;       // DSPKG_FLAG_GPU_MIP_METADATA for version 2
+	uint16_t version;     // 1 for legacy archives, 2 for GPU mip metadata, 3 for entry flags
+	uint16_t flags;       // DSPKG_FLAG_GPU_MIP_METADATA for version 2/3
 	uint32_t entry_count; // Number of entries
 	uint64_t data_offset; // Byte offset to start of data blob
 	uint64_t reserved;    // 0
@@ -48,6 +48,7 @@ struct DSPkgEntry {
 	uint32_t height = 0;
 	uint32_t pixel_format = 0;
 	uint32_t mip_count = 0;
+	uint32_t flags = 0;
 	PackedInt64Array mip_offsets;
 	PackedInt32Array mip_sizes;
 	PackedInt32Array mip_uncompressed_sizes;
