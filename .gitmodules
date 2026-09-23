@@ -1,6 +1,8 @@
 [submodule "thirdparty/libdeflate"]
 	path = thirdparty/libdeflate
 	url = https://github.com/medium-effort/libdeflate.git
+	ignore = untracked
+	
 [submodule "godot-cpp"]
 	path = godot-cpp
 	url = https://github.com/godotengine/godot-cpp.git
