@@ -32,24 +32,22 @@ godot::PackedByteArray make_pattern(int64_t p_size) {
 }
 
 // GDeflateCompressor/GDeflateDecompressor derive from RefCounted (a Godot
-// "Wrapped" type), so they MUST be heap-constructed with memnew: a stack
-// instance has no ClassDB binding callbacks and aborts with "Godot Object
-// created without binding callbacks".
+// "Wrapped" type), so they MUST be managed via godot::Ref and instantiated
+// via instantiate(). Never use raw pointers with memdelete(), which bypasses
+// RefCounted reference counting and causes heap corruption/SIGSEGV.
 bool check_round_trip(const godot::PackedByteArray &p_original, int p_level) {
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     godot::PackedByteArray compressed = compressor->compress(p_original, p_level);
     if (p_original.size() == 0) {
-        memdelete(compressor);
         return compressed.size() == 0;
     }
     if (compressed.size() == 0) {
-        memdelete(compressor);
         return false;
     }
-    godot::GDeflateDecompressor *decompressor = memnew(godot::GDeflateDecompressor);
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
     godot::PackedByteArray decompressed = decompressor->decompress(compressed, static_cast<int>(p_original.size()));
-    memdelete(decompressor);
-    memdelete(compressor);
     return decompressed.size() == p_original.size() && decompressed == p_original;
 }
 
@@ -59,17 +57,17 @@ bool check_round_trip(const godot::PackedByteArray &p_original, int p_level) {
 // as test_gdeflate.gd.
 GDEX_TEST(gdeflate, roundtrip_1000_byte_gdscript_pattern) {
     godot::PackedByteArray original = make_pattern(1000);
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     GDEX_EXPECT_EQ(compressor->get_compression_level(), 1);
     godot::PackedByteArray compressed = compressor->compress(original, 1);
     GDEX_EXPECT_GT(compressed.size(), 0);
-    godot::GDeflateDecompressor *decompressor = memnew(godot::GDeflateDecompressor);
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
     godot::PackedByteArray decompressed =
             decompressor->decompress(compressed, static_cast<int>(original.size()));
     GDEX_EXPECT_EQ(decompressed.size(), original.size());
     GDEX_EXPECT_TRUE(decompressed == original);
-    memdelete(decompressor);
-    memdelete(compressor);
 }
 
 GDEX_TEST(gdeflate, roundtrip_levels_1_6_12) {
@@ -82,17 +80,17 @@ GDEX_TEST(gdeflate, roundtrip_levels_1_6_12) {
 
 GDEX_TEST(gdeflate, roundtrip_uses_member_level_by_default) {
     godot::PackedByteArray original = make_pattern(2048);
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     compressor->set_compression_level(6);
     GDEX_EXPECT_EQ(compressor->get_compression_level(), 6);
     godot::PackedByteArray compressed = compressor->compress(original);
     GDEX_EXPECT_GT(compressed.size(), 0);
-    godot::GDeflateDecompressor *decompressor = memnew(godot::GDeflateDecompressor);
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
     godot::PackedByteArray decompressed =
             decompressor->decompress(compressed, static_cast<int>(original.size()));
     GDEX_EXPECT_TRUE(decompressed == original);
-    memdelete(decompressor);
-    memdelete(compressor);
 }
 
 GDEX_TEST(gdeflate, roundtrip_highly_compressible_zeros_shrink) {
@@ -103,15 +101,15 @@ GDEX_TEST(gdeflate, roundtrip_highly_compressible_zeros_shrink) {
     for (int64_t i = 0; i < original.size(); i++) {
         original[i] = 0;
     }
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     godot::PackedByteArray compressed = compressor->compress(original, 1);
     GDEX_EXPECT_GT(compressed.size(), 0);
     GDEX_EXPECT_LT(compressed.size(), original.size());
-    godot::GDeflateDecompressor *decompressor = memnew(godot::GDeflateDecompressor);
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
     GDEX_EXPECT_TRUE(
             decompressor->decompress(compressed, static_cast<int>(original.size())) == original);
-    memdelete(decompressor);
-    memdelete(compressor);
 }
 
 // SHOULD-pass: tile-boundary expectations around kDefaultTileSize (64 KiB).
@@ -126,7 +124,8 @@ GDEX_TEST(gdeflate, roundtrip_tile_boundary_sizes) {
 }
 
 GDEX_TEST(gdeflate, compress_bound_covers_output) {
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     GDEX_EXPECT_EQ(compressor->compress_bound(0), 0);
     GDEX_EXPECT_EQ(compressor->compress_bound(-5), 0);
     const int64_t sizes[] = { 1, 1000, 4096, kTileSize };
@@ -136,11 +135,11 @@ GDEX_TEST(gdeflate, compress_bound_covers_output) {
         GDEX_EXPECT_GT(compressed.size(), 0);
         GDEX_EXPECT_GE(compressor->compress_bound(static_cast<int>(size)), compressed.size());
     }
-    memdelete(compressor);
 }
 
 GDEX_TEST(gdeflate, compression_level_clamps_1_to_12) {
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     GDEX_EXPECT_EQ(compressor->get_compression_level(), 1);
     compressor->set_compression_level(0);
     GDEX_EXPECT_EQ(compressor->get_compression_level(), 1);
@@ -150,11 +149,11 @@ GDEX_TEST(gdeflate, compression_level_clamps_1_to_12) {
     GDEX_EXPECT_EQ(compressor->get_compression_level(), 12);
     compressor->set_compression_level(6);
     GDEX_EXPECT_EQ(compressor->get_compression_level(), 6);
-    memdelete(compressor);
 }
 
 GDEX_TEST(gdeflate, worker_count_clamps_1_to_8) {
-    godot::GDeflateDecompressor *decompressor = memnew(godot::GDeflateDecompressor);
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
     // Default is CPU-dependent (fallback 4); only the clamped range is asserted.
     GDEX_EXPECT_GE(decompressor->get_worker_count(), 1);
     GDEX_EXPECT_LE(decompressor->get_worker_count(), 8);
@@ -164,35 +163,34 @@ GDEX_TEST(gdeflate, worker_count_clamps_1_to_8) {
     GDEX_EXPECT_EQ(decompressor->get_worker_count(), 8);
     decompressor->set_worker_count(2);
     GDEX_EXPECT_EQ(decompressor->get_worker_count(), 2);
-    memdelete(decompressor);
 }
 
 GDEX_TEST(gdeflate, empty_input_yields_empty) {
     godot::PackedByteArray empty;
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     GDEX_EXPECT_EQ(compressor->compress(empty, 1).size(), 0);
-    godot::GDeflateDecompressor *decompressor = memnew(godot::GDeflateDecompressor);
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
     GDEX_EXPECT_EQ(decompressor->decompress(empty, 100).size(), 0);
     godot::PackedByteArray original = make_pattern(64);
     godot::PackedByteArray compressed = compressor->compress(original, 1);
     GDEX_EXPECT_GT(compressed.size(), 0);
     GDEX_EXPECT_EQ(decompressor->decompress(compressed, 0).size(), 0);
-    memdelete(decompressor);
-    memdelete(compressor);
 }
 
 GDEX_TEST(gdeflate, wrong_original_size_yields_empty) {
     godot::PackedByteArray original = make_pattern(1000);
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     godot::PackedByteArray compressed = compressor->compress(original, 1);
     GDEX_EXPECT_GT(compressed.size(), 0);
-    godot::GDeflateDecompressor *decompressor = memnew(godot::GDeflateDecompressor);
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
     GDEX_EXPECT_EQ(
             decompressor->decompress(compressed, static_cast<int>(original.size()) + 1).size(), 0);
     GDEX_EXPECT_EQ(
             decompressor->decompress(compressed, static_cast<int>(original.size()) - 1).size(), 0);
-    memdelete(decompressor);
-    memdelete(compressor);
 }
 
 // Corrupt the trailing payload byte; header/tile table stay valid.
@@ -205,29 +203,29 @@ GDEX_TEST(gdeflate, wrong_original_size_yields_empty) {
 // detection is not a property of the current decompressor.
 GDEX_TEST(gdeflate, corrupt_payload_no_crash_wellformed_size) {
     godot::PackedByteArray original = make_pattern(4096);
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     godot::PackedByteArray compressed = compressor->compress(original, 1);
     GDEX_EXPECT_GT(compressed.size(), 0);
-    godot::GDeflateDecompressor *decompressor = memnew(godot::GDeflateDecompressor);
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
     godot::PackedByteArray corrupted = compressed;
     corrupted[corrupted.size() - 1] = static_cast<uint8_t>(corrupted[corrupted.size() - 1] ^ 0xFF);
     const int64_t result_size =
             decompressor->decompress(corrupted, static_cast<int>(original.size())).size();
     GDEX_EXPECT_TRUE(result_size == 0 || result_size == original.size());
-    memdelete(decompressor);
-    memdelete(compressor);
 }
 
 GDEX_TEST(gdeflate, truncated_stream_yields_empty_no_crash) {
     godot::PackedByteArray original = make_pattern(4096);
-    godot::GDeflateCompressor *compressor = memnew(godot::GDeflateCompressor);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
     godot::PackedByteArray compressed = compressor->compress(original, 1);
     GDEX_EXPECT_GT(compressed.size(), 16);
-    godot::GDeflateDecompressor *decompressor = memnew(godot::GDeflateDecompressor);
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
     godot::PackedByteArray truncated = compressed;
     truncated.resize(compressed.size() / 2);
     GDEX_EXPECT_EQ(
             decompressor->decompress(truncated, static_cast<int>(original.size())).size(), 0);
-    memdelete(decompressor);
-    memdelete(compressor);
 }

@@ -99,7 +99,6 @@ godot::Ref<godot::RefCounted> make_request(gdextest::TestContext &ctx) {
     godot::Ref<godot::RefCounted> req(
         godot::ClassDB::instantiate(godot::StringName("DSRequest")));
     GDEX_ASSERT_TRUE(req.is_valid());
-    ctx.track_ref(req.ptr());
     return req;
 }
 
