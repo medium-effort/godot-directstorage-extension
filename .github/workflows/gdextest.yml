@@ -32,7 +32,7 @@ jobs:
   run-gdextest:
     name: Run gdextest ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -106,7 +106,13 @@ jobs:
             scons-${{ matrix.os }}-
 
       - name: Build extension and tests
-        run: scons -j 2 target=editor tests=true arch=x86_64
+        # Do not hardcode arch= here: macos-latest is arm64 and passing x86_64
+        # causes gdextest.py test to trigger a second full rebuild (it uses the
+        # TOML build.args which have no arch, defaulting to universal on macOS).
+        # Leaving arch unset lets SCons select the host architecture so both
+        # this step and the gdextest run step agree on the output path and no
+        # rebuild is needed.
+        run: scons -j 2 target=editor tests=true
         env:
           GODOT: ${{ env.GODOT }}
           SCONS_CACHE: ${{ github.workspace }}/.scons-cache

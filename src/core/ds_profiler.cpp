@@ -254,7 +254,10 @@ int DSProfiler::_get_gpu_decompression_active_monitor() const {
 }
 
 void DSProfiler::_bind_methods() {
-	ClassDB::register_class<DSProfilerResult>();
+	// NOTE: DSProfilerResult is registered in initialize_directstorage_accelerator_module()
+	// in register_types.cpp. Do NOT call ClassDB::register_class<DSProfilerResult>() here:
+	// doing so re-entrantly mutates ClassDB::classes while register_class<DSProfiler> is
+	// mid-execution, which is undefined behaviour and can corrupt the class registry.
 
 	ClassDB::bind_method(D_METHOD("record_workload", "bytes", "duration_us"), &DSProfiler::record_workload);
 	ClassDB::bind_method(D_METHOD("record_result", "result"), &DSProfiler::record_result);

@@ -64,6 +64,9 @@ void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_lev
 	ClassDB::register_class<DSContext>();
 	ClassDB::register_class<DSRequest>();
 	ClassDB::register_class<DSErrorHandler>();
+	// DSProfilerResult must be registered before DSProfiler. It was previously
+	// registered inside DSProfiler::_bind_methods() which is re-entrant and unsafe.
+	ClassDB::register_class<DSProfilerResult>();
 	ClassDB::register_class<DSProfiler>();
 	ClassDB::register_class<GDeflateCompressor>();
 	ClassDB::register_class<GDeflateDecompressor>();

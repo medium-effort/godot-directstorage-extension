@@ -112,9 +112,15 @@ if ARGUMENTS.get("tests", 0):
         gdextest_lib = _gdex_env.SConscript(
             "extern/gdextest/SConscript",
             variant_dir="build/gdextest", duplicate=0,
-            exports={"env": _gdex_env, "gdextest": {
-                "suites": Glob("tests/**/*.cpp"),
-            }},
+            # Do NOT pass "suites" here: the SConscript treats a non-empty
+            # "suites" list as the complete source set and skips .gdextest.toml
+            # discovery. When "suites" is omitted the SConscript falls back to
+            # gdextest_SOURCES (set by `gdextest.py test` from the TOML), which
+            # includes the extension implementation files (src/core, src/formats,
+            # src/integration, src/platform/fallback, etc.) alongside the test
+            # files. Without those sources the test dylib links but crashes at
+            # runtime on macOS because dyld cannot resolve the extension symbols.
+            exports={"env": _gdex_env, "gdextest": {}},
         )
         if gdextest_lib:
             Default(gdextest_lib)
