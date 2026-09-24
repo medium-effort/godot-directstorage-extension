@@ -9,4 +9,4 @@
 
 [submodule "extern/gdextest"]
 	path = extern/gdextest
-	url = https://github.com/Dead-Shrimp-Studio/gdextest.git
+	url = https://github.com/medium-effort/gdextest.git
