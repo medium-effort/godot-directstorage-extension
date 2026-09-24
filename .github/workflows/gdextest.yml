@@ -96,8 +96,8 @@ jobs:
           fi
           echo "GODOT=${GITHUB_WORKSPACE}/${BIN}" >> "$GITHUB_ENV"
 
-      - name: Setup SCons cache
-        uses: actions/cache@v4
+      - name: Restore SCons cache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.scons-cache
           key: scons-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}
@@ -112,11 +112,30 @@ jobs:
         # Leaving arch unset lets SCons select the host architecture so both
         # this step and the gdextest run step agree on the output path and no
         # rebuild is needed.
-        run: scons -j 2 target=editor tests=true
+        # NOTE: keep these flags identical to [gdextest.build] args in
+        # .gdextest.toml. The test step re-invokes scons with the TOML args;
+        # any extra flag here (e.g. debug_symbols=no) changes the build
+        # signature and forces a second full rebuild there. -j is safe: it is
+        # a SCons option, not part of the signature.
+        shell: bash
+        run: |
+          NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+          scons -j "$NPROC" target=editor tests=true
         env:
           GODOT: ${{ env.GODOT }}
           SCONS_CACHE: ${{ github.workspace }}/.scons-cache
-          SCONS_CACHE_LIMIT: 4096
+
+      - name: Save SCons cache
+        # Save immediately after the build instead of relying on the post-job
+        # step: actions/cache skips the post save when the job fails, so a
+        # platform with failing tests (macOS) never accumulates cache and pays
+        # a full rebuild every run. The run-suffixed key can never collide
+        # with the restored entry, so re-runs are safe.
+        uses: actions/cache/save@v4
+        if: '!cancelled()'
+        with:
+          path: ${{ github.workspace }}/.scons-cache
+          key: scons-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}-run-${{ github.run_id }}-${{ github.run_attempt }}
           
       - name: Run gdextest
         shell: bash
@@ -127,6 +146,41 @@ jobs:
             --gdextest-raw-log="${{ github.workspace }}/godot-raw.log"
         env:
           GODOT: ${{ env.GODOT }}
+
+      - name: Show godot raw log head (crash diagnosis)
+        # The failure tail only shows the backtrace; the head shows which
+        # suite/init step died. Runs on all OSes, never fails the job.
+        if: always()
+        shell: bash
+        run: |
+          LOG="${{ github.workspace }}/godot-raw.log"
+          if [ -f "$LOG" ]; then
+            echo "=== godot-raw.log: $(wc -l < "$LOG") lines; first 150 ==="
+            head -n 150 "$LOG"
+          else
+            echo "godot-raw.log not found; listing workspace root:"
+            ls -la "${{ github.workspace }}" | head -n 40
+          fi
+
+      - name: Symbolize macOS crash backtrace
+        # Resolves the libdirectstorage_tests offsets from the SIGSEGV
+        # backtrace (e.g. +dfdec +aa0b0 +ac7b8 +6038c) to file:line via atos.
+        # Best-effort: prints a notice instead of failing if stripped/missing.
+        if: failure() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          DYLIB=$(ls bin/libdirectstorage_tests.*.dylib 2>/dev/null | head -n 1 || true)
+          if [ -z "$DYLIB" ]; then echo "test dylib not found; skipping atos"; exit 0; fi
+          echo "dylib: $DYLIB"
+          LOG="${{ github.workspace }}/godot-raw.log"
+          OFFSETS=$(grep -o 'libdirectstorage_tests[^)]*)' "$LOG" 2>/dev/null | grep -o '+[0-9a-fA-F]*' | tr -d '+' | sort -u || true)
+          if [ -z "$OFFSETS" ]; then
+            echo "no dylib offsets in raw log; falling back to last-known crash offsets"
+            OFFSETS="dfdec aa0b0 ac7b8 6038c"
+          fi
+          echo "offsets: $OFFSETS"
+          # shellcheck disable=SC2086
+          xcrun atos -o "$DYLIB" -arch arm64 $OFFSETS || echo "atos failed (dylib may be stripped)"
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
