@@ -62,16 +62,17 @@ godot::PackedByteArray compress_data(gdextest::TestContext &ctx, const godot::Pa
     if (!godot::ClassDB::class_exists(godot::StringName("GDeflateCompressor"))) {
         GDEX_SKIP("GDeflateCompressor class absent.");
     }
-    godot::Object *compressor = godot::ClassDB::instantiate(godot::StringName("GDeflateCompressor"));
-    GDEX_ASSERT_NOT_NULL(compressor);
+    godot::Ref<godot::RefCounted> compressor(
+        godot::ClassDB::instantiate(godot::StringName("GDeflateCompressor")));
+    GDEX_ASSERT_TRUE(compressor.is_valid());
     godot::Variant compressed_var = compressor->call(godot::StringName("compress"), data, 1);
-    memdelete(compressor);
     return static_cast<godot::PackedByteArray>(compressed_var);
 }
 
 // Fetch a live Engine singleton by name, or SKIP with the
 // consumer_extension diagnostic (fallback step 2: report, don't fail).
 godot::Object *require_singleton(gdextest::TestContext &ctx, const char *p_name) {
+    (void)ctx;
     godot::Engine *engine = godot::Engine::get_singleton();
     godot::Object *obj = nullptr;
     if (engine != nullptr && engine->has_singleton(godot::StringName(p_name))) {
@@ -245,10 +246,12 @@ GDEX_TEST_T(context_lifecycle, fallback_gdeflate_corrupted_payload_fails_gracefu
     godot::Object *ds = require_singleton(ctx, "DSContext");
     godot::PackedByteArray original = create_pattern(4096);
     godot::PackedByteArray compressed = compress_data(ctx, original);
-    GDEX_ASSERT_GT(compressed.size(), 0);
+    GDEX_ASSERT_TRUE(compressed.size() > 0);
 
-    // Corrupt the trailing payload byte (leaves header intact)
-    compressed[compressed.size() - 1] = static_cast<uint8_t>(compressed[compressed.size() - 1] ^ 0xFF);
+    // Corrupt the compressed payload data (leaves header and tile table intact)
+    for (int64_t i = 16; i < compressed.size(); i++) {
+        compressed[i] = static_cast<uint8_t>(compressed[i] ^ 0xFF);
+    }
 
     const godot::String file_path = "user://__gdextest_corrupt.bin";
     godot::Ref<godot::FileAccess> f = godot::FileAccess::open(file_path, godot::FileAccess::WRITE);
@@ -291,7 +294,7 @@ GDEX_TEST_T(context_lifecycle, fallback_gdeflate_size_mismatch_fails_gracefully,
     godot::Object *ds = require_singleton(ctx, "DSContext");
     godot::PackedByteArray original = create_pattern(4096);
     godot::PackedByteArray compressed = compress_data(ctx, original);
-    GDEX_ASSERT_GT(compressed.size(), 0);
+    GDEX_ASSERT_TRUE(compressed.size() > 0);
 
     const godot::String file_path = "user://__gdextest_size_mismatch.bin";
     godot::Ref<godot::FileAccess> f = godot::FileAccess::open(file_path, godot::FileAccess::WRITE);
