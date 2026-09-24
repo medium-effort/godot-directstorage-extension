@@ -212,7 +212,7 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 			return false;
 		}
 		PackedByteArray &dest = p_request->get_destination_buffer_ref();
-		if (dest.size() < static_cast<int64_t>(uncompressed_size)) {
+		if (dest.size() != static_cast<int64_t>(uncompressed_size)) {
 			dest.resize(static_cast<int64_t>(uncompressed_size));
 		}
 		if (dest.size() == 0) {
@@ -223,7 +223,7 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 
 		bool ok = GDeflate::Decompress(
 				dest.ptrw(),
-				dest.size(),
+				static_cast<size_t>(uncompressed_size),
 				raw_bytes.ptr(),
 				raw_bytes.size(),
 				num_workers);

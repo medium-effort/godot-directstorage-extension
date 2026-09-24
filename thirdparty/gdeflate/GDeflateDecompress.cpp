@@ -52,6 +52,11 @@ namespace GDeflate
             return false;
         }
 
+        if (header->tileSizeIdx != 1 || header->numTiles == 0 || header->lastTileSize > kDefaultTileSize)
+        {
+            return false;
+        }
+
         return true;
     }
 
@@ -85,19 +90,41 @@ namespace GDeflate
                 break;
 
             const size_t tileOffset = tileIndex > 0 ? tileOffsets[tileIndex] : 0;
-            libdeflate_gdeflate_in_page compressedPage{};
-            compressedPage.data = inDataPtr + tileOffset;
-            compressedPage.nbytes =
+            if (tileIndex < context.numItems - 1 && tileOffsets[tileIndex + 1] < tileOffset) {
+                context.failed = true;
+                break;
+            }
+            const size_t tileNbytes =
                 tileIndex < context.numItems - 1 ? tileOffsets[tileIndex + 1] - tileOffset : tileOffsets[0];
 
-            auto outputOffset = tileIndex * kDefaultTileSize;
+            // Bound the input page: corrupt tile tables must fail, never OOB-read.
+            const size_t dataStart = static_cast<size_t>(inDataPtr - context.inputPtr);
+            const size_t dataAvail = dataStart <= context.inputSize ? context.inputSize - dataStart : 0;
+            if (tileOffset > dataAvail || tileNbytes > dataAvail - tileOffset) {
+                context.failed = true;
+                break;
+            }
+            libdeflate_gdeflate_in_page compressedPage{};
+            compressedPage.data = inDataPtr + tileOffset;
+            compressedPage.nbytes = tileNbytes;
+
+            // Bound the output: the last tile is usually partial, so a full
+            // kDefaultTileSize write heap-overflows when corrupt input decodes
+            // past the real end (SIGSEGV on macOS; latent on Windows).
+            const size_t outputOffset = static_cast<size_t>(tileIndex) * kDefaultTileSize;
+            if (outputOffset >= context.outputSize) {
+                context.failed = true;
+                break;
+            }
+            const size_t outputAvail = std::min(static_cast<size_t>(kDefaultTileSize),
+                    context.outputSize - outputOffset);
 
             decompressResult = libdeflate_gdeflate_decompress(
                 decompressor.get(),
                 &compressedPage,
                 1,
                 context.outputPtr + outputOffset,
-                static_cast<size_t>(kDefaultTileSize),
+                outputAvail,
                 nullptr);
 
             if ( decompressResult != LIBDEFLATE_SUCCESS)
@@ -110,7 +137,7 @@ namespace GDeflate
 
     bool Decompress(uint8_t* output, size_t outputSize, const uint8_t* in, size_t inSize, uint32_t numWorkers)
     {
-        if (nullptr == output || nullptr == in || 0 == outputSize || 0 == inSize)
+        if (nullptr == output || nullptr == in || 0 == outputSize || inSize < sizeof(TileStream))
             return false;
 
         numWorkers = std::min(kMaxWorkers, numWorkers);
@@ -121,13 +148,12 @@ namespace GDeflate
         if (!ValidateStream(header))
             return false;
 
-        std::thread workers[kMaxWorkers];
+        const size_t tileTableSize = sizeof(TileStream) + static_cast<size_t>(header->numTiles) * sizeof(uint32_t);
+        if (inSize < tileTableSize)
+            return false;
 
-        // Run a tile per thread
-        header = reinterpret_cast<const TileStream*>(in);
-
-        if (!ValidateStream(header))
-        {
+        const size_t uncompressedSize = header->GetUncompressedSize();
+        if (uncompressedSize == 0 || outputSize < uncompressedSize) {
             return false;
         }
 
@@ -137,12 +163,14 @@ namespace GDeflate
         context.inputSize = inSize;
 
         context.outputPtr = output;
-        context.outputSize = header->GetUncompressedSize();
+        context.outputSize = uncompressedSize;
 
         context.globalIndex = 0;
         context.numItems = header->numTiles;
 
         context.failed = false;
+
+        std::thread workers[kMaxWorkers];
 
         uint32_t numWorkersLeft = context.numItems > (2 * numWorkers) ? numWorkers : 1;
         const uint32_t compressorId = header->id;
