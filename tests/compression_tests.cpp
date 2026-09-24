@@ -2,6 +2,7 @@
 #include "gdextest/registry.h"
 #include "compression/gdeflate_compressor.h"
 #include "compression/gdeflate_decompressor.h"
+#include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/core/memory.hpp>
 
 // C++ mirror of project/headless_tests/test_gdeflate.gd (authoritative).
