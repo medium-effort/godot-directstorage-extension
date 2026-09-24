@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 21 September 2026
+Last updated: 24 September 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -280,6 +280,25 @@ In Godot 4, custom GDExtension classes are registered with [ClassDB](https://doc
 - Registering classes inheriting from `RefCounted`, `Resource`, or `ResourceFormatLoader` must occur at `MODULE_INITIALIZATION_LEVEL_SCENE`. Registering them too early (e.g. CORE) causes undefined behavior because base engine types are not yet registered.
 - Clean deinitialization must unregister resources in reverse order during shutdown.
 - When binding methods via `ClassDB::bind_method(D_METHOD("method_name", "arg1"), &MyClass::method_name)`, method parameter counts and default values ([DEFVAL](https://docs.godotengine.org/en/stable/classes/class_classdb.html)) must strictly match between C++ and GDScript. Mismatched signatures can cause silent invocation failures or engine crashes.
+
+### The Re-Entrancy Trap: `register_class` Inside `_bind_methods()`
+`ClassDB::register_class<A>()` invokes `A::_bind_methods()` midway through mutating the class registry. Calling `ClassDB::register_class<B>()` from inside `A::_bind_methods()` therefore re-entrantly mutates `ClassDB::classes` while registration of `A` is still in flight — undefined behavior that can corrupt the registry and segfault the engine at extension load (observed as a `signal 11` crash in the macOS editor at `directstorage_accelerator_init` time):
+```cpp
+// CRASH-PRONE: re-entrant registry mutation mid-registration of DSProfiler!
+void DSProfiler::_bind_methods() {
+    ClassDB::register_class<DSProfilerResult>();
+    ...
+}
+```
+
+### The Rule
+- Register every class exactly once, explicitly, in the module initializer (`initialize_<name>_module`), in dependency order — dependencies before dependents:
+```cpp
+// SAFE: flat, ordered registration at MODULE_INITIALIZATION_LEVEL_SCENE
+ClassDB::register_class<DSProfilerResult>(); // dependency first
+ClassDB::register_class<DSProfiler>();
+```
+- **NEVER call `ClassDB::register_class` from inside any `_bind_methods()`**. `_bind_methods()` is for `bind_method`/`bind_integer_constant`/property calls only.
 
 ---
 

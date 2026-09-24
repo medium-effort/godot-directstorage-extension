@@ -109,6 +109,19 @@ if ARGUMENTS.get("tests", 0):
         _gdex_env = env.Clone()
         if "msvc" in _gdex_env.get("TOOLS", []):
             _gdex_env.Append(LINKFLAGS=["/ignore:4199"])
+        _gdex_exports = {"env": _gdex_env, "gdextest": {}}
+        if _gdex_env.get("platform", "") != "windows":
+            # gdextest has no per-platform sources: .gdextest.toml lists both
+            # backends, so a macOS/Linux test lib would compile Win32Backend
+            # stubs that the main lib (see project_sources above) excludes.
+            # Filter them here so the test build's source closure mirrors the
+            # main build. Windows keeps win32 for the D3D12 suites.
+            _raw_sources = os.environ.get("gdextest_SOURCES", "")
+            if _raw_sources:
+                _all = _raw_sources.split(os.pathsep)
+                _filtered = [p for p in _all if "src/platform/win32/" not in p.replace("\\", "/")]
+                if len(_filtered) != len(_all):
+                    _gdex_exports["gdextest"] = {"suites": _filtered}
         gdextest_lib = _gdex_env.SConscript(
             "extern/gdextest/SConscript",
             variant_dir="build/gdextest", duplicate=0,
@@ -120,7 +133,9 @@ if ARGUMENTS.get("tests", 0):
             # src/integration, src/platform/fallback, etc.) alongside the test
             # files. Without those sources the test dylib links but crashes at
             # runtime on macOS because dyld cannot resolve the extension symbols.
-            exports={"env": _gdex_env, "gdextest": {}},
+            # (Exception: non-Windows filtering above passes the TOML list minus
+            # src/platform/win32, which is equivalent to full discovery.)
+            exports=_gdex_exports,
         )
         if gdextest_lib:
             Default(gdextest_lib)

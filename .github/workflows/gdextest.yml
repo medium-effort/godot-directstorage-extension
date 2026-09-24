@@ -123,7 +123,8 @@ jobs:
         run: |
           python extern/gdextest/tools/gdextest.py test \
             --json=test-results.json \
-            --junit=test-results.xml
+            --junit=test-results.xml \
+            --gdextest-raw-log="${{ github.workspace }}/godot-raw.log"
         env:
           GODOT: ${{ env.GODOT }}
 
@@ -135,6 +136,7 @@ jobs:
           path: |
             test-results.json
             test-results.xml
+            godot-raw.log
           if-no-files-found: ignore
             
       - name: Publish test report (GitHub Annotations)

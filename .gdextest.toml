@@ -8,7 +8,9 @@ exclude = ["tests/helpers/**"]
 # NOTE: code under test must compile INTO the test library.
 # Closure (verified by include-scan): formats -> compression -> ds_error_handler;
 # integration (cache/loader/preloader) -> core (context/request/profiler) ->
-# platform backends (win32 + fallback). register_types.cpp IS included: the
+# platform backends (win32 + fallback). SConstruct filters src/platform/win32
+# out of the test build on non-Windows (mirroring the main lib, which gates
+# win32 on env["platform"] == "windows"); macOS/Linux test runs use fallback. register_types.cpp IS included: the
 # DS classes (DSContext/DSTextureCache/DSResourceFormatLoader/...) must be
 # registered in ClassDB, and the test adapter forwards the module
 # initialize/uninitialize lifecycle to it (engine-coupled suites otherwise
