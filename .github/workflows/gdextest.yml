@@ -6,14 +6,35 @@ name: Run gdextest
 on:
   push:
     branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.agents/**'
+      - '.gitignore'
   pull_request:
     branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.agents/**'
+      - '.gitignore'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
 
 jobs:
   run-gdextest:
     name: Run gdextest ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     
@@ -21,7 +42,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: true
+          token: ${{ secrets.SUBMODULES_TOKEN }}
+          submodules: recursive
 
       - name: Configure C++ compiler (Linux/Ubuntu)
         if: runner.os == 'Linux'
@@ -32,11 +54,17 @@ jobs:
       - name: Configure C++ compiler (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install scons cmake
+          brew install cmake
           
       - name: Configure Python and SCons
         run: |
           python -m pip install --upgrade pip setuptools wheel scons
+
+      - name: Cache Godot binary
+        uses: actions/cache@v4
+        with:
+          path: godot.zip
+          key: godot-4.7.2-${{ matrix.os }}
 
       - name: Download Godot 4.7.2
         shell: bash
@@ -56,17 +84,30 @@ jobs:
               BIN="Godot_v4.7.2-stable_win64_console.exe"
               ;;
           esac
-          curl -fsSL -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/4.7.2-stable/${FILE}"
+          if [ ! -f godot.zip ]; then
+            curl -fsSL -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/4.7.2-stable/${FILE}"
+          fi
           unzip -o godot.zip
           if [ "${{ runner.os }}" != "Windows" ]; then
             chmod +x "$BIN"
           fi
           echo "GODOT=${GITHUB_WORKSPACE}/${BIN}" >> "$GITHUB_ENV"
-          
+
+      - name: Setup SCons cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.scons-cache
+          key: scons-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}
+          restore-keys: |
+            scons-${{ matrix.os }}-${{ github.ref_name }}-
+            scons-${{ matrix.os }}-
+
       - name: Build extension and tests
-        run: scons target=editor tests=true arch=x86_64
+        run: scons -j 2 target=editor tests=true arch=x86_64
         env:
           GODOT: ${{ env.GODOT }}
+          SCONS_CACHE: ${{ github.workspace }}/.scons-cache
+          SCONS_CACHE_LIMIT: 4096
           
       - name: Run gdextest
         shell: bash
@@ -85,9 +126,13 @@ jobs:
           path: |
             test-results.json
             test-results.xml
+          if-no-files-found: ignore
             
       - name: Publish test report (GitHub Annotations)
-        if: always()
-        uses: EnricoMi/publish-unit-test-result-action@v2
+        uses: dorny/test-reporter@v1
+        if: always() && hashFiles('test-results.xml') != ''
         with:
-          junit_files: test-results.xml
+          name: gdextest (${{ matrix.os }})
+          path: test-results.xml
+          reporter: java-junit
+          fail-on-error: false
