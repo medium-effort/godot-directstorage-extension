@@ -73,7 +73,16 @@ if (-not $RemoteHost -or -not $RemoteDir) {
     Show-BuildFailure -Step "Configuration Error" -Message "REMOTE_HOST or REMOTE_DIR is missing in $EnvFilePath" -Code 1
 }
 
-$ArtifactRemoteDir = "$RemoteDir/project/addons/directstorage_accelerator/bin"
+# Path separator variants: remote cmd.exe treats / as a switch prefix
+# (so D:/ssh-tunnel/... parses /ssh-tunnel as a flag), while tar/scp
+# expect forward slashes. Use the Win variant for cmd builtins
+# (mkdir/cd/del/echo) and the Tar variant for tar -C / scp paths.
+# NOTE: use .Replace() (literal) — -replace is regex and a lone '\' throws
+# "InvalidRegularExpression", leaving the variable empty and breaking tar -C.
+$RemoteDirWin = $RemoteDir.Replace('/', '\')
+$RemoteDirTar = $RemoteDir.Replace('\', '/')
+
+$ArtifactRemoteDir = "$RemoteDirTar/project/addons/directstorage_accelerator/bin"
 $ArtifactLocalDir  = "./project/addons/directstorage_accelerator/bin"
 
 # 1. Probe connectivity (Local Wi-Fi first, fallback to Tailscale)
@@ -99,7 +108,7 @@ if ($LASTEXITCODE -eq 0) {
 
 # 2. Ensure target directory exists on Device B
 Write-Host "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
-ssh $ActiveHost "if not exist `"$RemoteDir`" mkdir `"$RemoteDir`""
+ssh $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to ensure remote build directory exists on $ActiveHost." -Code $LASTEXITCODE
 }
@@ -133,7 +142,7 @@ $tarExcludes = @(
     "--exclude=./wavexecute_tasks"
 ) -join " "
 
-cmd.exe /c "tar -czf - $tarExcludes . | ssh $ActiveHost ""tar -xzf - -C $RemoteDir"""
+cmd.exe /c "tar -czf - $tarExcludes . | ssh $ActiveHost ""tar -xzf - -C $RemoteDirTar"""
 
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [3/6] Source Sync" -Message "Failed to sync source files to Device B ($ActiveHost)." -Code $LASTEXITCODE
@@ -145,10 +154,10 @@ $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
 # Exit status cannot ride the ssh code: OpenSSH's cmd shell returns 0 even
 # when SCons fails, and %ERRORLEVEL% expands before SCons runs. A marker
 # file written only after a successful scons is the reliable signal.
-$RemoteMarker = "$RemoteDir\gdextest_scons.ok"
-ssh $ActiveHost "if exist `"$RemoteMarker`" del /q `"$RemoteMarker`""
-ssh $ActiveHost "cd /d $RemoteDir && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarker`""
-ssh $ActiveHost "if exist `"$RemoteMarker`" (exit /b 0) else (exit /b 1)"
+$RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
+ssh $ActiveHost "if exist `"$RemoteMarkerWin`" del /q `"$RemoteMarkerWin`""
+ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`""
+ssh $ActiveHost "if exist `"$RemoteMarkerWin`" (exit /b 0) else (exit /b 1)"
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost). Detected via missing success marker (ssh does not propagate the SCons exit code)." -Code 1
 }
@@ -168,7 +177,7 @@ if ($IncludeTests) {
     if (!(Test-Path "./bin")) {
         New-Item -ItemType Directory -Force -Path "./bin" | Out-Null
     }
-    scp -C "$ActiveHost`:$RemoteDir/bin/libdirectstorage_tests*.dll" "./bin/"
+    scp -C "$ActiveHost`:$RemoteDirTar/bin/libdirectstorage_tests*.dll" "./bin/"
     if ($LASTEXITCODE -ne 0) {
         Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll (libdirectstorage_tests*.dll) from Device B ($ActiveHost). The remote test build likely failed." -Code $LASTEXITCODE
     }

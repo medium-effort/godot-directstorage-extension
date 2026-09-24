@@ -30,7 +30,7 @@ plugin_class = "GdextestPlugin"
 [gdextest.fixture]
 directory = "build/gdextest/project"
 project_name = "directstorage-accelerator-tests"
-assets = ["project/test_assets/**"]
+assets = ["project/test_assets/**/*"]
 scan_timeout_ms = 30000
 
 [gdextest.output]

@@ -188,7 +188,7 @@ GDEX_TEST_T(loader, recognize_path_intercepts_dstex, TAG_INTEGRATION) {
 	// when they exist on disk (static fixture asset, no staging needed).
 	const godot::String png_fixture("res://project/test_assets/test.png");
 	if (!godot::FileAccess::file_exists(png_fixture)) {
-		GDEX_SKIP("fixture asset missing: project/test_assets/test.png (assets glob project/test_assets/** did not stage it)");
+		GDEX_SKIP("fixture asset missing: project/test_assets/test.png (assets glob project/test_assets/**/* did not stage it)");
 	}
 	GDEX_EXPECT_FALSE(loader->_recognize_path(png_fixture, tex2d));
 

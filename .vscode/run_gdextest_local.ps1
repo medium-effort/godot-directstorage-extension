@@ -14,7 +14,7 @@
       [1/5] doctor  - `gdextest doctor` (config/Godot/SCons checks, no build).
       [2/5] fixture - `generate_fixture.py` with the newest
                       bin/libdirectstorage_tests*.dll, then manual staging of
-                      `project/test_assets/**` per [gdextest.fixture] assets.
+                      `project/test_assets/**/*` per [gdextest.fixture] assets.
       [3/5] warmup  - cold-cache deterministic pass (exit 134 tolerated).
       [4/5] run     - headless editor run; renderer flag BEFORE `--`,
                       runner flags AFTER `--`, and nothing else after `--`.
@@ -146,7 +146,7 @@ if ($LASTEXITCODE -ne 0) {
 # [2/5] fixture assets: the generator call above stages none (no
 # --fixture-asset flags), so copy per [gdextest.fixture] assets manually,
 # preserving repo-relative paths exactly as copy_globbed_assets would.
-Write-Host "Staging [gdextest.fixture] assets (project/test_assets/**)..." -ForegroundColor Cyan
+Write-Host "Staging [gdextest.fixture] assets (project/test_assets/**/*)..." -ForegroundColor Cyan
 $AssetSource = Join-Path $RepoRoot "project/test_assets"
 if (-not (Test-Path $AssetSource)) {
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "Asset source project/test_assets/ not found; cannot stage fixture assets." -Code 1

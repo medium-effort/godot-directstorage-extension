@@ -364,11 +364,11 @@ def write_build_manifest():
     is_dirty = False
 
     try:
-        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
         commit_short = commit_hash[:7]
-        commit_msg = subprocess.check_output(["git", "log", "-1", "--pretty=%s"], text=True).strip()
-        commit_date = subprocess.check_output(["git", "log", "-1", "--pretty=%cI"], text=True).strip()
-        status_out = subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
+        commit_msg = subprocess.check_output(["git", "log", "-1", "--pretty=%s"], text=True, stderr=subprocess.DEVNULL).strip()
+        commit_date = subprocess.check_output(["git", "log", "-1", "--pretty=%cI"], text=True, stderr=subprocess.DEVNULL).strip()
+        status_out = subprocess.check_output(["git", "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL).strip()
         is_dirty = len(status_out) > 0
     except Exception:
         pass
