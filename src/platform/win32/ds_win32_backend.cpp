@@ -821,8 +821,8 @@ void Win32Backend::poll_batch_status() {
 #endif
 }
 
-void Win32Backend::poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value) {
 #ifdef _WIN32
+void Win32Backend::poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value) {
 	if (!p_queue.completion_fence || p_fence_value == 0 ||
 			p_queue.completion_fence->GetCompletedValue() < p_fence_value) {
 		return;
@@ -848,8 +848,8 @@ void Win32Backend::poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>>
 		}
 	}
 	complete_chunked_requests();
-#endif
 }
+#endif
 
 #ifdef _WIN32
 void Win32Backend::update_profiler_queue_depth_locked() {
@@ -1410,10 +1410,12 @@ bool Win32Backend::initialize() {
 	return initialize("");
 }
 
+#ifdef _WIN32
 int Win32Backend::priority_to_queue_index(DSRequest::DSPriority p_priority) {
 	int priority = static_cast<int>(p_priority);
 	return priority >= DSRequest::PRIORITY_LOW && priority <= DSRequest::PRIORITY_HIGH ? priority : DSRequest::PRIORITY_NORMAL;
 }
+#endif
 
 bool Win32Backend::is_path_valid(const String &p_path) {
 #ifdef _WIN32
