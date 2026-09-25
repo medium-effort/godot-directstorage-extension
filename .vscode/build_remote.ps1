@@ -1,7 +1,8 @@
 param(
     [string]$Target = "editor",
     [switch]$IncludePdb,
-    [switch]$IncludeTests
+    [switch]$IncludeTests,
+    [switch]$Verbose
 )
 
 function Show-BuildFailure {
@@ -33,6 +34,16 @@ function Show-BuildSuccess {
     Write-Host " [BUILD SUCCESS] $Message " -ForegroundColor White -BackgroundColor DarkGreen
     Write-Host "================================================================================" -ForegroundColor Green
     Write-Host ""
+}
+
+function Write-VerboseHost {
+    param(
+        [string]$Message,
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray
+    )
+    if ($Verbose) {
+        Write-Host $Message -ForegroundColor $ForegroundColor
+    }
 }
 
 # Load configuration from .env file
@@ -86,19 +97,19 @@ $ArtifactRemoteDir = "$RemoteDirTar/project/addons/directstorage_accelerator/bin
 $ArtifactLocalDir  = "./project/addons/directstorage_accelerator/bin"
 
 # 1. Probe connectivity (Local Wi-Fi first, fallback to Tailscale)
-Write-Host "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
+Write-VerboseHost "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
 $ActiveHost = $null
 & ssh -4 -o BatchMode=yes -o ConnectTimeout=2 $RemoteHost "exit 0" 2>$null
 
 if ($LASTEXITCODE -eq 0) {
     $ActiveHost = $RemoteHost
-    Write-Host "Connected via local network ($ActiveHost)." -ForegroundColor Green
+    Write-VerboseHost "Connected via local network ($ActiveHost)." -ForegroundColor Green
 } elseif ($RemoteHostFallback) {
-    Write-Host "Local host unreachable. Attempting Tailscale fallback ($RemoteHostFallback)..." -ForegroundColor Yellow
+    Write-VerboseHost "Local host unreachable. Attempting Tailscale fallback ($RemoteHostFallback)..." -ForegroundColor Yellow
     & ssh -o BatchMode=yes -o ConnectTimeout=4 $RemoteHostFallback "exit 0" 2>$null
     if ($LASTEXITCODE -eq 0) {
         $ActiveHost = $RemoteHostFallback
-        Write-Host "Connected via Tailscale ($ActiveHost)." -ForegroundColor Green
+        Write-VerboseHost "Connected via Tailscale ($ActiveHost)." -ForegroundColor Green
     } else {
         Show-BuildFailure -Step "Step [1/6] Connectivity" -Message "Neither primary host ($RemoteHost) nor fallback ($RemoteHostFallback) could be reached!" -Code 1
     }
@@ -107,14 +118,14 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 # 2. Ensure target directory exists on Device B
-Write-Host "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
+Write-VerboseHost "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
 ssh $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to ensure remote build directory exists on $ActiveHost." -Code $LASTEXITCODE
 }
 
 # 3. Stream source files via native tar over SSH (using cmd.exe for raw binary piping)
-Write-Host "[3/6] Syncing source files to Device B..." -ForegroundColor Cyan
+Write-VerboseHost "[3/6] Syncing source files to Device B..." -ForegroundColor Cyan
 $tarExcludes = @(
     "--exclude=.git",
     "--exclude=.vscode",
@@ -149,21 +160,35 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 4. Trigger SCons build on Device B
-Write-Host "[4/6] Compiling target=$Target on Device B..." -ForegroundColor Cyan
+Write-VerboseHost "[4/6] Compiling target=$Target on Device B..." -ForegroundColor Cyan
 $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
 # Exit status cannot ride the ssh code: OpenSSH's cmd shell returns 0 even
 # when SCons fails, and %ERRORLEVEL% expands before SCons runs. A marker
 # file written only after a successful scons is the reliable signal.
 $RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
 ssh $ActiveHost "if exist `"$RemoteMarkerWin`" del /q `"$RemoteMarkerWin`""
-ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`""
+if ($Verbose) {
+    ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`""
+} else {
+    $sconsOutput = ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`"" 2>&1
+}
 ssh $ActiveHost "if exist `"$RemoteMarkerWin`" (exit /b 0) else (exit /b 1)"
 if ($LASTEXITCODE -ne 0) {
+    if (-not $Verbose -and $sconsOutput) {
+        $errorLines = $sconsOutput | Where-Object { $_ -match "error[:\s]|fatal|failed|exception" }
+        if ($errorLines) {
+            Write-Host "--- SCons Compilation Errors ---" -ForegroundColor Red
+            $errorLines | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+        } else {
+            Write-Host "--- SCons Output (tail) ---" -ForegroundColor Red
+            $sconsOutput | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+        }
+    }
     Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost). Detected via missing success marker (ssh does not propagate the SCons exit code)." -Code 1
 }
 
 # 5. Pull back compiled binary and debug symbols to Device A
-Write-Host "[5/6] Pulling artifacts back to Device A (compressed)..." -ForegroundColor Cyan
+Write-VerboseHost "[5/6] Pulling artifacts back to Device A (compressed)..." -ForegroundColor Cyan
 if (!(Test-Path $ArtifactLocalDir)) {
     New-Item -ItemType Directory -Force -Path $ArtifactLocalDir | Out-Null
 }
@@ -186,16 +211,16 @@ scp -C "$ActiveHost`:$ArtifactRemoteDir/build_manifest.json" "$ArtifactLocalDir/
 
 # Pull large PDB debug symbols only when explicitly requested
 if ($IncludePdb) {
-    Write-Host "Pulling debug symbols (.pdb) with compression..." -ForegroundColor Cyan
+    Write-VerboseHost "Pulling debug symbols (.pdb) with compression..." -ForegroundColor Cyan
     scp -C "$ActiveHost`:$ArtifactRemoteDir/*.pdb" "$ArtifactLocalDir/" 2>$null
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "Warning: Failed to download .pdb debug symbols." -ForegroundColor Yellow
+        Write-VerboseHost "Warning: Failed to download .pdb debug symbols." -ForegroundColor Yellow
     }
 } else {
-    Write-Host "Skipping .pdb download (use -IncludePdb if attaching a C++ debugger)." -ForegroundColor DarkGray
+    Write-VerboseHost "Skipping .pdb download (use -IncludePdb if attaching a C++ debugger)." -ForegroundColor DarkGray
 }
 
-Write-Host "Artifacts updated on Device A." -ForegroundColor Green
+Write-VerboseHost "Artifacts updated on Device A." -ForegroundColor Green
 
 # 6. Post-build synchronization to external test project (e.g. TPS demo)
 $EnableSyncVal = if ($env:ENABLE_POST_BUILD_ADDON_SYNC) { $env:ENABLE_POST_BUILD_ADDON_SYNC } `
@@ -221,11 +246,11 @@ if ($ShouldSync) {
     }
 
     if ($TargetGuid -and $CurrentGuid -and ($TargetGuid.Trim().ToLower() -ne $CurrentGuid.Trim().ToLower())) {
-        Write-Host "Skipping post-build sync: Machine GUID ($CurrentGuid) does not match target ($TargetGuid)." -ForegroundColor DarkGray
+        Write-VerboseHost "Skipping post-build sync: Machine GUID ($CurrentGuid) does not match target ($TargetGuid)." -ForegroundColor DarkGray
     } elseif (-not (Test-Path "D:\")) {
-        Write-Host "Skipping post-build sync: Drive D: not found." -ForegroundColor DarkGray
+        Write-VerboseHost "Skipping post-build sync: Drive D: not found." -ForegroundColor DarkGray
     } else {
-        Write-Host "[6/6] Syncing addon to external project ($SyncTargetDir)..." -ForegroundColor Cyan
+        Write-VerboseHost "[6/6] Syncing addon to external project ($SyncTargetDir)..." -ForegroundColor Cyan
         $LocalAddonDir = (Resolve-Path (Join-Path $PSScriptRoot "..\project\addons\directstorage_accelerator")).Path
 
         if (Test-Path $LocalAddonDir) {
@@ -336,16 +361,17 @@ if ($ShouldSync) {
             }
 
             if ($copiedCount -gt 0) {
-                Write-Host "Post-build sync complete: Updated $copiedCount file(s) -> $SyncTargetDir" -ForegroundColor Green
+                Write-VerboseHost "Post-build sync complete: Updated $copiedCount file(s) -> $SyncTargetDir" -ForegroundColor Green
             } else {
-                Write-Host "Post-build sync: Target $SyncTargetDir is already up to date." -ForegroundColor DarkGray
+                Write-VerboseHost "Post-build sync: Target $SyncTargetDir is already up to date." -ForegroundColor DarkGray
             }
         }
     }
 } else {
-    Write-Host "Post-build addon sync is disabled (ENABLE_POST_BUILD_ADDON_SYNC=0)." -ForegroundColor DarkGray
+    Write-VerboseHost "Post-build addon sync is disabled (ENABLE_POST_BUILD_ADDON_SYNC=0)." -ForegroundColor DarkGray
 }
 
-Show-BuildSuccess -Message "All build and sync steps completed successfully!"
+$syncMsg = if ($ShouldSync -and $copiedCount -gt 0) { " (Synced $copiedCount file(s))" } else { "" }
+Show-BuildSuccess -Message "All build and sync steps completed successfully!$syncMsg"
 
 

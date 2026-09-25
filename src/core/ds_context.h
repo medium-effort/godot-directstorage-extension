@@ -46,7 +46,7 @@ private:
 	bool gpu_requests_pending = false;
 	uint64_t completion_fence = 0;
 	mutable std::mutex context_mutex;
-	static constexpr size_t MAX_EXECUTION_REPORTS = 1024;
+	static constexpr size_t MAX_EXECUTION_REPORTS = 32768;
 	Dictionary request_execution_reports;
 	std::unordered_map<int64_t, Ref<DSRequest>> tracked_requests;
 	std::unordered_set<int64_t> pending_request_ids;

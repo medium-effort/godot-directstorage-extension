@@ -32,6 +32,10 @@ var _tracked_tags: Dictionary = {}
 var _finished_tags: Dictionary = {}
 ## Set once the missing-stream-API warning has been emitted (avoids spamming).
 var _stream_api_missing_warned: bool = false
+## Background texture-ingestion task (`WorkerThreadPool` task ID, -1 = idle).
+## `poll_completed()` builds `ImageTexture` only (Quirks Sec25 worker-safe);
+## evict-path RID frees defer via `call_on_render_thread` (Sec27).
+var _poll_task_id: int = -1
 
 
 ## Starts tracking progress for a prewarm tag returned by `prewarm_async()`.
@@ -96,13 +100,21 @@ func _process(_delta: float) -> void:
 	#    retry next frame). Never routes through the sync flush path.
 	if ctx.has_stream_pending():
 		ctx.flush_stream_async()
-	# 3. Build textures for terminal prewarm requests (C++ render-thread
-	#    gate decides Texture2DRD vs ImageTexture). No-op when the cache
-	#    singleton is unavailable.
+	# 3. Build textures for terminal prewarm requests (always ImageTexture,
+	#    pipeline-safe on worker threads per GODOT_QUIRKS Sec25). Ingestion
+	#    runs on WorkerThreadPool at full CPU speed so the main thread spends
+	#    0.0 ms on texture creation; evict-path RID frees defer to the render
+	#    thread internally (Sec27).
 	if ClassDB.class_exists("DSTextureCache"):
 		var cache = Engine.get_singleton("DSTextureCache")
 		if cache != null:
-			cache.poll_completed()
+			if _poll_task_id != -1 and WorkerThreadPool.is_task_completed(_poll_task_id):
+				WorkerThreadPool.wait_for_task_completion(_poll_task_id)
+				_poll_task_id = -1
+			if _poll_task_id == -1 and cache.has_method("get_unbuilt_prewarm_count") and int(cache.call("get_unbuilt_prewarm_count", 0)) > 0:
+				_poll_task_id = WorkerThreadPool.add_task(_background_poll_completed, false, "DS_PollCompleted")
+			if _poll_task_id == -1:
+				cache.poll_completed(0, 0, 2000)
 	# 4. Emit per-tag progress / finished for tracked tags.
 	_poll_prewarm_progress(ctx)
 
@@ -125,6 +137,22 @@ func _poll_prewarm_progress(ctx: Object) -> void:
 			prewarm_finished.emit(tag)
 
 
+## Background texture ingestion: drains all terminal prewarm requests at
+## full CPU speed without a microsecond budget. Runs on WorkerThreadPool;
+## safe because `build_texture()` produces `ImageTexture` only (Sec25) and
+## `store()` evictions defer RID frees to the render thread (Sec27).
+func _background_poll_completed() -> void:
+	if not ClassDB.class_exists("DSTextureCache"):
+		return
+	var cache = Engine.get_singleton("DSTextureCache")
+	if cache == null or not cache.has_method("poll_completed") or not cache.has_method("get_unbuilt_prewarm_count"):
+		return
+	while int(cache.call("get_unbuilt_prewarm_count", 0)) > 0:
+		var built: int = int(cache.call("poll_completed", 0, 64, 0))
+		if built <= 0:
+			break
+
+
 ## Collects finished batches without submitting anything new. Used when the
 ## stream API is unavailable so processes that poll for completion on their
 ## own still finish.
@@ -141,6 +169,9 @@ func _poll_legacy_completions(ctx: Object) -> void:
 ## Shuts down [DSContext] before the autoload is deleted.
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_PREDELETE:
+		if _poll_task_id != -1:
+			WorkerThreadPool.wait_for_task_completion(_poll_task_id)
+			_poll_task_id = -1
 		if ClassDB.class_exists("DSContext"):
 			var ctx = Engine.get_singleton("DSContext")
 			if ctx and ctx.is_initialized():

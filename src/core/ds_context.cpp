@@ -93,6 +93,16 @@ DSContext::~DSContext() {
 void DSContext::evict_old_reports_if_needed_locked() {
 	while (request_execution_reports.size() > (int)MAX_EXECUTION_REPORTS && !report_order.empty()) {
 		int64_t request_id = report_order.front();
+		if (pending_request_ids.count(request_id) > 0) {
+			break;
+		}
+		std::unordered_map<int64_t, Ref<DSRequest>>::const_iterator tracked_it = tracked_requests.find(request_id);
+		if (tracked_it != tracked_requests.end() && tracked_it->second.is_valid()) {
+			DSRequest::Status st = tracked_it->second->get_status();
+			if (st != DSRequest::STATUS_COMPLETED && st != DSRequest::STATUS_FAILED) {
+				break;
+			}
+		}
 		report_order.pop_front();
 		request_execution_reports.erase(request_id);
 		tracked_requests.erase(request_id);
@@ -827,7 +837,16 @@ Error DSContext::flush_stream_async() {
 			// manager can retry next frame instead of losing requests.
 			return ERR_BUSY;
 		}
-		to_submit.swap(stream_queue);
+		uint16_t cap = get_queue_capacity();
+		size_t max_batch_requests = (cap > 64) ? (cap / 2) : 64;
+		if (max_batch_requests > 256) {
+			max_batch_requests = 256;
+		}
+		size_t count_to_pop = std::min(stream_queue.size(), max_batch_requests);
+		for (size_t i = 0; i < count_to_pop; ++i) {
+			to_submit.push_back(stream_queue.front());
+			stream_queue.pop_front();
+		}
 	}
 	int submitted_request_count = 0;
 	for (std::deque<Ref<DSRequest>>::iterator it = to_submit.begin(); it != to_submit.end(); ++it) {
@@ -869,6 +888,7 @@ Error DSContext::flush_stream_async() {
 		if (submitted_request_count > 0) {
 			completion_fence = backend_fence != 0 ? backend_fence : completion_fence + 1;
 		}
+		// Stream-only: sync pending counts/ids belong to flush_batch paths.
 		finalize_completed_reports_locked();
 		evict_old_reports_if_needed_locked();
 	}
@@ -1015,26 +1035,25 @@ void DSContext::collect_completed_results() {
 	#ifdef _WIN32
 	if (active_backend->get_name() == "Win32DirectStorage") {
 		Win32Backend *backend = static_cast<Win32Backend *>(active_backend);
-		if (!backend->has_pending_results()) {
-			return;
-		}
-		bool has_gpu_pending = false;
-		{
-			std::lock_guard<std::mutex> lock(context_mutex);
-			has_gpu_pending = gpu_requests_pending;
-		}
-		if (has_gpu_pending && !synchronize_rendering_device("DirectStorage async completion")) {
-			return;
-		}
-		uint64_t fence_value = 0;
-		int completed_count = 0;
-		int error_code = 0;
-		String error_message;
-		while (backend->collect_completed_batch(fence_value, completed_count, error_code, error_message)) {
-			if (error_code != 0) {
-				call_deferred("emit_signal", "batch_failed", error_code, error_message);
-			} else {
-				call_deferred("emit_signal", "batch_completed", static_cast<int64_t>(fence_value), completed_count);
+		if (backend->has_pending_results()) {
+			bool has_gpu_pending = false;
+			{
+				std::lock_guard<std::mutex> lock(context_mutex);
+				has_gpu_pending = gpu_requests_pending;
+			}
+			if (has_gpu_pending && !synchronize_rendering_device("DirectStorage async completion")) {
+				return;
+			}
+			uint64_t fence_value = 0;
+			int completed_count = 0;
+			int error_code = 0;
+			String error_message;
+			while (backend->collect_completed_batch(fence_value, completed_count, error_code, error_message)) {
+				if (error_code != 0) {
+					call_deferred("emit_signal", "batch_failed", error_code, error_message);
+				} else {
+					call_deferred("emit_signal", "batch_completed", static_cast<int64_t>(fence_value), completed_count);
+				}
 			}
 		}
 		{

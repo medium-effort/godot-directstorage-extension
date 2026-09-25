@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 24 September 2026
+Last updated: 25 September 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -678,6 +678,9 @@ As implemented in `src/integration/ds_texture_cache.cpp`:
 ### Upstream: Engine-Side Survivors Still Leak (godotengine/godot#116815, open)
 `Texture2DRD` scope-exit never frees the RID even outside any cache: a tool-script repro (`texture_create` + `set_texture_rd_rid`, texture dropped at function end) exits with `WARNING: 1 RID of type "Texture" was leaked` on D3D12 Forward+ (4.5.1/4.6/master, `needs testing`, no fix). Our game-run D3D12 proof shows the same mechanism from the other side — cache fully cleared (`cached_count=0`), scene instance freed, threaded texture released, 10-frame drain, yet exactly 2 RIDs leak with a clean ObjectDB. Those survivors are engine-held (`ResourceCache` residents via `take_over_path`, scene subresources, thread-load results): no owner remains to `free_rid` them, and the wrapper will not do it. Treat small-count exit residuals with empty caches as this upstream behavior, not as evict-path regressions; only a scaling-with-resolve-count census indicates our bug.
 
+### Test-Script Holder Hygiene for the Shutdown Census
+Headless test scripts that retain texture `Ref`s in script-level arrays (or locals) until `quit()` produce their own exit noise — `WARNING: N ObjectDB instances were leaked at exit` plus `ERROR: N resources still in use at exit` — which masks the census above. Clear every holder (`array.clear()`, `unref()` locals) after the final RID check and before `_finish()`; a proof script that does so exits with zero ObjectDB/resource warnings, leaving any residual as a genuine signal.
+
 ---
 
 ## 28. Per-Path I/O Cost Reality: `exists()` Probes and Cold Opens
@@ -703,5 +706,262 @@ A headless streaming test cannot assume it owns the flush/collect pipeline exclu
 
 ### The Rule
 Design autoload frame drivers so that double-driving (autoload `_process` plus manual test pumping) is harmless, and never assert exact submit/flush counts that a concurrent driver could perturb—assert bounds (`1 <= submits <= slack`) instead.
+
+---
+
+## 30. DirectStorage Queue Capacity Saturation & Stall at High Multi-Mip Volumes
+
+### The Engine Reality
+DirectStorage queues (`IDStorageQueue`) are instantiated with a fixed request capacity configured via `DSTORAGE_QUEUE_DESC.Capacity` (`thirdparty/directstorage/include/dstorage.h:113-122`; min 128 / max 8192 at `:43-50`). The extension defaults to 2000 (`src/core/ds_context.h:42`, wired at `src/platform/win32/ds_win32_backend.cpp:1561-1563`). In production scenes with numerous large textures (such as `tps-demo` with ~250 textures), multi-mip splitting (Section 8) turns 250 textures into 1,240+ independent subresource requests (`ds_win32_backend.cpp:2132-2196`, one `EnqueueRequest` per mip at `:2079`).
+
+### The Pitfall: Unbounded Enqueue Blocks the Submitting Thread at 84%–93%
+If an asynchronous preloader or streaming manager dumps all 1,240 requests into `EnqueueRequest` without chunking, the queue saturates. Per the SDK (`dstorage.h:954-957`), `EnqueueRequest` returns `void` and **blocks** until a free entry exists (auto-submitting at half-full) — it does not fail, and fences still signal. The real hazard is the submitting thread blocking while holding the batch lock, which stalls pipeline progress.
+
+In game benchmarks, this manifested as an indefinite loading freeze where the progress bar halted at 84%–93% while CPU and GPU utilization dropped to near zero.
+
+### The Invariant Rule: Batch Chunking
+Never dump unbounded request arrays into a DirectStorage queue in a single flush. Stream submission routines (`flush_stream_async()`, `src/core/ds_context.cpp:840-845`) partition pending requests into chunks:
+```cpp
+// Submit at most min(capacity / 2, 256) requests per batch (floor 64 for small capacities)
+uint32_t batch_size = std::min<uint32_t>(m_queue_capacity / 2, 256);
+```
+Submitting half-capacity chunks respects the SDK half-full auto-submit threshold and leaves headroom for in-flight completions. Note: only the stream path chunks; the sync `flush_batch()` / `Win32Backend::submit_batch()` path (`ds_context.cpp:736-773`, `ds_win32_backend.cpp:2438+`) submits whole slots with `ERR_BUSY` backpressure instead.
+
+---
+
+## 31. `Texture2DRD` Pipeline Incompatibilities in Godot 4.7 Forward+
+
+### The Architectural Reality
+[Texture2DRD](https://docs.godotengine.org/en/stable/classes/class_texture2drd.html) is an engine wrapper intended for raw compute shader output buffers and viewport textures. Wrapping prewarmed DirectStorage textures in `Texture2DRD` for general scene assets causes three distinct, fatal failures across Godot 4.7's rendering architecture:
+
+1. **2D CanvasItem Batch Renderer Failure (`RendererCanvasRenderRD`)**:
+   - In Godot 4.7 Forward+, all 2D canvas drawing (crosshairs, HUD, fonts, UI elements) is processed by `RendererCanvasRenderRD` (`servers/rendering/renderer_rd/renderer_canvas_render_rd.cpp:3017-3023`).
+   - Batch uniform-set creation fails when a diffuse / normal / specular / sampler RID is null or invalid. CanvasTexture tracking (`:3029-3040`) is opt-in invalidation only.
+   - Raw `Texture2DRD` instances hit the failure below when their backing RIDs are not yet valid, not because tracking is missing:
+     ```text
+     ERROR: Failed to create uniform set for batch.
+        at: (servers/rendering/renderer_rd/renderer_canvas_render_rd.cpp:3023)
+     ```
+2. **D3D12 sRGB Material Views & the RD Share Gate**:
+   - Godot's 3D PBR material pipeline requires an sRGB format view for Albedo sampling (`servers/rendering/renderer_rd/storage_rd/texture_storage.cpp:2221-2233`) created via `texture_create_shared`.
+   - The RenderingDevice enforces an RD-level gate: the view format must be in `allowed_shared_formats` (`servers/rendering/rendering_device.cpp:1792-1793`; populated at `:1719`, appended by `_texture_ensure_shareable_format` at `:2591-2596`). Without the entry, `texture_create_shared` returns an invalid `RID()`.
+   - The D3D12 driver itself always creates typeless resources (`drivers/d3d12/rendering_device_driver_d3d12.cpp:1280`); the failure is the RD-level early-out, not a D3D12 view rejection. Creating a raw `Texture2DRD` via `rd->texture_create()` without routing through `_texture_ensure_shareable_format()` leaves the sRGB view invalid:
+     ```text
+     ERROR: Texture (binding: 1, index 0) is not a valid texture.
+        at: (servers/rendering/rendering_device.cpp:4502)
+     ```
+3. **Asynchronous Initialization Race & Placeholder Dummy Substitution**:
+   - In Godot engine source (`scene/resources/texture_rd.cpp:82`), `Texture2DRD::set_texture_rd_rid()` does **not** immediately bind the texture; it defers assignment to the render thread via `RenderingServer::call_on_render_thread()`.
+   - If a scene node or material queries `get_rid()` on the main thread before that callback executes, `texture_rd.cpp:57-60` detects `texture_rid.is_null()` and substitutes a temporary placeholder dummy (`texture_2d_placeholder_create()`).
+   - Materials bound against the placeholder can then hit generic draw-list validation errors (invalid-texture at `rendering_device.cpp:4502`, or `Uniforms were never supplied for set (%d)` at `:6033,:6197,:6562,:6845,:6985` which fires when no set is bound at all). The placeholder masks the null but binds the wrong content/format.
+
+### The Solution: Prewarm into `ImageTexture`
+For general scene prewarming, wrap decompressed mip buffers in standard [ImageTexture](https://docs.godotengine.org/en/stable/classes/class_imagetexture.html):
+- DirectStorage still executes high-speed NVMe DMA transfers and GDeflate hardware/CPU decompression into memory.
+- `Image::create_from_data` wraps the contiguous natural mip buffer in microseconds without pixel copying.
+- `ImageTexture::create_from_image` delegates resource initialization to `RenderingServer`, which automatically provisions D3D12 typeless formats, sRGB views, 2D canvas batch proxies, and Decal atlas integration without a single pipeline error.
+
+---
+
+## 32. Sub-Thread Worker Contention & Cooperative CPU Decompression Fallback
+
+### The Engine Reality
+When running concurrent prewarming and threaded scene loading (Async Prewarm running concurrently with `ResourceLoader.load_threaded_request()`, referred to as Approach B in Section 15), Godot's `WorkerThreadPool` background threads parse scene nodes and resolve texture dependencies while the DirectStorage streaming queue is actively in flight.
+
+### The Pitfall: Worker Thread Blocking
+If a background worker thread calling `DSResourceFormatLoader::load()` attempts to enqueue DirectStorage requests while the stream queue is busy, or waits on DirectStorage hardware completion fences, thread contention occurs. If worker threads block on busy DirectStorage slots, the entire scene loading thread stalls.
+
+### The Rule: Cooperative Sub-Thread Diversion
+When `p_use_sub_threads` is true and DirectStorage has pending streams (`has_stream_pending()`) or uncompleted batches, the loader must immediately divert to fast multi-threaded CPU software decompression (`GDeflateDecompressor`):
+```cpp
+bool ds_usable = ds_ctx && ds_ctx->is_initialized();
+if (p_use_sub_threads && ds_usable) {
+    if (!ds_ctx->is_batch_complete() || ds_ctx->has_stream_pending()) {
+        ds_usable = false; // Fast cooperative CPU fallback
+    }
+}
+```
+This keeps background worker threads completely non-blocking and prevents thread starvation during concurrent scene parsing.
+
+---
+
+## 33. Concurrent Pipeline In-Flight Dependency Awaiting (`pending_paths` & Condition Variable)
+
+### The Engine Reality
+When `ResourceLoader.load_threaded_request()` runs concurrently with `DSPreloader` streaming (the concurrent two-pass pipeline, Section 15 Approach B), a background worker thread may encounter an asset that `DSPreloader` has already submitted to DirectStorage but has not yet finished streaming or storing into `DSTextureCache`. Without synchronization, the worker thread risks performing redundant disk reads or racing on cache insertion.
+
+### The Solution: Path Refcounting & Condition Variable
+1. `DSPreloader` tracks all in-flight texture paths under a mutex:
+   ```cpp
+   std::unordered_map<String, int> pending_paths;
+   std::condition_variable pending_cv;
+   ```
+2. When a worker thread in `DSResourceFormatLoader` needs a texture, it checks `DSPreloader::is_texture_pending(path)`.
+3. If pending, the worker thread waits on `pending_cv.wait_for(...)` until the preloader finishes streaming.
+4. When `DSPreloader::poll_completed()` stores the ready texture into `DSTextureCache`, it decrements `pending_paths` and fires `pending_cv.notify_all()`. The worker thread awakens and immediately retrieves the pre-warmed texture from cache.
+
+### The Render-Thread Deadlock Guard
+If `await_pending_texture()` is called from the **render thread**, it MUST NOT sleep on `std::condition_variable`—because `DSPreloader::poll_completed()` itself requires the render thread! Sleeping would deadlock the engine. On the render thread, `await_pending_texture()` must synchronously pump completions (`collect_completed_results()` + `poll_completed()`) inline.
+
+---
+
+## 34. Exported Build Texture Discovery: `.godot/imported` Absence & Sidecar `.dspkg` Querying
+
+### The Engine Reality
+In the editor and development builds, imported textures reside as loose `.dstex` files inside `.godot/imported/`. In exported release or debug builds, `.godot/imported/` does **not** exist on disk, and textures are stripped from `.pck` into loose sidecar container archives (`textures.dspkg`, Section 21) when bundling is enabled in the export plugin.
+
+### The Pitfall: Empty Directory Scans in Exported Binaries
+Any prewarming script that relies on scanning directory trees (`res://...`) or probing `.godot/imported` via `FileAccess.file_exists` will find 0 textures in an exported binary, silently failing to prewarm any assets.
+
+### The Rule: Direct `.dspkg` Archive Querying
+In exported builds (`OS.has_feature("template")`), prewarming routines must query `DSPkg` directly:
+```gdscript
+if OS.has_feature("template"):
+    var dspkg := DSPkg.new()
+    if dspkg.open(ProjectSettings.globalize_path("res://textures.dspkg")) == OK:
+        for entry in dspkg.get_entries():
+            texture_paths.append(entry)
+```
+Querying the package manifest directly from the sidecar archive header guarantees 100% texture discovery in exported games without relying on the editor-only imported cache directory.
+
+---
+
+## 35. Texture Cache Capacity Eviction vs. Externally-Bound `Texture2DRD` RIDs
+
+### The Engine Reality
+`DSTextureCache` defaults to `max_entries = 256` (`src/integration/ds_texture_cache.h:28`, overridable via the `directstorage/texture_cache_max_entries` project setting or `set_max_entries()`). When a bulk prewarm stores ~250 level textures on top of a handful of boot/menu residents, LRU pressure evicts the oldest entries — typically the menu's own textures. Per the Section 27 discipline the cache then calls `free_rid()` on evicted `Texture2DRD` RIDs, which is correct only while the cache is the sole owner.
+
+### The Pitfall: Evicting Textures That Are Still Drawn
+Eviction drops the cache's `Ref`, but materials in the still-visible menu scene (3D background, `TextureRect` art outside hidden containers) keep drawing those exact objects every frame — now with dead RIDs. The result is per-frame spam with zero DS-side warnings (every load succeeded):
+```text
+uniform_set_create: Texture (binding: 1, index 0) is not a valid texture.
+draw_list_draw: Uniforms were never supplied for set (3) ...
+```
+
+### The Diagnostic Signature
+Attribution is almost mechanical: clean menu idle + spam only while the loading screen is up + clean gameplay + error count scaling with load duration (not asset count) = the cache evicted a texture the visible scene still binds. `DSTextureCache.get_cached_count()` at Play press plus the prewarm set size predicts the collision exactly (e.g. 6 + ~250 against a 256 cap).
+
+### The Rules
+1. Size capacity with headroom for residents plus the largest prewarm set (`texture_cache_max_entries=2048` for a ~250-texture project with menu residents).
+2. Eviction skips entries still held outside the cache (implemented in `src/integration/ds_texture_cache.cpp`): the cache holds exactly one `Ref` per canonical entry and aliases add none, so `get_reference_count() > 1` means a live outside owner (scene material, `TextureRect`, handed-out `get_cached()` Ref, engine `ResourceCache` resident via `take_over_path`). `_evict_oldest()`, `store()`, and `set_max_entries()` all scan oldest-first past held entries; when every entry is held, the cache keeps temporary over-capacity with a `push_warning` naming the path instead of force-freeing the oldest live RID (the old mass-clear fallbacks are removed). Verified at cap 16 with 133 prewarmed textures over 5 cache-resident menu textures: zero rendering errors, all menu RIDs valid.
+
+---
+
+## 36. RID Namespace Gotcha in GDScript Diagnostics (`texture_is_valid`)
+
+### The Engine Reality
+In Godot, `Texture2D.get_rid()` returns a `RenderingServer` RID across all texture subclasses — including both `ImageTexture` (`scene/resources/image_texture.cpp:132-138`) and `Texture2DRD` (`scene/resources/texture_rd.cpp:56-63`).
+`Texture2DRD` wraps an underlying `RenderingDevice` texture RID, but exposes it via `get_texture_rd_rid()` (bound as the GDScript property `texture_rd_rid`, `texture_rd.cpp:117-119`).
+Meanwhile, `RenderingDevice.texture_is_valid(RID)` (`servers/rendering/rendering_device.cpp:2915-2919`) strictly queries `RenderingDevice`'s internal texture owner (`texture_owner.owns(p_texture)`).
+
+### The Pitfalls
+1. **Passing `get_rid()` to `RenderingDevice`**: Passing `tex.get_rid()` to `rd.texture_is_valid()` passes a `RenderingServer` RID into the `RenderingDevice` namespace, returning `false` (or throwing errors) even for valid `Texture2DRD` instances.
+2. **False Positives on `ImageTexture`**: A diagnostic script that validates scene textures against `RenderingDevice` cannot check `ImageTexture` at all, because `ImageTexture` device allocations are managed internally by `RenderingServer` and do not expose a `texture_rd_rid`. Checking an `ImageTexture` with `rd.texture_is_valid()` flags every healthy CPU/streamed texture as invalid.
+
+### The Rule
+When writing GDScript test harnesses or diagnostics to verify hardware VRAM residency:
+- Gate the check on `tex is Texture2DRD`.
+- Inspect `(tex as Texture2DRD).texture_rd_rid`, **never** `tex.get_rid()`.
+- Guard with `rd != null`, `rd.has_method("texture_is_valid")`, and an early-out for headless/Compatibility runs (Section 11):
+```gdscript
+if tex is Texture2DRD:
+    var rd_rid: RID = (tex as Texture2DRD).texture_rd_rid
+    if rd and rd.has_method("texture_is_valid"):
+        assert(rd.texture_is_valid(rd_rid), "Texture2DRD has invalid device RID")
+```
+
+---
+
+## 37. Prewarm Progress Units Are Stream Requests, Not Textures
+
+### The Engine Reality
+A prewarm tag total starts at 0 and bumps once per enqueued stream request (`src/integration/ds_preloader.cpp:920-923`). With multi-mip splitting (Section 8), one texture issues ~5 requests, so a 30-texture chunk reports progress in units of ~150.
+
+### The Pitfall: Count-Based Bar Mapping Overshoots
+Treating `done` as a texture count (`(base + done) / total_textures`) overshoots the bar to clamped-full mid-chunk, then snaps back at the next chunk — a visible flash between full and actual. Map the ratio instead, and guard the `(0, 0)` initial callback:
+```gdscript
+var ratio := float(done) / float(maxi(total, 1))
+bar.value = ((base_count + ratio * chunk_count) / total_textures) * max_progress
+```
+
+---
+
+## 38. Loading-Screen Errors Belong to the Visible Scene, Not the Loading One
+
+### The Engine Reality
+During `ResourceLoader.load_threaded_request()` the loading scene is parsed off-tree and never drawn; the menu scene (3D background, environment, sky, lights, unhidden UI) keeps rendering every frame until the swap.
+
+### The Pitfall: Misattributing Draw Errors to the Load Pipeline
+Per-frame rendering errors during loading therefore implicate actors in the *visible* menu — including non-mesh ones a material-only audit misses (`TextureRect` art, `PanoramaSkyMaterial`, light projector slots, volumetric fog). Hiding menu visuals at Play press is both a one-line discriminator (spam vanishes = menu actor) and a UX fix: it also removes the frozen-background frame Section 16 warns about.
+
+---
+
+## 39. Refcount Guards Must Read Pristine Counts (No Retain-Before-Check)
+
+### The Engine Reality
+In godot-cpp, every `Ref<T>` copy — including a `push_back` into a holding vector — increments the pointed-to `RefCounted`'s reference count immediately. A guard of the form `get_reference_count() > 1 means externally held` therefore observes not just outside owners but every local copy the checking code itself has already taken.
+
+### The Pitfall: Retain-Before-Check Skips the True Oldest
+The first cut of the Section 35 guard kept the legacy push-before-evict pattern: the caller pushed the oldest entry's `Ref` into the evicted list, *then* `_evict_oldest()` scanned counts. The push raised the oldest entry's count to 2, so the guard always classified the true oldest as externally held and silently evicted the second-oldest instead — 4 existing cache tests failed with wrong-victim eviction (never a crash or leak, which is why it looked almost right).
+
+### The Rule
+Capture candidate `Ref`s only *after* selection, inside the evictor: `_evict_oldest()` scans pristine counts, and only the selected victim's `Ref` is retained for the render-thread RID release (`src/integration/ds_texture_cache.cpp`, `src/integration/ds_texture_cache.h`). Never snapshot-then-scan; any helper that returns "the evictable entry" must return it by path/key and let the caller retain after removal is decided.
+
+---
+
+## 40. `ResourceLoader.load_threaded_request()` with `use_sub_threads = true` Causes Deadlocks and Race Conditions
+
+### The Engine Reality
+In Godot 4.x (`core/io/resource_loader.cpp` and `core/io/resource_format_binary.cpp:639`), setting `p_use_sub_threads = true` instructs Godot's binary format loader to distribute external scene sub-dependencies (`.glb`, `.scn`, `.tres`, `.wav`) as parallel asynchronous tasks across Godot's `WorkerThreadPool` (`LOAD_THREAD_DISTRIBUTE`).
+
+### The Bug / Deadlock Mechanism
+When a complex scene contains multiple models or sub-scenes that share common dependencies (e.g. shared materials, collision shapes, sound effects):
+1. **Race Condition in `thread_load_tasks`**: Sub-tasks for internal dependencies are registered without user-facing load tokens (`p_for_user = false`). When one worker thread finishes loading a shared sub-resource, it unreferences the task and removes it from `thread_load_tasks`.
+2. **Missing Token Assertion Failure**: A second worker thread that was awaiting or loading the same dependency calls `_load_complete_inner()`, finds `!thread_load_tasks.has(local_path)` at `core/io/resource_loader.cpp:1041`, and logs:
+   ```text
+   ERROR: Bug in ResourceLoader logic, please report.
+      at: _load_complete_inner (core/io/resource_loader.cpp:1041)
+   ERROR: Can't load dependency: 'res://path/to/material.tres'.
+   ```
+3. **Deadlock in `WorkerThreadPool::yield()`**: If tasks have mutual or nested dependencies, worker threads can enter an unresolvable wait loop in `_run_load_task()`, hanging permanently at 85%–92% completion. No error is emitted while deadlocked because the threads are suspended waiting on condition variables.
+4. **Cascading Teardown Errors on Window Close**: If the user closes the frozen window, Godot begins engine teardown. The suspended worker threads wake up to an already-erased `thread_load_tasks` table, dumping dozens of `Can't load dependency` and `Failed loading resource` errors simultaneously.
+
+### The Rule
+Never pass `use_sub_threads = true` to `ResourceLoader.load_threaded_request()` for complex scenes with interdependent hierarchies. Always set `use_sub_threads = false`:
+```gdscript
+ResourceLoader.load_threaded_request(LEVEL_PATH, "", false, ResourceLoader.CACHE_MODE_REUSE)
+```
+Because DirectStorage has already prewarmed and cached all heavy textures in `DSTextureCache` and `ResourceCache`, single-threaded background parsing is near-instantaneous (~300 ms), completely stable, and immune to `WorkerThreadPool` race conditions.
+
+---
+
+## 41. Main-Thread Frame Hitches from Fixed-Count Texture Polling & Synchronous Scene Dependency Traversal
+
+### The Engine Reality
+When prewarming textures on background NVMe DirectStorage queues, I/O decompression completes asynchronously across worker queues at multiple gigabytes per second. To make these completed payloads visible to Godot, the main engine thread must ingest and wrap them into usable engine texture objects (`ImageTexture` or `Texture2DRD`) via `DSTextureCache.poll_completed()`.
+
+### The Two Frame Hitch Sources
+Benchmarking loading screen frame times on real hardware (e.g. NVIDIA GTX 1050 Ti) revealed two distinct causes of main-thread frame freezes:
+
+1. **Frame #2 Dependency Crawl Freeze (~136 ms stall)**:
+   - Calling `DSPreloader.collect_scene_textures(scene_path)` synchronously traverses the root scene's dependencies using `ResourceLoader.get_dependencies()`.
+   - On exported binary scenes (`.scn`), parsing deep dependency trees, embedded materials, and mesh variants on the main thread takes **100 ms to 150 ms**, freezing the loading screen immediately upon button press before progress starts.
+
+2. **Frames #6–#16 Fixed-Count Ingestion Hitches (43 ms to 112 ms periodic freezes)**:
+   - Polling completions with a fixed item count (e.g. `poll_completed(tag, 8)`) assumes uniform texture creation cost.
+   - On desktop GPUs, creating an unpadded 2048x2048 or 4096x4096 BC1/BC3 texture (including `unpad_footprint_mip` row unpadding and `ImageTexture::create_from_image`) costs **8 ms to 14 ms** per texture.
+   - Processing 8 large textures in a single frame consumes **64 ms to 112 ms** of synchronous CPU execution time on the main thread, resulting in visible 4-to-7 frame video freezes during progress bar movement.
+
+### The Fix: Microsecond Time Budgeting & Exported Manifest Fast-Path
+1. **Microsecond Time Budgeting (`p_max_usec`)**:
+   Instead of a fixed texture count, provide a microsecond time limit to `poll_completed(tag, max_items, max_usec)`. By measuring `Time::get_singleton()->get_ticks_usec()` after each texture build and yielding when `elapsed >= p_max_usec` (e.g. `4000` usec / 4 ms):
+   - Large 4K textures yield after just 1 texture (~8 ms elapsed), leaving ample headroom for 60 FPS rendering.
+   - Small 256x256 textures batch multiple items within the same 4 ms budget.
+   - Main-thread frame time never exceeds 16.6 ms, completely eliminating frame stutters.
+
+2. **Instant Package Manifest Lookup (<0.5 ms)**:
+   In exported builds where `textures.dspkg` is deployed, the archive already contains the pre-indexed list of all bundled textures. Querying `dspkg.get_entries()` directly against the requested coverage directories discovers all dependencies in **<0.5 ms**, completely bypassing the 100+ ms binary scene crawl.
+
+
 
 

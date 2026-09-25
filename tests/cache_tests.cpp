@@ -28,6 +28,13 @@
 //   always misses; store() with IGNORE/IGNORE_DEEP is a no-op; evict() is
 //   idempotent; set_enabled(false) drains the cache; set_max_entries()
 //   clamps <1 to 1 and evicts oldest-first while over cap.
+// - EVICTION GUARD: entries with reference_count > 1 (cache's own Ref plus
+//   an outside holder: scene material, handed-out Ref, engine resident) are
+//   skipped by _evict_oldest()/store()/set_max_entries(); all-held capacity
+//   pressure keeps temporary over-capacity with a push_warning instead of
+//   freeing a live Texture2DRD RID (GODOT_QUIRKS.md section 35). Aliases add
+//   no Refs, so the 1:1 alias case still evicts at count == 1 and the
+//   twin-guard drop_live_refs filter is unchanged.
 // - LINKAGE NOTE: compile-in decided, consumer_extension NOT
 //   configured, so the Engine "DSTextureCache" singleton is absent at
 //   runtime. Every test memnews its OWN instance and never touches
@@ -256,11 +263,59 @@ GDEX_TEST_T(cache, thread_safety_smoke_concurrent_access, TAG_INTEGRATION) {
         worker.join();
     }
 
-    // No crash, no lock corruption: count is coherent and within the cap.
-    GDEX_EXPECT_GE(cache->get_cached_count(), 0);
-    GDEX_EXPECT_LE(cache->get_cached_count(), cache->get_max_entries());
+    // No crash, no lock corruption. Note: `textures` still holds a Ref to
+    // every stored texture, so all entries are externally held and eviction
+    // correctly kept temporary over-capacity instead of freeing live RIDs.
+    // Drop the externals and re-apply the cap before asserting the bound.
+    textures.clear();
+    cache->set_max_entries(64);
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 64);
     cache->clear();
     GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+}
+
+GDEX_TEST_T(cache, eviction_skips_externally_held_entries, TAG_INTEGRATION) {
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+    cache->set_max_entries(3);
+
+    // Resident held outside the cache (simulates a menu texture the visible
+    // scene still draws while a prewarm stores over capacity).
+    godot::Ref<godot::Texture2D> held = make_test_texture(0.1f);
+    cache->store("res://gdextest_cache_guard_held", held);
+    cache->store(cache_path("res://gdextest_cache_guard_", 1), make_test_texture(0.2f));
+    cache->store(cache_path("res://gdextest_cache_guard_", 2), make_test_texture(0.3f));
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 3);
+
+    // Over capacity with the oldest externally held: the held entry survives
+    // (temporary over-capacity is NOT taken here since an unheld victim
+    // exists); the oldest unheld entry evicts first and the held RID is kept.
+    cache->store(cache_path("res://gdextest_cache_guard_", 3), make_test_texture(0.4f));
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 3);
+    GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_cache_guard_held").is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached(cache_path("res://gdextest_cache_guard_", 1)).is_null());
+    GDEX_EXPECT_TRUE(cache->get_cached(cache_path("res://gdextest_cache_guard_", 3)).is_valid());
+    GDEX_EXPECT_TRUE(held.is_valid());
+
+    // Every entry externally held: the store keeps temporary over-capacity
+    // (with a push_warning) instead of freeing a live RID.
+    godot::Ref<godot::Texture2D> hold2 = cache->get_cached(cache_path("res://gdextest_cache_guard_", 2));
+    godot::Ref<godot::Texture2D> hold3 = cache->get_cached(cache_path("res://gdextest_cache_guard_", 3));
+    GDEX_ASSERT_TRUE(hold2.is_valid());
+    GDEX_ASSERT_TRUE(hold3.is_valid());
+    cache->store(cache_path("res://gdextest_cache_guard_", 4), make_test_texture(0.5f));
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 4);
+    GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_cache_guard_held").is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached(cache_path("res://gdextest_cache_guard_", 4)).is_valid());
+
+    // Release the newer holders: the next over-capacity store drains the
+    // unheld entries oldest-first while the still-held oldest survives.
+    hold2.unref();
+    hold3.unref();
+    cache->store(cache_path("res://gdextest_cache_guard_", 5), make_test_texture(0.6f));
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 3);
+    GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_cache_guard_held").is_valid());
+    GDEX_EXPECT_TRUE(held.is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached(cache_path("res://gdextest_cache_guard_", 5)).is_valid());
 }
 
 GDEX_TEST_T(cache, alias_storage_shares_single_lru_slot, TAG_INTEGRATION) {

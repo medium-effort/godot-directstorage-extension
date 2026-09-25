@@ -47,6 +47,7 @@
 #include "../core/ds_request.h"
 #include "../formats/dspkg_format.h"
 
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
@@ -148,11 +149,17 @@ public:
 	// (+ engine ResourceCache residency via take_over_path) by this call.
 	// Intended to be called from the main thread each frame while a prewarm
 	// is in flight (the batch manager calls it from its per-frame hook).
-	static int poll_completed(uint64_t p_tag = 0);
+	// When p_max_items > 0, at most p_max_items textures are processed in this call.
+	// When p_max_usec > 0, processing yields as soon as elapsed microseconds exceed the budget.
+	static int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, uint32_t p_max_usec = 0);
 
 	// Diagnostic: number of tracked textures with at least one
 	// unfinished request. p_tag == 0 counts all tags.
 	static int get_pending_prewarm_count(uint64_t p_tag = 0);
+
+	// Diagnostic: number of tracked textures still residing in the preloader's
+	// pending state awaiting poll_completed(). p_tag == 0 counts all tags.
+	static int get_unbuilt_prewarm_count(uint64_t p_tag = 0);
 
 	// Release all held Refs + the archive handle. Called from
 	// ~DSTextureCache (module teardown) so no Ref outlives Godot.
@@ -171,6 +178,13 @@ public:
 	// True for engine authoring extensions this preloader accepts.
 	static bool is_engine_source_path(const String &p_path);
 
+	// Check if a texture path (engine path or payload key) is currently in-flight in the prewarm stream.
+	static bool is_texture_pending(const String &p_path);
+
+	// Await completion of a pending texture in-flight in the prewarm stream (e.g. from ResourceLoader worker threads).
+	// On render thread, pumps completions immediately to avoid deadlocks. On worker threads, waits on condition variable.
+	static Ref<Texture2D> await_pending_texture(const String &p_path, uint32_t p_timeout_ms = 3000);
+
 private:
 	struct Tracked {
 		uint64_t tag = 0;
@@ -180,7 +194,9 @@ private:
 
 	struct State {
 		std::mutex mutex;
+		std::condition_variable pending_cv;
 		std::unordered_map<int64_t, Tracked> pending;
+		HashMap<String, int> pending_paths;
 		int64_t next_id = 1;
 		std::mutex archive_mutex;
 		String archive_path;

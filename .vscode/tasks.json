@@ -9,7 +9,8 @@
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                "${workspaceFolder}/.vscode/build_remote.ps1"
+                "${workspaceFolder}/.vscode/build_remote.ps1",
+                "-Verbose"
             ],
             "group": {
                 "kind": "build",
@@ -36,7 +37,8 @@
                 "Bypass",
                 "-File",
                 "${workspaceFolder}/.vscode/build_remote.ps1",
-                "-IncludeTests"
+                "-IncludeTests",
+                "-Verbose"
             ],
             "group": "build",
             "presentation": {
@@ -71,7 +73,8 @@
                 "-File",
                 "${workspaceFolder}/.vscode/build_remote.ps1",
                 "-Target",
-                "template_debug"
+                "template_debug",
+                "-Verbose"
             ],
             "group": "build",
             "presentation": {
@@ -96,7 +99,8 @@
                 "-File",
                 "${workspaceFolder}/.vscode/build_remote.ps1",
                 "-Target",
-                "template_release"
+                "template_release",
+                "-Verbose"
             ],
             "group": "build",
             "presentation": {
@@ -119,7 +123,8 @@
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                "${workspaceFolder}/.vscode/run_gdextest_local.ps1"
+                "${workspaceFolder}/.vscode/run_gdextest_local.ps1",
+                "-Verbose"
             ],
             "group": "test",
             "presentation": {
@@ -142,7 +147,8 @@
                 "-File",
                 "${workspaceFolder}/.vscode/run_d3d12_windowed.ps1",
                 "-Filter",
-                "gpu_*"
+                "gpu_*",
+                "-Verbose"
             ],
             "group": "test",
             "presentation": {

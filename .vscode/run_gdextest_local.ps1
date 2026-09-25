@@ -40,7 +40,8 @@ param(
     [string]$Filter = "",
     [string]$RenderingDriver = "",
     [string]$Json = "results.json",
-    [string]$GodotExe = ($env:GODOT)
+    [string]$GodotExe = ($env:GODOT),
+    [switch]$Verbose
 )
 
 $ErrorActionPreference = "Stop"
@@ -102,6 +103,16 @@ function Show-RunSuccess {
     Write-Host ""
 }
 
+function Write-VerboseHost {
+    param(
+        [string]$Message,
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray
+    )
+    if ($Verbose) {
+        Write-Host $Message -ForegroundColor $ForegroundColor
+    }
+}
+
 # All stages run from the repo root (this script lives in .vscode/).
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $RepoRoot
@@ -119,34 +130,48 @@ $FixtureRoot = "build/gdextest/project"
 # NOTE: invoke via `python .../gdextest.py`, never `& ./extern/gdextest/gdextest`
 # (a POSIX sh wrapper that cannot activate on Windows PowerShell; spike
 # defect #2). $LASTEXITCODE may stay $null when activation fails, so coerce.
-Write-Host "[1/5] doctor: validating config/Godot/SCons (no build)..." -ForegroundColor Cyan
-Write-Host "Using Godot: $GodotExe" -ForegroundColor DarkGray
+Write-VerboseHost "[1/5] doctor: validating config/Godot/SCons (no build)..." -ForegroundColor Cyan
+Write-VerboseHost "Using Godot: $GodotExe" -ForegroundColor DarkGray
 $env:GODOT = $GodotExe
-& python extern/gdextest/tools/gdextest.py doctor
+if ($Verbose) {
+    & python extern/gdextest/tools/gdextest.py doctor
+} else {
+    $doctorOut = & python extern/gdextest/tools/gdextest.py doctor 2>&1
+}
 $DoctorCode = $LASTEXITCODE
 if ((-not $?) -or ($null -eq $DoctorCode) -or ($DoctorCode -ne 0)) {
+    if (-not $Verbose -and $doctorOut) {
+        Write-Host ($doctorOut -join "`n") -ForegroundColor Red
+    }
     if ($null -eq $DoctorCode -or $DoctorCode -eq 0) { $DoctorCode = 1 }
     Show-StepFailure -Step "Step [1/5] Doctor" -Message "gdextest doctor checks failed." -Code $DoctorCode
 }
 
 # [2/5] fixture: generate the disposable Godot project for the test library.
-Write-Host "[2/5] fixture: generating Godot fixture project..." -ForegroundColor Cyan
+Write-VerboseHost "[2/5] fixture: generating Godot fixture project..." -ForegroundColor Cyan
 $TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.dll" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 if (-not $TestDll) {
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "No test library found at bin/libdirectstorage_tests*.dll. Build with .vscode/build_remote.ps1 -IncludeTests first." -Code 1
 }
-Write-Host "Using test library: $($TestDll.FullName)" -ForegroundColor DarkGray
-& python extern/gdextest/tools/generate_fixture.py --project-root $FixtureRoot --library $TestDll.FullName --godot-version 4.7 --library-key windows.debug.x86_64 --project-name "directstorage-accelerator-tests" --scan-timeout-ms 30000
+Write-VerboseHost "Using test library: $($TestDll.FullName)" -ForegroundColor DarkGray
+if ($Verbose) {
+    & python extern/gdextest/tools/generate_fixture.py --project-root $FixtureRoot --library $TestDll.FullName --godot-version 4.7 --library-key windows.debug.x86_64 --project-name "directstorage-accelerator-tests" --scan-timeout-ms 30000
+} else {
+    $fixtureOut = & python extern/gdextest/tools/generate_fixture.py --project-root $FixtureRoot --library $TestDll.FullName --godot-version 4.7 --library-key windows.debug.x86_64 --project-name "directstorage-accelerator-tests" --scan-timeout-ms 30000 2>&1
+}
 if ($LASTEXITCODE -ne 0) {
+    if (-not $Verbose -and $fixtureOut) {
+        Write-Host ($fixtureOut -join "`n") -ForegroundColor Red
+    }
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "generate_fixture.py failed." -Code $LASTEXITCODE
 }
 
 # [2/5] fixture assets: the generator call above stages none (no
 # --fixture-asset flags), so copy per [gdextest.fixture] assets manually,
 # preserving repo-relative paths exactly as copy_globbed_assets would.
-Write-Host "Staging [gdextest.fixture] assets (project/test_assets/**/*)..." -ForegroundColor Cyan
+Write-VerboseHost "Staging [gdextest.fixture] assets (project/test_assets/**/*)..." -ForegroundColor Cyan
 $AssetSource = Join-Path $RepoRoot "project/test_assets"
 if (-not (Test-Path $AssetSource)) {
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "Asset source project/test_assets/ not found; cannot stage fixture assets." -Code 1
@@ -167,13 +192,13 @@ $FixtureAssets = Join-Path (Join-Path $RepoRoot $FixtureRoot) "project/test_asse
 if (-not (Test-Path $FixtureAssets)) {
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "Fixture assets did not land in $FixtureRoot/project/test_assets/." -Code 1
 }
-Write-Host "Fixture assets staged: $stagedCount file(s) -> $FixtureRoot/project/test_assets/" -ForegroundColor Green
+Write-VerboseHost "Fixture assets staged: $stagedCount file(s) -> $FixtureRoot/project/test_assets/" -ForegroundColor Green
 
 # [3/5] warmup: cold-cache deterministic pass (output discarded).
 # A single retry absorbs the observed cold-cache flake (first attempt once
 # exited 0xC0000005, immediate retry passed; spike observation). Exit 134
 # (cold-cache shutdown abort) is expected per upstream docs/cli.md.
-Write-Host "[3/5] warmup: cold-cache deterministic pass..." -ForegroundColor Cyan
+Write-VerboseHost "[3/5] warmup: cold-cache deterministic pass..." -ForegroundColor Cyan
 # Godot writes warnings to stderr; with $ErrorActionPreference = "Stop" that
 # becomes a terminating NativeCommandError before $LASTEXITCODE is read.
 # Relax EAP for the native call and gate purely on the exit code.
@@ -185,10 +210,10 @@ for ($attempt = 1; $attempt -le 2; $attempt++) {
     $ErrorActionPreference = "Stop"
     if ($null -eq $WarmupCode) { $WarmupCode = 1 }
     if ($WarmupCode -eq 0 -or $WarmupCode -eq 134) { break }
-    Write-Host "Warmup attempt $attempt exited $WarmupCode; retrying once..." -ForegroundColor Yellow
+    Write-VerboseHost "Warmup attempt $attempt exited $WarmupCode; retrying once..." -ForegroundColor Yellow
 }
 if ($WarmupCode -eq 134) {
-    Write-Host "Warmup exited 134 (cold-cache shutdown abort; import completed -- expected per upstream docs/cli.md)." -ForegroundColor Yellow
+    Write-VerboseHost "Warmup exited 134 (cold-cache shutdown abort; import completed -- expected per upstream docs/cli.md)." -ForegroundColor Yellow
 } elseif ($WarmupCode -ne 0) {
     Show-StepFailure -Step "Step [3/5] Warmup" -Message "Warmup pass failed twice." -Code $WarmupCode
 }
@@ -196,7 +221,7 @@ if ($WarmupCode -eq 134) {
 # [4/5] run: renderer flag BEFORE `--`, runner flags AFTER `--`,
 # and never anything else after `--`. Test failures (exit 1) still proceed
 # to report; the report exit code gates the pipeline.
-Write-Host "[4/5] run: headless editor test run..." -ForegroundColor Cyan
+Write-VerboseHost "[4/5] run: headless editor test run..." -ForegroundColor Cyan
 $GodotArgs = @("--headless", "--editor")
 if ($RenderingDriver) {
     $GodotArgs += "--rendering-driver"
@@ -214,7 +239,7 @@ if ($Filter) {
 # (spike defect #5: `report results.json` from repo root found nothing).
 $ReportJson = if ([System.IO.Path]::IsPathRooted($Json)) { $Json } else { Join-Path $FixtureRoot $Json }
 $GodotArgs += "--gdextest-json=$Json"
-Write-Host "Godot command: $GodotExe $($GodotArgs -join ' ')" -ForegroundColor DarkGray
+Write-VerboseHost "Godot command: $GodotExe $($GodotArgs -join ' ')" -ForegroundColor DarkGray
 # Remove any previous results so a crashed run cannot be masked by a stale
 # JSON (a prior crash left an old results.json that the report stage happily
 # re-printed as PASSED).
@@ -224,26 +249,42 @@ if (Test-Path $ReportJson) {
 # Same EAP relaxation as the warmup: engine warnings on stderr must not abort
 # the run before the JSON is written.
 $ErrorActionPreference = "Continue"
-& $GodotExe @GodotArgs
+if ($Verbose) {
+    & $GodotExe @GodotArgs
+} else {
+    $godotOut = & $GodotExe @GodotArgs 2>&1
+}
 $RunCode = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 if ($null -eq $RunCode) { $RunCode = 1 }
 # Exit 0 = all passed, 1 = test failures (both still write JSON). A negative
 # code (e.g. 0xC0000005-class abort) means the host crashed before writing.
 if ($RunCode -lt 0) {
+    if (-not $Verbose -and $godotOut) {
+        Write-Host "--- Godot Engine Output (tail) ---" -ForegroundColor Red
+        $godotOut | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+    }
     Show-StepFailure -Step "Step [4/5] Run" -Message "Godot host crashed before writing results (exit $RunCode). See the engine output above." -Code 1
 }
 if (-not (Test-Path $ReportJson)) {
+    if (-not $Verbose -and $godotOut) {
+        Write-Host "--- Godot Engine Output (tail) ---" -ForegroundColor Red
+        $godotOut | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+    }
     Show-StepFailure -Step "Step [4/5] Run" -Message "Test run produced no results file at $ReportJson (exit $RunCode); the suite likely aborted during startup." -Code $(if ($RunCode -ne 0) { $RunCode } else { 1 })
 }
 if ($RunCode -ne 0) {
-    Write-Host "Test run exited $RunCode; proceeding to report (report exit code gates the pipeline)." -ForegroundColor Yellow
+    Write-VerboseHost "Test run exited $RunCode; proceeding to report (report exit code gates the pipeline)." -ForegroundColor Yellow
 }
 
 # [5/5] report: console + JUnit; propagate its exit code as the script's.
 # Same python-invocation + null-code-coercion rules as step [1/5].
-Write-Host "[5/5] report: rendering console + JUnit report..." -ForegroundColor Cyan
-& python extern/gdextest/tools/gdextest.py report $ReportJson --console --json $ReportJson --junit=test-results.xml
+Write-VerboseHost "[5/5] report: rendering console + JUnit report..." -ForegroundColor Cyan
+if ($Verbose) {
+    & python extern/gdextest/tools/gdextest.py report $ReportJson --console --json $ReportJson --junit=test-results.xml
+} else {
+    $reportOut = & python extern/gdextest/tools/gdextest.py report $ReportJson --console --json $ReportJson --junit=test-results.xml 2>&1
+}
 $ReportCode = $LASTEXITCODE
 if ((-not $?) -or ($null -eq $ReportCode)) { $ReportCode = 1 }
 # Concise totals line: the gtest-style console report buries pass/fail/skip
@@ -261,6 +302,10 @@ try {
     Write-Host "Tests: could not parse totals from $ReportJson" -ForegroundColor Yellow
 }
 if ($ReportCode -ne 0) {
+    if (-not $Verbose -and $reportOut) {
+        Write-Host "--- Test Failure Details ---" -ForegroundColor Red
+        $reportOut | ForEach-Object { Write-Host $_ }
+    }
     Show-StepFailure -Step "Step [5/5] Report" -Message "Tests failed or report could not be generated (see console report above)." -Code $ReportCode
 }
 

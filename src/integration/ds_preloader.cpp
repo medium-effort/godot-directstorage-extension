@@ -17,6 +17,7 @@
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/texture2drd.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -968,8 +969,15 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 				s.next_id = 1;
 			}
 			s.pending[id] = tracked;
+			s.pending_paths[tracked.meta.engine_path]++;
+			if (tracked.meta.payload_key != tracked.meta.engine_path) {
+				s.pending_paths[tracked.meta.payload_key]++;
+			}
 			enqueued += reqs.size();
 		}
+	}
+	if (enqueued > 0) {
+		ctx->flush_stream_async();
 	}
 	UtilityFunctions::print_verbose("DSPreloader: prewarm tag ", String::num_uint64(tag), " tracking ", (int64_t)payloads.size(), " textures (", (int64_t)enqueued, " stream requests, ", (int64_t)skipped_cached, " cached, ", (int64_t)skipped_unresolvable, " skipped).");
 	return tag;
@@ -992,205 +1000,119 @@ Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vect
 		return Ref<Texture2D>();
 	}
 
-	// Assemble natural (unpadded) mip data. v2 buffers carry D3D12
-	// footprints (256-byte row pitch); unpad per mip exactly like the sync
-	// loader CPU path. v1 buffers are already natural.
-	std::vector<PackedByteArray> natural_mips;
-	uint32_t cur_w = p_meta.width;
-	uint32_t cur_h = p_meta.height;
 	size_t expected_mips = p_meta.is_v2 ? (size_t)p_meta.mip_count : 1;
 	if (p_buffers.size() != expected_mips) {
 		UtilityFunctions::push_warning("DSPreloader: Request/buffer count mismatch for '", p_meta.engine_path, "'; dropping prewarmed texture.");
 		return Ref<Texture2D>();
 	}
+
+	// 1. Calculate mip layouts and total natural data size upfront
+	std::vector<DSTexMipLayout> layouts;
+	layouts.reserve(p_buffers.size());
+	int64_t total_natural_size = 0;
+	uint32_t cur_w = p_meta.width;
+	uint32_t cur_h = p_meta.height;
 	for (size_t i = 0; i < p_buffers.size(); ++i) {
 		if (p_buffers[i].size() == 0) {
 			UtilityFunctions::push_warning("DSPreloader: Empty completed payload for '", p_meta.engine_path, "'; dropping prewarmed texture.");
 			return Ref<Texture2D>();
 		}
 		if (p_meta.is_v2) {
-			PackedByteArray natural = DSTex::unpad_footprint_mip(p_buffers[i], cur_w, cur_h, img_fmt);
-			if (natural.size() == 0) {
-				return Ref<Texture2D>();
-			}
-			natural_mips.push_back(natural);
+			DSTexMipLayout layout = DSTex::get_mip_layout(cur_w, cur_h, img_fmt);
+			layouts.push_back(layout);
+			total_natural_size += (int64_t)layout.source_size;
 		} else {
-			natural_mips.push_back(p_buffers[i]);
+			total_natural_size += (int64_t)p_buffers[i].size();
 		}
 		cur_w = std::max<uint32_t>(1, cur_w / 2);
 		cur_h = std::max<uint32_t>(1, cur_h / 2);
 	}
 
-	DSContext *ds_ctx = DSContext::get_singleton();
-	bool gpu_active = ds_ctx != nullptr && ds_ctx->is_gpu_decompression_enabled();
-	RenderingServer *rs = RenderingServer::get_singleton();
-	RenderingDevice *rd = rs != nullptr ? rs->get_rendering_device() : nullptr;
+	// 2. Single pre-allocated buffer: unpad directly into destination without intermediate allocations
+	PackedByteArray natural_data;
+	natural_data.resize(total_natural_size);
+	uint8_t *dst_ptr = natural_data.ptrw();
+	int64_t dst_offset = 0;
 
-	// Thread-affinity gate for Texture2DRD construction. Mirrors the sync
-	// loader: Texture2DRD (texture_create + get_driver_resource + free_rid)
-	// asserts is_on_render_thread(), so off-render-thread completion
-	// (main thread under multi-threaded rendering, ResourceLoader workers,
-	// foreign backend threads) MUST take the CPU ImageTexture path, which
-	// is worker-safe by construction. as_image_texture sources
-	// (Light3D projector / Decal compatible) bypass the GPU path even
-	// on the render thread.
-	bool can_attempt_gpu = false;
-	if (p_meta.as_image_texture) {
-		UtilityFunctions::print_verbose("DSPreloader: Texture requested as ImageTexture for '" + p_meta.engine_path + "'; bypassing GPU upload.");
-	} else if (gpu_active && p_meta.is_v2) {
-		if (rs == nullptr || !rs->is_on_render_thread()) {
-			UtilityFunctions::print_verbose("DSPreloader: GPU upload unavailable off render thread for '" + p_meta.engine_path + "'; using ImageTexture.");
-		} else if (rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
-			UtilityFunctions::print_verbose("DSPreloader: GPU upload requires D3D12 driver for '" + p_meta.engine_path + "'; using ImageTexture.");
-		} else if (rd == nullptr) {
-			UtilityFunctions::print_verbose("DSPreloader: GPU upload unavailable (no RenderingDevice) for '" + p_meta.engine_path + "'; using ImageTexture.");
-		} else {
-			can_attempt_gpu = true;
-		}
-	}
-
-	Ref<Texture2D> result;
-	if (can_attempt_gpu && rd != nullptr) {
-		Ref<RDTextureFormat> rd_fmt;
-		rd_fmt.instantiate();
-		rd_fmt->set_width((int32_t)p_meta.width);
-		rd_fmt->set_height((int32_t)p_meta.height);
-		rd_fmt->set_format((RenderingDevice::DataFormat)p_meta.pixel_format);
-		rd_fmt->set_mipmaps((int32_t)(p_meta.mip_count > 0 ? p_meta.mip_count : 1));
-		rd_fmt->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);
-		rd_fmt->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
-
-		Ref<RDTextureView> rd_view;
-		rd_view.instantiate();
-
-		// Single-blob packing for TEXTURE_TYPE_2D (layers == 1).
-		// RenderingDevice requires data.size() == array_layers
-		// (rendering_device.cpp:1636-1638) with data[0].size() ==
-		// get_image_format_required_size(...) (commons 761-799): one tight
-		// blob with all mips concatenated, no inter-mip padding. Pitch math
-		// (S3TC block vs uncompressed byte) lives in
-		// DSTex::get_mip_layout/unpad_footprint_mip above; packing shape
-		// stays single-blob for both. The v2 256-byte row-pitch /
-		// 512-byte placement footprint metadata is consumed during unpad
-		// (file offsets), not as padding inside this init blob.
-		if (p_meta.mip_count == 0 || p_meta.mip_count > 16) {
-			UtilityFunctions::push_warning("DSPreloader: Invalid mip count for '", p_meta.engine_path, "'; falling back to ImageTexture.");
-			can_attempt_gpu = false;
-		}
-		uint64_t total_init_size = 0;
-		if (can_attempt_gpu) {
-			for (size_t i = 0; i < natural_mips.size(); ++i) {
-				uint64_t mip_size = (uint64_t)natural_mips[i].size();
-				if (mip_size == 0 || mip_size > UINT32_MAX || total_init_size > UINT32_MAX - mip_size) {
-					UtilityFunctions::push_warning("DSPreloader: Invalid mip payload size for '", p_meta.engine_path, "'; falling back to ImageTexture.");
-					can_attempt_gpu = false;
-					break;
-				}
-				total_init_size += mip_size;
-			}
-		}
-		PackedByteArray packed_init;
-		if (can_attempt_gpu) {
-			packed_init.resize((int64_t)total_init_size);
-			uint8_t *dst = packed_init.ptrw();
-			uint64_t dst_off = 0;
-			for (size_t i = 0; i < natural_mips.size(); ++i) {
-				int64_t mip_size = natural_mips[i].size();
-				if (mip_size > 0) {
-					memcpy(dst + dst_off, natural_mips[i].ptr(), (size_t)mip_size);
-					dst_off += (uint64_t)mip_size;
-				}
-			}
-		}
-		TypedArray<PackedByteArray> init_data;
-		if (can_attempt_gpu) {
-			init_data.append(packed_init);
-		}
-		if (!can_attempt_gpu) {
-			// Validation rejected the GPU init blob above; skip
-			// texture_create and fall through to the CPU ImageTexture path.
-		} else {
-			RID tex_rid = rd->texture_create(rd_fmt, rd_view, init_data);
-			if (tex_rid.is_valid()) {
-				uint64_t native_format = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, tex_rid, 0);
-				if (native_format != 0) {
-					Ref<Texture2DRD> tex_rd;
-					tex_rd.instantiate();
-					tex_rd->set_texture_rd_rid(tex_rid);
-					result = tex_rd;
-				} else {
-					UtilityFunctions::push_warning("DSPreloader: Could not retrieve the native texture format for ", p_meta.engine_path, "; falling back to ImageTexture.");
-					rd->free_rid(tex_rid);
-				}
+	for (size_t i = 0; i < p_buffers.size(); ++i) {
+		const uint8_t *src = p_buffers[i].ptr();
+		if (p_meta.is_v2) {
+			const DSTexMipLayout &layout = layouts[i];
+			uint8_t *dst = dst_ptr + dst_offset;
+			if (p_buffers[i].size() == static_cast<int64_t>(layout.source_size) ||
+					p_buffers[i].size() != static_cast<int64_t>(layout.footprint_size) ||
+					layout.row_pitch == 0 || layout.source_row_bytes == 0) {
+				memcpy(dst, src, p_buffers[i].size());
 			} else {
-				UtilityFunctions::push_warning("DSPreloader: GPU texture upload failed for ", p_meta.engine_path, "; falling back to ImageTexture.");
+				for (uint64_t r = 0; r < layout.row_count; ++r) {
+					memcpy(dst + r * layout.source_row_bytes, src + r * layout.row_pitch, static_cast<size_t>(layout.source_row_bytes));
+				}
 			}
-		} // else: validated single-blob upload attempt above
+			dst_offset += (int64_t)layout.source_size;
+		} else {
+			memcpy(dst_ptr + dst_offset, src, p_buffers[i].size());
+			dst_offset += p_buffers[i].size();
+		}
 	}
 
-	if (result.is_null()) {
-		PackedByteArray natural_data;
-		for (size_t i = 0; i < natural_mips.size(); ++i) {
-			natural_data.append_array(natural_mips[i]);
-		}
-		Ref<Image> image = Image::create_from_data((int)p_meta.width, (int)p_meta.height, p_meta.mip_count > 1, (Image::Format)img_fmt, natural_data);
-		if (image.is_valid() && !image->is_empty()) {
-			// sRGB fallback mirrors the sync loader: drill to an 8-bit
-			// format and linearize so CPU-sampled colors match GPU sampling.
-			if (p_meta.is_srgb) {
-				if (image->get_format() != Image::FORMAT_RGB8 && image->get_format() != Image::FORMAT_RGBA8) {
-					image->decompress();
-					if (image->get_format() != Image::FORMAT_RGB8 && image->get_format() != Image::FORMAT_RGBA8) {
-						image->convert(Image::FORMAT_RGBA8);
-					}
-				}
-				if (image->get_format() == Image::FORMAT_RGB8 || image->get_format() == Image::FORMAT_RGBA8) {
-					image->srgb_to_linear();
-				}
-			}
-			result = ImageTexture::create_from_image(image);
-		}
+	Ref<Image> image = Image::create_from_data((int)p_meta.width, (int)p_meta.height, p_meta.mip_count > 1, (Image::Format)img_fmt, natural_data);
+	if (image.is_valid() && !image->is_empty()) {
+		return ImageTexture::create_from_image(image);
 	}
-	return result;
+	return Ref<Texture2D>();
 }
 
-int DSPreloader::poll_completed(uint64_t p_tag) {
-	std::vector<Tracked> ready;
-	{
-		std::lock_guard<std::mutex> lock(state().mutex);
-		State &s = state();
-		for (std::unordered_map<int64_t, Tracked>::iterator it = s.pending.begin(); it != s.pending.end();) {
-			const Tracked &t = it->second;
-			if (p_tag != 0 && t.tag != p_tag) {
-				++it;
-				continue;
+int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_usec) {
+	DSTextureCache *cache = DSTextureCache::get_singleton();
+	if (cache == nullptr) {
+		UtilityFunctions::push_warning("DSPreloader: DSTextureCache singleton unavailable during poll.");
+		return 0;
+	}
+
+	uint64_t start_usec = (p_max_usec > 0 && Time::get_singleton()) ? Time::get_singleton()->get_ticks_usec() : 0;
+	int stored = 0;
+
+	while (true) {
+		if (p_max_items > 0 && stored >= p_max_items) {
+			break;
+		}
+		if (p_max_usec > 0 && Time::get_singleton()) {
+			uint64_t elapsed = Time::get_singleton()->get_ticks_usec() - start_usec;
+			if (elapsed >= p_max_usec) {
+				break;
 			}
-			bool all_terminal = true;
-			for (int i = 0; i < t.requests.size(); ++i) {
-				if (!is_terminal(t.requests[i])) {
-					all_terminal = false;
+		}
+
+		Tracked t;
+		bool found = false;
+		{
+			std::lock_guard<std::mutex> lock(state().mutex);
+			State &s = state();
+			for (std::unordered_map<int64_t, Tracked>::iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+				const Tracked &cand = it->second;
+				if (p_tag != 0 && cand.tag != p_tag) {
+					continue;
+				}
+				bool all_terminal = true;
+				for (int i = 0; i < cand.requests.size(); ++i) {
+					if (!is_terminal(cand.requests[i])) {
+						all_terminal = false;
+						break;
+					}
+				}
+				if (all_terminal) {
+					t = cand;
+					s.pending.erase(it);
+					found = true;
 					break;
 				}
 			}
-			if (!all_terminal) {
-				++it;
-				continue;
-			}
-			ready.push_back(t); // Ref copies keep requests alive past erase
-			it = s.pending.erase(it);
 		}
-	}
-	if (ready.empty()) {
-		return 0;
-	}
-	DSTextureCache *cache = DSTextureCache::get_singleton();
-	if (cache == nullptr) {
-		UtilityFunctions::push_warning("DSPreloader: DSTextureCache singleton unavailable during poll; dropping ", (int64_t)ready.size(), " completed prewarms.");
-		return 0;
-	}
-	int stored = 0;
-	for (size_t i = 0; i < ready.size(); ++i) {
-		const Tracked &t = ready[i];
+
+		if (!found) {
+			break;
+		}
+
 		bool ok = true;
 		std::vector<PackedByteArray> buffers;
 		for (int r = 0; r < t.requests.size(); ++r) {
@@ -1200,24 +1122,46 @@ int DSPreloader::poll_completed(uint64_t p_tag) {
 			}
 			buffers.push_back(t.requests[r]->get_destination_buffer());
 		}
-		if (!ok) {
+
+		if (ok) {
+			Ref<Texture2D> tex = build_texture(t.meta, buffers);
+			if (tex.is_valid()) {
+				String alias = (t.meta.payload_key != t.meta.engine_path) ? t.meta.payload_key : String();
+				cache->store(t.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias);
+				stored++;
+			} else {
+				UtilityFunctions::push_warning("DSPreloader: Failed to build prewarmed texture for ", t.meta.engine_path, ".");
+			}
+		} else {
 			UtilityFunctions::print_verbose("DSPreloader: Prewarm texture '", t.meta.engine_path, "' did not complete; dropping (sync load remains available).");
-			continue;
 		}
-		Ref<Texture2D> tex = build_texture(t.meta, buffers);
-		if (tex.is_null()) {
-			UtilityFunctions::push_warning("DSPreloader: Failed to build prewarmed texture for ", t.meta.engine_path, ".");
-			continue;
+
+		// Safely unblock any worker threads awaiting this specific texture
+		{
+			std::lock_guard<std::mutex> lock(state().mutex);
+			State &s = state();
+			if (!t.meta.engine_path.is_empty()) {
+				auto it_p = s.pending_paths.find(t.meta.engine_path);
+				if (it_p != s.pending_paths.end()) {
+					it_p->value--;
+					if (it_p->value <= 0) {
+						s.pending_paths.erase(t.meta.engine_path);
+					}
+				}
+			}
+			if (!t.meta.payload_key.is_empty() && t.meta.payload_key != t.meta.engine_path) {
+				auto it_p = s.pending_paths.find(t.meta.payload_key);
+				if (it_p != s.pending_paths.end()) {
+					it_p->value--;
+					if (it_p->value <= 0) {
+						s.pending_paths.erase(t.meta.payload_key);
+					}
+				}
+			}
+			s.pending_cv.notify_all();
 		}
-		// Store canonical engine path with remapped payload key as alias so
-		// both keys resolve pointer-identical textures with 1:1 LRU capacity.
-		// Engine ResourceCache residency is handled inside store() via
-		// take_over_path, so ResourceLoader.load(..., CACHE_MODE_REUSE)
-		// binds without a disk re-read.
-		String alias = (t.meta.payload_key != t.meta.engine_path) ? t.meta.payload_key : String();
-		cache->store(t.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias);
-		stored++;
 	}
+
 	return stored;
 }
 
@@ -1244,11 +1188,28 @@ int DSPreloader::get_pending_prewarm_count(uint64_t p_tag) {
 	return count;
 }
 
+int DSPreloader::get_unbuilt_prewarm_count(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	State &s = state();
+	if (p_tag == 0) {
+		return (int)s.pending.size();
+	}
+	int count = 0;
+	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+		if (it->second.tag == p_tag) {
+			count++;
+		}
+	}
+	return count;
+}
+
 void DSPreloader::shutdown() {
 	std::lock_guard<std::mutex> archive_lock(state().archive_mutex);
 	{
 		std::lock_guard<std::mutex> lock(state().mutex);
 		state().pending.clear();
+		state().pending_paths.clear();
+		state().pending_cv.notify_all();
 	}
 	state().archive.unref();
 	state().archive_path = String();
@@ -1262,6 +1223,71 @@ void DSPreloader::shutdown() {
 	// generation (called outside the pending-lock scope above; order stays
 	// archive_mutex -> mutex, matching rescan_archive()).
 	invalidate_header_cache();
+}
+
+bool DSPreloader::is_texture_pending(const String &p_path) {
+	if (p_path.is_empty()) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(state().mutex);
+	return state().pending_paths.has(p_path);
+}
+
+Ref<Texture2D> DSPreloader::await_pending_texture(const String &p_path, uint32_t p_timeout_ms) {
+	if (p_path.is_empty()) {
+		return Ref<Texture2D>();
+	}
+
+	DSTextureCache *cache = DSTextureCache::get_singleton();
+	if (cache != nullptr) {
+		Ref<Texture2D> hit = cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
+		if (hit.is_valid()) {
+			return hit;
+		}
+	}
+
+	RenderingServer *rs = RenderingServer::get_singleton();
+	bool is_render_thread = (rs != nullptr) && rs->is_on_render_thread();
+
+	if (is_render_thread) {
+		// On the render thread, we cannot sleep on pending_cv because poll_completed()
+		// itself requires the render thread. Pump completions directly to prevent deadlocks:
+		DSContext *ctx = DSContext::get_singleton();
+		if (ctx != nullptr) {
+			if (ctx->has_stream_pending()) {
+				ctx->flush_stream_async();
+			}
+			ctx->collect_completed_results();
+		}
+		poll_completed();
+		if (cache != nullptr) {
+			return cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
+		}
+		return Ref<Texture2D>();
+	}
+
+	// On a worker thread: wait for the render thread (e.g. DSBatchManager::_process)
+	// to complete the in-flight stream request and store the texture into DSTextureCache.
+	std::unique_lock<std::mutex> lock(state().mutex);
+	State &s = state();
+
+	if (!s.pending_paths.has(p_path)) {
+		lock.unlock();
+		if (cache != nullptr) {
+			return cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
+		}
+		return Ref<Texture2D>();
+	}
+
+	s.pending_cv.wait_for(lock, std::chrono::milliseconds(p_timeout_ms), [&s, &p_path]() {
+		return !s.pending_paths.has(p_path);
+	});
+
+	lock.unlock();
+	if (cache != nullptr) {
+		return cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
+	}
+	return Ref<Texture2D>();
 }
 
 } // namespace godot

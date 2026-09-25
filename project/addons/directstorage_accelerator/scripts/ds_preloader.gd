@@ -41,7 +41,7 @@ const EXCLUDED_EXTENSIONS: PackedStringArray = ["exr", "hdr"]
 
 ## Resource extensions recursed into by [method collect_scene_textures] when
 ## walking [code]ResourceLoader.get_dependencies()[/code].
-const TRAVERSABLE_EXTENSIONS: PackedStringArray = ["tscn", "scn", "tres", "res", "material", "godot"]
+const TRAVERSABLE_EXTENSIONS: PackedStringArray = ["tscn", "scn", "tres", "res", "material", "godot", "glb", "gltf"]
 
 ## Default main-thread budget per frame for the sync fallback loop, leaving
 ## headroom for 60 FPS loading-screen rendering.
@@ -92,10 +92,53 @@ static func _resolve_dependency_path(raw_dep: String) -> String:
 ## [code]compatibility/as_image_texture[/code] (for example Light3D projector
 ## or Decal textures that need a CPU [code]ImageTexture[/code]).
 ## Returns a sorted, de-duplicated [PackedStringArray] of engine paths.
+## Resolves the physical path of textures.dspkg in both editor (res://) and exported builds (exe dir).
+static func _resolve_dspkg_path() -> String:
+	const logical := "res://textures.dspkg"
+	if FileAccess.file_exists(logical):
+		return logical
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	if not exe_dir.is_empty():
+		var exe_archive := exe_dir.path_join("textures.dspkg")
+		if FileAccess.file_exists(exe_archive):
+			return exe_archive
+	var globalized := ProjectSettings.globalize_path(logical)
+	if FileAccess.file_exists(globalized):
+		return globalized
+	return ""
+
+
 static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedStringArray = PackedStringArray()) -> PackedStringArray:
 	var found: Dictionary = {}
-	var visited: Dictionary = {}
 	var root_scene: String = _resolve_dependency_path(scene_path)
+	var dirs: Dictionary = {}
+	if not root_scene.is_empty():
+		dirs[root_scene.get_base_dir()] = true
+	for extra_dir in extra_scan_dirs:
+		var normalized: String = extra_dir.strip_edges()
+		if not normalized.is_empty():
+			dirs[normalized] = true
+
+	# Fast-path for exported builds / packages: when textures.dspkg exists and coverage dirs are provided,
+	# query DSPkg entries directly (<0.5 ms) and avoid the slow 100+ ms recursive dependency crawl.
+	var pkg_path: String = _resolve_dspkg_path()
+	if not extra_scan_dirs.is_empty() and not pkg_path.is_empty() and ClassDB.class_exists("DSPkg"):
+		var dspkg: RefCounted = ClassDB.instantiate("DSPkg")
+		if dspkg != null and dspkg.has_method("open") and dspkg.has_method("get_entries"):
+			if dspkg.call("open", pkg_path) == OK:
+				var pkg_entries: Array = dspkg.call("get_entries")
+				for entry in pkg_entries:
+					var entry_str := String(entry)
+					for dir in dirs.keys():
+						if entry_str.begins_with(dir) and _is_prewarmable_texture(entry_str) and not _is_excluded_import(entry_str):
+							found[entry_str] = true
+							break
+				if not found.is_empty():
+					var out := PackedStringArray(found.keys())
+					out.sort()
+					return out
+
+	var visited: Dictionary = {}
 	var stack: Array[String] = []
 	if not root_scene.is_empty():
 		stack.push_back(root_scene)
@@ -116,14 +159,20 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 					found[dep_path] = true
 			elif _is_traversable_resource(dep_path):
 				stack.push_back(dep_path)
-	# DirAccess sweep: scene directory (dynamic-load catch-all) + caller dirs.
-	var dirs: Dictionary = {}
-	if not root_scene.is_empty():
-		dirs[root_scene.get_base_dir()] = true
-	for extra_dir in extra_scan_dirs:
-		var normalized: String = extra_dir.strip_edges()
-		if not normalized.is_empty():
-			dirs[normalized] = true
+
+	# In exported builds with textures.dspkg, loose PNGs don't exist on disk;
+	# query DSPkg entries directly so packaged textures in the target directories are included:
+	if not pkg_path.is_empty() and ClassDB.class_exists("DSPkg"):
+		var dspkg: RefCounted = ClassDB.instantiate("DSPkg")
+		if dspkg != null and dspkg.has_method("open") and dspkg.has_method("get_entries"):
+			if dspkg.call("open", pkg_path) == OK:
+				var pkg_entries: Array = dspkg.call("get_entries")
+				for entry in pkg_entries:
+					var entry_str := String(entry)
+					for dir in dirs.keys():
+						if entry_str.begins_with(dir) and _is_prewarmable_texture(entry_str) and not _is_excluded_import(entry_str):
+							found[entry_str] = true
+							break
 	for dir in dirs.keys():
 		_sweep_directory(dir, found)
 	var out := PackedStringArray(found.keys())
@@ -183,14 +232,20 @@ static func get_prewarm_progress(tag: int) -> Vector2i:
 
 
 ## Returns [code]true[/code] when every stream request for [param tag] is
-## terminal. Unknown tags report [code]true[/code] (nothing pending).
+## terminal and all completed textures have been built into DSTextureCache.
+## Unknown tags report [code]true[/code] (nothing pending).
 static func is_prewarm_complete(tag: int) -> bool:
 	if not ClassDB.class_exists("DSContext"):
 		return true
 	var ctx: Object = Engine.get_singleton("DSContext")
 	if ctx == null or not ctx.has_method("is_prewarm_complete"):
 		return true
-	return bool(ctx.call("is_prewarm_complete", tag))
+	var complete: bool = bool(ctx.call("is_prewarm_complete", tag))
+	if complete and ClassDB.class_exists("DSTextureCache"):
+		var cache: Object = Engine.get_singleton("DSTextureCache")
+		if cache != null and cache.has_method("get_unbuilt_prewarm_count"):
+			return int(cache.call("get_unbuilt_prewarm_count", tag)) == 0
+	return complete
 
 
 ## Cancels the prewarm for [param tag]: queued requests fail with a
@@ -220,6 +275,11 @@ static func await_prewarm_finished(tag: int, on_progress: Callable = Callable())
 			await (loop as SceneTree).process_frame
 		else:
 			return
+		var manager: Node = (loop as SceneTree).root.get_node_or_null("DSBatchManager") if (loop is SceneTree) else null
+		if manager == null and ClassDB.class_exists("DSTextureCache"):
+			var cache: Object = Engine.get_singleton("DSTextureCache")
+			if cache != null and cache.has_method("poll_completed"):
+				cache.call("poll_completed", tag, 0, 2000)
 		if on_progress.is_valid():
 			var progress: Vector2i = get_prewarm_progress(tag)
 			on_progress.call(progress.x, progress.y)

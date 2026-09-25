@@ -41,7 +41,8 @@ param(
     [string]$JsonName = "d3d12_windowed.json",
     [int]$QuitAfterFrames = 600,
     [int]$TimeoutSec = 120,
-    [string]$GodotExe = $env:GODOT
+    [string]$GodotExe = $env:GODOT,
+    [switch]$Verbose
 )
 
 function Get-GodotConsolePath {
@@ -68,6 +69,16 @@ function Get-GodotConsolePath {
         }
     }
     return $null
+}
+
+function Write-VerboseHost {
+    param(
+        [string]$Message,
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray
+    )
+    if ($Verbose) {
+        Write-Host $Message -ForegroundColor $ForegroundColor
+    }
 }
 
 $ErrorActionPreference = "Stop"
@@ -103,7 +114,7 @@ if (-not (Test-Path -LiteralPath $FixtureBin)) {
 }
 $FixtureDll = Join-Path $FixtureBin $TestDll.Name
 Copy-Item -LiteralPath $TestDll.FullName -Destination $FixtureDll -Force
-Write-Host "Using test library: $($TestDll.FullName)" -ForegroundColor DarkGray
+Write-VerboseHost "Using test library: $($TestDll.FullName)" -ForegroundColor DarkGray
 
 # Remove stale results so a crash cannot be masked by an old JSON.
 foreach ($f in @($JsonRel, $LogOut, $LogErr)) {
@@ -124,9 +135,9 @@ $ArgList = @(
     "--gdextest-json=$JsonName"
 )
 
-Write-Host "Godot: $GodotExe" -ForegroundColor DarkGray
-Write-Host "Args : $($ArgList -join ' ')" -ForegroundColor DarkGray
-Write-Host "Running windowed D3D12 test (no kill gate; relying on tree->quit())..." -ForegroundColor Cyan
+Write-VerboseHost "Godot: $GodotExe" -ForegroundColor DarkGray
+Write-VerboseHost "Args : $($ArgList -join ' ')" -ForegroundColor DarkGray
+Write-VerboseHost "Running windowed D3D12 test (no kill gate; relying on tree->quit())..." -ForegroundColor Cyan
 
 $p = Start-Process -FilePath $GodotExe -ArgumentList $ArgList `
     -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr `
@@ -143,19 +154,74 @@ $p = Start-Process -FilePath $GodotExe -ArgumentList $ArgList `
 #       $p.WaitForExit(5000) | Out-Null
 #   }
 $timedOut = $false
-$p.WaitForExit()
+try {
+    Wait-Process -InputObject $p -ErrorAction SilentlyContinue
+} catch {}
+$exitCode = if ($null -ne $p.ExitCode) { $p.ExitCode } else { 0 }
 
-Write-Host ""
-Write-Host "=== Exit code: $($p.ExitCode) (timedOut=$timedOut) ===" -ForegroundColor Cyan
-Write-Host "=== STDOUT (filtered) ===" -ForegroundColor Cyan
-if (Test-Path $LogOut) {
-    Get-Content $LogOut | Select-String -Pattern "DirectStorage|D3D12|RenderingDevice|PASSED|FAILED|SKIP|gpu_|GDX_TEST_OUTPUT|backend|leaked|RID" | Select-Object -First 60
+if ($Verbose) {
+    Write-Host ""
+    Write-Host "=== Exit code: $exitCode (timedOut=$timedOut) ===" -ForegroundColor Cyan
+    Write-Host "=== STDOUT (filtered) ===" -ForegroundColor Cyan
+    if (Test-Path $LogOut) {
+        Get-Content $LogOut | Select-String -Pattern "DirectStorage|D3D12|RenderingDevice|PASSED|FAILED|SKIP|gpu_|GDX_TEST_OUTPUT|backend|leaked|RID" | Select-Object -First 60
+    }
+    Write-Host "=== JSON produced? ===" -ForegroundColor Cyan
+    if (Test-Path $JsonRel) {
+        $size = (Get-Item $JsonRel).Length
+        Write-Host "YES: $JsonRel ($size bytes)" -ForegroundColor Green
+        Get-Content $JsonRel -Raw
+    } else {
+        Write-Host "NO JSON at $JsonRel" -ForegroundColor Red
+    }
 }
-Write-Host "=== JSON produced? ===" -ForegroundColor Cyan
+
+$testPassed = $false
 if (Test-Path $JsonRel) {
-    $size = (Get-Item $JsonRel).Length
-    Write-Host "YES: $JsonRel ($size bytes)" -ForegroundColor Green
-    Get-Content $JsonRel -Raw
+    try {
+        $doc = Get-Content -LiteralPath $JsonRel -Raw | ConvertFrom-Json
+        $t = $doc.totals
+        if ($t) {
+            $crashedNote = if ($t.crashed) { ", crashed: $($t.crashed)" } else { "" }
+            $isSuccess = ($exitCode -eq 0 -and $t.fail -eq 0 -and (-not $t.crashed -or $t.crashed -eq 0))
+            $color = if ($isSuccess) { "Green" } else { "Red" }
+            Write-Host "Tests: passed $($t.pass), failed $($t.fail), skipped $($t.skip)$crashedNote (exit code $exitCode)" -ForegroundColor $color
+            $testPassed = $isSuccess
+        }
+    } catch {
+        Write-Host "Tests: could not parse totals from $JsonRel" -ForegroundColor Yellow
+    }
 } else {
-    Write-Host "NO JSON at $JsonRel" -ForegroundColor Red
+    Write-Host "Tests: no results file generated at $JsonRel (exit code $exitCode)" -ForegroundColor Red
+}
+
+if (-not $testPassed -and -not $Verbose) {
+    if (Test-Path $LogErr) {
+        $errContent = Get-Content $LogErr -ErrorAction SilentlyContinue
+        if ($errContent) {
+            Write-Host "--- Stderr ---" -ForegroundColor Red
+            $errContent | Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+        }
+    }
+    if (Test-Path $LogOut) {
+        $failLines = Get-Content $LogOut -ErrorAction SilentlyContinue | Select-String -Pattern "\[FAILED\]|ERROR:|error:|CRASH|EXCEPTION|FATAL"
+        if ($failLines) {
+            Write-Host "--- Relevant stdout errors ---" -ForegroundColor Red
+            $failLines | Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+        }
+    }
+}
+
+if ($testPassed) {
+    Write-Host ""
+    Write-Host "================================================================================" -ForegroundColor Green
+    Write-Host " [RUN SUCCESS] D3D12 windowed tests completed successfully! " -ForegroundColor White -BackgroundColor DarkGreen
+    Write-Host "================================================================================" -ForegroundColor Green
+    exit 0
+} else {
+    Write-Host ""
+    Write-Host "================================================================================" -ForegroundColor Red
+    Write-Host " [RUN FAILED] D3D12 windowed tests failed " -ForegroundColor White -BackgroundColor DarkRed
+    Write-Host "================================================================================" -ForegroundColor Red
+    exit $(if ($exitCode -ne 0) { $exitCode } else { 1 })
 }

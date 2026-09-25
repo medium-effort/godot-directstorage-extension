@@ -1,4 +1,5 @@
 #include "ds_resource_format_loader.h"
+#include "ds_preloader.h"
 #include "ds_texture_cache.h"
 #include "../compression/gdeflate_decompressor.h"
 #include "../core/ds_context.h"
@@ -375,30 +376,25 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				return true;
 			}
 			if (p_use_sub_threads) {
-				ds_ctx->flush_batch_async();
+				Error err = ds_ctx->flush_batch_async();
+				if (err != OK) {
+					return false;
+				}
 				return wait_for_async_requests(ds_ctx, p_requests);
 			}
 			ds_ctx->flush_batch();
 			return true;
 		};
-		auto apply_srgb_fallback = [&](Ref<Image> &p_image) {
-			if (!p_is_srgb || p_image.is_null()) {
-				return;
-			}
-			if (p_image->get_format() != Image::FORMAT_RGB8 && p_image->get_format() != Image::FORMAT_RGBA8) {
-				p_image->decompress();
-				if (p_image->get_format() != Image::FORMAT_RGB8 && p_image->get_format() != Image::FORMAT_RGBA8) {
-					p_image->convert(Image::FORMAT_RGBA8);
-				}
-			}
-			if (p_image->get_format() == Image::FORMAT_RGB8 || p_image->get_format() == Image::FORMAT_RGBA8) {
-				p_image->srgb_to_linear();
-			}
-		};
+
 		PackedByteArray natural_texture_data;
 		if (p_is_v2 && p_mip_offsets.size() >= static_cast<int64_t>(mip_count) && p_mip_sizes.size() >= static_cast<int64_t>(mip_count)) {
 			// Decompress each mip independently and unpad from 256-byte pitch footprint to natural image data
 			bool ds_usable = ds_ctx && ds_ctx->is_initialized();
+			if (p_use_sub_threads && ds_usable) {
+				if (!ds_ctx->is_batch_complete() || ds_ctx->has_stream_pending()) {
+					ds_usable = false;
+				}
+			}
 			Vector<Ref<DSRequest>> mip_requests;
 			if (ds_usable) {
 				mip_requests.resize(mip_count);
@@ -479,7 +475,6 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 			if (all_mips_ok && natural_texture_data.size() > 0) {
 				Ref<Image> image = Image::create_from_data(p_width, p_height, mip_count > 1, static_cast<Image::Format>(img_fmt), natural_texture_data);
 				if (image.is_valid() && !image->is_empty()) {
-					apply_srgb_fallback(image);
 					result_texture = ImageTexture::create_from_image(image);
 				}
 			}
@@ -487,6 +482,11 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 			// Legacy v1 path (single continuous stream, not footprint padded)
 			PackedByteArray decompressed_data;
 			bool ds_usable = ds_ctx && ds_ctx->is_initialized();
+			if (p_use_sub_threads && ds_usable) {
+				if (!ds_ctx->is_batch_complete() || ds_ctx->has_stream_pending()) {
+					ds_usable = false;
+				}
+			}
 			if (ds_usable) {
 				Ref<DSRequest> req;
 				Vector<Ref<DSRequest>> queued_requests;
@@ -524,7 +524,6 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 			if (decompressed_data.size() > 0) {
 				Ref<Image> image = Image::create_from_data(p_width, p_height, mip_count > 1, static_cast<Image::Format>(img_fmt), decompressed_data);
 				if (image.is_valid() && !image->is_empty()) {
-					apply_srgb_fallback(image);
 					result_texture = ImageTexture::create_from_image(image);
 				}
 			}
@@ -558,6 +557,32 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 				cached = cache->get_cached(p_original_path, p_cache_mode);
 				if (cached.is_valid()) {
 					return cached;
+				}
+			}
+
+			// In-flight stream entries are pumped on the main/render thread.
+			// Worker threads must never block: fall through to CPU path.
+			String wait_path;
+			if (DSPreloader::is_texture_pending(p_path)) {
+				wait_path = p_path;
+			} else if (!p_original_path.is_empty() && DSPreloader::is_texture_pending(p_original_path)) {
+				wait_path = p_original_path;
+			}
+
+			if (!wait_path.is_empty()) {
+				RenderingServer *rs_tmp = RenderingServer::get_singleton();
+				bool on_render = rs_tmp != nullptr && rs_tmp->is_on_render_thread();
+				if (on_render) {
+					cached = DSPreloader::await_pending_texture(wait_path, 0);
+					if (cached.is_valid()) {
+						return cached;
+					}
+				}
+				if (!p_original_path.is_empty() && p_original_path != wait_path) {
+					cached = cache->get_cached(p_original_path, p_cache_mode);
+					if (cached.is_valid()) {
+						return cached;
+					}
 				}
 			}
 		}

@@ -14,6 +14,7 @@
 #include <mutex>
 
 #include <cstdint>
+#include <vector>
 
 namespace godot {
 
@@ -37,7 +38,7 @@ private:
 	HashMap<String, String> alias_map;
 	List<String> lru_list;
 
-	bool _evict_oldest();
+	bool _evict_oldest(std::vector<Ref<Texture2D>> &r_evicted);
 	void _remove_entry(const String &p_canonical_path);
 	void _bind_alias_locked(const String &p_canonical_path, const String &p_alias_path);
 	void _unbind_alias_locked(const String &p_alias_path);
@@ -81,8 +82,9 @@ public:
 	// requests (GPU texture on the render thread, ImageTexture elsewhere)
 	// and stores them; returns textures stored by this call.
 	uint64_t prewarm_async(const PackedStringArray &p_paths);
-	int poll_completed(uint64_t p_tag = 0);
+	int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, int p_max_usec = 0);
 	int get_pending_prewarm_count(uint64_t p_tag = 0) const;
+	int get_unbuilt_prewarm_count(uint64_t p_tag = 0) const;
 
 	void set_enabled(bool p_enabled);
 	bool is_enabled() const;

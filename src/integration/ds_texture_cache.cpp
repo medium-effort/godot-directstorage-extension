@@ -135,6 +135,21 @@ static void ds_texture_cache_drop_live_refs(std::vector<Ref<Texture2D>> &p_evict
 	}
 }
 
+// External-holder guard (GODOT_QUIRKS.md section 35): the cache holds exactly
+// one Ref per canonical entry (aliases add no Refs), so a reference count
+// above 1 means an outside owner still draws the texture (scene material,
+// TextureRect, handed-out get_cached() Ref, engine ResourceCache resident via
+// take_over_path). Evicting such an entry and freeing its Texture2DRD RID
+// would kill a texture the visible scene still binds (per-frame
+// uniform_set_create/draw_list spam). Null/invalid entries hold no live
+// object and stay evictable, preserving today's behavior.
+static bool ds_texture_cache_is_externally_held(const Ref<Texture2D> &p_texture) {
+	if (p_texture.is_null() || !p_texture.is_valid()) {
+		return false;
+	}
+	return p_texture->get_reference_count() > 1;
+}
+
 // Releases evicted textures: frees owned Texture2DRD RIDs on the render
 // thread, then drops the Refs. MUST be called WITHOUT cache_mutex held.
 static void ds_texture_cache_release_evicted(std::vector<Ref<Texture2D>> &p_evicted) {
@@ -188,8 +203,9 @@ void DSTextureCache::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_cached_count"), &DSTextureCache::get_cached_count);
 
 	ClassDB::bind_method(D_METHOD("prewarm_async", "paths"), &DSTextureCache::prewarm_async);
-	ClassDB::bind_method(D_METHOD("poll_completed", "tag"), &DSTextureCache::poll_completed, DEFVAL((uint64_t)0));
+	ClassDB::bind_method(D_METHOD("poll_completed", "tag", "max_items", "max_usec"), &DSTextureCache::poll_completed, DEFVAL((uint64_t)0), DEFVAL(0), DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("get_pending_prewarm_count", "tag"), &DSTextureCache::get_pending_prewarm_count, DEFVAL((uint64_t)0));
+	ClassDB::bind_method(D_METHOD("get_unbuilt_prewarm_count", "tag"), &DSTextureCache::get_unbuilt_prewarm_count, DEFVAL((uint64_t)0));
 
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "enabled"), "set_enabled", "is_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_entries"), "set_max_entries", "get_max_entries");
@@ -226,15 +242,36 @@ DSTextureCache::~DSTextureCache() {
 	}
 }
 
-bool DSTextureCache::_evict_oldest() {
+// Evicts the oldest entry not held outside the cache, retaining its Ref in
+// r_evicted for the caller's render-thread RID release. The external-holder
+// scan MUST run on pristine counts: callers must not push candidate Refs
+// anywhere before this call (each push_back adds one to the reference count
+// and would make the true oldest look externally held, silently shifting
+// eviction to newer entries). Returns false when every entry is externally
+// held (or the list is empty), in which case r_evicted is untouched and the
+// caller keeps temporary over-capacity instead of force-freeing a live RID.
+bool DSTextureCache::_evict_oldest(std::vector<Ref<Texture2D>> &r_evicted) {
 	if (lru_list.is_empty()) {
 		return false;
 	}
 
-	List<String>::Element *oldest = lru_list.back();
-	const String oldest_path = oldest->get();
-	_remove_entry(oldest_path);
-	return true;
+	// Eviction guard: scan oldest-first and skip entries still held outside
+	// the cache (their Texture2DRD RID must never be freed while drawn).
+	// Stale LRU nodes with no map entry are pruned inline so the scan can
+	// continue toward newer candidates.
+	for (List<String>::Element *e = lru_list.back(); e != nullptr;) {
+		List<String>::Element *older = e->prev();
+		const String path = e->get();
+		if (!cache_map.has(path)) {
+			lru_list.erase(e);
+		} else if (!ds_texture_cache_is_externally_held(cache_map[path].texture)) {
+			r_evicted.push_back(cache_map[path].texture);
+			_remove_entry(path);
+			return true;
+		}
+		e = older;
+	}
+	return false;
 }
 
 void DSTextureCache::_remove_entry(const String &p_canonical_path) {
@@ -382,24 +419,21 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 			}
 		} else {
 			while (static_cast<int>(cache_map.size()) >= max_entries) {
-				if (lru_list.is_empty()) {
-					for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-						evicted.push_back(kv.value.texture);
+				// _evict_oldest() scans pristine counts, retains the victim's
+				// Ref, and removes the entry; still-cached Refs can no longer
+				// land in `evicted`, so drop_live_refs below only filters the
+				// capacity-replace twin case as before.
+				if (!_evict_oldest(evicted)) {
+					if (lru_list.is_empty()) {
+						// Inconsistent state (entries without LRU nodes):
+						// never mass-free live RIDs; keep over-capacity.
+						UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)max_entries, ") reached with no LRU order; keeping '", p_path, "' over capacity instead of freeing live RIDs.");
+					} else {
+						// Every entry is externally held: keep them (temporary
+						// over-capacity) instead of force-freeing the oldest
+						// live RID (see GODOT_QUIRKS.md section 35).
+						UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)max_entries, ") reached with all entries externally held; keeping '", p_path, "' over capacity instead of freeing a live RID.");
 					}
-					cache_map.clear();
-					alias_map.clear();
-					break;
-				}
-				const String oldest_path = lru_list.back()->get();
-				if (cache_map.has(oldest_path)) {
-					evicted.push_back(cache_map[oldest_path].texture);
-				}
-				if (!_evict_oldest()) {
-					for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-						evicted.push_back(kv.value.texture);
-					}
-					cache_map.clear();
-					alias_map.clear();
 					break;
 				}
 			}
@@ -480,12 +514,16 @@ uint64_t DSTextureCache::prewarm_async(const PackedStringArray &p_paths) {
 	return DSPreloader::prewarm_async(p_paths);
 }
 
-int DSTextureCache::poll_completed(uint64_t p_tag) {
-	return DSPreloader::poll_completed(p_tag);
+int DSTextureCache::poll_completed(uint64_t p_tag, int p_max_items, int p_max_usec) {
+	return DSPreloader::poll_completed(p_tag, p_max_items, (uint32_t)std::max(0, p_max_usec));
 }
 
 int DSTextureCache::get_pending_prewarm_count(uint64_t p_tag) const {
 	return DSPreloader::get_pending_prewarm_count(p_tag);
+}
+
+int DSTextureCache::get_unbuilt_prewarm_count(uint64_t p_tag) const {
+	return DSPreloader::get_unbuilt_prewarm_count(p_tag);
 }
 
 void DSTextureCache::evict(const String &p_path) {
@@ -574,24 +612,18 @@ void DSTextureCache::set_max_entries(int p_max) {
 
 		max_entries = p_max < 1 ? 1 : p_max;
 		while (static_cast<int>(cache_map.size()) > max_entries) {
-			if (lru_list.is_empty()) {
-				for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-					evicted.push_back(kv.value.texture);
+			// Same single-call pattern as store(): pristine-count scan,
+			// victim Ref retained, entry removed.
+			if (!_evict_oldest(evicted)) {
+				if (lru_list.is_empty()) {
+					// Inconsistent state (entries without LRU nodes): never
+					// mass-free live RIDs; keep over-capacity and warn.
+					UtilityFunctions::push_warning("DSTextureCache: shrink to max_entries (", (int64_t)max_entries, ") deferred with no LRU order; keeping temporary over-capacity instead of freeing live RIDs.");
+				} else {
+					// Every entry is externally held: keep temporary
+					// over-capacity instead of force-freeing a live RID.
+					UtilityFunctions::push_warning("DSTextureCache: shrink to max_entries (", (int64_t)max_entries, ") deferred with all entries externally held; keeping temporary over-capacity instead of freeing live RIDs.");
 				}
-				cache_map.clear();
-				alias_map.clear();
-				break;
-			}
-			const String oldest_path = lru_list.back()->get();
-			if (cache_map.has(oldest_path)) {
-				evicted.push_back(cache_map[oldest_path].texture);
-			}
-			if (!_evict_oldest()) {
-				for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-					evicted.push_back(kv.value.texture);
-				}
-				cache_map.clear();
-				alias_map.clear();
 				break;
 			}
 		}
