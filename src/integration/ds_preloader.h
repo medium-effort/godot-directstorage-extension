@@ -17,12 +17,13 @@
 //   (mip_offsets/sizes/uncompressed/row_pitch) from enqueue through to the
 //   build step ("v2 footprint passthrough"); the build unpads rows via
 //   DSTex::unpad_footprint_mip exactly like the sync loader CPU path.
-// - Texture OBJECT construction is thread-gated like the sync loader:
-//   Texture2DRD (RenderingDevice::texture_create + get_driver_resource) only
-//   where RenderingServer::is_on_render_thread() on D3D12; every other thread
-//   (main thread in multi-threaded rendering, ResourceLoader workers,
-//   background threads) builds CPU ImageTexture. as_image_texture
-//   sources always take the ImageTexture path.
+// - Texture OBJECT construction is ImageTexture-only (worker-safe by
+//   construction, no RenderingDevice thread affinity): build_texture()
+//   produces ImageTexture::create_from_image() on every thread. GPU-direct
+//   Texture2DRD upload was removed as the Q31 decision (CPU -> ImageTexture
+//   -> RenderingServer marshal replaces NVMe -> VRAM zero-copy; avoids the
+//   per-frame call_on_render_thread drain). as_image_texture sources take
+//   the same ImageTexture path.
 // - Each enqueued DSRequest Ref is held in the pending table until its status
 //   is finished (COMPLETED/FAILED, including cancelled) and poll_completed()
 //   has consumed it, so completion threads can never touch a freed request.

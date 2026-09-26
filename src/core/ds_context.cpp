@@ -107,6 +107,13 @@ void DSContext::evict_old_reports_if_needed_locked() {
 		request_execution_reports.erase(request_id);
 		tracked_requests.erase(request_id);
 	}
+	// Observability for the 32768-cap risk: eviction legitimately blocks on
+	// pending/in-flight IDs (they must not be freed). If the deque is still
+	// over capacity here, growth is unbounded until those requests terminate.
+	// Verbose-only to avoid spamming the main-thread flush path per request.
+	if (request_execution_reports.size() > (int)MAX_EXECUTION_REPORTS) {
+		UtilityFunctions::print_verbose("[DirectStorage] Execution reports over cap (", (int64_t)request_execution_reports.size(), " > ", (int64_t)MAX_EXECUTION_REPORTS, ") with pending/in-flight IDs blocking eviction; growth bounded by request termination.");
+	}
 }
 
 void DSContext::remove_report_locked(int64_t p_request_id) {

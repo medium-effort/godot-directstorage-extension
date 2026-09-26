@@ -36,6 +36,12 @@ var _stream_api_missing_warned: bool = false
 ## `poll_completed()` builds `ImageTexture` only (Quirks Sec25 worker-safe);
 ## evict-path RID frees defer via `call_on_render_thread` (Sec27).
 var _poll_task_id: int = -1
+## Cached DSTextureCache capability probe (avoids per-frame `has_method` /
+## `call` reflection; probed once, compatible with older builds lacking
+## `get_unbuilt_prewarm_count` / `poll_completed`).
+var _cache_caps_probed: bool = false
+var _has_get_unbuilt: bool = false
+var _has_poll: bool = false
 
 
 ## Starts tracking progress for a prewarm tag returned by `prewarm_async()`.
@@ -108,12 +114,16 @@ func _process(_delta: float) -> void:
 	if ClassDB.class_exists("DSTextureCache"):
 		var cache = Engine.get_singleton("DSTextureCache")
 		if cache != null:
+			if not _cache_caps_probed:
+				_has_get_unbuilt = cache.has_method("get_unbuilt_prewarm_count")
+				_has_poll = cache.has_method("poll_completed")
+				_cache_caps_probed = true
 			if _poll_task_id != -1 and WorkerThreadPool.is_task_completed(_poll_task_id):
 				WorkerThreadPool.wait_for_task_completion(_poll_task_id)
 				_poll_task_id = -1
-			if _poll_task_id == -1 and cache.has_method("get_unbuilt_prewarm_count") and int(cache.call("get_unbuilt_prewarm_count", 0)) > 0:
+			if _poll_task_id == -1 and _has_get_unbuilt and int(cache.get_unbuilt_prewarm_count(0)) > 0:
 				_poll_task_id = WorkerThreadPool.add_task(_background_poll_completed, false, "DS_PollCompleted")
-			if _poll_task_id == -1:
+			if _poll_task_id == -1 and _has_poll:
 				cache.poll_completed(0, 0, 2000)
 	# 4. Emit per-tag progress / finished for tracked tags.
 	_poll_prewarm_progress(ctx)
@@ -145,10 +155,12 @@ func _background_poll_completed() -> void:
 	if not ClassDB.class_exists("DSTextureCache"):
 		return
 	var cache = Engine.get_singleton("DSTextureCache")
-	if cache == null or not cache.has_method("poll_completed") or not cache.has_method("get_unbuilt_prewarm_count"):
+	if cache == null:
 		return
-	while int(cache.call("get_unbuilt_prewarm_count", 0)) > 0:
-		var built: int = int(cache.call("poll_completed", 0, 64, 0))
+	# Caps probed on the main thread in _process before this task is spawned;
+	# direct calls here avoid per-iteration has_method/call reflection.
+	while int(cache.get_unbuilt_prewarm_count(0)) > 0:
+		var built: int = int(cache.poll_completed(0, 64, 0))
 		if built <= 0:
 			break
 

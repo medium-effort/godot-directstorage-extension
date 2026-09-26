@@ -1087,7 +1087,37 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 	uint64_t start_usec = (p_max_usec > 0 && Time::get_singleton()) ? Time::get_singleton()->get_ticks_usec() : 0;
 	int stored = 0;
 
-	while (true) {
+	// Single-scan collect: gather terminal entry IDs under one lock instead
+	// of re-scanning the full pending map after every build (O(N^2)).
+	// Extraction stays per-item below so a usec-budget break leaves the
+	// remainder in pending instead of dropping them.
+	std::vector<int64_t> terminal_ids;
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		terminal_ids.reserve(s.pending.size());
+		for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+			const Tracked &cand = it->second;
+			if (p_tag != 0 && cand.tag != p_tag) {
+				continue;
+			}
+			bool all_terminal = true;
+			for (int i = 0; i < cand.requests.size(); ++i) {
+				if (!is_terminal(cand.requests[i])) {
+					all_terminal = false;
+					break;
+				}
+			}
+			if (all_terminal) {
+				terminal_ids.push_back(it->first);
+				if (p_max_items > 0 && (int)(terminal_ids.size() + stored) >= p_max_items) {
+					break;
+				}
+			}
+		}
+	}
+
+	for (size_t ti = 0; ti < terminal_ids.size(); ++ti) {
 		if (p_max_items > 0 && stored >= p_max_items) {
 			break;
 		}
@@ -1103,29 +1133,20 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 		{
 			std::lock_guard<std::mutex> lock(state().mutex);
 			State &s = state();
-			for (std::unordered_map<int64_t, Tracked>::iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
-				const Tracked &cand = it->second;
-				if (p_tag != 0 && cand.tag != p_tag) {
-					continue;
-				}
-				bool all_terminal = true;
-				for (int i = 0; i < cand.requests.size(); ++i) {
-					if (!is_terminal(cand.requests[i])) {
-						all_terminal = false;
-						break;
-					}
-				}
-				if (all_terminal) {
-					t = cand;
+			std::unordered_map<int64_t, Tracked>::iterator it = s.pending.find(terminal_ids[ti]);
+			if (it != s.pending.end()) {
+				// Tag filter re-check: a concurrent poll may have retagged?
+				// Pending entries are immutable once enqueued, but the
+				// caller tag may differ per concurrent poll call.
+				if (p_tag == 0 || it->second.tag == p_tag) {
+					t = it->second;
 					s.pending.erase(it);
 					found = true;
-					break;
 				}
 			}
 		}
-
 		if (!found) {
-			break;
+			continue;
 		}
 
 		bool ok = true;
@@ -1297,6 +1318,9 @@ Ref<Texture2D> DSPreloader::await_pending_texture(const String &p_path, uint32_t
 	s.pending_cv.wait_for(lock, std::chrono::milliseconds(p_timeout_ms), [&s, &p_path]() {
 		return !s.pending_paths.has(p_path);
 	});
+	if (s.pending_paths.has(p_path)) {
+		UtilityFunctions::print_verbose("[DirectStorage] await_pending_texture timed out waiting for '", p_path, "' after ", (int64_t)p_timeout_ms, " ms; falling through to cache/CPU path.");
+	}
 
 	lock.unlock();
 	if (cache != nullptr) {
