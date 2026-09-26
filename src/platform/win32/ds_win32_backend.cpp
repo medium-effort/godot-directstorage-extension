@@ -883,21 +883,26 @@ void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, c
 		}
 	}
 	release_resource_guards(p_slot.requests);
-	close_batch_files(p_slot.files);
+	close_slot_files(p_slot);
 	p_slot.submitted = false;
 	p_slot.completion_ready = true;
 }
 #endif
 
 #ifdef _WIN32
-void Win32Backend::close_batch_files(Vector<IDStorageFile *> &p_files) {
-	for (int i = 0; i < p_files.size(); i++) {
-		if (p_files[i]) {
-			p_files[i]->Close();
-			p_files[i]->Release();
+// Slot lifetime close: releases every slot-owned file handle, empties the
+// vector, and drops the open-file cache in one step so a cleared slot can
+// never serve a stale handle. Sole closer for BatchSlot files; all reset,
+// completion, cancel, and shutdown paths go through here.
+void Win32Backend::close_slot_files(BatchSlot &p_slot) {
+	for (int i = 0; i < p_slot.files.size(); i++) {
+		if (p_slot.files[i]) {
+			p_slot.files[i]->Close();
+			p_slot.files[i]->Release();
 		}
 	}
-	p_files.clear();
+	p_slot.files.clear();
+	p_slot.file_cache.clear();
 }
 
 void Win32Backend::completion_thread_func() {
@@ -917,7 +922,7 @@ void Win32Backend::completion_thread_func() {
 					slot.requests[i]->set_error_message(p_message);
 				}
 			}
-			close_batch_files(slot.files);
+			close_slot_files(slot);
 			complete_chunked_requests();
 			release_resource_guards(slot.requests);
 			slot.completed_count = count_completed_requests(slot.requests);
@@ -1683,7 +1688,7 @@ void Win32Backend::shutdown() {
 
 	for (QueueState &queue : priority_queues) {
 		for (BatchSlot &slot : queue.batch_slots) {
-			close_batch_files(slot.files);
+			close_slot_files(slot);
 			{
 				std::lock_guard<std::mutex> lock(batch_mutex);
 				slot.requests.clear();
@@ -1790,7 +1795,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	int current_slot = active_batch_slot.load();
 	BatchSlot *slot_ptr = &queue.batch_slots[current_slot];
 	if (!slot_ptr->submitted && slot_ptr->completion_ready) {
-		close_batch_files(slot_ptr->files);
+		close_slot_files(*slot_ptr);
 		slot_ptr->requests.clear();
 		slot_ptr->fence_value = 0;
 		slot_ptr->completed_count = 0;
@@ -1801,7 +1806,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		int alternate_slot = 1 - current_slot;
 		BatchSlot &alt_slot = queue.batch_slots[alternate_slot];
 		if (!alt_slot.submitted && alt_slot.completion_ready) {
-			close_batch_files(alt_slot.files);
+			close_slot_files(alt_slot);
 			alt_slot.requests.clear();
 			alt_slot.fence_value = 0;
 			alt_slot.completed_count = 0;
@@ -1901,11 +1906,18 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		std::wstring wpath(reinterpret_cast<const wchar_t *>(norm_file_path.utf16().get_data()));
 
 		IDStorageFile *file = nullptr;
-		HRESULT hr = factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&file));
-		if (FAILED(hr) || !file) {
-			p_child->set_status(DSRequest::STATUS_FAILED);
-			p_child->set_error_message("Win32Backend: Failed to open file '" + path + "'.");
-			return false;
+		std::unordered_map<std::wstring, IDStorageFile *>::const_iterator cached_handle = slot.file_cache.find(wpath);
+		if (cached_handle != slot.file_cache.end()) {
+			file = cached_handle->second;
+		} else {
+			HRESULT hr = factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&file));
+			if (FAILED(hr) || !file) {
+				p_child->set_status(DSRequest::STATUS_FAILED);
+				p_child->set_error_message("Win32Backend: Failed to open file '" + path + "'.");
+				return false;
+			}
+			slot.files.push_back(file);
+			slot.file_cache[wpath] = file;
 		}
 
 	uint32_t src_size = p_child->get_size();
@@ -1915,8 +1927,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	}
 
 	if (src_size == 0 || uncompressed_size == 0) {
-		file->Close();
-		file->Release();
+		// Slot-owned handle: close_slot_files() releases it at batch
+		// completion; never closed on per-request error paths.
 		p_child->set_status(DSRequest::STATUS_FAILED);
 		p_child->set_error_message("Win32Backend: Invalid size parameters (src_size=" + String::num_uint64(src_size) + ", uncompressed_size=" + String::num_uint64(uncompressed_size) + ").");
 		return false;
@@ -1963,8 +1975,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 
 		if (!destination_error.is_empty()) {
-			file->Close();
-			file->Release();
+			// Slot-owned handle: close_slot_files() releases it at batch
+			// completion; never closed on per-request error paths.
 			p_child->set_status(DSRequest::STATUS_FAILED);
 			p_child->set_error_message(destination_error);
 			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
@@ -2024,8 +2036,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 
 		if (!destination_error.is_empty()) {
-			file->Close();
-			file->Release();
+			// Slot-owned handle: close_slot_files() releases it at batch
+			// completion; never closed on per-request error paths.
 			p_child->set_status(DSRequest::STATUS_FAILED);
 			p_child->set_error_message(destination_error);
 			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
@@ -2077,7 +2089,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		s_resource_guards[p_child.ptr()] = resource_guard;
 	}
 	queue.queue->EnqueueRequest(&request);
-	slot.files.push_back(file);
+	// slot.files push happens once at open time in the cache-miss branch
+	// above; cache hits reuse the already-tracked handle.
 
 	p_child->set_status(DSRequest::STATUS_SUBMITTED);
 	slot.requests.push_back(p_child);
@@ -2418,7 +2431,7 @@ bool Win32Backend::collect_completed_batch(uint64_t &r_fence_value, int &r_compl
 			r_completed_count = slot.completed_count;
 			r_error_code = slot.error_code;
 			r_error_message = slot.error_message;
-			close_batch_files(slot.files);
+			close_slot_files(slot);
 			slot.requests.clear();
 			slot.fence_value = 0;
 			slot.completed_count = 0;
@@ -2461,7 +2474,7 @@ void Win32Backend::submit_batch() {
 			for (QueueState &queue : priority_queues) {
 				BatchSlot &slot = queue.batch_slots[p_slot_index];
 				if (!slot.submitted && slot.completion_ready) {
-					close_batch_files(slot.files);
+					close_slot_files(slot);
 					slot.requests.clear();
 					slot.fence_value = 0;
 					slot.completed_count = 0;
@@ -2557,7 +2570,7 @@ void Win32Backend::submit_batch() {
 					profiler->record_workload(total_compressed_bytes, duration_us);
 				}
 				release_resource_guards(slot.requests);
-				close_batch_files(slot.files);
+				close_slot_files(slot);
 				slot.requests.clear();
 				slot.fence_value = 0;
 				slot.completed_count = 0;

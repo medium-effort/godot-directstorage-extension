@@ -8,7 +8,9 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -31,6 +33,14 @@ private:
 		HANDLE event = nullptr;
 		Vector<Ref<DSRequest>> requests;
 		Vector<IDStorageFile *> files;
+		// Open-file cache: normalized path -> slot-owned handle. Exported
+		// builds funnel ~256 requests per flush through one archive, so
+		// opening per request costs hundreds of kernel opens on the calling
+		// (main) thread per frame. First open pushes into files (closed at
+		// batch completion) and the map; hits reuse either. Guarded by
+		// batch_mutex like every other slot member; cleared together with
+		// files by close_slot_files() — never cleared or touched elsewhere.
+		std::unordered_map<std::wstring, IDStorageFile *> file_cache;
 		uint64_t fence_value = 0;
 		int completed_count = 0;
 		int error_code = 0;
@@ -90,7 +100,7 @@ private:
 	void poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value);
 	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch);
 	void update_profiler_queue_depth_locked();
-	static void close_batch_files(Vector<IDStorageFile *> &p_files);
+	static void close_slot_files(BatchSlot &p_slot);
 	static int priority_to_queue_index(DSRequest::DSPriority p_priority);
 #endif
 
