@@ -90,6 +90,13 @@ private:
 	void finalize_completed_reports_locked();
 	void count_stream_request_terminal(const Ref<DSRequest> &p_request);
 	bool enqueue_request_internal(Ref<DSRequest> p_request);
+	// Stream-flush fast path: same validation + tracking as
+	// enqueue_request_internal(), but WITHOUT the per-request
+	// collect_completed_results() / finalize_completed_reports_locked()
+	// maintenance. flush_stream_async() hoists both once per flush
+	// (collect before submit to free batch slots, finalize after),
+	// turning up to 256 O(tracked) scans per main-thread frame into one.
+	bool enqueue_stream_request_internal(Ref<DSRequest> p_request);
 
 protected:
 	static void _bind_methods();

@@ -728,6 +728,75 @@ bool DSContext::enqueue_request_internal(Ref<DSRequest> p_request) {
 	return enqueued;
 }
 
+bool DSContext::enqueue_stream_request_internal(Ref<DSRequest> p_request) {
+	if (p_request.is_null()) {
+		return false;
+	}
+
+	if (!initialized) {
+		initialize_ds();
+	}
+
+	if (!initialized || !active_backend) {
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message("DirectStorage Context not initialized.");
+		return false;
+	}
+
+	bool gpu_destination = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER ||
+			p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE;
+	if (gpu_destination && (active_backend->get_name() != "Win32DirectStorage" || !is_d3d12_backend())) {
+		String error_message = "GPU destinations require an active Win32 DirectStorage D3D12 backend.";
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message(error_message);
+		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+		if (err_handler) {
+			err_handler->report_error(error_message);
+		}
+		return false;
+	}
+
+	bool needs_sync = false;
+	{
+		std::lock_guard<std::mutex> lock(context_mutex);
+		needs_sync = gpu_destination && !gpu_requests_pending;
+	}
+	if (needs_sync && !synchronize_rendering_device("DirectStorage GPU request")) {
+		String error_message = "GPU destination request rejected: RenderingDevice could not be synchronized.";
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message(error_message);
+		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+		if (err_handler) {
+			err_handler->report_error(error_message);
+		}
+		return false;
+	}
+
+	// NOTE: no per-request has_pending_results()/collect_completed_results()
+	// and no finalize_completed_reports_locked()/evict_old_reports_if_needed_locked()
+	// here by design (see header). The flush caller owns both once per batch.
+	bool enqueued = active_backend->enqueue_request(p_request);
+	if (enqueued) {
+		std::lock_guard<std::mutex> lock(context_mutex);
+		if (gpu_destination) {
+			gpu_requests_pending = true;
+		}
+		pending_request_count++;
+		Dictionary report;
+		report["actual_destination_type"] = static_cast<int>(p_request->get_destination_type());
+		report["actual_backend"] = active_backend->get_name();
+		report["was_gpu_decompression_used"] = false;
+		report["gpu_decompression_pending"] = p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE &&
+				active_backend->get_name() == "Win32DirectStorage";
+		int64_t request_id = static_cast<int64_t>(p_request->get_instance_id());
+		remove_report_locked(request_id);
+		request_execution_reports[request_id] = report;
+		tracked_requests[request_id] = p_request;
+		pending_request_ids.insert(request_id);
+	}
+	return enqueued;
+}
+
 int DSContext::get_pending_request_count() const {
 	std::lock_guard<std::mutex> lock(context_mutex);
 	return pending_request_count;
@@ -821,12 +890,25 @@ Error DSContext::flush_stream_async() {
 	// Batch-manager-only entry point for the async prewarm queue.
 	// Never routes through sync flush_batch(): sync pending counts, pending id
 	// sets and gpu flags are untouched. Drains stream_queue into the backend
-	// via the shared internal enqueue (validation + tracking + Ref holding),
+	// via the stream internal enqueue (validation + tracking + Ref holding;
+	// per-request collect/finalize hoisted to once per flush),
 	// then submits non-blocking via submit_async().
 	if (!initialized || !active_backend) {
 		return ERR_UNCONFIGURED;
 	}
 	std::deque<Ref<DSRequest>> to_submit;
+	{
+		std::lock_guard<std::mutex> lock(stream_mutex);
+		if (stream_queue.empty()) {
+			return OK;
+		}
+	}
+	// Harvest finished batches once (outside stream_mutex: collect takes
+	// context_mutex + backend locks, and the established order is
+	// context -> stream, never reversed) before checking slot state, so a
+	// just-completed batch frees slots immediately instead of forcing an
+	// ERR_BUSY retry next frame (one wasted main-thread frame).
+	collect_completed_results();
 	{
 		std::lock_guard<std::mutex> lock(stream_mutex);
 		if (stream_queue.empty()) {
@@ -858,7 +940,10 @@ Error DSContext::flush_stream_async() {
 			// Cancelled while queued (terminal already counted by cancel_prewarm).
 			continue;
 		}
-		if (enqueue_request_internal(request)) {
+		// Stream fast path: per-request collect/finalize hoisted out of this
+		// main-thread loop (see enqueue_stream_request_internal); tag-reject
+		// accounting stays inline so progress cannot stall.
+		if (enqueue_stream_request_internal(request)) {
 			submitted_request_count++;
 		} else {
 			// Backend rejected: request is terminal (FAILED); count it so tag

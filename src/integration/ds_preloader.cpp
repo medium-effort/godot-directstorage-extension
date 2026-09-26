@@ -923,15 +923,23 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 	// is_prewarm_complete() settles exactly when every request is finished.
 	uint64_t tag = ctx->prewarm_async(PackedStringArray());
 	int enqueued = 0;
+	// Stutter guard: expand + stream-enqueue run WITHOUT state().mutex held.
+	// The old code held the preloader lock across the whole loop (buffer
+	// resizes + per-request stream enqueue for every payload), so the batch
+	// manager's per-frame get_unbuilt_prewarm_count() on the main thread
+	// blocked for the full enqueue duration (~tens of ms -> Frame #3 hitch).
+	// Stream enqueue only takes the context's stream_mutex, so no preloader
+	// lock is needed here; pending-table publication below is one short
+	// critical section with identical visibility semantics.
+	// Reused scratch vector: expand_requests() starts with
+	// clear()+reserve(), so one buffer serves all payloads and only
+	// the largest mip_count reallocates. tracked.requests = reqs below
+	// copies the Refs out (pending holds them), so reuse is
+	// use-after-clear safe. enqueue_request(req, true) semantics and
+	// the all-or-nothing per-payload failure path are untouched.
+	std::vector<Tracked> ready;
+	ready.reserve(payloads.size());
 	{
-		std::lock_guard<std::mutex> lock(state().mutex);
-		State &s = state();
-		// Reused scratch vector: expand_requests() starts with
-		// clear()+reserve(), so one buffer serves all payloads and only
-		// the largest mip_count reallocates. tracked.requests = reqs below
-		// copies the Refs out (pending holds them), so reuse is
-		// use-after-clear safe. enqueue_request(req, true) semantics and
-		// the all-or-nothing per-payload failure path are untouched.
 		Vector<Ref<DSRequest>> reqs;
 		for (size_t i = 0; i < payloads.size(); ++i) {
 			if (!expand_requests(payloads[i], tag, reqs)) {
@@ -964,16 +972,23 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 			tracked.tag = tag;
 			tracked.meta = payloads[i];
 			tracked.requests = reqs;
+			ready.push_back(tracked);
+			enqueued += reqs.size();
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		for (size_t i = 0; i < ready.size(); ++i) {
 			int64_t id = s.next_id++;
 			if (s.next_id == 0) {
 				s.next_id = 1;
 			}
-			s.pending[id] = tracked;
-			s.pending_paths[tracked.meta.engine_path]++;
-			if (tracked.meta.payload_key != tracked.meta.engine_path) {
-				s.pending_paths[tracked.meta.payload_key]++;
+			s.pending[id] = ready[i];
+			s.pending_paths[ready[i].meta.engine_path]++;
+			if (ready[i].meta.payload_key != ready[i].meta.engine_path) {
+				s.pending_paths[ready[i].meta.payload_key]++;
 			}
-			enqueued += reqs.size();
 		}
 	}
 	if (enqueued > 0) {

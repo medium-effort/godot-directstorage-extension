@@ -4,6 +4,7 @@
 name: Run gdextest
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, master]
     paths-ignore:
