@@ -97,6 +97,10 @@ private:
 	// (collect before submit to free batch slots, finalize after),
 	// turning up to 256 O(tracked) scans per main-thread frame into one.
 	bool enqueue_stream_request_internal(Ref<DSRequest> p_request);
+	// Shared validation + tracking for both enqueue paths above.
+	// p_skip_maintenance=true selects the stream behavior (no per-request
+	// collect/finalize); report bookkeeping is identical either way.
+	bool enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maintenance);
 
 protected:
 	static void _bind_methods();

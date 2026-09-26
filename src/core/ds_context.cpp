@@ -656,6 +656,20 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request, bool p_from_stream) {
 }
 
 bool DSContext::enqueue_request_internal(Ref<DSRequest> p_request) {
+	return enqueue_request_impl(p_request, false);
+}
+
+bool DSContext::enqueue_stream_request_internal(Ref<DSRequest> p_request) {
+	return enqueue_request_impl(p_request, true);
+}
+
+// Shared validation + tracking for the sync and stream enqueue paths.
+// p_skip_maintenance=true (stream flush) omits the per-request
+// collect_completed_results() / finalize+evict maintenance: the flush caller
+// hoists both once per batch (see flush_stream_async), turning up to 256
+// O(tracked) scans per main-thread frame into one. Report bookkeeping
+// (including report_order) is identical for both paths.
+bool DSContext::enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maintenance) {
 	if (p_request.is_null()) {
 		return false;
 	}
@@ -699,7 +713,9 @@ bool DSContext::enqueue_request_internal(Ref<DSRequest> p_request) {
 		return false;
 	}
 
-	if (has_pending_results()) {
+	// Sync path harvests inline so batch slots free immediately; the stream
+	// flush hoists this once per batch instead (see flush_stream_async).
+	if (!p_skip_maintenance && has_pending_results()) {
 		collect_completed_results();
 	}
 
@@ -722,77 +738,12 @@ bool DSContext::enqueue_request_internal(Ref<DSRequest> p_request) {
 		tracked_requests[request_id] = p_request;
 		pending_request_ids.insert(request_id);
 		report_order.push_back(request_id);
-		finalize_completed_reports_locked();
-		evict_old_reports_if_needed_locked();
-	}
-	return enqueued;
-}
-
-bool DSContext::enqueue_stream_request_internal(Ref<DSRequest> p_request) {
-	if (p_request.is_null()) {
-		return false;
-	}
-
-	if (!initialized) {
-		initialize_ds();
-	}
-
-	if (!initialized || !active_backend) {
-		p_request->set_status(DSRequest::STATUS_FAILED);
-		p_request->set_error_message("DirectStorage Context not initialized.");
-		return false;
-	}
-
-	bool gpu_destination = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER ||
-			p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE;
-	if (gpu_destination && (active_backend->get_name() != "Win32DirectStorage" || !is_d3d12_backend())) {
-		String error_message = "GPU destinations require an active Win32 DirectStorage D3D12 backend.";
-		p_request->set_status(DSRequest::STATUS_FAILED);
-		p_request->set_error_message(error_message);
-		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
-		if (err_handler) {
-			err_handler->report_error(error_message);
+		// Per-request finalize+evict only on the sync path; the stream flush
+		// runs both once after submit (see flush_stream_async).
+		if (!p_skip_maintenance) {
+			finalize_completed_reports_locked();
+			evict_old_reports_if_needed_locked();
 		}
-		return false;
-	}
-
-	bool needs_sync = false;
-	{
-		std::lock_guard<std::mutex> lock(context_mutex);
-		needs_sync = gpu_destination && !gpu_requests_pending;
-	}
-	if (needs_sync && !synchronize_rendering_device("DirectStorage GPU request")) {
-		String error_message = "GPU destination request rejected: RenderingDevice could not be synchronized.";
-		p_request->set_status(DSRequest::STATUS_FAILED);
-		p_request->set_error_message(error_message);
-		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
-		if (err_handler) {
-			err_handler->report_error(error_message);
-		}
-		return false;
-	}
-
-	// NOTE: no per-request has_pending_results()/collect_completed_results()
-	// and no finalize_completed_reports_locked()/evict_old_reports_if_needed_locked()
-	// here by design (see header). The flush caller owns both once per batch.
-	bool enqueued = active_backend->enqueue_request(p_request);
-	if (enqueued) {
-		std::lock_guard<std::mutex> lock(context_mutex);
-		if (gpu_destination) {
-			gpu_requests_pending = true;
-		}
-		pending_request_count++;
-		Dictionary report;
-		report["actual_destination_type"] = static_cast<int>(p_request->get_destination_type());
-		report["actual_backend"] = active_backend->get_name();
-		report["was_gpu_decompression_used"] = false;
-		report["gpu_decompression_pending"] = p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE &&
-				active_backend->get_name() == "Win32DirectStorage";
-		int64_t request_id = static_cast<int64_t>(p_request->get_instance_id());
-		remove_report_locked(request_id);
-		request_execution_reports[request_id] = report;
-		tracked_requests[request_id] = p_request;
-		pending_request_ids.insert(request_id);
 	}
 	return enqueued;
 }
