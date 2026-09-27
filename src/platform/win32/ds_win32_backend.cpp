@@ -905,6 +905,36 @@ void Win32Backend::close_slot_files(BatchSlot &p_slot) {
 	p_slot.file_cache.clear();
 }
 
+// Releases every backend-level cached file handle. Caller must hold
+// batch_mutex or guarantee no concurrent enqueue (init before the
+// completion thread starts, shutdown after it joins).
+void Win32Backend::clear_persistent_files() {
+	for (int i = 0; i < persistent_files.size(); i++) {
+		if (persistent_files[i]) {
+			persistent_files[i]->Close();
+			persistent_files[i]->Release();
+		}
+	}
+	persistent_files.clear();
+	persistent_file_cache.clear();
+}
+
+// Inserts an OpenFile'd handle into the backend-level cache. Returns false
+// (and leaves the map untouched) on null handle or duplicate path — the
+// caller keeps ownership on failure. Requires batch_mutex held, except
+// during initialize() before the completion thread starts.
+bool Win32Backend::cache_file_handle(const std::wstring &p_wpath, IDStorageFile *p_file) {
+	if (!p_file || p_wpath.empty()) {
+		return false;
+	}
+	if (persistent_file_cache.find(p_wpath) != persistent_file_cache.end()) {
+		return false;
+	}
+	persistent_files.push_back(p_file);
+	persistent_file_cache[p_wpath] = p_file;
+	return true;
+}
+
 void Win32Backend::completion_thread_func() {
 	HANDLE wait_handles[QUEUE_COUNT * BATCH_SLOT_COUNT + 1] = { completion_stop_event };
 	for (int i = 0; i < QUEUE_COUNT; i++) {
@@ -1614,9 +1644,49 @@ bool Win32Backend::initialize(const String &p_path) {
 		queues_ready = queues_ready && queue.queue != nullptr && queue.completion_event != nullptr && queue.batch_slots[0].event != nullptr && queue.batch_slots[1].event != nullptr && queue.completion_fence != nullptr;
 	}
 	if (queues_ready) {
+		// Eager archive pre-open: move the first OpenFile + BypassIO
+		// negotiation for the exported texture archive off the first
+		// prewarm frame and into init (autoload _ready, behind the menu).
+		// Single-threaded here (completion thread not started yet), so no
+		// lock needed. Silent on failure — the enqueue path opens lazily.
+		if (factory) {
+			String archive_logical = "res://textures.dspkg";
+			String archive_global = archive_logical;
+			if (ps && (archive_logical.begins_with("res://") || archive_logical.begins_with("user://"))) {
+				archive_global = ps->globalize_path(archive_logical);
+			}
+			if (FileAccess::file_exists(archive_global)) {
+				String norm_archive = archive_global.replace("/", "\\");
+				std::wstring w_archive(reinterpret_cast<const wchar_t *>(norm_archive.utf16().get_data()));
+				IDStorageFile *archive_file = nullptr;
+				if (SUCCEEDED(factory->OpenFile(w_archive.c_str(), IID_PPV_ARGS(&archive_file))) && archive_file) {
+					if (!cache_file_handle(w_archive, archive_file)) {
+						archive_file->Close();
+						archive_file->Release();
+					}
+				}
+			} else {
+				OS *os = OS::get_singleton();
+				if (os) {
+					String exe_archive = os->get_executable_path().get_base_dir().path_join("textures.dspkg");
+					if (FileAccess::file_exists(exe_archive)) {
+						String norm_exe = exe_archive.replace("/", "\\");
+						std::wstring w_exe(reinterpret_cast<const wchar_t *>(norm_exe.utf16().get_data()));
+						IDStorageFile *exe_file = nullptr;
+						if (SUCCEEDED(factory->OpenFile(w_exe.c_str(), IID_PPV_ARGS(&exe_file))) && exe_file) {
+							if (!cache_file_handle(w_exe, exe_file)) {
+								exe_file->Close();
+								exe_file->Release();
+							}
+						}
+					}
+				}
+			}
+		}
 		completion_stop_event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
 		if (!completion_stop_event) {
 			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Could not create the completion thread stop event.");
+			clear_persistent_files();
 			return false;
 		}
 			completion_thread_stop.store(false);
@@ -1719,6 +1789,13 @@ void Win32Backend::shutdown() {
 		}
 		queue.completion_fence_value = 0;
 		queue.completed_fence_value = 0;
+	}
+
+	// Completion thread is joined above, so no concurrent enqueue can run;
+	// take the lock for consistency with the enqueue path.
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		clear_persistent_files();
 	}
 
 	if (factory) {
@@ -1906,18 +1983,42 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		std::wstring wpath(reinterpret_cast<const wchar_t *>(norm_file_path.utf16().get_data()));
 
 		IDStorageFile *file = nullptr;
-		std::unordered_map<std::wstring, IDStorageFile *>::const_iterator cached_handle = slot.file_cache.find(wpath);
-		if (cached_handle != slot.file_cache.end()) {
-			file = cached_handle->second;
+		// Backend-level cache first: survives batch-slot recycling, so the
+		// shared archive pays OpenFile once per process instead of once per
+		// slot. Persistent handles are owned by persistent_files and must
+		// never be pushed into slot.files (close_slot_files would close a
+		// handle this map still serves). batch_mutex is held by the caller.
+		std::unordered_map<std::wstring, IDStorageFile *>::const_iterator persistent_handle = persistent_file_cache.find(wpath);
+		if (persistent_handle != persistent_file_cache.end()) {
+			file = persistent_handle->second;
 		} else {
-			HRESULT hr = factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&file));
-			if (FAILED(hr) || !file) {
-				p_child->set_status(DSRequest::STATUS_FAILED);
-				p_child->set_error_message("Win32Backend: Failed to open file '" + path + "'.");
-				return false;
+			std::unordered_map<std::wstring, IDStorageFile *>::const_iterator cached_handle = slot.file_cache.find(wpath);
+			if (cached_handle != slot.file_cache.end()) {
+				file = cached_handle->second;
+			} else {
+				HRESULT hr = factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&file));
+				if (FAILED(hr) || !file) {
+					p_child->set_status(DSRequest::STATUS_FAILED);
+					p_child->set_error_message("Win32Backend: Failed to open file '" + path + "'.");
+					return false;
+				}
+				// New opens join the persistent cache (slot files stay for
+				// legacy slot-owned handles only).
+				if (!cache_file_handle(wpath, file)) {
+					// Duplicate race: another path cached it first — use the
+					// winner and release ours.
+					file->Close();
+					file->Release();
+					persistent_handle = persistent_file_cache.find(wpath);
+					if (persistent_handle != persistent_file_cache.end()) {
+						file = persistent_handle->second;
+					} else {
+						p_child->set_status(DSRequest::STATUS_FAILED);
+						p_child->set_error_message("Win32Backend: Failed to cache file '" + path + "'.");
+						return false;
+					}
+				}
 			}
-			slot.files.push_back(file);
-			slot.file_cache[wpath] = file;
 		}
 
 	uint32_t src_size = p_child->get_size();
