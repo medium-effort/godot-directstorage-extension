@@ -52,7 +52,7 @@
 		<method name="flush_stream_async">
 			<return type="int" enum="@GlobalScope.Error" />
 			<description>
-				Submits all requests currently in the async stream (prewarm) queue without blocking the calling thread. Called once per frame by the [code]DSBatchManager[/code] autoload. Regular synchronous loads use a separate queue drained by [method flush_batch] / [method flush_batch_async] and are unaffected. Returns [constant OK] on submit, or [constant ERR_BUSY] when the backend is busy (the queue is kept for retry next frame).
+				Submits queued requests from the async stream (prewarm) queue without blocking the calling thread. Called once per frame by the [code]DSBatchManager[/code] autoload. Harvests finished batches first to free backend slots, then submits at most half the queue capacity per call (clamped to 64-256 requests); any remainder stays queued for the next frame. Regular synchronous loads use a separate queue drained by [method flush_batch] / [method flush_batch_async] and are unaffected. Returns [constant OK] on submit (including when the queue is empty), [constant ERR_BUSY] when all backend batch slots are occupied (the queue is kept for retry next frame), or [constant ERR_UNCONFIGURED] when uninitialized.
 			</description>
 		</method>
 		<method name="get_active_backend_name" qualifiers="const">
