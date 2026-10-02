@@ -17,7 +17,16 @@
 		</method>
 		<method name="clear">
 			<return type="void" />
-			<description>Removes every cached texture and unbinds all aliases.</description>
+			<description>
+				Removes every cached texture and unbinds all aliases, unconditionally destroying their underlying GPU [RenderingDevice] texture resources.
+				[b]Warning:[/b] Never call [method clear] while any active material, UI element, or on-screen mesh is drawing a cached texture. Freeing the underlying GPU RID while still bound causes rendering pipeline corruption ([code]uniform_set_create: Texture is not a valid texture[/code]) and renders affected models black. Use [method clear_unused] to safely evict only unreferenced textures while scenes are actively rendering, reserving [method clear] for full scene transitions or shutdown.
+			</description>
+		</method>
+		<method name="clear_unused">
+			<return type="int" />
+			<description>
+				Scans the cache and evicts only textures that are not held by any external reference ([code]ref_count == 1[/code]), destroying their GPU resources while leaving textures in active use by visible scenes, materials, or scripts intact. Unbinds associated aliases for evicted entries. Returns the number of evicted textures.
+			</description>
 		</method>
 		<method name="evict">
 			<return type="void" />

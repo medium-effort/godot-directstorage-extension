@@ -70,6 +70,7 @@ public:
 	String get_canonical_path(const String &p_path) const;
 	void evict(const String &p_path);
 	void clear();
+	int clear_unused();
 
 	// Async prewarm entry points. DSPreloader does the work; these thin
 	// delegates are the GDScript-visible surface (this class is already

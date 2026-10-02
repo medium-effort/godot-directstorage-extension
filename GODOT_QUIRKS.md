@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 25 September 2026
+Last updated: 2 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -962,6 +962,73 @@ Benchmarking loading screen frame times on real hardware (e.g. NVIDIA GTX 1050 T
 2. **Instant Package Manifest Lookup (<0.5 ms)**:
    In exported builds where `textures.dspkg` is deployed, the archive already contains the pre-indexed list of all bundled textures. Querying `dspkg.get_entries()` directly against the requested coverage directories discovers all dependencies in **<0.5 ms**, completely bypassing the 100+ ms binary scene crawl.
 
+---
 
+## 42. Discarding Speculative Threaded Loads (`load_threaded_get` Consumption)
 
+### The Engine Reality
+When loading resources on worker threads via `ResourceLoader.load_threaded_request()`, Godot instantiates an internal `ThreadLoadTask` in `core/io/resource_loader.h`. This structure holds a strong `Ref<Resource> resource` and a `LocalVector<Ref<Resource>> resource_dependencies` container to ensure all sub-resources remain allocated during background parsing. Godot provides no cancellation method (such as `cancel_threaded_request()`). The task and its strong references remain registered in Godot's internal tracking tables until `ResourceLoader.load_threaded_get()` is called, which consumes the task and unregisters it.
 
+### The Trap / Symptom
+If a game issues a speculative `load_threaded_request()` during the main menu or a lobby (e.g. preloading `level.tscn` in anticipation of a Play click), and the player toggles off the option or leaves the menu without launching the scene, the un-retrieved task keeps the entire parsed scene graph alive in memory indefinitely.
+In a production 3D title, this locks substantial GPU VRAM:
+* High-dynamic-range `LightmapGI` baked texture arrays (e.g., `level.exr` uncompressed in VRAM): **~280 MiB**.
+* 3D GLB mesh vertex, normal, tangent, and index buffers: **~180 MiB**.
+* Total wasted VRAM: **~460 MiB** retained in memory even though the level is never played.
+
+### The Rule
+To cancel or trash a background `ResourceLoader.load_threaded_request()`, wait for completion and call `load_threaded_get()` then immediately nullify the reference; Godot has no cancel API and retains strong references permanently until consumed.
+
+```gdscript
+func _discard_speculative_scene_async(path: String) -> void:
+	var status := ResourceLoader.load_threaded_get_status(path)
+	while status == ResourceLoader.THREAD_LOAD_IN_PROGRESS:
+		await get_tree().process_frame
+		status = ResourceLoader.load_threaded_get_status(path)
+	if status == ResourceLoader.THREAD_LOAD_LOADED:
+		var discarded: Resource = ResourceLoader.load_threaded_get(path)
+		discarded = null # Reference count drops to 0; Godot frees lightmaps and mesh buffers from VRAM
+```
+*(Implemented in `tps-demo/menu/menu.gd:334`)*
+
+---
+
+## 43. Unconditional Cache `clear()` Destroys On-Screen Texture RIDs
+
+### The Engine Reality
+In GDExtensions managing custom texture resources (`Texture2DRD` or native `RenderingDevice` texture allocations), the extension owns the underlying GPU texture RIDs. Calling `DSTextureCache::clear()` immediately passes every texture RID in the cache map to `RenderingDevice::free_rid()`. However, Godot's `StandardMaterial3D` and canvas pipelines hold active shader uniform sets (Set 3) binding those texture RIDs if any mesh or UI node currently in the SceneTree references them.
+
+### The Trap / Symptom
+If `DSTextureCache.clear()` is called while a scene using any cached texture is active (for example, clearing level textures while the main menu robot model shares or references prewarmed textures like `res://player/...`), the underlying GPU texture resource is destroyed on the rendering device out from under the active material.
+On the next render frame, Godot attempts to build or bind the uniform set and fails continuously:
+```text
+[1] uniform_set_create: Texture (binding: 1, index 0) is not a valid texture. Parameter "texture" is null.
+    -> <C++ Source> servers/rendering/rendering_device.cpp:4502 @ uniform_set_create()
+[2] draw_list_draw: Uniforms were never supplied for set (3) at the time of drawing, which are required by the pipeline.
+    -> <C++ Source> servers/rendering/rendering_device.cpp:6033 @ draw_list_draw()
+```
+The visible mesh turns completely black (drawing only untextured emission or fallback shaders), flooding the debugger with thousands of error messages per second.
+
+### The Rule
+Never call unconditional `DSTextureCache.clear()` while a scene using any cached texture is visible; call `DSTextureCache.clear_unused()` to evict only unreferenced textures (`ref_count == 1`) or restrict full `clear()` to scene transitions where no actors are rendered.
+
+For safe runtime cache eviction, `DSTextureCache::clear_unused()` scans canonical entries under `cache_mutex` using pristine reference counts before freeing:
+```cpp
+static bool ds_texture_cache_is_externally_held(const Ref<Texture2D> &p_texture) {
+	if (p_texture.is_null() || !p_texture.is_valid()) {
+		return false;
+	}
+	return p_texture->get_reference_count() > 1; // Held by active scene material or node outside cache
+}
+```
+Any entry with `ref_count == 1` is removed from the cache map, alias map, and LRU list, its live twin references are safely filtered, and its GPU RID is queued for render-thread release via `ds_texture_cache_release_evicted()` (`src/integration/ds_texture_cache.cpp:573`).
+
+In GDScript, call `clear_unused()` whenever toggling background preloads off or releasing idle level caches during active gameplay:
+```gdscript
+if ClassDB.class_exists("DSTextureCache"):
+	var cache: Object = Engine.get_singleton("DSTextureCache")
+	if cache != null and cache.has_method("clear_unused"):
+		var freed_count: int = cache.clear_unused()
+		print("[Cache] Safely evicted %d unreferenced textures" % freed_count)
+```
+Reserve unconditional `clear()` strictly for module teardown (`~DSTextureCache()`) or blank transition screens where all old actor nodes and materials have been completely freed.

@@ -193,6 +193,7 @@ void DSTextureCache::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_canonical_path", "path"), &DSTextureCache::get_canonical_path);
 	ClassDB::bind_method(D_METHOD("evict", "path"), &DSTextureCache::evict);
 	ClassDB::bind_method(D_METHOD("clear"), &DSTextureCache::clear);
+	ClassDB::bind_method(D_METHOD("clear_unused"), &DSTextureCache::clear_unused);
 
 	ClassDB::bind_method(D_METHOD("set_enabled", "enabled"), &DSTextureCache::set_enabled);
 	ClassDB::bind_method(D_METHOD("is_enabled"), &DSTextureCache::is_enabled);
@@ -569,6 +570,46 @@ void DSTextureCache::clear() {
 		ds_texture_cache_drop_live_refs(evicted, live_refs);
 	}
 	ds_texture_cache_release_evicted(evicted);
+}
+
+int DSTextureCache::clear_unused() {
+	std::vector<Ref<Texture2D>> evicted;
+	int evicted_count = 0;
+	{
+		std::lock_guard<std::mutex> lock(cache_mutex);
+
+		// 1. Identify unreferenced canonical paths using pristine refcounts
+		std::vector<String> to_remove;
+		to_remove.reserve(cache_map.size());
+		for (const KeyValue<String, CacheEntry> &kv : cache_map) {
+			if (!ds_texture_cache_is_externally_held(kv.value.texture)) {
+				to_remove.push_back(kv.key);
+			}
+		}
+
+		// 2. Remove unreferenced entries and retain victim refs
+		for (const String &path : to_remove) {
+			if (cache_map.has(path)) {
+				evicted.push_back(cache_map[path].texture);
+				_remove_entry(path);
+				evicted_count++;
+			}
+		}
+
+		// 3. Drop live refs to handle twin-key aliasing safely
+		std::vector<const Texture2D *> live_refs;
+		live_refs.reserve(cache_map.size());
+		for (const KeyValue<String, CacheEntry> &kv : cache_map) {
+			if (kv.value.texture.is_valid()) {
+				live_refs.push_back(kv.value.texture.ptr());
+			}
+		}
+		ds_texture_cache_drop_live_refs(evicted, live_refs);
+	}
+
+	// 4. Release GPU RIDs on render thread outside cache_mutex
+	ds_texture_cache_release_evicted(evicted);
+	return evicted_count;
 }
 
 void DSTextureCache::set_enabled(bool p_enabled) {

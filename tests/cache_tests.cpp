@@ -382,3 +382,79 @@ GDEX_TEST_T(cache, lru_eviction_purges_canonical_and_aliases, TAG_INTEGRATION) {
     GDEX_EXPECT_TRUE(cache->get_cached("res://t2.png").is_valid());
     GDEX_EXPECT_TRUE(cache->get_cached("res://t2.dstex").is_valid());
 }
+
+GDEX_TEST_T(cache, clear_unused_evicts_only_unreferenced_entries, TAG_INTEGRATION) {
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+
+    cache->store("res://gdextest_cu_0", make_test_texture(0.1f));
+    cache->store("res://gdextest_cu_1", make_test_texture(0.2f));
+    cache->store("res://gdextest_cu_2", make_test_texture(0.3f));
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 3);
+
+    // Hold external ref to texture #1 only
+    godot::Ref<godot::Texture2D> ref1 = cache->get_cached("res://gdextest_cu_1");
+    GDEX_ASSERT_TRUE(ref1.is_valid());
+
+    int evicted = cache->clear_unused();
+    GDEX_EXPECT_EQ(evicted, 2);
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 1);
+
+    GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_cu_0").is_null());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_cu_1").is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_cu_1").ptr() == ref1.ptr());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_cu_2").is_null());
+}
+
+GDEX_TEST_T(cache, clear_unused_with_aliases_and_subsequent_clear, TAG_INTEGRATION) {
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+
+    godot::Ref<godot::Texture2D> tex_a = make_test_texture(0.4f);
+    godot::Ref<godot::Texture2D> tex_b = make_test_texture(0.5f);
+    cache->store("res://tex_a.png", tex_a, godot::DSTextureCache::CACHE_MODE_REUSE, "res://tex_a.dstex");
+    cache->store("res://tex_b.png", tex_b, godot::DSTextureCache::CACHE_MODE_REUSE, "res://tex_b.dstex");
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 2);
+
+    // Hold external ref to tex_a; drop our local ref to tex_b
+    tex_b.unref();
+
+    int evicted = cache->clear_unused();
+    GDEX_EXPECT_EQ(evicted, 1);
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 1);
+
+    // tex_b and alias should be gone
+    GDEX_EXPECT_TRUE(cache->get_cached("res://tex_b.png").is_null());
+    GDEX_EXPECT_FALSE(cache->has_alias("res://tex_b.dstex"));
+
+    // tex_a and alias should still be present
+    GDEX_EXPECT_TRUE(cache->has_alias("res://tex_a.dstex"));
+    GDEX_EXPECT_TRUE(cache->get_cached("res://tex_a.png").is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://tex_a.dstex").is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://tex_a.dstex").ptr() == tex_a.ptr());
+
+    // Drop external ref to tex_a, clear_unused again
+    tex_a.unref();
+    int evicted_second = cache->clear_unused();
+    GDEX_EXPECT_EQ(evicted_second, 1);
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+    GDEX_EXPECT_FALSE(cache->has_alias("res://tex_a.dstex"));
+    GDEX_EXPECT_TRUE(cache->get_cached("res://tex_a.png").is_null());
+}
+
+GDEX_TEST_T(cache, clear_unused_all_held_or_empty, TAG_INTEGRATION) {
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+
+    // Empty cache returns 0
+    GDEX_EXPECT_EQ(cache->clear_unused(), 0);
+
+    godot::Ref<godot::Texture2D> t0 = make_test_texture(0.6f);
+    godot::Ref<godot::Texture2D> t1 = make_test_texture(0.7f);
+    cache->store("res://held0.png", t0);
+    cache->store("res://held1.png", t1);
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 2);
+
+    // Both held externally
+    GDEX_EXPECT_EQ(cache->clear_unused(), 0);
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 2);
+    GDEX_EXPECT_TRUE(cache->get_cached("res://held0.png").is_valid());
+    GDEX_EXPECT_TRUE(cache->get_cached("res://held1.png").is_valid());
+}
