@@ -76,9 +76,9 @@ Get-Content $EnvFilePath | ForEach-Object {
     }
 }
 
-$RemoteHost         = $env:REMOTE_HOST
+$RemoteHost = $env:REMOTE_HOST
 $RemoteHostFallback = $env:REMOTE_HOST_FALLBACK
-$RemoteDir          = $env:REMOTE_DIR
+$RemoteDir = $env:REMOTE_DIR
 
 if (-not $RemoteHost -or -not $RemoteDir) {
     Show-BuildFailure -Step "Configuration Error" -Message "REMOTE_HOST or REMOTE_DIR is missing in $EnvFilePath" -Code 1
@@ -94,7 +94,7 @@ $RemoteDirWin = $RemoteDir.Replace('/', '\')
 $RemoteDirTar = $RemoteDir.Replace('\', '/')
 
 $ArtifactRemoteDir = "$RemoteDirTar/project/addons/directstorage_accelerator/bin"
-$ArtifactLocalDir  = "./project/addons/directstorage_accelerator/bin"
+$ArtifactLocalDir = "./project/addons/directstorage_accelerator/bin"
 
 # 1. Probe connectivity (Local Wi-Fi first, fallback to Tailscale)
 Write-VerboseHost "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
@@ -104,16 +104,19 @@ $ActiveHost = $null
 if ($LASTEXITCODE -eq 0) {
     $ActiveHost = $RemoteHost
     Write-VerboseHost "Connected via local network ($ActiveHost)." -ForegroundColor Green
-} elseif ($RemoteHostFallback) {
+}
+elseif ($RemoteHostFallback) {
     Write-VerboseHost "Local host unreachable. Attempting Tailscale fallback ($RemoteHostFallback)..." -ForegroundColor Yellow
     & ssh -o BatchMode=yes -o ConnectTimeout=4 $RemoteHostFallback "exit 0" 2>$null
     if ($LASTEXITCODE -eq 0) {
         $ActiveHost = $RemoteHostFallback
         Write-VerboseHost "Connected via Tailscale ($ActiveHost)." -ForegroundColor Green
-    } else {
+    }
+    else {
         Show-BuildFailure -Step "Step [1/6] Connectivity" -Message "Neither primary host ($RemoteHost) nor fallback ($RemoteHostFallback) could be reached!" -Code 1
     }
-} else {
+}
+else {
     Show-BuildFailure -Step "Step [1/6] Connectivity" -Message "Cannot reach primary host ($RemoteHost) and no fallback is configured!" -Code 1
 }
 
@@ -169,7 +172,8 @@ $RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
 ssh $ActiveHost "if exist `"$RemoteMarkerWin`" del /q `"$RemoteMarkerWin`""
 if ($Verbose) {
     ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`""
-} else {
+}
+else {
     $sconsOutput = ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`"" 2>&1
 }
 ssh $ActiveHost "if exist `"$RemoteMarkerWin`" (exit /b 0) else (exit /b 1)"
@@ -179,7 +183,8 @@ if ($LASTEXITCODE -ne 0) {
         if ($errorLines) {
             Write-Host "--- SCons Compilation Errors ---" -ForegroundColor Red
             $errorLines | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
-        } else {
+        }
+        else {
             Write-Host "--- SCons Output (tail) ---" -ForegroundColor Red
             $sconsOutput | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
         }
@@ -216,7 +221,8 @@ if ($IncludePdb) {
     if ($LASTEXITCODE -ne 0) {
         Write-VerboseHost "Warning: Failed to download .pdb debug symbols." -ForegroundColor Yellow
     }
-} else {
+}
+else {
     Write-VerboseHost "Skipping .pdb download (use -IncludePdb if attaching a C++ debugger)." -ForegroundColor DarkGray
 }
 
@@ -224,32 +230,33 @@ Write-VerboseHost "Artifacts updated on Device A." -ForegroundColor Green
 
 # 6. Post-build synchronization to external test project (e.g. TPS demo)
 $EnableSyncVal = if ($env:ENABLE_POST_BUILD_ADDON_SYNC) { $env:ENABLE_POST_BUILD_ADDON_SYNC } `
-                 elseif ($env:ENABLE_ADDON_SYNC) { $env:ENABLE_ADDON_SYNC } `
-                 elseif ($env:DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC) { $env:DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC } `
-                 else { "1" }
+    elseif ($env:ENABLE_ADDON_SYNC) { $env:ENABLE_ADDON_SYNC } `
+    elseif ($env:DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC) { $env:DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC } `
+    else { "1" }
 
 $ShouldSync = ($EnableSyncVal.Trim().ToLower() -notin @("0", "false", "no", "off"))
-$SyncTargetDir = if ($env:SYNC_ADDON_DIR) { $env:SYNC_ADDON_DIR } `
-                 else { "<WORKSPACE_ROOT>\godot-tps-directstorage-integration-test\tps-demo\addons\directstorage_accelerator" }
+$SyncTargetDir = if ($env:SYNC_ADDON_DIR) { $env:SYNC_ADDON_DIR }
 
 $TargetGuid = if ($env:DEVICE_GUID) { $env:DEVICE_GUID } `
-              elseif ($env:TARGET_MACHINE_GUID) { $env:TARGET_MACHINE_GUID } `
-              else { "300c220b-66de-4a10-b184-86a6211dfeb2" }
+    elseif ($env:TARGET_MACHINE_GUID) { $env:TARGET_MACHINE_GUID }
 
 if ($ShouldSync) {
     # Verify machine GUID on Windows
     $CurrentGuid = $null
     try {
         $CurrentGuid = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Cryptography" -ErrorAction SilentlyContinue).MachineGuid
-    } catch {
+    }
+    catch {
         $CurrentGuid = $null
     }
 
     if ($TargetGuid -and $CurrentGuid -and ($TargetGuid.Trim().ToLower() -ne $CurrentGuid.Trim().ToLower())) {
         Write-VerboseHost "Skipping post-build sync: Machine GUID ($CurrentGuid) does not match target ($TargetGuid)." -ForegroundColor DarkGray
-    } elseif (-not (Test-Path "D:\")) {
+    }
+    elseif (-not (Test-Path "D:\")) {
         Write-VerboseHost "Skipping post-build sync: Drive D: not found." -ForegroundColor DarkGray
-    } else {
+    }
+    else {
         Write-VerboseHost "[6/6] Syncing addon to external project ($SyncTargetDir)..." -ForegroundColor Cyan
         $LocalAddonDir = (Resolve-Path (Join-Path $PSScriptRoot "..\project\addons\directstorage_accelerator")).Path
 
@@ -271,7 +278,8 @@ if ($ShouldSync) {
                 }
                 try {
                     Copy-Item -Path $SourcePath -Destination $DestinationPath -Force -ErrorAction Stop
-                } catch {
+                }
+                catch {
                     if ((Test-Path $DestinationPath) -and $DestinationPath.ToLower().EndsWith(".dll")) {
                         $oldPath = "$DestinationPath.old"
                         if (Test-Path $oldPath) {
@@ -283,9 +291,11 @@ if ($ShouldSync) {
                         }
                         try {
                             Move-Item -Path $DestinationPath -Destination $oldPath -Force -ErrorAction SilentlyContinue
-                        } catch { $null = $_ }
+                        }
+                        catch { $null = $_ }
                         Copy-Item -Path $SourcePath -Destination $DestinationPath -Force -ErrorAction SilentlyContinue
-                    } else {
+                    }
+                    else {
                         throw $_
                     }
                 }
@@ -309,7 +319,8 @@ if ($ShouldSync) {
                     if (-not (Test-Path $destPath)) {
                         New-Item -ItemType Directory -Force -Path $destPath | Out-Null
                     }
-                } else {
+                }
+                else {
                     $destParent = Split-Path $destPath -Parent
                     if (-not (Test-Path $destParent)) {
                         New-Item -ItemType Directory -Force -Path $destParent | Out-Null
@@ -318,7 +329,8 @@ if ($ShouldSync) {
                     $needCopy = $false
                     if (-not (Test-Path $destPath)) {
                         $needCopy = $true
-                    } else {
+                    }
+                    else {
                         $destItem = Get-Item $destPath
                         if ($item.Length -ne $destItem.Length -or $item.LastWriteTime -gt $destItem.LastWriteTime.AddSeconds(1)) {
                             $needCopy = $true
@@ -329,7 +341,8 @@ if ($ShouldSync) {
                         try {
                             Copy-SafeFile -SourcePath $item.FullName -DestinationPath $destPath
                             $copiedCount++
-                        } catch {
+                        }
+                        catch {
                             Write-Host "Warning: Failed to copy $($item.Name): $_" -ForegroundColor Yellow
                         }
                     }
@@ -355,19 +368,22 @@ if ($ShouldSync) {
                     if (Test-Path $destBin) {
                         Copy-Item -Path $manifestLocalPath -Destination $destManifest -Force
                     }
-                } catch {
+                }
+                catch {
                     $null = $_
                 }
             }
 
             if ($copiedCount -gt 0) {
                 Write-VerboseHost "Post-build sync complete: Updated $copiedCount file(s) -> $SyncTargetDir" -ForegroundColor Green
-            } else {
+            }
+            else {
                 Write-VerboseHost "Post-build sync: Target $SyncTargetDir is already up to date." -ForegroundColor DarkGray
             }
         }
     }
-} else {
+}
+else {
     Write-VerboseHost "Post-build addon sync is disabled (ENABLE_POST_BUILD_ADDON_SYNC=0)." -ForegroundColor DarkGray
 }
 

@@ -185,8 +185,6 @@ sync_toggle_str = os.environ.get(
 ).strip().lower()
 ENABLE_EXTERNAL_SYNC = sync_toggle_str not in ("0", "false", "no", "off")
 
-TPS_DEMO_ADDON_DIR = r"<WORKSPACE_ROOT>\godot-tps-directstorage-integration-test\tps-demo\addons\directstorage_accelerator"
-
 def get_machine_guid():
     if sys.platform == "win32":
         try:
@@ -383,8 +381,8 @@ def write_build_manifest():
     addon_sync_dir = os.path.join(addon_base_dir, "directstorage_accelerator")
     addon_src_sync_dir = os.path.join(addon_base_dir, "src")
 
-    # Device A sync target (TPS demo integration test)
-    tps_addon_sync_dir = os.environ.get("SYNC_ADDON_DIR", TPS_DEMO_ADDON_DIR)
+    # Device A sync target (external project configured via SYNC_ADDON_DIR in .env)
+    sync_addon_dir = os.environ.get("SYNC_ADDON_DIR", "")
 
     sync_info = {
         "target_path": target_sync_dir,
@@ -398,7 +396,7 @@ def write_build_manifest():
             "src_copied_files_count": 0
         },
         "tps_demo_addon": {
-            "target_path": tps_addon_sync_dir,
+            "target_path": sync_addon_dir,
             "synced": False,
             "copied_files_count": 0
         }
@@ -467,22 +465,25 @@ def write_build_manifest():
                 sync_info["addon_copyable"]["error"] = str(e)
                 print(f"[SCons] Post-build sync error ({addon_base_dir}): {e}")
 
-        # 2. Device A synchronization (to TPS demo test project)
+        # 2. Device A synchronization (to external project configured via SYNC_ADDON_DIR in .env)
         if curr_guid == DEVICE_A_GUID:
-            try:
-                os.makedirs(tps_addon_sync_dir, exist_ok=True)
-                clean_excluded_files(tps_addon_sync_dir, addon_windows_filter)
-                addon_src_dir = os.path.abspath("project/addons/directstorage_accelerator")
-                tps_copied = sync_changed_files(addon_src_dir, tps_addon_sync_dir, addon_windows_filter)
-                sync_info["tps_demo_addon"]["synced"] = True
-                sync_info["tps_demo_addon"]["copied_files_count"] = tps_copied
-                if tps_copied > 0:
-                    print(f"[SCons] Post-build sync: Copied/Updated {tps_copied} file(s) -> {tps_addon_sync_dir}")
-                else:
-                    print(f"[SCons] Post-build sync: Target {tps_addon_sync_dir} is up to date.")
-            except Exception as e:
-                sync_info["tps_demo_addon"]["error"] = str(e)
-                print(f"[SCons] Post-build sync error ({tps_addon_sync_dir}): {e}")
+            if not sync_addon_dir:
+                print("[SCons] Post-build sync skipped: SYNC_ADDON_DIR is not configured in .env.")
+            else:
+                try:
+                    os.makedirs(sync_addon_dir, exist_ok=True)
+                    clean_excluded_files(sync_addon_dir, addon_windows_filter)
+                    addon_src_dir = os.path.abspath("project/addons/directstorage_accelerator")
+                    tps_copied = sync_changed_files(addon_src_dir, sync_addon_dir, addon_windows_filter)
+                    sync_info["tps_demo_addon"]["synced"] = True
+                    sync_info["tps_demo_addon"]["copied_files_count"] = tps_copied
+                    if tps_copied > 0:
+                        print(f"[SCons] Post-build sync: Copied/Updated {tps_copied} file(s) -> {sync_addon_dir}")
+                    else:
+                        print(f"[SCons] Post-build sync: Target {sync_addon_dir} is up to date.")
+                except Exception as e:
+                    sync_info["tps_demo_addon"]["error"] = str(e)
+                    print(f"[SCons] Post-build sync error ({sync_addon_dir}): {e}")
 
     # Load existing manifest to preserve historical metadata for other targets
     targets_dict = {}
@@ -627,9 +628,9 @@ def write_build_manifest():
             os.makedirs(os.path.dirname(dst_addon_manifest), exist_ok=True)
             safe_copy_file(manifest_path, dst_addon_manifest)
 
-        if sync_info.get("tps_demo_addon", {}).get("synced", False):
+        if sync_info.get("tps_demo_addon", {}).get("synced", False) and sync_addon_dir:
             dst_tps_manifest = os.path.join(
-                tps_addon_sync_dir,
+                sync_addon_dir,
                 os.path.relpath(manifest_path, os.path.abspath("project/addons/directstorage_accelerator"))
             )
             os.makedirs(os.path.dirname(dst_tps_manifest), exist_ok=True)
@@ -712,29 +713,32 @@ def run_sync_copyable(target, source, env):
     return 0
 
 def run_sync_tps(target, source, env):
+    sync_addon_dir = os.environ.get("SYNC_ADDON_DIR", "")
+    if not sync_addon_dir:
+        print("[SCons] Sync skipped: SYNC_ADDON_DIR is not configured in .env or environment.")
+        return 0
     if not os.path.exists("D:\\"):
         print("[SCons] Sync skipped: D:\\ drive not found.")
         return 0
-    tps_addon_sync_dir = os.environ.get("SYNC_ADDON_DIR", TPS_DEMO_ADDON_DIR)
     try:
-        os.makedirs(tps_addon_sync_dir, exist_ok=True)
-        clean_excluded_files(tps_addon_sync_dir, addon_windows_filter)
+        os.makedirs(sync_addon_dir, exist_ok=True)
+        clean_excluded_files(sync_addon_dir, addon_windows_filter)
         addon_src_dir = os.path.abspath("project/addons/directstorage_accelerator")
-        copied = sync_changed_files(addon_src_dir, tps_addon_sync_dir, addon_windows_filter)
+        copied = sync_changed_files(addon_src_dir, sync_addon_dir, addon_windows_filter)
         if copied > 0:
-            print(f"[SCons] Sync: Copied/Updated {copied} file(s) -> {tps_addon_sync_dir}")
+            print(f"[SCons] Sync: Copied/Updated {copied} file(s) -> {sync_addon_dir}")
         else:
-            print(f"[SCons] Sync: Target {tps_addon_sync_dir} is up to date.")
+            print(f"[SCons] Sync: Target {sync_addon_dir} is up to date.")
         manifest_src = os.path.join(output_dir, "build_manifest.json")
         if os.path.exists(manifest_src):
             dst_manifest = os.path.join(
-                tps_addon_sync_dir,
+                sync_addon_dir,
                 os.path.relpath(manifest_src, os.path.abspath("project/addons/directstorage_accelerator"))
             )
             os.makedirs(os.path.dirname(dst_manifest), exist_ok=True)
             safe_copy_file(manifest_src, dst_manifest)
     except Exception as e:
-        print(f"[SCons] Sync error ({tps_addon_sync_dir}): {e}")
+        print(f"[SCons] Sync error ({sync_addon_dir}): {e}")
         return 1
     return 0
 
