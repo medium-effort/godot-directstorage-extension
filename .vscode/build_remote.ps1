@@ -150,6 +150,7 @@ $tarExcludes = @(
     "--exclude=*.ilk",
     "--exclude=*.idb",
     "--exclude=project/addons/directstorage_accelerator/bin/directstorage_accelerator*",
+    "--exclude=project/addons/directstorage_accelerator/bin/~*",
     # NOTE: do NOT exclude anything matching gdextest here. Windows bsdtar
     # matches --exclude patterns against every path component, so even an
     # anchored-looking "--exclude=./gdextest" strips extern/gdextest/ from the
@@ -201,8 +202,12 @@ if (!(Test-Path $ArtifactLocalDir)) {
     New-Item -ItemType Directory -Force -Path $ArtifactLocalDir | Out-Null
 }
 
+# Clean any remote hot-reload temporary DLLs before pulling
+ssh $ActiveHost "if exist `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`" del /q `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`"" 2>$null
+
 # Pull runtime DLLs and manifest with on-the-fly compression (-C)
-scp -C "$ActiveHost`:$ArtifactRemoteDir/*.dll" "$ArtifactLocalDir/"
+scp -C "$ActiveHost`:$ArtifactRemoteDir/directstorage_accelerator*.dll" "$ArtifactLocalDir/"
+scp -C "$ActiveHost`:$ArtifactRemoteDir/dstorage*.dll" "$ArtifactLocalDir/"
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy compiled .dll files from Device B ($ActiveHost)." -Code $LASTEXITCODE
 }

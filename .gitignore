@@ -1,13 +1,13 @@
-/DirectStorage
-/DirectStorageSample
-/mcp_tools
-
-
-# SCons build cache
+# ==============================================================================
+# SCons & Python Build Cache
+# ==============================================================================
 .sconsign.dblite
 .sconf_temp/
+/__pycache__
 
-# C/C++ compiled objects & MSVC debug/intermediate build files
+# ==============================================================================
+# C/C++ Compiled Objects & MSVC Build Artifacts
+# ==============================================================================
 *.obj
 *.o
 *.os
@@ -16,48 +16,62 @@
 *.ilk
 *.exp
 
-# Generated source files & doc data
+# ==============================================================================
+# Generated Source Files & Documentation Data
+# ==============================================================================
 src/gen/
 *.gen.cpp
 *.gen.h
 
-# Compiled GDExtension target outputs and build artifacts
+# ==============================================================================
+# Compiled GDExtension Target Outputs & Binaries
+# ==============================================================================
 project/addons/directstorage_accelerator/bin/directstorage_accelerator.*
 project/addons/directstorage_accelerator/bin/*.lib
 project/addons/directstorage_accelerator/bin/build_manifest.json
-
-
-# Godot runtime cache & imports
-.godot/
-.import/
-
-
-/project/addons/godot_ai
+project/addons/directstorage_accelerator/bin/*.dll.old
 project/addons/directstorage_accelerator/bin/~*
 
+# ==============================================================================
+# Godot Runtime Cache, Imports & Project Outputs
+# ==============================================================================
+.godot/
+.import/
+/project/exports
 project/test_assets/*.glb
 project/test_assets/*.png
-/project/exports
-/__pycache__
-/.git_backup_pre_rewrite
-.git_backup_pre_rewrite.bundle
 
+# ==============================================================================
+# Godot Local Addons
+# ==============================================================================
+/project/addons/godot_ai
 
-# Local environment variables and remote build credentials
+# ==============================================================================
+# Test Frameworks & Static Analysis (gdextest, cppcheck, logs)
+# ==============================================================================
+build/gdextest/
+bin/libdirectstorage_tests*
+gdextest_matrix.json
+test-results.xml
+src/cppcheck_result.xml
+/logs
+
+# ==============================================================================
+# Local Environment Variables & IDE Logs
+# ==============================================================================
 .env
 .env.local
 *.env
-src/cppcheck_result.xml
-
-# gdextest
-build/gdextest/
-bin/libdirectstorage_tests*
-
-# others
 .vscode/*.log
-test-results.xml
-gdextest_matrix.json
-/logs
+
+# ==============================================================================
+# ==============================================================================
+
+# ==============================================================================
+# ==============================================================================
+
+# ==============================================================================
+# ==============================================================================
 
 # ==============================================================================
 # Local Tooling & Agent Metadata

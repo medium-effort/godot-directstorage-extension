@@ -325,66 +325,12 @@ static void release_all_resource_guards() {
 	s_resource_guards.clear();
 }
 
-// One-shot guard re-query context. validate_resource_guard() runs on the
-// completion thread (or the polling thread via poll_batch_status()), but
-// RenderingDevice::get_driver_resource() is render-thread-affine, so the live
-// re-query is marshalled to the render thread with
-// RenderingServer::call_on_render_thread(). The waiting thread allocates the
-// context on its stack and publishes it via s_guard_validate_ctx; the
-// render-thread worker consumes it and signals completion. Completion-path
-// validation is serialized by batch_mutex, so a single atomic handoff slot is
-// sufficient (same pattern as the device-acquisition context below).
-struct DSGuardValidateContext {
-	std::mutex mutex;
-	std::condition_variable cv;
-	bool completed = false;
-	// Inputs set by the waiting thread before posting the worker.
-	bool is_buffer_request = false;
-	RID destination_rid;
-	// Outputs set by the render-thread worker.
-	uint64_t resource_handle = 0;
-	bool rd_available = false;
-};
-static std::atomic<DSGuardValidateContext *> s_guard_validate_ctx{ nullptr };
-
-// Render-thread worker posted via RenderingServer::call_on_render_thread().
-// Must be a file-static function: the completion path has no Godot Object to
-// bind, so callable_mp_static is required (same constraint as the device-acquisition worker).
-static void ds_win32_fetch_guard_resource_on_render_thread() {
-	DSGuardValidateContext *ctx = s_guard_validate_ctx.exchange(nullptr);
-	if (!ctx) {
-		return;
-	}
-	RenderingServer *rs = RenderingServer::get_singleton();
-	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
-	uint64_t handle = 0;
-	bool rd_available = false;
-	if (rd) {
-		rd_available = true;
-		auto resource_type = ctx->is_buffer_request
-				? RenderingDevice::DRIVER_RESOURCE_BUFFER
-				: RenderingDevice::DRIVER_RESOURCE_TEXTURE;
-		handle = rd->get_driver_resource(resource_type, ctx->destination_rid, 0);
-	}
-	{
-		std::lock_guard<std::mutex> lock(ctx->mutex);
-		ctx->resource_handle = handle;
-		ctx->rd_available = rd_available;
-		ctx->completed = true;
-	}
-	ctx->cv.notify_one();
-}
-
 // Render-thread-affine guard re-query used by validate_resource_guard().
-// Returns true and fills r_resource when the query ran against a live
-// RenderingDevice (inline when already on the render thread, otherwise via a
-// marshalled worker). Returns false when the render thread could not answer:
-// the bounded wait elapsed (render thread stalled or engine shutting down) or
-// the device was gone by the time the worker ran. In that case the caller
-// must fall back to the cached guard only and treat the RID-replacement check
-// as unverifiable. The wait is bounded so the completion thread can never
-// block shutdown unboundedly; the handoff-reclaim pattern keeps
-// a late worker from ever touching the stack context.
+// Returns true and fills r_resource when the query runs against a live
+// RenderingDevice inline on the render thread. When called off the render
+// thread (e.g. completion thread under batch_mutex), immediately returns false
+// without blocking, allowing validate_resource_guard() to safely fall back to
+// the AddRef'd guard resource without stalling frames or risking deadlocks.
 static bool ds_win32_query_guard_resource_on_render_thread(bool p_is_buffer_request, const RID &p_destination_rid, ID3D12Resource *&r_resource) {
 	r_resource = nullptr;
 	RenderingServer *rs = RenderingServer::get_singleton();
@@ -402,35 +348,9 @@ static bool ds_win32_query_guard_resource_on_render_thread(bool p_is_buffer_requ
 		r_resource = reinterpret_cast<ID3D12Resource *>(rd->get_driver_resource(resource_type, p_destination_rid, 0));
 		return true;
 	}
-	DSGuardValidateContext ctx;
-	ctx.is_buffer_request = p_is_buffer_request;
-	ctx.destination_rid = p_destination_rid;
-	s_guard_validate_ctx.store(&ctx);
-	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_guard_resource_on_render_thread));
-	{
-		std::unique_lock<std::mutex> lock(ctx.mutex);
-		// 250 ms >> one render frame (~16 ms at 60 fps), so a healthy render
-		// thread answers in time; a stalled or torn-down render thread delays
-		// completion-path validation by at most this bound, never shutdown.
-		constexpr std::chrono::milliseconds kGuardValidateTimeout(250);
-		bool signaled = ctx.cv.wait_for(lock, kGuardValidateTimeout, [&ctx] { return ctx.completed; });
-		if (!signaled) {
-			// Bounded degradation: if the worker has not picked
-			// up the handoff yet, reclaim it so a late worker cannot touch
-			// this stack context. If the worker already picked it up, it is
-			// about to signal, so wait for that signal instead.
-			if (s_guard_validate_ctx.exchange(nullptr) == &ctx) {
-				return false;
-			}
-			ctx.cv.wait(lock, [&ctx] { return ctx.completed; });
-		}
-		if (!ctx.rd_available) {
-			return false;
-		}
-		r_resource = reinterpret_cast<ID3D12Resource *>(ctx.resource_handle);
-		return true;
-	}
+	return false;
 }
+
 
 // Render-thread destination query context for enqueue_request().
 // Marshals RenderingDevice::get_driver_resource() and ID3D12Resource::GetDesc()
@@ -447,6 +367,7 @@ struct DSGPUDestinationContext {
 	bool rd_available = false;
 };
 static std::atomic<DSGPUDestinationContext *> s_gpu_dest_query_ctx{ nullptr };
+static std::mutex s_dest_query_mutex;
 
 static void ds_win32_fetch_destination_resource_on_render_thread() {
 	DSGPUDestinationContext *ctx = s_gpu_dest_query_ctx.exchange(nullptr);
@@ -520,6 +441,7 @@ static bool ds_win32_query_destination_resource_on_render_thread(
 		return true;
 	}
 
+	std::lock_guard<std::mutex> query_lock(s_dest_query_mutex);
 	DSGPUDestinationContext ctx;
 	ctx.is_buffer_request = p_is_buffer_request;
 	ctx.destination_rid = p_destination_rid;
@@ -1866,6 +1788,26 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		p_request->set_error_message("Win32Backend priority queue is not initialized.");
 		return false;
 	}
+
+	// Query GPU destination resource info once on the render thread BEFORE taking batch_mutex.
+	// This covers single requests and multi-subresource/chunk splits without
+	// issuing redundant cross-thread round-trips for each mip/chunk, and prevents
+	// holding batch_mutex across cross-thread render-thread waits.
+	bool is_gpu_buffer = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER;
+	bool is_gpu_texture = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE;
+	ID3D12Resource *cached_dest_resource = nullptr;
+	D3D12_RESOURCE_DESC cached_dest_desc = {};
+	uint64_t cached_dest_native_format = 0;
+	bool cached_rd_available = false;
+	bool cached_dest_resolved = false;
+	if (is_gpu_buffer || is_gpu_texture) {
+		RID dest_rid = p_request->get_destination_resource();
+		if (dest_rid.is_valid()) {
+			cached_dest_resolved = ds_win32_query_destination_resource_on_render_thread(
+					is_gpu_buffer, dest_rid, cached_dest_resource, cached_dest_desc, cached_dest_native_format, cached_rd_available);
+		}
+	}
+
 	std::lock_guard<std::mutex> lock(batch_mutex);
 	if (sync_batch_in_flight.load()) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
@@ -1957,24 +1899,6 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 		return false;
 	};
-
-	// Query GPU destination resource info once on the render thread.
-	// This covers single requests and multi-subresource/chunk splits without
-	// issuing redundant cross-thread round-trips for each mip/chunk.
-	bool is_gpu_buffer = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER;
-	bool is_gpu_texture = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE;
-	ID3D12Resource *cached_dest_resource = nullptr;
-	D3D12_RESOURCE_DESC cached_dest_desc = {};
-	uint64_t cached_dest_native_format = 0;
-	bool cached_rd_available = false;
-	bool cached_dest_resolved = false;
-	if (is_gpu_buffer || is_gpu_texture) {
-		RID dest_rid = p_request->get_destination_resource();
-		if (dest_rid.is_valid()) {
-			cached_dest_resolved = ds_win32_query_destination_resource_on_render_thread(
-					is_gpu_buffer, dest_rid, cached_dest_resource, cached_dest_desc, cached_dest_native_format, cached_rd_available);
-		}
-	}
 
 	auto enqueue_one = [&](const Ref<DSRequest> &p_child, uint64_t p_destination_offset) -> bool {
 		String path = p_child->get_file_path();
