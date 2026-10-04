@@ -467,3 +467,31 @@ func test_suite_008_backwards_compatibility_and_autoload(ctx: Object) -> void:
 		ctx.collect_completed_results()
 	ctx.flush_batch_async()
 	assert_true(true, "DSBatchManager per-frame autoload sequence executed without errors")
+
+	# 3. Test SYNC-01 interleaved async submission and synchronous flush_batch()
+	var fix_async: Dictionary = _generate_synthetic_dstex("user://test_sync01_async.dstex", 64, 64, 1)
+	var fix_sync2: Dictionary = _generate_synthetic_dstex("user://test_sync01_sync.dstex", 64, 64, 1)
+	assert_eq(fix_async["error"], OK, "Generated fixture for SYNC-01 async test")
+	assert_eq(fix_sync2["error"], OK, "Generated fixture for SYNC-01 sync test")
+
+	var req_async: DSRequest = _create_request(fix_async)
+	assert_true(ctx.enqueue_request(req_async), "Async request enqueued before sync flush")
+	ctx.flush_batch_async()
+
+	var req_sync_interleaved: DSRequest = _create_request(fix_sync2)
+	assert_true(ctx.enqueue_request(req_sync_interleaved), "Sync request enqueued while async is in-flight")
+	ctx.flush_batch()
+	assert_eq(req_sync_interleaved.get_status(), DSRequest.STATUS_COMPLETED, "SYNC-01: Interleaved synchronous flush_batch() completed immediately without signal stealing")
+	assert_eq(req_sync_interleaved.get_destination_buffer(), fix_sync2["raw_data"], "SYNC-01: Interleaved sync payload matches ground truth")
+
+	# Drain the in-flight async request
+	var max_iterations: int = 200
+	for iter in range(max_iterations):
+		if ctx.has_pending_results() or ctx.is_batch_complete():
+			ctx.collect_completed_results()
+		if req_async.get_status() == DSRequest.STATUS_COMPLETED:
+			break
+		await Engine.get_main_loop().process_frame
+
+	assert_eq(req_async.get_status(), DSRequest.STATUS_COMPLETED, "SYNC-01: In-flight async request completed successfully without interference")
+	assert_eq(req_async.get_destination_buffer(), fix_async["raw_data"], "SYNC-01: Async payload matches ground truth")

@@ -976,7 +976,10 @@ void Win32Backend::completion_thread_func() {
 			}
 		}
 
-		DWORD wait_result = WaitForMultipleObjects(QUEUE_COUNT * BATCH_SLOT_COUNT + 1, wait_handles, FALSE, INFINITE);
+		DWORD wait_result = WaitForMultipleObjects(QUEUE_COUNT * BATCH_SLOT_COUNT + 1, wait_handles, FALSE, 500);
+		if (wait_result == WAIT_TIMEOUT) {
+			continue;
+		}
 		if (wait_result == WAIT_OBJECT_0) {
 			std::lock_guard<std::mutex> lock(batch_mutex);
 			fail_pending_batches("DirectStorage backend shut down before batch completion.");
@@ -2602,28 +2605,23 @@ void Win32Backend::submit_batch() {
 		update_profiler_queue_depth_locked();
 	}
 
-	bool submitted_any = false;
-	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
-		BatchMetadata batch;
-		uint64_t start_time = 0;
-		uint64_t total_compressed_bytes = 0;
-		uint64_t total_uncompressed_bytes = 0;
-		int request_count = 0;
-		DSErrorHandler *err_handler = nullptr;
-		HANDLE batch_event = nullptr;
-		{
-			std::lock_guard<std::mutex> lock(batch_mutex);
+	Vector<int> submitted_queues;
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
 			QueueState &queue = priority_queues[queue_index];
 			BatchSlot &slot = queue.batch_slots[submit_slot_index];
 			if (!queue.queue || !queue.completion_fence || slot.requests.size() == 0) {
 				continue;
 			}
-			start_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
-			err_handler = DSErrorHandler::get_singleton();
+			uint64_t start_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
+			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 			if (err_handler) {
 				err_handler->clear_error();
 			}
-			request_count = count_logical_requests(slot.requests);
+			int request_count = count_logical_requests(slot.requests);
+			uint64_t total_compressed_bytes = 0;
+			uint64_t total_uncompressed_bytes = 0;
 			for (int i = 0; i < slot.requests.size(); i++) {
 				if (slot.requests[i].is_valid()) {
 					uint32_t req_size = slot.requests[i]->get_size();
@@ -2632,6 +2630,7 @@ void Win32Backend::submit_batch() {
 					total_uncompressed_bytes += req_unc_size > 0 ? req_unc_size : req_size;
 				}
 			}
+			BatchMetadata batch;
 			batch.queue_index = queue_index;
 			batch.slot_index = submit_slot_index;
 			batch.start_time = start_time;
@@ -2640,7 +2639,6 @@ void Win32Backend::submit_batch() {
 			batch.request_count = request_count;
 			uint64_t completion_value = queue.completion_fence_value + 1;
 			ResetEvent(slot.event);
-			batch_event = slot.event;
 			queue.completion_fence_value = completion_value;
 			batch.fence_value = completion_value;
 			slot.fence_value = completion_value;
@@ -2651,55 +2649,83 @@ void Win32Backend::submit_batch() {
 			queue.queue->EnqueueSignal(queue.completion_fence, completion_value);
 			queue.queue->EnqueueSetEvent(slot.event);
 			queue.queue->Submit();
-			submitted_any = true;
-			update_profiler_queue_depth_locked();
+			completion_queue.push_back(batch);
+			submitted_queues.push_back(queue_index);
 		}
+		if (submitted_queues.is_empty()) {
+			sync_batch_in_flight.store(false);
+			update_profiler_queue_depth_locked();
+			batch_cv.notify_all();
+			return;
+		}
+		active_batch_slot.store(1 - submit_slot_index);
+		batch_in_flight.store(!completion_queue.empty());
+		update_profiler_queue_depth_locked();
+	}
+	batch_cv.notify_one();
 
-		DWORD wait_result = WaitForSingleObject(batch_event, 5000);
-		{
-			std::lock_guard<std::mutex> lock(batch_mutex);
-			QueueState &queue = priority_queues[queue_index];
-			BatchSlot &slot = queue.batch_slots[submit_slot_index];
-			if (wait_result == WAIT_OBJECT_0) {
-				poll_batch_status(queue, slot.requests, batch.fence_value);
-				uint64_t end_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
-				uint64_t duration_us = end_time > start_time ? end_time - start_time : 1;
-				DSProfiler *profiler = DSProfiler::get_singleton();
-				if (profiler) {
-					ds_profiler_set_batch_metrics(total_compressed_bytes, total_uncompressed_bytes, request_count, -1,
-							(err_handler && err_handler->has_error()) ? 1 : 0);
-					profiler->record_workload(total_compressed_bytes, duration_us);
+	{
+		std::unique_lock<std::mutex> lock(batch_mutex);
+		bool completed = batch_cv.wait_for(lock, std::chrono::milliseconds(5000), [this, submit_slot_index, &submitted_queues]() {
+			for (int i = 0; i < submitted_queues.size(); i++) {
+				int q_idx = submitted_queues[i];
+				const BatchSlot &slot = priority_queues[q_idx].batch_slots[submit_slot_index];
+				if (slot.submitted || !slot.completion_ready) {
+					return false;
 				}
-				release_resource_guards(slot.requests);
-				close_slot_files(slot);
+			}
+			return true;
+		});
+
+		if (completed) {
+			for (int i = 0; i < submitted_queues.size(); i++) {
+				int q_idx = submitted_queues[i];
+				BatchSlot &slot = priority_queues[q_idx].batch_slots[submit_slot_index];
 				slot.requests.clear();
 				slot.fence_value = 0;
 				slot.completed_count = 0;
 				slot.error_code = 0;
 				slot.error_message = String();
-				slot.submitted = false;
 				slot.completion_ready = false;
-			} else {
-				UtilityFunctions::push_error("[DirectStorage] Win32Backend priority queue submit wait timed out or failed.");
-				for (int i = 0; i < slot.requests.size(); i++) {
-					if (slot.requests[i].is_valid()) {
-						slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
-						slot.requests[i]->set_error_message("Batch submission timed out.");
-					}
-				}
-				complete_chunked_requests();
-				completion_queue.push_back(batch);
-				batch_in_flight.store(true);
 			}
-			update_profiler_queue_depth_locked();
-		}
-		batch_cv.notify_all();
-	}
-
-	{
-		std::lock_guard<std::mutex> lock(batch_mutex);
-		if (submitted_any) {
-			active_batch_slot.store(1 - submit_slot_index);
+		} else {
+			UtilityFunctions::push_error("[DirectStorage] Win32Backend priority queue submit wait timed out or failed.");
+			for (std::deque<BatchMetadata>::iterator it = completion_queue.begin(); it != completion_queue.end(); ) {
+				if (it->slot_index == submit_slot_index) {
+					it = completion_queue.erase(it);
+				} else {
+					++it;
+				}
+			}
+			for (int i = 0; i < submitted_queues.size(); i++) {
+				int q_idx = submitted_queues[i];
+				BatchSlot &slot = priority_queues[q_idx].batch_slots[submit_slot_index];
+				if (slot.submitted || !slot.completion_ready) {
+					for (int r = 0; r < slot.requests.size(); r++) {
+						if (slot.requests[r].is_valid()) {
+							slot.requests[r]->set_status(DSRequest::STATUS_FAILED);
+							slot.requests[r]->set_error_message("Batch submission timed out.");
+						}
+					}
+					complete_chunked_requests();
+					release_resource_guards(slot.requests);
+					close_slot_files(slot);
+					slot.requests.clear();
+					slot.fence_value = 0;
+					slot.completed_count = 0;
+					slot.error_code = -1;
+					slot.error_message = "Batch submission timed out.";
+					slot.submitted = false;
+					slot.completion_ready = false;
+				} else {
+					slot.requests.clear();
+					slot.fence_value = 0;
+					slot.completed_count = 0;
+					slot.error_code = 0;
+					slot.error_message = String();
+					slot.completion_ready = false;
+				}
+			}
 		}
 		sync_batch_in_flight.store(false);
 		batch_in_flight.store(!completion_queue.empty());
