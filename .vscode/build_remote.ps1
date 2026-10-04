@@ -1,3 +1,6 @@
+# Don't use verbose unless an error happened and it requires inspecting
+# every build process' output.
+
 param(
     [string]$Target = "editor",
     [switch]$IncludePdb,

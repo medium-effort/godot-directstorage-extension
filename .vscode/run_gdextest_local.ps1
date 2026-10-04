@@ -36,6 +36,10 @@
     extension library + manifest must be added to stage [2/5] here.
     Out of scope for this task.
 #>
+
+# Don't use verbose unless an error happened and it requires inspecting
+# every build process' output.
+
 param(
     [string]$Filter = "",
     [string]$RenderingDriver = "",

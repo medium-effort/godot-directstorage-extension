@@ -186,6 +186,8 @@ public:
 	// On render thread, pumps completions immediately to avoid deadlocks. On worker threads, waits on condition variable.
 	static Ref<Texture2D> await_pending_texture(const String &p_path, uint32_t p_timeout_ms = 3000);
 
+	friend struct PreloaderUnpackTest;
+
 private:
 	struct Tracked {
 		uint64_t tag = 0;

@@ -1054,13 +1054,18 @@ Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vect
 		if (p_meta.is_v2) {
 			const DSTexMipLayout &layout = layouts[i];
 			uint8_t *dst = dst_ptr + dst_offset;
-			if (p_buffers[i].size() == static_cast<int64_t>(layout.source_size) ||
-					p_buffers[i].size() != static_cast<int64_t>(layout.footprint_size) ||
-					layout.row_pitch == 0 || layout.source_row_bytes == 0) {
-				memcpy(dst, src, p_buffers[i].size());
-			} else {
+			if (layout.row_pitch > 0 && layout.source_row_bytes > 0 &&
+					p_buffers[i].size() == static_cast<int64_t>(layout.footprint_size)) {
 				for (uint64_t r = 0; r < layout.row_count; ++r) {
 					memcpy(dst + r * layout.source_row_bytes, src + r * layout.row_pitch, static_cast<size_t>(layout.source_row_bytes));
+				}
+			} else {
+				size_t copy_bytes = std::min(static_cast<size_t>(p_buffers[i].size()), static_cast<size_t>(layout.source_size));
+				if (dst_offset + static_cast<int64_t>(copy_bytes) <= total_natural_size) {
+					memcpy(dst, src, copy_bytes);
+				} else {
+					UtilityFunctions::push_error("DSPreloader: Buffer overrun prevented for '", p_meta.engine_path, "'.");
+					return Ref<Texture2D>();
 				}
 			}
 			dst_offset += (int64_t)layout.source_size;
