@@ -548,3 +548,168 @@ GDEX_TEST_T(subresource, gpu_oversized_per_mip_requests, TAG_INTEGRATION | TAG_S
     }
     free_texture_rid(texture);
 }
+
+GDEX_TEST_T(subresource, gpu_bracket_barrier_multi_texture_async, TAG_INTEGRATION | TAG_SLOW) {
+    // Tests D3D12 bracket barrier transitions:
+    // 1. Multi-texture batching: Transitions 2 distinct hardware textures in one batch.
+    // 2. Async dispatch: Verifies worker-thread -> render-thread barrier dispatch
+    //    via s_barrier_dispatch_ctx and condition variable synchronization in submit_async().
+    // 3. Sequential batch reuse: Submits a second batch immediately to verify
+    //    D3D12BarrierContext command allocator reset and fence monotonicity.
+    // 4. Data integrity: Verifies readback matches written pattern payload for both textures.
+    if (!godot::ClassDB::class_exists("DSRequest") || !godot::ClassDB::class_exists("DSContext")) {
+        GDEX_SKIP("DSRequest/DSContext classes unavailable");
+    }
+    godot::Object *ds_ctx = ds_singleton("DSContext");
+    if (ds_ctx == nullptr) {
+        GDEX_SKIP("DSContext singleton unavailable");
+    }
+    if (!(bool)ds_ctx->call("initialize_ds") || !(bool)ds_ctx->call("is_d3d12_backend")) {
+        GDEX_SKIP("D3D12 DirectStorage backend unavailable");
+    }
+
+    godot::RenderingDevice *rd = godot::RenderingServer::get_singleton()->get_rendering_device();
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable");
+    }
+
+    // 1. Create two distinct textures (Texture A: 64x64, Texture B: 128x128).
+    godot::Ref<godot::RDTextureFormat> fmt_a;
+    fmt_a.instantiate();
+    godot::Ref<godot::RDTextureView> view_a;
+    view_a.instantiate();
+    fmt_a->set("format", (int64_t)godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+    fmt_a->set("width", 64);
+    fmt_a->set("height", 64);
+    fmt_a->set("mipmaps", 1);
+    fmt_a->set("usage_bits", (int64_t)(godot::RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+                                            godot::RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT));
+    godot::RID texture_a = rd->texture_create(fmt_a, view_a);
+    GDEX_ASSERT_TRUE(texture_a.is_valid());
+
+    godot::Ref<godot::RDTextureFormat> fmt_b;
+    fmt_b.instantiate();
+    godot::Ref<godot::RDTextureView> view_b;
+    view_b.instantiate();
+    fmt_b->set("format", (int64_t)godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+    fmt_b->set("width", 128);
+    fmt_b->set("height", 128);
+    fmt_b->set("mipmaps", 1);
+    fmt_b->set("usage_bits", (int64_t)(godot::RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+                                            godot::RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT));
+    godot::RID texture_b = rd->texture_create(fmt_b, view_b);
+    GDEX_ASSERT_TRUE(texture_b.is_valid());
+
+    godot::Variant native_format_a = rd->call("get_driver_resource",
+            (int64_t)godot::RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, texture_a, (int64_t)0);
+    godot::Variant native_format_b = rd->call("get_driver_resource",
+            (int64_t)godot::RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, texture_b, (int64_t)0);
+
+    // 2. Build payload files (.dstex v2 with footprint).
+    godot::PackedByteArray payload_a = make_pattern_footprint(64, 64, godot::Image::FORMAT_RGBA8);
+    const godot::String kPathA = "user://gdex_multi_tex_a.dstex";
+    godot::Ref<godot::DSTex> dstex_a;
+    dstex_a.instantiate();
+    GDEX_ASSERT_EQ((int64_t)dstex_a->write_to_file(kPathA, payload_a, 64, 64, godot::Image::FORMAT_RGBA8, 1, 1), (int64_t)godot::OK);
+    godot::Dictionary header_a = dstex_a->read_header(kPathA);
+    godot::PackedInt64Array offsets_a = header_a.get("mip_offsets", godot::PackedInt64Array());
+    godot::PackedInt32Array sizes_a = header_a.get("mip_sizes", godot::PackedInt32Array());
+    godot::PackedInt32Array unc_a = header_a.get("mip_uncompressed_sizes", godot::PackedInt32Array());
+    GDEX_ASSERT_EQ(offsets_a.size(), 1);
+
+    godot::PackedByteArray payload_b = make_pattern_footprint(128, 128, godot::Image::FORMAT_RGBA8);
+    const godot::String kPathB = "user://gdex_multi_tex_b.dstex";
+    godot::Ref<godot::DSTex> dstex_b;
+    dstex_b.instantiate();
+    GDEX_ASSERT_EQ((int64_t)dstex_b->write_to_file(kPathB, payload_b, 128, 128, godot::Image::FORMAT_RGBA8, 1, 1), (int64_t)godot::OK);
+    godot::Dictionary header_b = dstex_b->read_header(kPathB);
+    godot::PackedInt64Array offsets_b = header_b.get("mip_offsets", godot::PackedInt64Array());
+    godot::PackedInt32Array sizes_b = header_b.get("mip_sizes", godot::PackedInt32Array());
+    godot::PackedInt32Array unc_b = header_b.get("mip_uncompressed_sizes", godot::PackedInt32Array());
+    GDEX_ASSERT_EQ(offsets_b.size(), 1);
+
+    // 3. Batch 1: Enqueue both Texture A and Texture B concurrently in one batch.
+    godot::Variant req_a_holder = godot::ClassDB::instantiate("DSRequest");
+    godot::Object *req_a = req_a_holder;
+    req_a->set("file_path", kPathA);
+    req_a->set("offset", offsets_a[0]);
+    req_a->set("size", sizes_a[0]);
+    req_a->set("uncompressed_size", unc_a[0]);
+    req_a->set("compression_format", (int64_t)godot::DSRequest::COMPRESSION_GDEFLATE);
+    req_a->set("destination_type", (int64_t)godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    req_a->set("destination_resource", texture_a);
+    req_a->set("first_subresource", 0);
+    req_a->set("subresource_count", 1);
+    req_a->set("texture_format", native_format_a);
+
+    godot::Variant req_b_holder = godot::ClassDB::instantiate("DSRequest");
+    godot::Object *req_b = req_b_holder;
+    req_b->set("file_path", kPathB);
+    req_b->set("offset", offsets_b[0]);
+    req_b->set("size", sizes_b[0]);
+    req_b->set("uncompressed_size", unc_b[0]);
+    req_b->set("compression_format", (int64_t)godot::DSRequest::COMPRESSION_GDEFLATE);
+    req_b->set("destination_type", (int64_t)godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    req_b->set("destination_resource", texture_b);
+    req_b->set("first_subresource", 0);
+    req_b->set("subresource_count", 1);
+    req_b->set("texture_format", native_format_b);
+
+    GDEX_ASSERT_TRUE((bool)ds_ctx->call("enqueue_request", req_a_holder));
+    GDEX_ASSERT_TRUE((bool)ds_ctx->call("enqueue_request", req_b_holder));
+
+    // Submit asynchronously (tests worker-thread post-DMA barrier restoration).
+    godot::Error flush_err = (godot::Error)(int64_t)ds_ctx->call("flush_batch_async");
+    GDEX_ASSERT_EQ((int64_t)flush_err, (int64_t)godot::OK);
+
+    GDEX_EXPECT_TRUE((bool)ds_ctx->call("wait_for_completion", 10000));
+    for (int i = 0; i < 100 && !(bool)ds_ctx->call("is_batch_complete"); ++i) {
+        ds_ctx->call("collect_completed_results");
+        godot::OS::get_singleton()->delay_usec(50000);
+    }
+    ds_ctx->call("collect_completed_results");
+    GDEX_EXPECT_TRUE((bool)ds_ctx->call("is_batch_complete"));
+    GDEX_EXPECT_EQ((int64_t)req_a->get("status"), (int64_t)godot::DSRequest::STATUS_COMPLETED);
+    GDEX_EXPECT_EQ((int64_t)req_b->get("status"), (int64_t)godot::DSRequest::STATUS_COMPLETED);
+
+    // 4. Batch 2: Immediate sequential synchronous batch to test allocator reset and fence monotonicity.
+    godot::Variant req_a2_holder = godot::ClassDB::instantiate("DSRequest");
+    godot::Object *req_a2 = req_a2_holder;
+    req_a2->set("file_path", kPathA);
+    req_a2->set("offset", offsets_a[0]);
+    req_a2->set("size", sizes_a[0]);
+    req_a2->set("uncompressed_size", unc_a[0]);
+    req_a2->set("compression_format", (int64_t)godot::DSRequest::COMPRESSION_GDEFLATE);
+    req_a2->set("destination_type", (int64_t)godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    req_a2->set("destination_resource", texture_a);
+    req_a2->set("first_subresource", 0);
+    req_a2->set("subresource_count", 1);
+    req_a2->set("texture_format", native_format_a);
+
+    GDEX_ASSERT_TRUE((bool)ds_ctx->call("enqueue_request", req_a2_holder));
+    ds_ctx->call("flush_batch");
+    GDEX_EXPECT_TRUE((bool)ds_ctx->call("wait_for_completion", 10000));
+    GDEX_EXPECT_EQ((int64_t)req_a2->get("status"), (int64_t)godot::DSRequest::STATUS_COMPLETED);
+
+    // 5. Readback verification for both textures.
+    {
+        godot::PackedByteArray readback_a = rd->texture_get_data(texture_a, 0);
+        godot::PackedByteArray natural_a = godot::DSTex::unpad_footprint_mip(payload_a, 64, 64, godot::Image::FORMAT_RGBA8);
+        GDEX_EXPECT_EQ(readback_a.size(), natural_a.size());
+        if (readback_a.size() == natural_a.size() && natural_a.size() > 0) {
+            GDEX_EXPECT_EQ(memcmp(readback_a.ptr(), natural_a.ptr(), (size_t)natural_a.size()), 0);
+        }
+    }
+    {
+        godot::PackedByteArray readback_b = rd->texture_get_data(texture_b, 0);
+        godot::PackedByteArray natural_b = godot::DSTex::unpad_footprint_mip(payload_b, 128, 128, godot::Image::FORMAT_RGBA8);
+        GDEX_EXPECT_EQ(readback_b.size(), natural_b.size());
+        if (readback_b.size() == natural_b.size() && natural_b.size() > 0) {
+            GDEX_EXPECT_EQ(memcmp(readback_b.ptr(), natural_b.ptr(), (size_t)natural_b.size()), 0);
+        }
+    }
+
+    free_texture_rid(texture_a);
+    free_texture_rid(texture_b);
+}
+

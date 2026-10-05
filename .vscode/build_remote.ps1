@@ -99,6 +99,16 @@ $RemoteDirTar = $RemoteDir.Replace('\', '/')
 $ArtifactRemoteDir = "$RemoteDirTar/project/addons/directstorage_accelerator/bin"
 $ArtifactLocalDir = "./project/addons/directstorage_accelerator/bin"
 
+# 0. Check local disk space on Device A
+$LocalDriveLetter = (Split-Path -Qualifier (Resolve-Path ".").Path).TrimEnd(':')
+if ($LocalDriveLetter) {
+    $localDriveItem = Get-PSDrive $LocalDriveLetter -ErrorAction SilentlyContinue
+    if ($localDriveItem -and ($localDriveItem.Free / 1MB) -lt 500) {
+        $localFreeGb = [math]::Round($localDriveItem.Free / 1GB, 2)
+        Show-BuildFailure -Step "Local Disk Space Check" -Message "Local drive ${LocalDriveLetter}: on Device A has only $localFreeGb GB free space (less than 500 MB). Please free up disk space." -Code 1
+    }
+}
+
 # 1. Probe connectivity (Local Wi-Fi first, fallback to Tailscale)
 Write-VerboseHost "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
 $ActiveHost = $null
@@ -128,6 +138,29 @@ Write-VerboseHost "[2/6] Ensuring build directory exists on Device B..." -Foregr
 ssh $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to ensure remote build directory exists on $ActiveHost." -Code $LASTEXITCODE
+}
+
+# Check remote disk space on Device B before syncing sources
+$RemoteDriveLetter = ($RemoteDirWin -split ':')[0].Trim()
+if ($RemoteDriveLetter.Length -eq 1) {
+    Write-VerboseHost "Checking remote disk space on drive ${RemoteDriveLetter}: on Device B..." -ForegroundColor Cyan
+    $remoteFreeOutput = ssh $ActiveHost "powershell -NoProfile -Command `"[int64]((Get-PSDrive $RemoteDriveLetter).Free / 1MB)`"" 2>$null
+    if ($remoteFreeOutput) {
+        $remoteFreeMb = 0
+        $parsed = [int64]::TryParse($remoteFreeOutput.Trim(), [ref]$remoteFreeMb)
+        if ($parsed -and $remoteFreeMb -gt 0) {
+            $remoteFreeGb = [math]::Round($remoteFreeMb / 1024, 2)
+            if ($remoteFreeMb -lt 1536) {
+                Show-BuildFailure -Step "Step [2/6] Remote Disk Space Check" -Message "Drive ${RemoteDriveLetter}: on Device B ($ActiveHost) has only ${remoteFreeGb} GB free space. SCons compilation requires at least 1.5 GB free space." -Code 1
+            }
+            elseif ($remoteFreeMb -lt 3072) {
+                Write-Host "Warning: Drive ${RemoteDriveLetter}: on Device B ($ActiveHost) has only ${remoteFreeGb} GB free space. Consider cleaning up old build artifacts." -ForegroundColor Yellow
+            }
+            else {
+                Write-VerboseHost "Remote drive ${RemoteDriveLetter}: has ${remoteFreeGb} GB free space." -ForegroundColor Green
+            }
+        }
+    }
 }
 
 # 3. Stream source files via native tar over SSH (using cmd.exe for raw binary piping)

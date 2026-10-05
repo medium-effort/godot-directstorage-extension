@@ -26,6 +26,8 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
+#include <utility>
 
 namespace godot {
 
@@ -629,10 +631,26 @@ bool ds_win32_wait_for_completion(PlatformBackend *p_backend, uint64_t p_fence_v
 }
 #endif
 
+#ifdef _WIN32
+bool Win32Backend::has_in_flight_batches_locked() const {
+	if (!completion_queue.empty()) {
+		return true;
+	}
+	for (const QueueState &queue : priority_queues) {
+		for (const BatchSlot &slot : queue.batch_slots) {
+			if (slot.submitted) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+#endif
+
 bool Win32Backend::is_batch_complete() const {
 #ifdef _WIN32
 	std::lock_guard<std::mutex> lock(batch_mutex);
-	return completion_queue.empty();
+	return !has_in_flight_batches_locked();
 #else
 	return true;
 #endif
@@ -718,28 +736,46 @@ bool Win32Backend::wait_for_completion(uint64_t p_fence_value, uint32_t p_timeou
 
 void Win32Backend::poll_batch_status() {
 #ifdef _WIN32
-	std::lock_guard<std::mutex> lock(batch_mutex);
-	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
-		QueueState &queue = priority_queues[queue_index];
-		for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; slot_index++) {
-			BatchSlot &slot = queue.batch_slots[slot_index];
-			if (!slot.submitted || slot.completion_ready || !queue.completion_fence || slot.fence_value == 0 ||
-					queue.completion_fence->GetCompletedValue() < slot.fence_value) {
-				continue;
-			}
-			for (std::deque<BatchMetadata>::iterator it = completion_queue.begin(); it != completion_queue.end(); ++it) {
-				if (it->queue_index == queue_index && it->slot_index == slot_index) {
-					BatchMetadata batch = *it;
-					completion_queue.erase(it);
-					complete_batch_slot(queue, slot, batch);
-					break;
+	Vector<GPUTargetTransition> post_transitions;
+	std::deque<BatchMetadata> completed_batches;
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
+			QueueState &queue = priority_queues[queue_index];
+			for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; slot_index++) {
+				BatchSlot &slot = queue.batch_slots[slot_index];
+				if (!slot.submitted || slot.completion_ready || !queue.completion_fence || slot.fence_value == 0 ||
+						queue.completion_fence->GetCompletedValue() < slot.fence_value) {
+					continue;
+				}
+				for (std::deque<BatchMetadata>::iterator it = completion_queue.begin(); it != completion_queue.end(); ++it) {
+					if (it->queue_index == queue_index && it->slot_index == slot_index) {
+						completed_batches.push_back(*it);
+						completion_queue.erase(it);
+						for (int t = 0; t < slot.gpu_transitions.size(); t++) {
+							post_transitions.push_back(slot.gpu_transitions[t]);
+						}
+						slot.gpu_transitions.clear();
+						break;
+					}
 				}
 			}
 		}
 	}
-	batch_in_flight.store(!completion_queue.empty());
-	update_profiler_queue_depth_locked();
-	batch_cv.notify_all();
+
+	if (!post_transitions.is_empty()) {
+		execute_transitions(post_transitions, false);
+	}
+
+	if (!completed_batches.empty()) {
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		for (const BatchMetadata &batch : completed_batches) {
+			complete_batch_slot(priority_queues[batch.queue_index], priority_queues[batch.queue_index].batch_slots[batch.slot_index], batch);
+		}
+		batch_in_flight.store(has_in_flight_batches_locked());
+		update_profiler_queue_depth_locked();
+		batch_cv.notify_all();
+	}
 #endif
 }
 
@@ -825,6 +861,7 @@ void Win32Backend::close_slot_files(BatchSlot &p_slot) {
 	}
 	p_slot.files.clear();
 	p_slot.file_cache.clear();
+	p_slot.gpu_transitions.clear();
 }
 
 // Releases every backend-level cached file handle. Caller must hold
@@ -917,6 +954,7 @@ void Win32Backend::completion_thread_func() {
 		int completed_queue_index = completed_handle_index / BATCH_SLOT_COUNT;
 		int completed_slot_index = completed_handle_index % BATCH_SLOT_COUNT;
 		BatchMetadata batch;
+		Vector<GPUTargetTransition> post_transitions;
 		{
 			std::lock_guard<std::mutex> lock(batch_mutex);
 			std::deque<BatchMetadata>::iterator batch_it = completion_queue.end();
@@ -931,8 +969,19 @@ void Win32Backend::completion_thread_func() {
 			}
 			batch = *batch_it;
 			completion_queue.erase(batch_it);
+			BatchSlot &completed_slot = priority_queues[batch.queue_index].batch_slots[batch.slot_index];
+			post_transitions = completed_slot.gpu_transitions;
+			completed_slot.gpu_transitions.clear();
+		}
+
+		if (!post_transitions.is_empty()) {
+			execute_transitions(post_transitions, false);
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(batch_mutex);
 			complete_batch_slot(priority_queues[batch.queue_index], priority_queues[batch.queue_index].batch_slots[batch.slot_index], batch);
-			batch_in_flight.store(!completion_queue.empty());
+			batch_in_flight.store(has_in_flight_batches_locked());
 			update_profiler_queue_depth_locked();
 		}
 
@@ -957,6 +1006,7 @@ void Win32Backend::completion_thread_func() {
 
 #ifdef _WIN32
 static ID3D12Device *s_d3d12_device = nullptr;
+static ID3D12CommandQueue *s_d3d12_command_queue = nullptr;
 static std::mutex s_device_mutex;
 
 // One-shot render-thread acquisition context. The waiting thread allocates
@@ -1015,9 +1065,12 @@ static ID3D12Device *ds_win32_fetch_d3d12_device_direct() {
 		return nullptr;
 	}
 	ID3D12Device *device = reinterpret_cast<ID3D12Device *>(handle);
+	uint64_t queue_handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_COMMAND_QUEUE, RID(), 0);
+	ID3D12CommandQueue *queue = reinterpret_cast<ID3D12CommandQueue *>(queue_handle);
 	{
 		std::lock_guard<std::mutex> lock(s_device_mutex);
 		s_d3d12_device = device;
+		s_d3d12_command_queue = queue;
 	}
 	ds_win32_log_d3d12_adapter_identity(device);
 	return device;
@@ -1084,6 +1137,20 @@ ID3D12Device *ds_win32_get_d3d12_device() {
 		std::lock_guard<std::mutex> lock(s_device_mutex);
 		return s_d3d12_device;
 	}
+}
+
+ID3D12CommandQueue *ds_win32_get_d3d12_command_queue() {
+	{
+		std::lock_guard<std::mutex> lock(s_device_mutex);
+		if (s_d3d12_command_queue) {
+			return s_d3d12_command_queue;
+		}
+	}
+
+	ds_win32_get_d3d12_device();
+
+	std::lock_guard<std::mutex> lock(s_device_mutex);
+	return s_d3d12_command_queue;
 }
 
 // Shared DirectStorage runtime probe state. `is_available()` loads the
@@ -1425,6 +1492,132 @@ bool Win32Backend::is_path_valid(const String &p_path) {
 #endif
 }
 
+#ifdef _WIN32
+bool Win32Backend::init_barrier_context(ID3D12Device *p_device, ID3D12CommandQueue *p_queue) {
+	if (!p_device) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(barrier_context.mutex);
+	HRESULT hr = p_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&barrier_context.cmd_allocator));
+	if (FAILED(hr) || !barrier_context.cmd_allocator) {
+		return false;
+	}
+	hr = p_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, barrier_context.cmd_allocator, nullptr, IID_PPV_ARGS(&barrier_context.cmd_list));
+	if (FAILED(hr) || !barrier_context.cmd_list) {
+		cleanup_barrier_context();
+		return false;
+	}
+	barrier_context.cmd_list->Close();
+
+	hr = p_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&barrier_context.transition_fence));
+	if (FAILED(hr) || !barrier_context.transition_fence) {
+		cleanup_barrier_context();
+		return false;
+	}
+	barrier_context.fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+	if (!barrier_context.fence_event) {
+		cleanup_barrier_context();
+		return false;
+	}
+	barrier_context.fence_value = 0;
+	barrier_context.command_queue = p_queue ? p_queue : ds_win32_get_d3d12_command_queue();
+	return true;
+}
+
+void Win32Backend::cleanup_barrier_context() {
+	std::lock_guard<std::mutex> lock(barrier_context.mutex);
+	if (barrier_context.transition_fence) {
+		if (barrier_context.fence_value > 0 && barrier_context.fence_event) {
+			if (barrier_context.transition_fence->GetCompletedValue() < barrier_context.fence_value) {
+				barrier_context.transition_fence->SetEventOnCompletion(barrier_context.fence_value, barrier_context.fence_event);
+				WaitForSingleObject(barrier_context.fence_event, 1000);
+			}
+		}
+		barrier_context.transition_fence->Release();
+		barrier_context.transition_fence = nullptr;
+	}
+	if (barrier_context.fence_event) {
+		CloseHandle(barrier_context.fence_event);
+		barrier_context.fence_event = nullptr;
+	}
+	if (barrier_context.cmd_list) {
+		barrier_context.cmd_list->Release();
+		barrier_context.cmd_list = nullptr;
+	}
+	if (barrier_context.cmd_allocator) {
+		barrier_context.cmd_allocator->Release();
+		barrier_context.cmd_allocator = nullptr;
+	}
+	barrier_context.command_queue = nullptr;
+	barrier_context.fence_value = 0;
+}
+
+bool Win32Backend::execute_transitions(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common) {
+	if (p_transitions.is_empty()) {
+		return true;
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+		return false;
+	}
+
+	std::lock_guard<std::mutex> lock(barrier_context.mutex);
+	if (!barrier_context.cmd_allocator || !barrier_context.cmd_list || !barrier_context.transition_fence) {
+		return false;
+	}
+
+	ID3D12CommandQueue *godot_queue = barrier_context.command_queue ? barrier_context.command_queue : ds_win32_get_d3d12_command_queue();
+	if (!godot_queue) {
+		return false;
+	}
+	barrier_context.command_queue = godot_queue;
+
+	HRESULT hr = barrier_context.cmd_allocator->Reset();
+	if (FAILED(hr)) return false;
+	hr = barrier_context.cmd_list->Reset(barrier_context.cmd_allocator, nullptr);
+	if (FAILED(hr)) return false;
+
+	std::set<std::pair<ID3D12Resource *, uint32_t>> transitioned_subresources;
+	for (int i = 0; i < p_transitions.size(); i++) {
+		const GPUTargetTransition &t = p_transitions[i];
+		if (!t.resource) continue;
+		D3D12_RESOURCE_STATES state_before = p_to_common ? t.original_state : D3D12_RESOURCE_STATE_COMMON;
+		D3D12_RESOURCE_STATES state_after = p_to_common ? D3D12_RESOURCE_STATE_COMMON : t.original_state;
+		if (state_before == state_after) continue;
+
+		for (uint32_t s = 0; s < t.subresource_count; s++) {
+			uint32_t sub_idx = t.first_subresource + s;
+			if (!transitioned_subresources.insert(std::make_pair(t.resource, sub_idx)).second) {
+				continue;
+			}
+			D3D12_RESOURCE_BARRIER b = {};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+			b.Transition.pResource = t.resource;
+			b.Transition.Subresource = sub_idx;
+			b.Transition.StateBefore = state_before;
+			b.Transition.StateAfter = state_after;
+			barrier_context.cmd_list->ResourceBarrier(1, &b);
+		}
+	}
+	hr = barrier_context.cmd_list->Close();
+	if (FAILED(hr)) return false;
+
+	uint64_t target_fence = ++barrier_context.fence_value;
+	ID3D12CommandList *lists[] = { barrier_context.cmd_list };
+	godot_queue->ExecuteCommandLists(1, lists);
+	godot_queue->Signal(barrier_context.transition_fence, target_fence);
+
+	if (barrier_context.transition_fence->GetCompletedValue() < target_fence) {
+		hr = barrier_context.transition_fence->SetEventOnCompletion(target_fence, barrier_context.fence_event);
+		if (SUCCEEDED(hr)) {
+			WaitForSingleObject(barrier_context.fence_event, 500);
+		}
+	}
+	return barrier_context.transition_fence->GetCompletedValue() >= target_fence;
+}
+#endif
+
 bool Win32Backend::initialize(const String &p_path) {
 #ifdef _WIN32
 	s_backend_instance = this;
@@ -1569,6 +1762,7 @@ bool Win32Backend::initialize(const String &p_path) {
 		queues_ready = queues_ready && queue.queue != nullptr && queue.completion_event != nullptr && queue.batch_slots[0].event != nullptr && queue.batch_slots[1].event != nullptr && queue.completion_fence != nullptr;
 	}
 	if (queues_ready) {
+		init_barrier_context(ds_win32_get_d3d12_device(), ds_win32_get_d3d12_command_queue());
 		// Eager archive pre-open: move the first OpenFile + BypassIO
 		// negotiation for the exported texture archive off the first
 		// prewarm frame and into init (autoload _ready, behind the menu).
@@ -1716,6 +1910,8 @@ void Win32Backend::shutdown() {
 		queue.completed_fence_value = 0;
 	}
 
+	cleanup_barrier_context();
+
 	// Completion thread is joined above, so no concurrent enqueue can run;
 	// take the lock for consistency with the enqueue path.
 	{
@@ -1747,6 +1943,7 @@ void Win32Backend::shutdown() {
 	{
 		std::lock_guard<std::mutex> lock(s_device_mutex);
 		s_d3d12_device = nullptr;
+		s_d3d12_command_queue = nullptr;
 	}
 	active_batch_slot.store(0);
 	if (s_backend_instance == this) {
@@ -2116,6 +2313,14 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		resource_guard->AddRef();
 		s_resource_guards[p_child.ptr()] = resource_guard;
 	}
+	if (gpu_texture_destination && destination_texture) {
+		GPUTargetTransition transition;
+		transition.resource = destination_texture;
+		transition.original_state = D3D12_RESOURCE_STATE_COPY_DEST;
+		transition.first_subresource = p_child->get_first_subresource();
+		transition.subresource_count = p_child->get_subresource_count();
+		slot.gpu_transitions.push_back(transition);
+	}
 	queue.queue->EnqueueRequest(&request);
 	// slot.files push happens once at open time in the cache-miss branch
 	// above; cache hits reuse the already-tracked handle.
@@ -2326,19 +2531,33 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 
 void Win32Backend::submit_async() {
 #ifdef _WIN32
-	std::lock_guard<std::mutex> lock(batch_mutex);
 	if (sync_batch_in_flight.load()) {
 		return;
 	}
 	int submit_slot_index = active_batch_slot.load();
-	for (const QueueState &queue : priority_queues) {
-		const BatchSlot &slot = queue.batch_slots[submit_slot_index];
-		if (slot.submitted || slot.completion_ready) {
-			return;
+	Vector<GPUTargetTransition> pre_transitions;
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		for (const QueueState &queue : priority_queues) {
+			const BatchSlot &slot = queue.batch_slots[submit_slot_index];
+			if (slot.submitted || slot.completion_ready) {
+				return;
+			}
+			for (int t = 0; t < slot.gpu_transitions.size(); t++) {
+				pre_transitions.push_back(slot.gpu_transitions[t]);
+			}
+		}
+	}
+
+	if (!pre_transitions.is_empty()) {
+		if (!execute_transitions(pre_transitions, true)) {
+			UtilityFunctions::push_error("[DirectStorage] Failed to transition GPU destination textures to D3D12_RESOURCE_STATE_COMMON.");
 		}
 	}
 	std::deque<BatchMetadata> submitted_batches;
-	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
 		QueueState &queue = priority_queues[queue_index];
 		BatchSlot &slot = queue.batch_slots[submit_slot_index];
 		if (!queue.queue || slot.requests.size() == 0) {
@@ -2412,9 +2631,10 @@ void Win32Backend::submit_async() {
 	if (!submitted_batches.empty()) {
 		active_batch_slot.store(1 - submit_slot_index);
 	}
-	batch_in_flight.store(!completion_queue.empty());
+	batch_in_flight.store(has_in_flight_batches_locked());
 	update_profiler_queue_depth_locked();
 	batch_cv.notify_one();
+	}
 #endif
 }
 
@@ -2466,7 +2686,7 @@ bool Win32Backend::collect_completed_batch(uint64_t &r_fence_value, int &r_compl
 			slot.error_code = 0;
 			slot.error_message = String();
 			slot.completion_ready = false;
-			batch_in_flight.store(!completion_queue.empty());
+			batch_in_flight.store(has_in_flight_batches_locked());
 			update_profiler_queue_depth_locked();
 			batch_cv.notify_all();
 			return true;
@@ -2482,7 +2702,7 @@ void Win32Backend::submit_batch() {
 	{
 		std::unique_lock<std::mutex> lock(batch_mutex);
 		if (!batch_cv.wait_for(lock, std::chrono::milliseconds(5000), [this]() {
-				return completion_queue.empty() && !sync_batch_in_flight.load();
+				return !has_in_flight_batches_locked() && !sync_batch_in_flight.load();
 			})) {
 			UtilityFunctions::push_error("[DirectStorage] Timed out waiting for the previous batch to complete.");
 			return;
@@ -2527,6 +2747,22 @@ void Win32Backend::submit_batch() {
 			return;
 		}
 		update_profiler_queue_depth_locked();
+	}
+
+	Vector<GPUTargetTransition> pre_transitions;
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
+			const BatchSlot &slot = priority_queues[queue_index].batch_slots[submit_slot_index];
+			for (int t = 0; t < slot.gpu_transitions.size(); t++) {
+				pre_transitions.push_back(slot.gpu_transitions[t]);
+			}
+		}
+	}
+	if (!pre_transitions.is_empty()) {
+		if (!execute_transitions(pre_transitions, true)) {
+			UtilityFunctions::push_error("[DirectStorage] Failed to transition GPU destination textures to D3D12_RESOURCE_STATE_COMMON.");
+		}
 	}
 
 	Vector<int> submitted_queues;
@@ -2606,6 +2842,7 @@ void Win32Backend::submit_batch() {
 				int q_idx = submitted_queues[i];
 				BatchSlot &slot = priority_queues[q_idx].batch_slots[submit_slot_index];
 				slot.requests.clear();
+				slot.gpu_transitions.clear();
 				slot.fence_value = 0;
 				slot.completed_count = 0;
 				slot.error_code = 0;
@@ -2635,6 +2872,7 @@ void Win32Backend::submit_batch() {
 					release_resource_guards(slot.requests);
 					close_slot_files(slot);
 					slot.requests.clear();
+					slot.gpu_transitions.clear();
 					slot.fence_value = 0;
 					slot.completed_count = 0;
 					slot.error_code = -1;
@@ -2643,6 +2881,7 @@ void Win32Backend::submit_batch() {
 					slot.completion_ready = false;
 				} else {
 					slot.requests.clear();
+					slot.gpu_transitions.clear();
 					slot.fence_value = 0;
 					slot.completed_count = 0;
 					slot.error_code = 0;
@@ -2652,7 +2891,7 @@ void Win32Backend::submit_batch() {
 			}
 		}
 		sync_batch_in_flight.store(false);
-		batch_in_flight.store(!completion_queue.empty());
+		batch_in_flight.store(has_in_flight_batches_locked());
 		update_profiler_queue_depth_locked();
 	}
 	batch_cv.notify_all();

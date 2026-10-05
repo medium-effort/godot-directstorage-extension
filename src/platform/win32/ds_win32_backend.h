@@ -22,9 +22,29 @@ namespace godot {
 
 #ifdef _WIN32
 ID3D12Device *ds_win32_get_d3d12_device();
+ID3D12CommandQueue *ds_win32_get_d3d12_command_queue();
 #endif
 
 class Win32Backend : public PlatformBackend {
+public:
+#ifdef _WIN32
+	struct GPUTargetTransition {
+		ID3D12Resource *resource = nullptr;
+		D3D12_RESOURCE_STATES original_state = D3D12_RESOURCE_STATE_COPY_DEST;
+		uint32_t first_subresource = 0;
+		uint32_t subresource_count = 1;
+	};
+	struct D3D12BarrierContext {
+		ID3D12CommandAllocator *cmd_allocator = nullptr;
+		ID3D12GraphicsCommandList *cmd_list = nullptr;
+		ID3D12Fence *transition_fence = nullptr;
+		uint64_t fence_value = 0;
+		HANDLE fence_event = nullptr;
+		ID3D12CommandQueue *command_queue = nullptr;
+		std::mutex mutex;
+	};
+#endif
+
 private:
 #ifdef _WIN32
 	static constexpr int QUEUE_COUNT = 3;
@@ -33,6 +53,7 @@ private:
 		HANDLE event = nullptr;
 		Vector<Ref<DSRequest>> requests;
 		Vector<IDStorageFile *> files;
+		Vector<GPUTargetTransition> gpu_transitions;
 		// Open-file cache: normalized path -> slot-owned handle. Exported
 		// builds funnel ~256 requests per flush through one archive, so
 		// opening per request costs hundreds of kernel opens on the calling
@@ -113,11 +134,17 @@ private:
 	void completion_thread_func();
 	void poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value);
 	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch);
+	bool has_in_flight_batches_locked() const;
 	void update_profiler_queue_depth_locked();
 	static void close_slot_files(BatchSlot &p_slot);
 	void clear_persistent_files();
 	bool cache_file_handle(const std::wstring &p_wpath, IDStorageFile *p_file);
 	static int priority_to_queue_index(DSRequest::DSPriority p_priority);
+
+	D3D12BarrierContext barrier_context;
+	bool init_barrier_context(ID3D12Device *p_device, ID3D12CommandQueue *p_queue = nullptr);
+	void cleanup_barrier_context();
+	bool execute_transitions(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common);
 #endif
 
 public:

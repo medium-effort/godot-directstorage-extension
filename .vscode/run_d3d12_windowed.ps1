@@ -120,6 +120,7 @@ Write-VerboseHost "Using test library: $($TestDll.FullName)" -ForegroundColor Da
 foreach ($f in @($JsonRel, $LogOut, $LogErr)) {
     if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
 }
+Get-ChildItem -Path $FixtureBin -Filter "~*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
 $ArgList = @(
     "--editor",
