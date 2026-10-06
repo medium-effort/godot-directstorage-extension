@@ -82,6 +82,7 @@ double DSProfilerResult::get_physical_throughput_mibps() const {
 }
 
 DSProfiler::DSProfiler() {
+	result_history.reserve(MAX_RESULT_HISTORY);
 	if (singleton == nullptr) {
 		singleton = this;
 		register_performance_monitors();
@@ -107,17 +108,56 @@ void DSProfiler::record_workload(uint64_t p_bytes, uint64_t p_duration_us) {
 		metrics.error_state = 0;
 	}
 
+	// Build plain sample only: no Godot allocation on the calling (worker) thread.
+	ProfilerSample sample;
+	sample.compressed_bytes_read = static_cast<int64_t>(metrics.compressed_bytes);
+	sample.uncompressed_bytes_produced = static_cast<int64_t>(metrics.uncompressed_bytes);
+	sample.request_count = metrics.request_count;
+	sample.physical_read_duration_usec = static_cast<int64_t>(p_duration_us);
+	sample.decompression_duration_usec = metrics.decompression_duration_us;
+	sample.logical_throughput_bytes_per_sec = p_duration_us > 0 ? static_cast<double>(metrics.uncompressed_bytes) * 1000000.0 / static_cast<double>(p_duration_us) : 0.0;
+	sample.physical_throughput_bytes_per_sec = p_duration_us > 0 ? static_cast<double>(metrics.compressed_bytes) * 1000000.0 / static_cast<double>(p_duration_us) : 0.0;
+	sample.error_state = metrics.error_state;
+
+	std::lock_guard<std::mutex> lock(profiler_mutex);
+	_push_sample_locked(sample);
+}
+
+void DSProfiler::_push_sample_locked(const ProfilerSample &p_sample) {
+	last_sample = p_sample;
+	has_last_sample = true;
+	if (result_history.size() < MAX_RESULT_HISTORY) {
+		result_history.push_back(p_sample);
+	} else {
+		// Efficient O(1) ring buffer: overwrite oldest entry and advance head.
+		// No reallocation or O(N) shift; size remains capped at MAX_RESULT_HISTORY.
+		result_history[history_head] = p_sample;
+		history_head = (history_head + 1) % MAX_RESULT_HISTORY;
+	}
+	last_bytes = p_sample.compressed_bytes_read > 0 ? static_cast<uint64_t>(p_sample.compressed_bytes_read) : 0;
+	last_duration_us = p_sample.physical_read_duration_usec > 0 ? static_cast<uint64_t>(p_sample.physical_read_duration_usec) : 0;
+	last_throughput_mbps = p_sample.logical_throughput_bytes_per_sec / 1000000.0;
+	const int request_count = p_sample.request_count > 0 ? p_sample.request_count : 0;
+	last_requests_per_second = last_duration_us > 0 ? static_cast<double>(request_count) * 1000000.0 / static_cast<double>(last_duration_us) : 0.0;
+	last_average_latency_ms = request_count > 0 ? static_cast<double>(last_duration_us) / static_cast<double>(request_count) / 1000.0 : 0.0;
+	// last_queue_depth is intentionally NOT reset here; it is maintained via
+	// set_queue_depth() so backend queues can feed pending depth and the
+	// Performance monitor returns the last fed value thread-safely.
+	last_gpu_decompression_active = p_sample.decompression_duration_usec >= 0;
+}
+
+Ref<DSProfilerResult> DSProfiler::_make_result(const ProfilerSample &p_sample) {
 	Ref<DSProfilerResult> result;
 	result.instantiate();
-	result->compressed_bytes_read = static_cast<int64_t>(metrics.compressed_bytes);
-	result->uncompressed_bytes_produced = static_cast<int64_t>(metrics.uncompressed_bytes);
-	result->request_count = metrics.request_count;
-	result->physical_read_duration_usec = static_cast<int64_t>(p_duration_us);
-	result->decompression_duration_usec = metrics.decompression_duration_us;
-	result->logical_throughput_bytes_per_sec = p_duration_us > 0 ? static_cast<double>(metrics.uncompressed_bytes) * 1000000.0 / static_cast<double>(p_duration_us) : 0.0;
-	result->physical_throughput_bytes_per_sec = p_duration_us > 0 ? static_cast<double>(metrics.compressed_bytes) * 1000000.0 / static_cast<double>(p_duration_us) : 0.0;
-	result->error_state = metrics.error_state;
-	record_result(result);
+	result->compressed_bytes_read = p_sample.compressed_bytes_read;
+	result->uncompressed_bytes_produced = p_sample.uncompressed_bytes_produced;
+	result->request_count = p_sample.request_count;
+	result->physical_read_duration_usec = p_sample.physical_read_duration_usec;
+	result->decompression_duration_usec = p_sample.decompression_duration_usec;
+	result->logical_throughput_bytes_per_sec = p_sample.logical_throughput_bytes_per_sec;
+	result->physical_throughput_bytes_per_sec = p_sample.physical_throughput_bytes_per_sec;
+	result->error_state = p_sample.error_state;
+	return result;
 }
 
 void DSProfiler::record_result(const Ref<DSProfilerResult> &p_result) {
@@ -125,44 +165,57 @@ void DSProfiler::record_result(const Ref<DSProfilerResult> &p_result) {
 		return;
 	}
 
+	// Copy out plain values first (caller owns the Ref); store only the sample.
+	ProfilerSample sample;
+	sample.compressed_bytes_read = p_result->compressed_bytes_read;
+	sample.uncompressed_bytes_produced = p_result->uncompressed_bytes_produced;
+	sample.request_count = p_result->request_count;
+	sample.physical_read_duration_usec = p_result->physical_read_duration_usec;
+	sample.decompression_duration_usec = p_result->decompression_duration_usec;
+	sample.logical_throughput_bytes_per_sec = p_result->logical_throughput_bytes_per_sec;
+	sample.physical_throughput_bytes_per_sec = p_result->physical_throughput_bytes_per_sec;
+	sample.error_state = p_result->error_state;
+
 	std::lock_guard<std::mutex> lock(profiler_mutex);
-	last_result = p_result;
-	if ((int64_t)result_history.size() < (int64_t)MAX_RESULT_HISTORY) {
-		result_history.push_back(p_result);
-	} else {
-		// Efficient O(1) ring buffer: overwrite oldest entry and advance head.
-		// No reallocation or O(N) shift; size remains capped at MAX_RESULT_HISTORY.
-		result_history[history_head] = p_result;
-		history_head = (history_head + 1) % MAX_RESULT_HISTORY;
-	}
-	last_bytes = p_result->compressed_bytes_read > 0 ? static_cast<uint64_t>(p_result->compressed_bytes_read) : 0;
-	last_duration_us = p_result->physical_read_duration_usec > 0 ? static_cast<uint64_t>(p_result->physical_read_duration_usec) : 0;
-	last_throughput_mbps = p_result->get_logical_throughput_mbps();
-	const int request_count = p_result->request_count > 0 ? p_result->request_count : 0;
-	last_requests_per_second = last_duration_us > 0 ? static_cast<double>(request_count) * 1000000.0 / static_cast<double>(last_duration_us) : 0.0;
-	last_average_latency_ms = request_count > 0 ? static_cast<double>(last_duration_us) / static_cast<double>(request_count) / 1000.0 : 0.0;
-	// last_queue_depth is intentionally NOT reset here; it is maintained via
-	// set_queue_depth() so backend queues can feed pending depth and the
-	// Performance monitor returns the last fed value thread-safely.
-	last_gpu_decompression_active = p_result->decompression_duration_usec >= 0;
+	_push_sample_locked(sample);
 }
 
 Ref<DSProfilerResult> DSProfiler::get_last_result() const {
-	std::lock_guard<std::mutex> lock(profiler_mutex);
-	return last_result;
+	ProfilerSample sample;
+	bool valid = false;
+	{
+		std::lock_guard<std::mutex> lock(profiler_mutex);
+		sample = last_sample;
+		valid = has_last_sample;
+	}
+	if (!valid) {
+		return Ref<DSProfilerResult>();
+	}
+	return _make_result(sample);
 }
 
 Array DSProfiler::get_result_history() const {
-	std::lock_guard<std::mutex> lock(profiler_mutex);
-	if ((int64_t)result_history.size() < (int64_t)MAX_RESULT_HISTORY || history_head == 0) {
-		return result_history;
+	std::vector<ProfilerSample> snapshot;
+	{
+		std::lock_guard<std::mutex> lock(profiler_mutex);
+		const size_t count = result_history.size();
+		snapshot.reserve(count);
+		if (count < MAX_RESULT_HISTORY || history_head == 0) {
+			snapshot = result_history;
+		} else {
+			// Reorder ring buffer into chronological order (oldest -> newest).
+			for (size_t i = 0; i < MAX_RESULT_HISTORY; ++i) {
+				size_t src_idx = (history_head + i) % MAX_RESULT_HISTORY;
+				snapshot.push_back(result_history[src_idx]);
+			}
+		}
 	}
-	// Reorder ring buffer into chronological order (oldest -> newest) for callers.
+	// Build Godot objects outside the lock: zero cross-thread aliasing,
+	// no engine allocation while holding profiler_mutex.
 	Array ordered;
-	ordered.resize((int64_t)MAX_RESULT_HISTORY);
-	for (size_t i = 0; i < MAX_RESULT_HISTORY; ++i) {
-		size_t src_idx = (history_head + i) % MAX_RESULT_HISTORY;
-		ordered[(int64_t)i] = result_history[(int64_t)src_idx];
+	ordered.resize(static_cast<int64_t>(snapshot.size()));
+	for (size_t i = 0; i < snapshot.size(); ++i) {
+		ordered[static_cast<int64_t>(i)] = _make_result(snapshot[i]);
 	}
 	return ordered;
 }

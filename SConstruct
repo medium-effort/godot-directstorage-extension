@@ -2,6 +2,47 @@
 import os
 import sys
 
+import SCons.Script
+
+# Guard: refuse local builds when PREVENT_BUILD_ON_THIS_DEVICE=1 is set.
+# This must run before the godot-cpp SConscript (expensive) so the failure
+# is immediate. Sync-only / introspection invocations are allowed through.
+def _prevent_build_flag_set():
+    val = os.environ.get("PREVENT_BUILD_ON_THIS_DEVICE", "").strip().lower()
+    if val:
+        return val in ("1", "true", "yes", "y", "on")
+    # Fall back to .env so the flag also applies when set there but not
+    # exported into the environment (mirrors load_env_file() below, which
+    # runs later in this file).
+    try:
+        if os.path.isfile(".env"):
+            with open(".env", "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        if k.strip() == "PREVENT_BUILD_ON_THIS_DEVICE":
+                            return v.strip().strip('"').strip("'").lower() in ("1", "true", "yes", "y", "on")
+    except Exception:
+        pass
+    return False
+
+
+if _prevent_build_flag_set():
+    _sync_only = {"sync", "sync-all", "sync-addon", "sync-test", "sync-copyable", "sync-tps"}
+    _cmd_targets = set(SCons.Script.COMMAND_LINE_TARGETS)
+    _non_build = (
+        SCons.Script.GetOption("no_exec")
+        or SCons.Script.GetOption("clean")
+        or SCons.Script.GetOption("help")
+        or SCons.Script.GetOption("question")
+        or bool(_cmd_targets and _cmd_targets <= _sync_only)
+    )
+    if not _non_build:
+        print("[SCons] ERROR: Local builds are disabled on this device (PREVENT_BUILD_ON_THIS_DEVICE=1).")
+        print("[SCons] Use the remote build script instead: .vscode/build_remote.ps1")
+        Exit(1)
+
 EnsureSConsVersion(4, 0)
 EnsurePythonVersion(3, 8)
 

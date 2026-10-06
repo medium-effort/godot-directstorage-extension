@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <vector>
 
 namespace godot {
 
@@ -51,8 +52,20 @@ private:
 	static DSProfiler *singleton;
 	mutable std::mutex profiler_mutex;
 	static constexpr size_t MAX_RESULT_HISTORY = 1024;
-	Ref<DSProfilerResult> last_result;
-	Array result_history;
+	// Plain-data sample: no Godot types, safe to write from any thread.
+	struct ProfilerSample {
+		int64_t compressed_bytes_read = 0;
+		int64_t uncompressed_bytes_produced = 0;
+		int request_count = 0;
+		int64_t physical_read_duration_usec = 0;
+		int64_t decompression_duration_usec = -1;
+		double logical_throughput_bytes_per_sec = 0.0;
+		double physical_throughput_bytes_per_sec = 0.0;
+		int error_state = 0;
+	};
+	ProfilerSample last_sample;
+	bool has_last_sample = false;
+	std::vector<ProfilerSample> result_history;
 	size_t history_head = 0;
 	double last_throughput_mbps = 0.0;
 	double last_requests_per_second = 0.0;
@@ -62,6 +75,8 @@ private:
 	uint64_t last_bytes = 0;
 	uint64_t last_duration_us = 0;
 	bool performance_monitors_registered = false;
+	void _push_sample_locked(const ProfilerSample &p_sample);
+	static Ref<DSProfilerResult> _make_result(const ProfilerSample &p_sample);
 
 protected:
 	static void _bind_methods();
