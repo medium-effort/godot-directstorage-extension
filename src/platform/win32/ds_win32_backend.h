@@ -23,6 +23,7 @@ namespace godot {
 #ifdef _WIN32
 ID3D12Device *ds_win32_get_d3d12_device();
 ID3D12CommandQueue *ds_win32_get_d3d12_command_queue();
+void ds_win32_invalidate_d3d12_device();
 #endif
 
 class Win32Backend : public PlatformBackend {

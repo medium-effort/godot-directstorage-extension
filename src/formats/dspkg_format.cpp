@@ -13,6 +13,9 @@ constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE_V3 = 44;
 constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE_LEGACY = 50;
 constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE_V3 = 54;
 constexpr uint64_t DSPKG_MAX_PAYLOAD_SIZE = static_cast<uint64_t>(INT32_MAX);
+// FMT-01: per-entry sane cap matching DSTEX_MAX_TOTAL_BYTES (512 MiB) so a
+// hostile archive entry cannot force a huge transient allocation.
+constexpr uint64_t DSPKG_MAX_ENTRY_BYTES = 512ULL * 1024ULL * 1024ULL;
 constexpr uint16_t DSPKG_VERSION_LEGACY = 1;
 constexpr uint16_t DSPKG_VERSION_GPU_METADATA = 2;
 constexpr uint16_t DSPKG_VERSION_ENTRY_FLAGS = 3;
@@ -54,7 +57,8 @@ bool get_payload_range(const DSPkgHeader &p_header, const DSPkgEntry &p_entry, u
 
 bool payload_sizes_are_supported(const DSPkgEntry &p_entry) {
 	return p_entry.compressed_size > 0 && p_entry.original_size > 0 &&
-			p_entry.compressed_size <= DSPKG_MAX_PAYLOAD_SIZE && p_entry.original_size <= DSPKG_MAX_PAYLOAD_SIZE;
+			p_entry.compressed_size <= DSPKG_MAX_PAYLOAD_SIZE && p_entry.original_size <= DSPKG_MAX_PAYLOAD_SIZE &&
+			p_entry.compressed_size <= DSPKG_MAX_ENTRY_BYTES && p_entry.original_size <= DSPKG_MAX_ENTRY_BYTES;
 }
 
 bool metadata_arrays_are_valid(const Dictionary &p_metadata, uint32_t p_mip_count) {

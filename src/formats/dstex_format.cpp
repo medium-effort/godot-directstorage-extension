@@ -602,6 +602,10 @@ Dictionary DSTex::read_header(const String &p_path) {
 		UtilityFunctions::push_error("DSTex: Invalid mip count (must be 1..16).");
 		return Dictionary();
 	}
+	if (!dstex_sizes_are_sane(header.width, header.height, header.original_size, header.compressed_size)) {
+		UtilityFunctions::push_error("DSTex: Header sizes exceed sane texture bounds (FMT-01).");
+		return Dictionary();
+	}
 	{
 		uint64_t entry_size = (header.version == 1) ? sizeof(DSTexMipEntry) : sizeof(DSTexMipEntryV2);
 		uint64_t file_len = file->get_length();
@@ -723,6 +727,10 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	}
 	if (header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT) {
 		UtilityFunctions::push_error("DSTex: Invalid mip count (must be 1..16).");
+		return Dictionary();
+	}
+	if (!dstex_sizes_are_sane(header.width, header.height, header.original_size, header.compressed_size)) {
+		UtilityFunctions::push_error("DSTex: Header sizes exceed sane texture bounds (FMT-01).");
 		return Dictionary();
 	}
 	{

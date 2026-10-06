@@ -49,12 +49,38 @@ struct DSTexMipEntryV2 {
 
 static_assert(sizeof(DSTexMipEntryV2) == 24, "DSTexMipEntryV2 must be 24 bytes");
 
-// Defensive parsing limits (C8 remediation):
+// Defensive parsing limits (C8 remediation + FMT-01 hardening):
 // - Maximum mip count is 16 (covers up to 64k texture resolution, prevents unbounded allocations).
 // - Mip table must satisfy: sizeof(DSTexHeader) + mip_count * entry_size <= file_length.
 // - For v1, data_offset + compressed_size <= file_length.
 // - For v2, each mip_offsets[i] + mip_sizes[i] <= file_length.
+// - FMT-01: dimensions and total bytes are additionally capped so a hostile
+//   header claiming 2 GiB cannot force a huge transient allocation. The byte
+//   cap matches MAX_PREWARM_REQUEST_BYTES (512 MiB) in ds_preloader.cpp.
 static constexpr uint32_t DSTEX_MAX_MIP_COUNT = 16;
+static constexpr uint32_t DSTEX_MAX_DIMENSION = 16384;
+static constexpr uint64_t DSTEX_MAX_TOTAL_BYTES = 512ULL * 1024ULL * 1024ULL;
+
+// Generous upper bound: 16 bytes/px (RGBA32F) x 2 for mips + footprint padding.
+inline bool dstex_sizes_are_sane(uint32_t p_width, uint32_t p_height, uint64_t p_original, uint64_t p_compressed) {
+	if (p_width == 0 || p_height == 0 || p_width > DSTEX_MAX_DIMENSION || p_height > DSTEX_MAX_DIMENSION) {
+		return false;
+	}
+	if (p_original == 0 || p_original > DSTEX_MAX_TOTAL_BYTES) {
+		return false;
+	}
+	if (p_compressed == 0 || p_compressed > DSTEX_MAX_TOTAL_BYTES) {
+		return false;
+	}
+	uint64_t px = static_cast<uint64_t>(p_width) * static_cast<uint64_t>(p_height);
+	if (px > UINT64_MAX / 32ULL) {
+		return false;
+	}
+	if (p_original > px * 32ULL) {
+		return false;
+	}
+	return true;
+}
 
 struct DSTexMipLayout {
 	uint64_t source_row_bytes = 0;

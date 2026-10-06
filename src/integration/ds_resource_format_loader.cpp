@@ -231,6 +231,10 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		UtilityFunctions::push_error("DSResourceFormatLoader: Invalid 2D texture dimensions or mip count for '", p_cache_key, "' (width=", p_width, ", height=", p_height, ", mips=", p_mip_count, ").");
 		return Variant();
 	}
+	if (!dstex_sizes_are_sane(p_width, p_height, p_original_size, p_compressed_size)) {
+		UtilityFunctions::push_error("DSResourceFormatLoader: Payload exceeds sane texture bounds for '", p_cache_key, "' (FMT-01).");
+		return Variant();
+	}
 
 	if (p_pixel_format >= RenderingDevice::DATA_FORMAT_MAX) {
 		UtilityFunctions::push_error("DSResourceFormatLoader: Unsupported texture data format ", p_pixel_format, " for '", p_cache_key, "'.");

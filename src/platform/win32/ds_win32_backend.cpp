@@ -174,6 +174,7 @@ static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vec
 		std::memcpy(&header, header_data.ptr(), sizeof(header));
 		if (header.magic != 0x58455444 || header.version != 2 || header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT ||
 				header.compressed_size == 0 || header.original_size == 0 || header.reserved != 0 ||
+				!dstex_sizes_are_sane(header.width, header.height, header.original_size, header.compressed_size) ||
 				header.mip_count > (std::numeric_limits<uint64_t>::max() - sizeof(DSTexHeader)) / sizeof(DSTexMipEntryV2)) {
 			return false;
 		}
@@ -1068,9 +1069,33 @@ static ID3D12Device *ds_win32_fetch_d3d12_device_direct() {
 	uint64_t queue_handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_COMMAND_QUEUE, RID(), 0);
 	ID3D12CommandQueue *queue = reinterpret_cast<ID3D12CommandQueue *>(queue_handle);
 	{
+		// D3D12-02: hold our own COM references so a Godot device recreation
+		// (TDR / driver update / adapter change) cannot leave a dangling raw
+		// pointer. AddRef the new pointers first, then Release the old ones.
+		if (device) {
+			device->AddRef();
+		}
+		if (queue) {
+			queue->AddRef();
+		}
 		std::lock_guard<std::mutex> lock(s_device_mutex);
+		ID3D12Device *old_device = s_d3d12_device;
+		ID3D12CommandQueue *old_queue = s_d3d12_command_queue;
 		s_d3d12_device = device;
 		s_d3d12_command_queue = queue;
+		if (old_device) {
+			old_device->Release();
+		}
+		if (old_queue && old_queue != queue) {
+			old_queue->Release();
+		} else if (old_queue && old_queue == queue && queue) {
+			// Same queue re-fetched: balance the extra AddRef above.
+			queue->Release();
+		}
+		if (old_device == device && device) {
+			// Same device re-fetched: balance the extra AddRef above.
+			device->Release();
+		}
 	}
 	ds_win32_log_d3d12_adapter_identity(device);
 	return device;
@@ -1091,10 +1116,46 @@ static void ds_win32_fetch_d3d12_device_on_render_thread() {
 	}
 }
 
-ID3D12Device *ds_win32_get_d3d12_device() {
+// D3D12-02: release owned COM references and clear the cache. Safe from any
+// thread; COM Release is thread-safe. Called on shutdown and on
+// device-removed detection so a stale pointer can never be returned.
+void ds_win32_invalidate_d3d12_device() {
+	ID3D12Device *old_device = nullptr;
+	ID3D12CommandQueue *old_queue = nullptr;
 	{
 		std::lock_guard<std::mutex> lock(s_device_mutex);
-		if (s_d3d12_device) {
+		old_device = s_d3d12_device;
+		old_queue = s_d3d12_command_queue;
+		s_d3d12_device = nullptr;
+		s_d3d12_command_queue = nullptr;
+	}
+	if (old_device) {
+		old_device->Release();
+	}
+	if (old_queue) {
+		old_queue->Release();
+	}
+}
+
+ID3D12Device *ds_win32_get_d3d12_device() {
+	// D3D12-02: validate the cached device against device-removed (TDR /
+	// driver update). Hold a temporary AddRef across the unlock so a
+	// concurrent invalidate cannot free the pointer mid-check.
+	ID3D12Device *cached = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_device_mutex);
+		cached = s_d3d12_device;
+		if (cached) {
+			cached->AddRef();
+		}
+	}
+	if (cached) {
+		HRESULT removed = cached->GetDeviceRemovedReason();
+		cached->Release();
+		if (FAILED(removed)) {
+			ds_win32_invalidate_d3d12_device();
+		} else {
+			std::lock_guard<std::mutex> lock(s_device_mutex);
 			return s_d3d12_device;
 		}
 	}
@@ -1941,9 +2002,7 @@ void Win32Backend::shutdown() {
 		}
 	}
 	{
-		std::lock_guard<std::mutex> lock(s_device_mutex);
-		s_d3d12_device = nullptr;
-		s_d3d12_command_queue = nullptr;
+		ds_win32_invalidate_d3d12_device();
 	}
 	active_batch_slot.store(0);
 	if (s_backend_instance == this) {

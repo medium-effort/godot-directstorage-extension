@@ -53,3 +53,21 @@ GDEX_TEST(dstex, mip_layout_zero_extent_is_empty) {
     GDEX_EXPECT_EQ(layout.footprint_size, 0ULL);
     GDEX_EXPECT_EQ(layout.source_size, 0ULL);
 }
+
+// FMT-01: hostile header caps are pure integer checks — no texture file is
+// allocated. A 64x64 RGBA8 mip chain is ~16 KiB; the "2 GiB claim" below is
+// just a uint64 passed to the validator, costing zero storage.
+GDEX_TEST(dstex, sane_sizes_accept_small_texture) {
+    GDEX_EXPECT_TRUE(godot::dstex_sizes_are_sane(64, 64, 16384, 1000));
+}
+
+GDEX_TEST(dstex, sane_sizes_reject_2gib_claim) {
+    const uint64_t two_gib = 1ULL << 31;
+    GDEX_EXPECT_FALSE(godot::dstex_sizes_are_sane(64, 64, two_gib, 1000));
+    GDEX_EXPECT_FALSE(godot::dstex_sizes_are_sane(64, 64, 16384, two_gib));
+}
+
+GDEX_TEST(dstex, sane_sizes_reject_oversize_dim) {
+    GDEX_EXPECT_FALSE(godot::dstex_sizes_are_sane(65535, 65535, 16384, 1000));
+    GDEX_EXPECT_FALSE(godot::dstex_sizes_are_sane(0, 64, 16384, 1000));
+}
