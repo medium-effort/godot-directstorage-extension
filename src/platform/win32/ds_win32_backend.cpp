@@ -1769,7 +1769,11 @@ bool Win32Backend::initialize(const String &p_path) {
 	HRESULT hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
 
 	if (SUCCEEDED(hr) && factory) {
+#ifdef DEBUG_ENABLED
+		factory->SetDebugFlags(DSTORAGE_DEBUG_SHOW_ERRORS | DSTORAGE_DEBUG_RECORD_OBJECT_NAMES);
+#else
 		factory->SetDebugFlags(DSTORAGE_DEBUG_NONE);
+#endif
 		factory->SetStagingBufferSize(staging_mb * 1024 * 1024);
 
 		DSTORAGE_QUEUE_DESC queueDesc = {};
