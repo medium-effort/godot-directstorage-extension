@@ -42,6 +42,21 @@ var _poll_task_id: int = -1
 var _cache_caps_probed: bool = false
 var _has_get_unbuilt: bool = false
 var _has_poll: bool = false
+## Adaptive slice backpressure (Rev1 plan: Q13/Q41).
+## EMA of main-thread frame time; slice budgets passed by value to the
+## worker via bind() so no cross-thread mutable read occurs.
+var _slice_ema_ms: float = 0.0
+var _slice_ema_init: bool = false
+var _smooth_streak: int = 2
+## Backpressure path tracking: transition-only log + per-batch slice counts
+## (no per-frame spam). Silent by default; Settings enables `_slice_debug`
+## during loading benchmarks and prints the summary in its own profiler.
+var _slice_label: String = "warm"
+var _warm_slices: int = 0
+var _mild_slices: int = 0
+var _heavy_slices: int = 0
+var _drain_reported: bool = true
+var _slice_debug: bool = false
 
 
 ## Starts tracking progress for a prewarm tag returned by `prewarm_async()`.
@@ -67,6 +82,26 @@ func is_tracking_prewarm(tag: int) -> bool:
 	return _tracked_tags.has(tag)
 
 
+## Enables/disables backpressure slice logging. Off by default so regular
+## loads stay silent; the loading benchmark turns it on for the load only.
+func set_slice_debug(enabled: bool) -> void:
+	_slice_debug = enabled
+
+
+## Clears per-batch slice counters (called at benchmark start).
+func reset_slice_stats() -> void:
+	_warm_slices = 0
+	_mild_slices = 0
+	_heavy_slices = 0
+	_drain_reported = true
+	_smooth_streak = 2
+
+
+## Returns per-batch slice counts for the benchmark profiler.
+func get_slice_stats() -> Dictionary:
+	return {"warm": _warm_slices, "mild": _mild_slices, "heavy": _heavy_slices, "label": _slice_label}
+
+
 ## Initializes [DSContext] and reports the selected backend when the autoload
 ## enters the scene tree.
 func _ready() -> void:
@@ -82,7 +117,7 @@ func _ready() -> void:
 ## Drives the async stream queue once per frame. Stream-only: never touches
 ## the sync loader queue (`flush_batch` / `flush_batch_async` are NEVER
 ## called here) and never blocks (`wait_for_completion` is NEVER called).
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if not ClassDB.class_exists("DSContext"):
 		return
 	var ctx = Engine.get_singleton("DSContext")
@@ -108,9 +143,10 @@ func _process(_delta: float) -> void:
 		ctx.flush_stream_async()
 	# 3. Build textures for terminal prewarm requests (always ImageTexture,
 	#    pipeline-safe on worker threads per GODOT_QUIRKS Sec25). Ingestion
-	#    runs on WorkerThreadPool at full CPU speed so the main thread spends
-	#    0.0 ms on texture creation; evict-path RID frees defer to the render
-	#    thread internally (Sec27).
+	#    runs on WorkerThreadPool in one bounded slice per task (Q13/Q41:
+	#    usec is the real guard, items is a cap for small textures) so the
+	#    Render Thread drains D3D12 alloc/uploads within budget; evict-path
+	#    RID frees defer to the render thread internally (Sec27).
 	if ClassDB.class_exists("DSTextureCache"):
 		var cache = Engine.get_singleton("DSTextureCache")
 		if cache != null:
@@ -118,13 +154,61 @@ func _process(_delta: float) -> void:
 				_has_get_unbuilt = cache.has_method("get_unbuilt_prewarm_count")
 				_has_poll = cache.has_method("poll_completed")
 				_cache_caps_probed = true
+			# Adaptive backpressure: EMA over clamped delta + 2-frame streak
+			# gate (Rev1: immediate delta is noisy under the 120-148ms clamp).
+			var frame_ms: float = delta * 1000.0
+			if not _slice_ema_init:
+				_slice_ema_ms = frame_ms
+				_slice_ema_init = true
+			else:
+				_slice_ema_ms = 0.5 * frame_ms + 0.5 * _slice_ema_ms
+			var slice_items: int = 3
+			var slice_usec: int = 4000
+			var slice_label: String = "mild"
+			if _slice_ema_ms > 45.0:
+				slice_items = 1
+				slice_usec = 4000
+				slice_label = "heavy"
+				_smooth_streak = 0
+			elif _slice_ema_ms > 20.0:
+				slice_items = 3
+				slice_usec = 4000
+				slice_label = "mild"
+				_smooth_streak = 0
+			else:
+				_smooth_streak += 1
+				if _smooth_streak >= 2:
+					if _slice_ema_ms < 10.0:
+						slice_items = 12
+						slice_usec = 8000
+					else:
+						slice_items = 8
+						slice_usec = 8000
+					slice_label = "warm"
+			if slice_label != _slice_label:
+				if _slice_debug:
+					print("[DirectStorage] DSBatchManager slice: %s -> %s (ema %.1f ms)" % [_slice_label, slice_label, _slice_ema_ms])
+				_slice_label = slice_label
 			if _poll_task_id != -1 and WorkerThreadPool.is_task_completed(_poll_task_id):
 				WorkerThreadPool.wait_for_task_completion(_poll_task_id)
 				_poll_task_id = -1
 			if _poll_task_id == -1 and _has_get_unbuilt and int(cache.get_unbuilt_prewarm_count(0)) > 0:
-				_poll_task_id = WorkerThreadPool.add_task(_background_poll_completed, false, "DS_PollCompleted")
+				_poll_task_id = WorkerThreadPool.add_task(_background_poll_slice.bind(slice_items, slice_usec), false, "DS_PollCompleted")
+				if slice_label == "heavy":
+					_heavy_slices += 1
+				elif slice_label == "mild":
+					_mild_slices += 1
+				else:
+					_warm_slices += 1
+				_drain_reported = false
 			if _poll_task_id == -1 and _has_poll:
-				cache.poll_completed(0, 0, 2000)
+				cache.poll_completed(0, 1, 2000)
+			if not _drain_reported and _poll_task_id == -1 and _has_get_unbuilt and int(cache.get_unbuilt_prewarm_count(0)) == 0:
+				if _slice_debug:
+					print("[DirectStorage] DSBatchManager prewarm drained: warm=%d mild=%d heavy=%d" % [_warm_slices, _mild_slices, _heavy_slices])
+				_drain_reported = true
+				# Counters intentionally NOT reset here; Settings resets them at
+				# benchmark start and reads them in its end-of-load summary.
 	# 4. Emit per-tag progress / finished for tracked tags.
 	_poll_prewarm_progress(ctx)
 
@@ -147,22 +231,21 @@ func _poll_prewarm_progress(ctx: Object) -> void:
 			prewarm_finished.emit(tag)
 
 
-## Background texture ingestion: drains all terminal prewarm requests at
-## full CPU speed without a microsecond budget. Runs on WorkerThreadPool;
-## safe because `build_texture()` produces `ImageTexture` only (Sec25) and
-## `store()` evictions defer RID frees to the render thread (Sec27).
-func _background_poll_completed() -> void:
+## Background texture ingestion: exactly one bounded slice per task.
+## Runs on WorkerThreadPool; budgets arrive by value via bind() (no
+## cross-thread mutable read). Safe because `build_texture()` produces
+## `ImageTexture` only (Sec25) and `store()` evictions defer RID frees to
+## the render thread (Sec27). Requires C++ `poll_completed` to stop on
+## EITHER limit (items OR usec, Q41); usec is the real hitch guard.
+func _background_poll_slice(p_items: int, p_usec: int) -> void:
 	if not ClassDB.class_exists("DSTextureCache"):
 		return
 	var cache = Engine.get_singleton("DSTextureCache")
 	if cache == null:
 		return
-	# Caps probed on the main thread in _process before this task is spawned;
-	# direct calls here avoid per-iteration has_method/call reflection.
-	while int(cache.get_unbuilt_prewarm_count(0)) > 0:
-		var built: int = int(cache.poll_completed(0, 64, 0))
-		if built <= 0:
-			break
+	# One adaptive slice per frame lets the Render Thread absorb D3D12
+	# texture allocations/uploads without stalling presentation:
+	cache.poll_completed(0, p_items, p_usec)
 
 
 ## Collects finished batches without submitting anything new. Used when the
