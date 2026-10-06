@@ -20,7 +20,15 @@ const COMBINED_INDEX_MAX_KEY_BYTES: int = 1024
 const COMBINED_INDEX_MIP_SLOTS: int = 16
 
 var _dspkg: RefCounted = null
-var _temp_dspkg_path: String = "user://temp_textures.dspkg"
+## Staging/final archive paths. Both live in the target export directory so no
+## temporary data is written to C: (user://). finalize() writes the staging
+## file once; it is then renamed to the final name (metadata-only, no extra
+## disk space needed for a copy).
+var _staging_dspkg_path: String = ""
+var _target_dspkg_path: String = ""
+## Legacy temp location from before direct-to-export writes. Only used to
+## clean up stale artifacts on C:.
+const LEGACY_TEMP_DSPKG_PATH: String = "user://temp_textures.dspkg"
 var _has_textures: bool = false
 ## Texture paths bundled by this export run.
 var _bundled_entries: Array[Dictionary] = []
@@ -88,6 +96,8 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_bundled_entries.clear()
 	_archive_failed = false
 	_dspkg = null
+	_staging_dspkg_path = ""
+	_target_dspkg_path = ""
 
 	if not _bundle_dspkg_enabled:
 		print("[DirectStorage Exporter] Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK.")
@@ -99,15 +109,25 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		push_warning("[DirectStorage Exporter] DSPkg class not found. Skipping archive bundling.")
 		return
 
-	_cleanup_temp_dspkg()
+	if _target_export_dir.is_empty():
+		push_error("[DirectStorage Exporter] FATAL: no export directory resolved; textures.dspkg cannot be written. The export is incomplete and binaries will NOT be deployed.")
+		_archive_failed = true
+		return
+
+	_target_dspkg_path = _target_export_dir.path_join("textures.dspkg")
+	_staging_dspkg_path = _target_export_dir.path_join("textures.dspkg.tmp")
+	_warn_if_low_disk_space(_target_export_dir)
+	_cleanup_staging()
+	_cleanup_legacy_user_temp()
 	_dspkg = ClassDB.instantiate("DSPkg")
 	if _dspkg != null:
-		var err: Error = _dspkg.create(_temp_dspkg_path)
+		var err: Error = _dspkg.create(_staging_dspkg_path)
 		if err != OK:
-			push_error("[DirectStorage Exporter] Failed to create temporary DSPkg archive at: " + _temp_dspkg_path + ": " + error_string(err))
+			push_error("[DirectStorage Exporter] Failed to create DSPkg staging archive at: " + _staging_dspkg_path + ": " + error_string(err))
 			_dspkg = null
+			_archive_failed = true
 		else:
-			print("[DirectStorage Exporter] Initialized temporary DSPkg archive at: ", _temp_dspkg_path)
+			print("[DirectStorage Exporter] Initialized DSPkg staging archive at: ", _staging_dspkg_path)
 
 ## Reads v2 per-mip footprint data so DSPkg can preserve GPU upload layouts.
 func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
@@ -178,48 +198,155 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 		skip()
 		print("[DirectStorage Exporter] Skipped texture payload from PCK: ", resource_path)
 
-## Finalizes the archive, writes textures.dspkg (if enabled), and deploys binaries.
+## Finalizes the archive, renames textures.dspkg.tmp to textures.dspkg
+## (if enabled), and deploys binaries. A DSPkg failure is fatal for this
+## plugin's outputs: partial archives are removed and binary deployment is
+## skipped so a broken build is never silently shipped. NOTE: Godot does not
+## let an EditorExportPlugin abort the core PCK/exe steps from _export_end(),
+## so push_error() here marks the export as failed in the log but the
+## remaining core steps still run outside this plugin's control.
 func _export_end() -> void:
+	var dspkg_ok := true
 	if _archive_failed:
-		print("[DirectStorage Exporter] Export finished without a textures.dspkg archive because bundling was aborted after an entry failure.")
+		dspkg_ok = false
+		push_error("[DirectStorage Exporter] FATAL: export finished without a textures.dspkg archive because bundling was aborted after an earlier failure. Partial archives were removed and binaries were NOT deployed. See earlier errors for the cause (a likely candidate is out of disk space).")
 	elif _dspkg != null and _bundle_dspkg_enabled:
 		if _has_textures:
 			var err: Error = _dspkg.finalize()
-			if err == OK:
-				if not _target_export_dir.is_empty():
-					var target_dspkg_path := _target_export_dir.path_join("textures.dspkg")
-					var temp_dspkg_path := ProjectSettings.globalize_path(_temp_dspkg_path)
-					if not FileAccess.file_exists(temp_dspkg_path):
-						push_error("[DirectStorage Exporter] Finalized archive is missing at '" + temp_dspkg_path + "'; textures.dspkg was not deployed.")
-					else:
-						var copy_err := DirAccess.copy_absolute(temp_dspkg_path, target_dspkg_path)
-						if copy_err == OK:
-							print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", target_dspkg_path)
-							_write_combined_header_index(target_dspkg_path.get_basename() + ".headers.idx")
-						else:
-							push_error("[DirectStorage Exporter] Failed to copy textures.dspkg to '" + target_dspkg_path + "': " + error_string(copy_err) + ". Verify the export directory is writable and not locked by another process.")
-				else:
-					push_error("[DirectStorage Exporter] Target export directory is empty; could not deploy textures.dspkg. Verify the export path passed to _export_begin().")
+			if err != OK:
+				dspkg_ok = false
+				_report_storage_failure("finalize DSPkg staging archive", err, _staging_dspkg_path)
+				_cleanup_staging()
+				_remove_file_silent(_target_dspkg_path)
+			elif _staging_dspkg_path.is_empty() or _target_dspkg_path.is_empty():
+				dspkg_ok = false
+				push_error("[DirectStorage Exporter] FATAL: export directory was lost before finalize; textures.dspkg was not deployed and binaries were NOT deployed.")
+			elif not FileAccess.file_exists(_staging_dspkg_path):
+				dspkg_ok = false
+				push_error("[DirectStorage Exporter] FATAL: finalized staging archive is missing at '" + _staging_dspkg_path + "'; textures.dspkg was not deployed and binaries were NOT deployed.")
 			else:
-				push_error("[DirectStorage Exporter] Failed to finalize DSPkg archive: " + error_string(err) + ". The temporary archive will be removed.")
+				_remove_file_silent(_target_dspkg_path)
+				var rename_err := DirAccess.rename_absolute(_staging_dspkg_path, _target_dspkg_path)
+				if rename_err == OK:
+					print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", _target_dspkg_path)
+					_write_combined_header_index(_target_dspkg_path.get_basename() + ".headers.idx")
+				else:
+					dspkg_ok = false
+					_report_storage_failure("rename textures.dspkg.tmp to textures.dspkg", rename_err, _target_dspkg_path)
+					_cleanup_staging()
+					_remove_file_silent(_target_dspkg_path)
 		else:
 			print("[DirectStorage Exporter] Export finished. No DirectStorage (.dstex) textures were found to bundle.")
 
 	_dspkg = null
-	_cleanup_temp_dspkg()
+	_cleanup_staging()
+	_cleanup_legacy_user_temp()
+
+	if not dspkg_ok:
+		# Do not ship DLLs next to a missing/broken textures.dspkg.
+		return
 
 	# Deploy native shared libraries to the exact subfolder expected by GDExtension runtime
 	if not _target_export_dir.is_empty() and _export_features.has("windows"):
 		_deploy_windows_binaries(_target_export_dir, _is_debug_export, _export_features)
 
-## Removes the per-export archive without leaving stale user:// artifacts behind.
-func _cleanup_temp_dspkg() -> void:
-	if not FileAccess.file_exists(_temp_dspkg_path):
+## Removes the per-export staging file (textures.dspkg.tmp) in the target
+## export directory. A rename needs no extra disk space, so normally nothing
+## is left behind; this covers finalize/rename failures and interruptions.
+func _cleanup_staging() -> void:
+	_remove_file_silent(_staging_dspkg_path)
+
+## Removes the pre-direct-write temp artifact on C:, if a previous version
+## left one behind. Best-effort migration cleanup only.
+func _cleanup_legacy_user_temp() -> void:
+	if not FileAccess.file_exists(LEGACY_TEMP_DSPKG_PATH):
 		return
-	var temp_dspkg_path := ProjectSettings.globalize_path(_temp_dspkg_path)
-	var remove_err := DirAccess.remove_absolute(temp_dspkg_path)
-	if remove_err != OK and FileAccess.file_exists(_temp_dspkg_path):
-		push_warning("[DirectStorage Exporter] Could not remove temporary archive '" + _temp_dspkg_path + "': " + error_string(remove_err) + ". Remove it before the next export.")
+	var global_path := ProjectSettings.globalize_path(LEGACY_TEMP_DSPKG_PATH)
+	var remove_err := DirAccess.remove_absolute(global_path)
+	if remove_err != OK and FileAccess.file_exists(LEGACY_TEMP_DSPKG_PATH):
+		push_warning("[DirectStorage Exporter] Could not remove legacy temporary archive '" + LEGACY_TEMP_DSPKG_PATH + "': " + error_string(remove_err) + ". Remove it before the next export.")
+
+func _remove_file_silent(abs_path: String) -> void:
+	if abs_path.is_empty() or not FileAccess.file_exists(abs_path):
+		return
+	DirAccess.remove_absolute(abs_path)
+
+## Best-effort free-space query for an absolute directory. Returns bytes free,
+## or -1 when the engine build does not expose DirAccess.get_space_left().
+func _get_free_space_bytes(abs_dir: String) -> int:
+	if abs_dir.is_empty():
+		return -1
+	if not DirAccess.dir_exists_absolute(abs_dir):
+		return -1
+	var probe: DirAccess = DirAccess.open(abs_dir)
+	if probe == null:
+		return -1
+	if not probe.has_method("get_space_left"):
+		return -1
+	var free_value: Variant = probe.call("get_space_left")
+	if typeof(free_value) == TYPE_INT:
+		return int(free_value)
+	return -1
+
+func _format_bytes(bytes_value: int) -> String:
+	if bytes_value < 0:
+		return "unknown"
+	var value := float(bytes_value)
+	if value < 1024.0:
+		return str(bytes_value) + " B"
+	value /= 1024.0
+	if value < 1024.0:
+		return "%.1f KiB" % value
+	value /= 1024.0
+	if value < 1024.0:
+		return "%.1f MiB" % value
+	value /= 1024.0
+	return "%.2f GiB" % value
+
+## Early warning when the target drive is nearly full. The final archive size
+## is only known at finalize() time, so this cannot abort the export; it just
+## names the drive and the free bytes while there is still time to free space.
+func _warn_if_low_disk_space(abs_dir: String) -> void:
+	const WARN_THRESHOLD_BYTES: int = 1024 * 1024 * 1024
+	var free_bytes := _get_free_space_bytes(abs_dir)
+	if free_bytes < 0:
+		return
+	print("[DirectStorage Exporter] Free space on export drive: ", _format_bytes(free_bytes), " (", abs_dir, ")")
+	if free_bytes < WARN_THRESHOLD_BYTES:
+		push_warning("[DirectStorage Exporter] Low disk space: only " + _format_bytes(free_bytes) + " free at '" + abs_dir + "'. The textures.dspkg + PCK + exe typically need several hundred MiB. Free up space before the export fails with file-write errors.")
+
+func _is_disk_space_error(err: Error) -> bool:
+	return err == ERR_FILE_CANT_WRITE or err == ERR_FILE_CANT_OPEN or err == ERR_CANT_CREATE or err == FAILED
+
+## Explicit failure report that names disk space as the likely cause (with
+## free bytes and staging size when known) instead of a generic write error.
+## Partial outputs are the caller's responsibility; binaries are NOT deployed.
+func _report_storage_failure(stage: String, err: Error, abs_path: String) -> void:
+	var free_bytes := _get_free_space_bytes(_target_export_dir)
+	var staging_bytes := -1
+	if not _staging_dspkg_path.is_empty() and FileAccess.file_exists(_staging_dspkg_path):
+		var probe := FileAccess.open(_staging_dspkg_path, FileAccess.READ)
+		if probe != null and probe.is_open():
+			staging_bytes = int(probe.get_length())
+			probe.close()
+	var detail := "[DirectStorage Exporter] FATAL: failed to " + stage + " ('" + abs_path + "'): " + error_string(err)
+	if _is_disk_space_error(err):
+		detail += ". This is most likely OUT OF DISK SPACE on the export drive"
+		if not _target_export_dir.is_empty():
+			detail += " ('" + _target_export_dir + "'"
+			if free_bytes >= 0:
+				detail += ", free: " + _format_bytes(free_bytes)
+			detail += ")"
+		if staging_bytes >= 0:
+			detail += "; staging archive size: " + _format_bytes(staging_bytes)
+		detail += ". Free up space (the PCK + exe + textures.dspkg together need several hundred MiB), delete any partial textures.dspkg / textures.dspkg.tmp, and re-export."
+	else:
+		detail += ". Verify the export directory is writable and not locked by another process"
+		if free_bytes >= 0:
+			detail += " (free space: " + _format_bytes(free_bytes) + " at '" + _target_export_dir + "')"
+		detail += "."
+	detail += " Partial archives were removed and binaries were NOT deployed."
+	push_error(detail)
 
 ## Deploys the GDExtension DLL and DirectStorage runtime dependencies to addons/directstorage_accelerator/bin.
 func _deploy_windows_binaries(target_base_dir: String, is_debug: bool, features: PackedStringArray) -> void:
