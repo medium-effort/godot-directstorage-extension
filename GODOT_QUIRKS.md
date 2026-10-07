@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 2 October 2026
+Last updated: 7 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -52,14 +52,17 @@ In a real game project like `tps-demo` with ~250 textures:
 ```
 
 ### The Invariant Rule
-Direct GPU texture decompression into [Texture2DRD](https://docs.godotengine.org/en/stable/classes/class_texture2drd.html) is only viable **on the render thread** (synchronous loads or runtime streaming systems).
-Off-render-thread background loads (`load_threaded_request`) **MUST enforce the thread-affinity gate**:
+Direct GPU texture decompression into [Texture2DRD](https://docs.godotengine.org/en/stable/classes/class_texture2drd.html) is only viable **on the main or render thread** (synchronous loads or runtime streaming systems).
+Worker-thread background loads (`load_threaded_request` with sub-threads) **MUST enforce the thread-affinity gate**:
 ```cpp
 if (!rs || !rs->is_on_render_thread()) {
     // Clean, immediate fallback to CPU GDeflate + DirectStorage BypassIO memory pipeline.
 }
 ```
 This CPU memory pathway decompressing into [ImageTexture](https://docs.godotengine.org/en/stable/classes/class_imagetexture.html) takes ~0.5 ms per texture, loading 250 textures in ~125 ms total without a single frame stall.
+
+### Correction (2026-10-07): the Gate Passes on the Main Thread
+`RenderingServer::is_on_render_thread()` returns `Thread::get_caller_id() == server_thread` (`servers/rendering/rendering_server_default.h:1212`), and `server_thread` initializes to `Thread::MAIN_ID` (`rendering_server_default.h:82`) — so the gate is TRUE on the main thread and only worker/foreign threads divert. Proven by `project/headless_tests/test_thread_affinity.gd` (windowed D3D12, GTX 1050 Ti): a main-thread sync `ResourceLoader.load()` executed the GPU branch end-to-end (GDeflate dispatch, `STATUS_COMPLETED`, byte-exact mip 0/1 readback), while `load_threaded_request(use_sub_threads=true)` diverted to `ImageTexture` in 0ms. ARCH-01's "100% dead code" verdict therefore applies to worker-thread loads only. The gate above stays as written — it passes main, diverts workers.
 
 ---
 
@@ -1032,3 +1035,42 @@ if ClassDB.class_exists("DSTextureCache"):
 		print("[Cache] Safely evicted %d unreferenced textures" % freed_count)
 ```
 Reserve unconditional `clear()` strictly for module teardown (`~DSTextureCache()`) or blank transition screens where all old actor nodes and materials have been completely freed.
+
+## 44. Shareable Format Lists Must Contain the Base Format
+
+### The Engine Reality
+`RenderingDevice::texture_create()` validates the format's shareable list up front (`servers/rendering/rendering_device.cpp:1552`): when the list is non-empty, the texture's own base format must be present in it, otherwise creation fails closed with a null RID. The sRGB counterpart alone is not sufficient, even though only the counterpart view is what shaders actually sample.
+
+### The Trap / Symptom
+Adding only the sRGB counterpart via `add_shareable_format(srgb)` (the intuitive recipe for 3D PBR albedo sampling) fails every allocation:
+```text
+ERROR: If supplied a list of shareable formats, the current format must be present in the list
+    at: texture_create (servers/rendering/rendering_device.cpp:1553)
+```
+The null RID silently kills the GPU branch, which then falls through to the CPU path — where a second, unrelated failure can mask the root cause entirely. This cost one red build plus a full debug cycle (see Q02 amendment).
+
+### The Rule
+Always `add_shareable_format()` the base format itself first, then the sRGB counterpart.
+```cpp
+rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(p_pixel_format));
+rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(srgb_fmt));
+```
+Skip the list entirely when the format is already sRGB or has no sRGB counterpart (floats, BC4/BC5/BC6, R16 family — see Q31). Implemented in `src/integration/ds_resource_format_loader.cpp:303`.
+
+## 45. CPU Fallback Rejects Partial Mip Chains
+
+### The Engine Reality
+`Image::create_from_data()` with `use_mipmaps=true` demands the complete Godot mip chain down to 1x1 (`core/io/image.cpp:2455`). A 64x4 RGBA8 texture needs 7 levels totaling 1404 bytes. GPU upload has no such requirement — DirectStorage happily decompresses whatever subresources the file carries.
+
+### The Trap / Symptom
+A test asset carrying only 2 mips (1280 bytes) loads fine on the GPU path but fails the CPU fallback with:
+```text
+ERROR: Expected Image data size of 64x4x4 (RGBA8 with 6 mipmaps) = 1404 bytes, got 1280 bytes instead.
+    at: initialize_data (core/io/image.cpp:2455)
+ERROR: DSResourceFormatLoader: Failed to create GPU/Image texture for user://test_thread_affinity_texture.dstex
+```
+This asymmetry means a green GPU-path test can hide a broken CPU fallback; the sub-thread test (which forces CPU) caught it. Partial-chain production files would hit the same wall (tracked as issue #0039).
+
+### The Rule
+Never feed `Image::create_from_data(use_mipmaps=true)` fewer mips than Godot's full chain; test assets must carry complete chains like the exporter writes.
+Test payloads now build every level to 1x1 (64x4 = 7 mips, mip 0/1 patterns preserved for byte-exact asserts) in `project/headless_tests/test_thread_affinity.gd`.

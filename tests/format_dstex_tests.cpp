@@ -71,3 +71,34 @@ GDEX_TEST(dstex, sane_sizes_reject_oversize_dim) {
     GDEX_EXPECT_FALSE(godot::dstex_sizes_are_sane(65535, 65535, 16384, 1000));
     GDEX_EXPECT_FALSE(godot::dstex_sizes_are_sane(0, 64, 16384, 1000));
 }
+
+// Phase 1 loader share policy: counterpart-only sRGB share via
+// DSTex::get_srgb_rd_format(). Linear color formats map to their sRGB
+// counterpart; already-sRGB returns itself (caller skips self-share as
+// no-op); non-color data formats (floats, BC4/BC5/BC6, R16 family) return
+// themselves and are skipped by the caller.
+GDEX_TEST(dstex, srgb_counterpart_linear_maps_to_srgb) {
+    using RD = godot::RenderingDevice;
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_R8G8B8A8_UNORM), (int)RD::DATA_FORMAT_R8G8B8A8_SRGB);
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_BC1_RGB_UNORM_BLOCK), (int)RD::DATA_FORMAT_BC1_RGB_SRGB_BLOCK);
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_BC3_UNORM_BLOCK), (int)RD::DATA_FORMAT_BC3_SRGB_BLOCK);
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_BC7_UNORM_BLOCK), (int)RD::DATA_FORMAT_BC7_SRGB_BLOCK);
+}
+
+GDEX_TEST(dstex, srgb_counterpart_already_srgb_returns_self) {
+    using RD = godot::RenderingDevice;
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_R8G8B8A8_SRGB), (int)RD::DATA_FORMAT_R8G8B8A8_SRGB);
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_BC7_SRGB_BLOCK), (int)RD::DATA_FORMAT_BC7_SRGB_BLOCK);
+    GDEX_EXPECT_TRUE(godot::DSTex::is_rd_format_srgb(RD::DATA_FORMAT_R8G8B8A8_SRGB));
+    GDEX_EXPECT_TRUE(godot::DSTex::is_rd_format_srgb(RD::DATA_FORMAT_BC7_SRGB_BLOCK));
+    GDEX_EXPECT_FALSE(godot::DSTex::is_rd_format_srgb(RD::DATA_FORMAT_R8G8B8A8_UNORM));
+    GDEX_EXPECT_FALSE(godot::DSTex::is_rd_format_srgb(RD::DATA_FORMAT_BC7_UNORM_BLOCK));
+}
+
+GDEX_TEST(dstex, srgb_counterpart_noncolor_returns_self_for_skip) {
+    using RD = godot::RenderingDevice;
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_R32_SFLOAT), (int)RD::DATA_FORMAT_R32_SFLOAT);
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_BC4_UNORM_BLOCK), (int)RD::DATA_FORMAT_BC4_UNORM_BLOCK);
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_BC6H_SFLOAT_BLOCK), (int)RD::DATA_FORMAT_BC6H_SFLOAT_BLOCK);
+    GDEX_EXPECT_FALSE(godot::DSTex::is_rd_format_srgb(RD::DATA_FORMAT_R32_SFLOAT));
+}

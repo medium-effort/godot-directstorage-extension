@@ -137,7 +137,15 @@ if env["platform"] == "windows":
 # Build with: scons tests=true
 # Run with:   ./extern/gdextest/gdextest test
 # Gated on tests flag so normal builds never require extern/gdextest.
-if ARGUMENTS.get("tests", 0):
+# The flag is declared explicitly so `tests=true` is a known SCons variable
+# (otherwise SCons warns "Unknown SCons variables were passed and will be
+# ignored"). BoolVariable also normalizes values, so `tests=false` is False
+# (raw ARGUMENTS strings are truthy for ANY non-empty value, including
+# "false" and "0").
+_tests_options = SCons.Script.Variables()
+_tests_options.Add(SCons.Script.BoolVariable("tests", "Build the gdextest unit-test library alongside the extension", False))
+_tests_options.Update(env)
+if env["tests"]:
     if os.path.isfile("extern/gdextest/SConscript"):
         # The test library now compiles in the Win32 backend, so it DOES
         # import dstorage.dll. Keep the main env's /DELAYLOAD:dstorage.dll +

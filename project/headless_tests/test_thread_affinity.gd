@@ -2,13 +2,16 @@ extends SceneTree
 
 const TEXTURE_WIDTH := 64
 const TEXTURE_HEIGHT := 4
-const MIP_COUNT := 2
+# Full mip chain is REQUIRED: Image::create_from_data(..., use_mipmaps=true)
+# expects every level down to 1x1 (64x4 -> 7 levels, 1404 bytes). A partial
+# chain builds a payload Godot rejects (1404-vs-1280 style size error).
+const MIP_COUNT := 7
 const ROW_PITCH := 256
 const BASE_MIP_BYTES := ROW_PITCH * TEXTURE_HEIGHT
 const MIP1_WIDTH := TEXTURE_WIDTH / 2
 const MIP1_HEIGHT := TEXTURE_HEIGHT / 2
 const MIP1_OFFSET := BASE_MIP_BYTES
-const PAYLOAD_SIZE := BASE_MIP_BYTES + ROW_PITCH * MIP1_HEIGHT
+const PAYLOAD_SIZE := BASE_MIP_BYTES + ROW_PITCH * MIP1_HEIGHT + ROW_PITCH * 5
 
 var failures := 0
 
@@ -35,6 +38,7 @@ func _initialize() -> void:
 	_test_gpu_buffer_destination(ctx, rd)
 	await _test_off_thread_enqueue(ctx, rd)
 	_test_resource_loader_gpu_texture(rd)
+	await _test_worker_loader_fallback()
 	_finish()
 
 func _test_gpu_texture_destination(ctx: Object, rd: RenderingDevice) -> void:
@@ -208,6 +212,34 @@ func _test_resource_loader_gpu_texture(rd: RenderingDevice) -> void:
 	else:
 		_fail("Loaded texture did not yield a valid RID for readback")
 
+func _test_worker_loader_fallback() -> void:
+	print("[Thread Affinity] Testing sub-thread loader CPU fallback (no render-thread block)...")
+	var dstex_path := "user://test_thread_affinity_texture.dstex"
+	var req_err: Error = ResourceLoader.load_threaded_request(dstex_path, "", true, ResourceLoader.CACHE_MODE_IGNORE)
+	_check(req_err == OK, "load_threaded_request(use_sub_threads=true) accepted: " + error_string(req_err))
+	if req_err != OK:
+		return
+	var start_msec := Time.get_ticks_msec()
+	var status := ResourceLoader.load_threaded_get_status(dstex_path)
+	var spins := 0
+	while status != ResourceLoader.THREAD_LOAD_LOADED and status != ResourceLoader.THREAD_LOAD_FAILED and status != ResourceLoader.THREAD_LOAD_INVALID_RESOURCE and spins < 600:
+		await process_frame
+		status = ResourceLoader.load_threaded_get_status(dstex_path)
+		spins += 1
+	var elapsed_msec := Time.get_ticks_msec() - start_msec
+	_check(status == ResourceLoader.THREAD_LOAD_LOADED, "sub-thread load reached LOADED: status=" + str(status))
+	_check(elapsed_msec < 10000, "sub-thread load completed without render-thread stall (" + str(elapsed_msec) + "ms)")
+	if status != ResourceLoader.THREAD_LOAD_LOADED:
+		return
+	var loaded = ResourceLoader.load_threaded_get(dstex_path)
+	_check(loaded is Texture2D, "sub-thread loaded resource is Texture2D")
+	_check(loaded is ImageTexture, "sub-thread load falls back to worker-safe ImageTexture")
+	_check(not (loaded is Texture2DRD), "sub-thread load never takes GPU Texture2DRD path")
+	if loaded is Texture2D:
+		_check(loaded.get_width() == TEXTURE_WIDTH and loaded.get_height() == TEXTURE_HEIGHT, "sub-thread fallback texture has expected dimensions")
+		var img: Image = loaded.get_image()
+		_check(img != null and not img.is_empty(), "sub-thread fallback texture carries CPU pixels")
+
 func _test_gpu_buffer_destination(ctx: Object, rd: RenderingDevice) -> void:
 	print("[Thread Affinity] Testing GPU buffer destination...")
 	const BUFFER_SIZE := 1024
@@ -270,20 +302,28 @@ func _test_gpu_buffer_destination(ctx: Object, rd: RenderingDevice) -> void:
 func _make_texture_payload() -> PackedByteArray:
 	var payload := PackedByteArray()
 	payload.resize(PAYLOAD_SIZE)
-	for y in range(TEXTURE_HEIGHT):
-		for x in range(TEXTURE_WIDTH):
-			var pixel_offset := y * ROW_PITCH + x * 4
-			payload[pixel_offset] = (x * 4) % 256
-			payload[pixel_offset + 1] = (y * 63) % 256
-			payload[pixel_offset + 2] = 180
-			payload[pixel_offset + 3] = 255
-	for y in range(MIP1_HEIGHT):
-		for x in range(MIP1_WIDTH):
-			var pixel_offset := MIP1_OFFSET + y * ROW_PITCH + x * 4
-			payload[pixel_offset] = 220
-			payload[pixel_offset + 1] = (x * 8) % 256
-			payload[pixel_offset + 2] = (y * 100) % 256
-			payload[pixel_offset + 3] = 255
+	var mip_dims := [[64, 4], [32, 2], [16, 1], [8, 1], [4, 1], [2, 1], [1, 1]]
+	var mip_base := 0
+	for mip in range(mip_dims.size()):
+		var w: int = mip_dims[mip][0]
+		var h: int = mip_dims[mip][1]
+		for y in range(h):
+			for x in range(w):
+				var pixel_offset := mip_base + y * ROW_PITCH + x * 4
+				if mip == 0:
+					payload[pixel_offset] = (x * 4) % 256
+					payload[pixel_offset + 1] = (y * 63) % 256
+					payload[pixel_offset + 2] = 180
+				elif mip == 1:
+					payload[pixel_offset] = 220
+					payload[pixel_offset + 1] = (x * 8) % 256
+					payload[pixel_offset + 2] = (y * 100) % 256
+				else:
+					payload[pixel_offset] = (100 + mip * 13 + x) % 256
+					payload[pixel_offset + 1] = (50 + mip * 29 + y * 3) % 256
+					payload[pixel_offset + 2] = (mip * 40) % 256
+				payload[pixel_offset + 3] = 255
+		mip_base += ROW_PITCH * h
 	return payload
 
 func _check(condition: bool, message: String) -> void:

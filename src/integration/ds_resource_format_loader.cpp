@@ -301,6 +301,16 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		rd_fmt->set_mipmaps(static_cast<int32_t>(p_mip_count > 0 ? p_mip_count : 1));
 		rd_fmt->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);
 		rd_fmt->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
+		// Shareable-list validation (rendering_device.cpp:1552): a non-empty
+		// list MUST contain the base format itself. Add base first, then the
+		// sRGB counterpart for 3D PBR albedo sampling.
+		if (!DSTex::is_rd_format_srgb(static_cast<int>(p_pixel_format))) {
+			int srgb_fmt = DSTex::get_srgb_rd_format(static_cast<int>(p_pixel_format));
+			if (srgb_fmt != RenderingDevice::DATA_FORMAT_MAX && srgb_fmt != static_cast<int>(p_pixel_format)) {
+				rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(p_pixel_format));
+				rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(srgb_fmt));
+			}
+		}
 
 		Ref<RDTextureView> rd_view;
 		rd_view.instantiate();

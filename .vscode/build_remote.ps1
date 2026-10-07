@@ -5,7 +5,8 @@ param(
     [string]$Target = "editor",
     [switch]$IncludePdb,
     [switch]$IncludeTests,
-    [switch]$Verbose
+    [switch]$Verbose,
+    [switch]$SkipVerify
 )
 
 function Show-BuildFailure {
@@ -184,6 +185,9 @@ $tarExcludes = @(
     "--exclude=*.idb",
     "--exclude=project/addons/directstorage_accelerator/bin/directstorage_accelerator*",
     "--exclude=project/addons/directstorage_accelerator/bin/~*",
+    # Sync-verification manifest rides outside the tarball (uploaded via scp
+    # in step [3b/6]); exclude any leftover so it can never be compiled in.
+    "--exclude=sync_manifest.tmp",
     # NOTE: do NOT exclude anything matching gdextest here. Windows bsdtar
     # matches --exclude patterns against every path component, so even an
     # anchored-looking "--exclude=./gdextest" strips extern/gdextest/ from the
@@ -197,6 +201,58 @@ cmd.exe /c "tar -czf - $tarExcludes . | ssh $ActiveHost ""tar -xzf - -C $RemoteD
 
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [3/6] Source Sync" -Message "Failed to sync source files to Device B ($ActiveHost)." -Code $LASTEXITCODE
+}
+
+# [3b/6] Verify the sync end-to-end: hash compiled inputs locally, re-hash
+# the Device B copies, and fail loudly on any MISSING/HASH mismatch. The
+# tar stream exit code alone cannot catch a short sync, and SCons plus its
+# cache will happily compile stale sources into a "successful" build.
+if (-not $SkipVerify) {
+    Write-VerboseHost "[3b/6] Verifying source sync integrity on Device B..." -ForegroundColor Cyan
+    $SyncVerifyRoots = @("src", "tests", "thirdparty/gdeflate", "thirdparty/libdeflate", "extern/gdextest/src", "extern/gdextest/tools")
+    $SyncVerifyFiles = @("SConstruct", ".gdextest.toml", "extern/gdextest/SConscript")
+    $CwdPath = (Resolve-Path ".").Path
+    $ManifestEntries = New-Object System.Collections.Generic.List[string]
+    foreach ($syncRoot in $SyncVerifyRoots) {
+        if (Test-Path -LiteralPath $syncRoot) {
+            foreach ($manifestFile in (Get-ChildItem -LiteralPath $syncRoot -Recurse -File)) {
+                $relPath = ($manifestFile.FullName.Substring($CwdPath.Length).TrimStart("\", "/")).Replace("\", "/")
+                $ManifestEntries.Add($relPath + "|" + (Get-FileHash -LiteralPath $manifestFile.FullName -Algorithm SHA256).Hash)
+            }
+        }
+    }
+    foreach ($singleFile in $SyncVerifyFiles) {
+        if (Test-Path -LiteralPath $singleFile) {
+            $ManifestEntries.Add($singleFile.Replace("\", "/") + "|" + (Get-FileHash -LiteralPath $singleFile -Algorithm SHA256).Hash)
+        }
+    }
+    # Relative name (no drive colon) so scp treats it as a local path.
+    $ManifestTmp = "sync_manifest.tmp"
+    $ManifestEntries | Set-Content -LiteralPath $ManifestTmp -Encoding Ascii
+    $RemoteManifestTar = "$RemoteDirTar/sync_manifest.txt"
+    scp "$ManifestTmp" "$ActiveHost`:$RemoteManifestTar"
+    Remove-Item $ManifestTmp -Force -ErrorAction SilentlyContinue
+    if ($LASTEXITCODE -ne 0) {
+        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Failed to upload sync manifest to Device B ($ActiveHost)." -Code $LASTEXITCODE
+    }
+    if ($ManifestEntries.Count -eq 0) {
+        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Sync manifest is empty; nothing was hashed on Device A. Refusing vacuous pass." -Code 1
+    }
+    # The verifier rides along via scp and runs with spaceless arguments only,
+    # so the ssh invocation needs no quoting (nested quoting through
+    # ssh -> cmd -> powershell is fragile and already caused one false red).
+    $RemoteVerifyTar = "$RemoteDirTar/verify_remote.ps1"
+    scp ".vscode/verify_remote.ps1" "$ActiveHost`:$RemoteVerifyTar"
+    if ($LASTEXITCODE -ne 0) {
+        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Failed to upload verifier script to Device B ($ActiveHost)." -Code $LASTEXITCODE
+    }
+    $RemoteVerifyWin = "$RemoteDirWin\verify_remote.ps1"
+    $VerifyOut = ssh $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -ManifestName sync_manifest.txt 2>&1
+    if ($VerifyOut -notcontains "SYNC_MANIFEST_OK") {
+        $detailLines = @($VerifyOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 20) -join "`n"
+        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Device B verification failed ($ActiveHost) with no clean OK. Raw remote output:`n$detailLines" -Code 1
+    }
+    Write-VerboseHost "Source sync verified ($($ManifestEntries.Count) files)." -ForegroundColor Green
 }
 
 # 4. Trigger SCons build on Device B
@@ -254,6 +310,52 @@ if ($IncludeTests) {
     }
 }
 scp -C "$ActiveHost`:$ArtifactRemoteDir/build_manifest.json" "$ArtifactLocalDir/" 2>$null
+
+# [5b/6] Verify pulled artifacts equal the Device B files (transfer
+# integrity). A truncated scp must never pass as a fresh build.
+if (-not $SkipVerify) {
+    Write-VerboseHost "[5b/6] Verifying pulled artifact hashes against Device B..." -ForegroundColor Cyan
+    $PullChecks = @(
+        @{ Pattern = "directstorage_accelerator*.dll"; LocalDir = $ArtifactLocalDir; Required = $true },
+        @{ Pattern = "dstorage*.dll"; LocalDir = $ArtifactLocalDir; Required = $true },
+        @{ Pattern = "build_manifest.json"; LocalDir = $ArtifactLocalDir; Required = $false }
+    )
+    if ($IncludeTests) {
+        $PullChecks += @{ Pattern = "libdirectstorage_tests*.dll"; LocalDir = "./bin"; Required = $true }
+    }
+    # Remote hashes come from the verifier script (quoteless invocation, same
+    # as step [3b/6]) so no nested quoting is needed here either.
+    $ArtOut = ssh $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -Artifacts 2>&1
+    $RemoteArtifacts = @{}
+    foreach ($artLine in @($ArtOut)) {
+        $artText = $artLine.ToString()
+        if ($artText.StartsWith("ARTIFACT:")) {
+            $artRest = $artText.Substring(9)
+            $artSep = $artRest.IndexOf("|")
+            if ($artSep -gt 0) {
+                $RemoteArtifacts[$artRest.Substring(0, $artSep)] = $artRest.Substring($artSep + 1)
+            }
+        }
+    }
+    foreach ($pullCheck in $PullChecks) {
+        $matchedNames = @($RemoteArtifacts.Keys | Where-Object { $_ -like $pullCheck.Pattern })
+        if ($matchedNames.Count -eq 0 -and $pullCheck.Required) {
+            $rawRemote = @($ArtOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 10) -join "`n"
+            Show-BuildFailure -Step "Step [5/6] Artifact Verification" -Message "No artifacts matched on Device B for pattern $($pullCheck.Pattern). Raw remote output:`n$rawRemote" -Code 1
+        }
+        foreach ($matchedName in $matchedNames) {
+            $LocalFile = Join-Path $pullCheck.LocalDir $matchedName
+            if (-not (Test-Path -LiteralPath $LocalFile)) {
+                Show-BuildFailure -Step "Step [5/6] Artifact Verification" -Message "Pulled artifact missing locally: $matchedName." -Code 1
+            }
+            $LocalHash = (Get-FileHash -LiteralPath $LocalFile -Algorithm SHA256).Hash
+            if ($LocalHash -ne $RemoteArtifacts[$matchedName]) {
+                Show-BuildFailure -Step "Step [5/6] Artifact Verification" -Message "Hash mismatch on $matchedName : transfer corrupted." -Code 1
+            }
+        }
+    }
+    Write-VerboseHost "Pulled artifacts verified." -ForegroundColor Green
+}
 
 # Pull large PDB debug symbols only when explicitly requested
 if ($IncludePdb) {
