@@ -116,3 +116,43 @@ GDEX_TEST(preloader_unpack, truncated_payload_safe_under_copy) {
 	godot::Ref<godot::Texture2D> tex = godot::PreloaderUnpackTest::build_texture(meta, buffers);
 	GDEX_EXPECT_TRUE(tex.is_valid());
 }
+
+GDEX_TEST(preloader_unpack, partial_mip_chain_falls_back_to_base_no_mipmaps) {
+	// #0039: 64x64 needs a full chain of 7 for use_mipmaps=true.
+	// Supply only 2 mips -> base slice without mipmaps + warning, not failure.
+	godot::DSPreloader::Payload meta;
+	meta.engine_path = "res://test_partial_chain.png";
+	meta.width = 64;
+	meta.height = 64;
+	meta.mip_count = 2;
+	meta.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGBA8);
+	meta.is_v2 = true;
+
+	// mip0 64x64 RGBA8: row 256, pitch 256, footprint 16384.
+	godot::PackedByteArray mip0;
+	mip0.resize(16384);
+	memset(mip0.ptrw(), 0x5A, 16384);
+	// mip1 32x32 RGBA8: row 128, pitch 256, footprint 8192.
+	godot::PackedByteArray mip1;
+	mip1.resize(8192);
+	uint8_t *w1 = mip1.ptrw();
+	memset(w1, 0, 8192);
+	for (int r = 0; r < 32; ++r) {
+		memset(w1 + r * 256, 0xA5, 128);
+	}
+
+	std::vector<godot::PackedByteArray> buffers;
+	buffers.push_back(mip0);
+	buffers.push_back(mip1);
+
+	godot::Ref<godot::Texture2D> tex = godot::PreloaderUnpackTest::build_texture(meta, buffers);
+	GDEX_EXPECT_TRUE(tex.is_valid());
+	godot::Ref<godot::ImageTexture> img_tex = tex;
+	GDEX_EXPECT_TRUE(img_tex.is_valid());
+	godot::Ref<godot::Image> img = img_tex->get_image();
+	GDEX_EXPECT_TRUE(img.is_valid());
+	GDEX_EXPECT_EQ(img->get_width(), 64);
+	GDEX_EXPECT_EQ(img->get_height(), 64);
+	GDEX_EXPECT_FALSE(img->has_mipmaps());
+	GDEX_EXPECT_EQ(img->get_data().size(), 16384);
+}

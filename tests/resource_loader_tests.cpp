@@ -9,6 +9,7 @@
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
+#include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/resource_format_loader.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
@@ -235,6 +236,44 @@ GDEX_TEST_T(loader, load_loose_dstex_ignore_returns_valid_texture, TAG_INTEGRATI
 	godot::Ref<godot::Texture2D> tex_again(again);
 	GDEX_ASSERT_TRUE(tex_again.is_valid());
 	GDEX_EXPECT_TRUE(cache->get_cached(godot::String(dstex_path), godot::DSTextureCache::CACHE_MODE_REUSE).is_null());
+
+	remove_user_file(dstex_path);
+}
+
+// --- Load: partial mip chain falls back to base without mipmaps (#0039) ------
+
+GDEX_TEST_T(loader, load_partial_mip_chain_returns_base_without_mipmaps, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_loader_partial_chain.dstex";
+	// 64x64 RGBA8 needs a full chain of 7 for use_mipmaps=true.
+	// Write only 2 mips (base 16384 + mip1 4096 = 20480 natural bytes).
+	godot::PackedByteArray raw;
+	raw.resize(20480);
+	uint8_t *w = raw.ptrw();
+	for (int64_t i = 0; i < 20480; ++i) {
+		w[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+	}
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	GDEX_ASSERT_TRUE(dstex.is_valid());
+	if (dstex->write_to_file(godot::String(dstex_path), raw, 64, 64, godot::Image::FORMAT_RGBA8, 2, 1) != godot::OK) {
+		GDEX_ABORT_TEST("fixture partial-chain DSTex write failed");
+	}
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	godot::Variant result = loader->_load(godot::String(dstex_path), godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+	godot::Ref<godot::Texture2D> tex(result);
+	GDEX_ASSERT_TRUE(tex.is_valid());
+	GDEX_EXPECT_EQ(tex->get_width(), 64);
+	GDEX_EXPECT_EQ(tex->get_height(), 64);
+	godot::Ref<godot::ImageTexture> img_tex = tex;
+	GDEX_ASSERT_TRUE(img_tex.is_valid());
+	godot::Ref<godot::Image> img = img_tex->get_image();
+	GDEX_ASSERT_TRUE(img.is_valid());
+	GDEX_EXPECT_FALSE(img->has_mipmaps());
+	GDEX_EXPECT_EQ(img->get_data().size(), 16384);
 
 	remove_user_file(dstex_path);
 }

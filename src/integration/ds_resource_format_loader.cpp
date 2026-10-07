@@ -48,6 +48,22 @@ LoaderArchiveResolution &loader_archive_resolution() {
 	return s;
 }
 
+// Full Godot mip chain length for Image::create_from_data(use_mipmaps=true).
+// Partial chains (1 < mips < full) must fall back to base-mip-only instead of failing.
+static uint32_t ds_full_mip_chain_count(uint32_t p_w, uint32_t p_h) {
+	uint32_t n = 1;
+	while (p_w > 1 || p_h > 1) {
+		if (p_w > 1) {
+			p_w /= 2;
+		}
+		if (p_h > 1) {
+			p_h /= 2;
+		}
+		++n;
+	}
+	return n;
+}
+
 } // namespace
 
 void DSResourceFormatLoader::_bind_methods() {
@@ -487,7 +503,29 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 			}
 
 			if (all_mips_ok && natural_texture_data.size() > 0) {
-				Ref<Image> image = Image::create_from_data(p_width, p_height, mip_count > 1, static_cast<Image::Format>(img_fmt), natural_texture_data);
+				// Graceful Base Fallback: use_mipmaps=true demands the full chain.
+				// Partial chains slice mip 0 and build without mipmaps + warning.
+				bool use_mipmaps = mip_count > 1;
+				PackedByteArray image_data;
+				const uint32_t full_chain = ds_full_mip_chain_count(p_width, p_height);
+				if (use_mipmaps && mip_count < full_chain) {
+					const DSTexMipLayout base_layout = DSTex::get_mip_layout(p_width, p_height, img_fmt);
+					const int64_t base_size = static_cast<int64_t>(base_layout.source_size);
+					if (base_size > 0 && natural_texture_data.size() >= base_size) {
+						image_data.resize(base_size);
+						memcpy(image_data.ptrw(), natural_texture_data.ptr(), static_cast<size_t>(base_size));
+						use_mipmaps = false;
+						UtilityFunctions::push_warning("DSResourceFormatLoader: Partial mip chain (", mip_count, " of ", full_chain, ") for '", p_cache_key, "'; using base mip without mipmaps.");
+					} else {
+						UtilityFunctions::push_error("DSResourceFormatLoader: Partial mip chain with bad base size for '", p_cache_key, "' (mips=", mip_count, ", full=", full_chain, ").");
+					}
+				} else {
+					image_data = natural_texture_data;
+				}
+				Ref<Image> image;
+				if (image_data.size() > 0) {
+					image = Image::create_from_data(p_width, p_height, use_mipmaps, static_cast<Image::Format>(img_fmt), image_data);
+				}
 				if (image.is_valid() && !image->is_empty()) {
 					result_texture = ImageTexture::create_from_image(image);
 				}
@@ -536,7 +574,28 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				}
 			}
 			if (decompressed_data.size() > 0) {
-				Ref<Image> image = Image::create_from_data(p_width, p_height, mip_count > 1, static_cast<Image::Format>(img_fmt), decompressed_data);
+				// Graceful Base Fallback (v1): partial chains slice mip 0, no mipmaps.
+				bool use_mipmaps_v1 = mip_count > 1;
+				PackedByteArray image_data_v1;
+				const uint32_t full_chain_v1 = ds_full_mip_chain_count(p_width, p_height);
+				if (use_mipmaps_v1 && mip_count < full_chain_v1) {
+					const DSTexMipLayout base_layout_v1 = DSTex::get_mip_layout(p_width, p_height, img_fmt);
+					const int64_t base_size_v1 = static_cast<int64_t>(base_layout_v1.source_size);
+					if (base_size_v1 > 0 && decompressed_data.size() >= base_size_v1) {
+						image_data_v1.resize(base_size_v1);
+						memcpy(image_data_v1.ptrw(), decompressed_data.ptr(), static_cast<size_t>(base_size_v1));
+						use_mipmaps_v1 = false;
+						UtilityFunctions::push_warning("DSResourceFormatLoader: Partial mip chain (", mip_count, " of ", full_chain_v1, ") for '", p_cache_key, "'; using base mip without mipmaps.");
+					} else {
+						UtilityFunctions::push_error("DSResourceFormatLoader: Partial mip chain with bad base size for '", p_cache_key, "' (mips=", mip_count, ", full=", full_chain_v1, ").");
+					}
+				} else {
+					image_data_v1 = decompressed_data;
+				}
+				Ref<Image> image;
+				if (image_data_v1.size() > 0) {
+					image = Image::create_from_data(p_width, p_height, use_mipmaps_v1, static_cast<Image::Format>(img_fmt), image_data_v1);
+				}
 				if (image.is_valid() && !image->is_empty()) {
 					result_texture = ImageTexture::create_from_image(image);
 				}

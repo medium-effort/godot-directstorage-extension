@@ -31,6 +31,21 @@ namespace godot {
 // header claiming gigabytes must be rejected before resize() runs.
 static constexpr uint64_t MAX_PREWARM_REQUEST_BYTES = 512ULL * 1024ULL * 1024ULL;
 
+// Full Godot mip chain length for Image::create_from_data(use_mipmaps=true).
+static uint32_t ds_preloader_full_mip_chain_count(uint32_t p_w, uint32_t p_h) {
+	uint32_t n = 1;
+	while (p_w > 1 || p_h > 1) {
+		if (p_w > 1) {
+			p_w /= 2;
+		}
+		if (p_h > 1) {
+			p_h /= 2;
+		}
+		++n;
+	}
+	return n;
+}
+
 DSPreloader::State &DSPreloader::state() {
 	static State s;
 	return s;
@@ -1075,7 +1090,33 @@ Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vect
 		}
 	}
 
-	Ref<Image> image = Image::create_from_data((int)p_meta.width, (int)p_meta.height, p_meta.mip_count > 1, (Image::Format)img_fmt, natural_data);
+	// Graceful Base Fallback: partial chains slice mip 0, no mipmaps + warning.
+	bool use_mipmaps = p_meta.mip_count > 1;
+	PackedByteArray image_data;
+	const uint32_t full_chain = ds_preloader_full_mip_chain_count(p_meta.width, p_meta.height);
+	if (use_mipmaps && p_meta.mip_count < full_chain) {
+		int64_t base_size = 0;
+		if (p_meta.is_v2 && !layouts.empty()) {
+			base_size = static_cast<int64_t>(layouts[0].source_size);
+		} else {
+			const DSTexMipLayout base_layout = DSTex::get_mip_layout(p_meta.width, p_meta.height, img_fmt);
+			base_size = static_cast<int64_t>(base_layout.source_size);
+		}
+		if (base_size > 0 && natural_data.size() >= base_size) {
+			image_data.resize(base_size);
+			memcpy(image_data.ptrw(), natural_data.ptr(), static_cast<size_t>(base_size));
+			use_mipmaps = false;
+			UtilityFunctions::push_warning("DSPreloader: Partial mip chain (", p_meta.mip_count, " of ", full_chain, ") for '", p_meta.engine_path, "'; using base mip without mipmaps.");
+		} else {
+			UtilityFunctions::push_error("DSPreloader: Partial mip chain with bad base size for '", p_meta.engine_path, "'.");
+		}
+	} else {
+		image_data = natural_data;
+	}
+	Ref<Image> image;
+	if (image_data.size() > 0) {
+		image = Image::create_from_data((int)p_meta.width, (int)p_meta.height, use_mipmaps, (Image::Format)img_fmt, image_data);
+	}
 	if (image.is_valid() && !image->is_empty()) {
 		return ImageTexture::create_from_image(image);
 	}
