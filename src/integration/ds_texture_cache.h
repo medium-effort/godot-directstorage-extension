@@ -79,10 +79,17 @@ public:
 	// resolves .import/package remaps internally, skips paths already held
 	// in the caches, enqueues the DSContext stream queue and returns the
 	// stream tag for DSContext::is_prewarm_complete/get_prewarm_progress/
-	// cancel_prewarm. poll_completed() builds textures for finished
-	// requests (GPU texture on the render thread, ImageTexture elsewhere)
-	// and stores them; returns textures stored by this call.
+	// cancel_prewarm. prewarm_gpu_async() is the Phase-2 GPU variant (same
+	// contract; GPU-eligible payloads allocate on the render thread and
+	// complete as Texture2DRD, the rest take the memory path under the
+	// same tag). pump_gpu_prewarm() posts at most one pending GPU chunk
+	// per call (batch manager ticks it every frame). poll_completed()
+	// builds textures for finished requests and stores them; returns
+	// textures stored by this call.
 	uint64_t prewarm_async(const PackedStringArray &p_paths);
+	uint64_t prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size = 16, bool p_prefer_gpu = true);
+	void pump_gpu_prewarm();
+	bool is_gpu_prewarm_available();
 	int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, int p_max_usec = 0);
 	int get_pending_prewarm_count(uint64_t p_tag = 0) const;
 	int get_unbuilt_prewarm_count(uint64_t p_tag = 0) const;

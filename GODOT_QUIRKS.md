@@ -1072,5 +1072,40 @@ ERROR: DSResourceFormatLoader: Failed to create GPU/Image texture for user://tes
 This asymmetry means a green GPU-path test can hide a broken CPU fallback; the sub-thread test (which forces CPU) caught it. Partial-chain production files would hit the same wall (tracked as issue #0039).
 
 ### The Rule
-Never feed `Image::create_from_data(use_mipmaps=true)` fewer mips than Godot's full chain; test assets must carry complete chains like the exporter writes.
-Test payloads now build every level to 1x1 (64x4 = 7 mips, mip 0/1 patterns preserved for byte-exact asserts) in `project/headless_tests/test_thread_affinity.gd`.
+Never pass `use_mipmaps=true` to `Image::create_from_data` with partial mip chains; slice mip 0 and load with `use_mipmaps=false`.
+Implemented via Graceful Base Fallback in `src/integration/ds_resource_format_loader.cpp:505,576` and `src/integration/ds_preloader.cpp:1092`: `ds_full_mip_chain_count(w, h)` detects partial chains (`1 < mips < full_chain`), copies base mip 0 pixels, and creates the `Image` with `use_mipmaps=false` alongside a warning (resolving issue #0039). Test payloads also build every level to 1x1 (64x4 = 7 mips) in `project/headless_tests/test_thread_affinity.gd` so mipmaps are preserved.
+
+## 46. Engine Posts Throw Under Our Mutex
+
+### The Engine Reality
+`RenderingServer::call_on_render_thread()` is safe to call from extension threads (the Win32 backend's destination-query rendezvous depends on it), but invoking it while holding an extension-owned `std::mutex` threw an unknown (non-`std::exception`) object that escaped synchronously on the calling thread — no engine log, no crash, JSON still written. Bisected with stderr markers: identical post lock-free passes (`render_post_smoke` + `dma_fills_vram_texture` green on D3D12).
+
+### The Trap / Symptom
+`prewarm_gpu_async threw an unknown exception` from inside `pump_gpu_prewarm`, between the `Callable` construction print and the posted print — every statement individually innocent, only the under-lock post threw.
+
+### The Rule
+Never call into the engine while holding extension mutexes: pop state under lock, release, then post.
+```cpp
+// pump_gpu_prewarm: pop chunk under state().mutex, release, then post.
+RenderingServer *rs = RenderingServer::get_singleton();
+if (rs != nullptr) {
+    Callable gpu_chunk_callable = callable_mp_static(process_gpu_chunk_on_render_thread);
+    rs->call_on_render_thread(gpu_chunk_callable);
+}
+```
+See Q02 (thread affinity), Q33 (render pump).
+
+## 47. Defender Breaks Safe-Save Commits on Fresh res:// Files
+
+### The Engine Reality
+Godot's safe-save writes to a temp file and renames over the target at `close()` (`drivers/windows/file_access_windows.cpp:277`). In editor test runs, antivirus scan windows on brand-new `res://` files fail the rename, and `DirAccess::remove` on the same locked files fails too — both silently if return codes are ignored. A stale `textures.dspkg` then survives deletes and overwrites and poisons every later resolve in the process.
+
+### The Trap / Symptom
+```
+ERROR: Safe save failed. ... running a paranoid antivirus ...
+    at: _close (drivers/windows/file_access_windows.cpp:277)
+```
+Followed by `has_texture()` false on a just-staged archive whose staging reported success, and a stale entry dump (`mem`/`ctl` paths where `dma` paths were staged).
+
+### The Rule
+In editor test runs, treat every `res://` write as suspect: remove + copy + reopen-verify + one 500 ms retry, never trust the copy return code alone; make removal failures loud (`push_warning`, never ignored). Implemented in `tests/gpu_prewarm_tests.cpp` (`stage_gpu_dspkg`, `remove_abs`).

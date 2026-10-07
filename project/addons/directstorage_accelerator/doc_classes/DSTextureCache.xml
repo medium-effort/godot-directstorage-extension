@@ -71,6 +71,10 @@
 			<return type="bool" />
 			<description>Returns whether the texture cache is actively enabled.</description>
 		</method>
+		<method name="is_gpu_prewarm_available">
+			<return type="bool" />
+			<description>Returns whether hardware GPU DirectStorage prewarming is currently available (requires an initialized D3D12 DirectStorage backend with GPU decompression enabled and a live D3D12 [RenderingDevice]).</description>
+		</method>
 		<method name="poll_completed">
 			<return type="int" />
 			<param index="0" name="tag" type="int" default="0" />
@@ -82,6 +86,17 @@
 			<return type="int" />
 			<param index="0" name="paths" type="PackedStringArray" />
 			<description>Enqueues engine texture paths for asynchronous streaming prewarm and returns the stream tag. File remapping is resolved internally, and paths already in the cache are skipped without enqueueing. Track the tag with [method DSContext.is_prewarm_complete] and [method DSContext.get_prewarm_progress], or stop it early with [method DSContext.cancel_prewarm]. Returns [code]0[/code] when the extension is unavailable.</description>
+		</method>
+		<method name="prewarm_gpu_async">
+			<return type="int" />
+			<param index="0" name="paths" type="PackedStringArray" />
+			<param index="1" name="chunk_size" type="int" default="16" />
+			<param index="2" name="prefer_gpu" type="bool" default="true" />
+			<description>Enqueues engine texture paths for GPU-accelerated asynchronous streaming prewarm and returns the stream tag. When running under the D3D12 rendering driver with GPU decompression enabled, eligible color textures (v2 format, color-sampled, without the as_image_texture flag) are allocated directly as [Texture2DRD] resources on the render thread and filled via DirectStorage DMA decompression straight into VRAM. Ineligible textures or non-D3D12 platforms automatically fall back to the CPU [ImageTexture] memory stream path under the same stream tag. Textures are allocated in render-thread chunks of [param chunk_size] (default 16) to bound frame time. Returns [code]0[/code] when the extension is unavailable.</description>
+		</method>
+		<method name="pump_gpu_prewarm">
+			<return type="void" />
+			<description>Dispatches at most one queued GPU prewarm allocation chunk to the render thread per call. Automatically ticked once per frame by [code]DSBatchManager[/code]. Safe to call manually; no-op when idle or when a chunk is already in flight.</description>
 		</method>
 		<method name="has_alias" qualifiers="const">
 			<return type="bool" />

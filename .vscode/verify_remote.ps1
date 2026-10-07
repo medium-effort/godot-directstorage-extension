@@ -14,7 +14,8 @@
 param(
     [string]$RemoteDir = "",
     [string]$ManifestName = "",
-    [switch]$Artifacts
+    [switch]$Artifacts,
+    [switch]$TouchTests
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +23,24 @@ $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrEmpty($RemoteDir)) {
     Write-Output "VERIFY_ERROR:Missing -RemoteDir"
     exit 2
+}
+
+# Rebuild forcing: bump the mtime of every test source so SCons cannot
+# consider a changed/new tests/*.cpp up to date (observed: edited suites
+# silently skipped until touched). Test TUs only (fast); extension sources
+# have never shown the same staleness.
+if ($TouchTests) {
+    $testsDir = Join-Path $RemoteDir "tests"
+    $touched = 0
+    foreach ($testFile in (Get-ChildItem -LiteralPath $testsDir -Filter *.cpp -Recurse -File -ErrorAction SilentlyContinue)) {
+        $testFile.LastWriteTime = Get-Date
+        $touched++
+    }
+    Write-Output ("TOUCHED_TESTS=" + $touched)
+    if ($touched -eq 0) {
+        Write-Output "VERIFY_ERROR:No test sources found under tests/"
+        exit 2
+    }
 }
 
 if ($ManifestName -ne "") {

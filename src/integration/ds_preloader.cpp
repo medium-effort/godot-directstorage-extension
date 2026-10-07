@@ -17,7 +17,10 @@
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/texture2drd.hpp>
+#include <godot_cpp/classes/thread.hpp>
 #include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/variant/callable.hpp>
+#include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -862,12 +865,7 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 	return r_out.size() > 0;
 }
 
-uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
-	DSContext *ctx = DSContext::get_singleton();
-	if (ctx == nullptr) {
-		UtilityFunctions::push_error("DSPreloader: DSContext singleton unavailable; prewarm_async aborted.");
-		return 0;
-	}
+void DSPreloader::collect_prewarm_payloads(const PackedStringArray &p_paths, std::vector<Payload> &r_payloads, int &r_skipped_cached, int &r_skipped_unresolvable) {
 	DSTextureCache *cache = DSTextureCache::get_singleton();
 	ResourceLoader *rl = ResourceLoader::get_singleton();
 
@@ -882,10 +880,7 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 	load_combined_index();
 
 	HashMap<String, bool> seen;
-	std::vector<Payload> payloads;
-	payloads.reserve((size_t)p_paths.size());
-	int skipped_cached = 0;
-	int skipped_unresolvable = 0;
+	r_payloads.reserve((size_t)p_paths.size());
 	for (int i = 0; i < p_paths.size(); ++i) {
 		String path = p_paths[i].strip_edges();
 		if (path.is_empty() || seen.has(path)) {
@@ -906,17 +901,17 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 		if (cache) {
 			Ref<Texture2D> hit = cache->get_cached(path, DSTextureCache::CACHE_MODE_REUSE);
 			if (hit.is_valid()) {
-				skipped_cached++;
+				r_skipped_cached++;
 				continue;
 			}
 		}
 		if (rl && rl->has_cached(path)) {
-			skipped_cached++;
+			r_skipped_cached++;
 			continue;
 		}
 		Payload payload;
 		if (!resolve_payload(path, payload) || !validate_payload(payload)) {
-			skipped_unresolvable++;
+			r_skipped_unresolvable++;
 			continue;
 		}
 		// Payload bytes already cached under the remapped key (e.g. a sync
@@ -926,12 +921,24 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 			Ref<Texture2D> payload_hit = cache->get_cached(payload.payload_key, DSTextureCache::CACHE_MODE_REUSE);
 			if (payload_hit.is_valid()) {
 				cache->add_alias(payload.payload_key, payload.engine_path);
-				skipped_cached++;
+				r_skipped_cached++;
 				continue;
 			}
 		}
-		payloads.push_back(payload);
+		r_payloads.push_back(payload);
 	}
+}
+
+uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
+	DSContext *ctx = DSContext::get_singleton();
+	if (ctx == nullptr) {
+		UtilityFunctions::push_error("DSPreloader: DSContext singleton unavailable; prewarm_async aborted.");
+		return 0;
+	}
+	std::vector<Payload> payloads;
+	int skipped_cached = 0;
+	int skipped_unresolvable = 0;
+	collect_prewarm_payloads(p_paths, payloads, skipped_cached, skipped_unresolvable);
 
 	// Tag first with an empty list (total 0); each stream enqueue below bumps
 	// the tag total by exactly one, so total == tracked request count and
@@ -1011,6 +1018,470 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 	}
 	UtilityFunctions::print_verbose("DSPreloader: prewarm tag ", String::num_uint64(tag), " tracking ", (int64_t)payloads.size(), " textures (", (int64_t)enqueued, " stream requests, ", (int64_t)skipped_cached, " cached, ", (int64_t)skipped_unresolvable, " skipped).");
 	return tag;
+}
+
+// --- Phase 2: prewarm-owned GPU path ---------------------------------------
+// Design: texture_create + stream-enqueue + flush-attempt all run inside
+// one render-thread callback per chunk, so backend destination queries
+// run inline (zero cross-thread rendezvous). A main-thread batch-manager
+// flush stays as the rare ERR_BUSY fallback (correct, pays rendezvous).
+
+bool DSPreloader::main_or_render_thread() {
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (rs != nullptr && rs->is_on_render_thread()) {
+		return true;
+	}
+	return Thread::is_main_thread();
+}
+
+bool DSPreloader::is_gpu_prewarm_eligible(const Payload &p_payload) {
+	if (!p_payload.is_v2) {
+		return false;
+	}
+	if (p_payload.as_image_texture) {
+		return false;
+	}
+	if (p_payload.width == 0 || p_payload.height == 0 || p_payload.mip_count == 0) {
+		return false;
+	}
+	if (p_payload.pixel_format >= (uint32_t)RenderingDevice::DATA_FORMAT_MAX) {
+		return false;
+	}
+	// Color-sampled formats only: linear color formats carry an sRGB
+	// counterpart path and already-sRGB formats map to self; float and
+	// single/dual-channel data formats (which map to themselves) and
+	// unknown formats (MAX) are out.
+	if (DSTex::is_rd_format_srgb(static_cast<int>(p_payload.pixel_format))) {
+		// Already-sRGB color base: GPU uploads it directly.
+	} else {
+		const int srgb_fmt = DSTex::get_srgb_rd_format(static_cast<int>(p_payload.pixel_format));
+		if (srgb_fmt == RenderingDevice::DATA_FORMAT_MAX || srgb_fmt == static_cast<int>(p_payload.pixel_format)) {
+			return false;
+		}
+	}
+	const int64_t mips = (int64_t)p_payload.mip_count;
+	if (p_payload.mip_offsets.size() < mips || p_payload.mip_sizes.size() < mips ||
+			p_payload.mip_uncompressed_sizes.size() < mips) {
+		return false;
+	}
+	return true;
+}
+
+bool DSPreloader::is_gpu_prewarm_available() {
+	DSContext *ctx = DSContext::get_singleton();
+	if (ctx == nullptr || !ctx->is_initialized()) {
+		return false;
+	}
+	if (!ctx->is_d3d12_backend() || !ctx->is_gpu_decompression_enabled()) {
+		return false;
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (rs == nullptr || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+		return false;
+	}
+	return rs->get_rendering_device() != nullptr;
+}
+
+void DSPreloader::mark_gpu_item_failed(int64_t p_pending_id) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	std::unordered_map<int64_t, Tracked>::iterator it = state().pending.find(p_pending_id);
+	if (it != state().pending.end()) {
+		it->second.gpu_failed = true;
+	}
+}
+
+void DSPreloader::queue_gpu_orphan_rid(const RID &p_rid) {
+	if (!p_rid.is_valid()) {
+		return;
+	}
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		state().gpu_orphans.push_back(p_rid);
+	}
+	pump_gpu_orphans();
+}
+
+void DSPreloader::pump_gpu_orphans() {
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		if (s.gpu_orphans.empty() || s.gpu_orphan_free_posted) {
+			return;
+		}
+		RenderingServer *rs = RenderingServer::get_singleton();
+		if (rs == nullptr) {
+			// No RenderingDevice exists on this host (e.g. headless CI):
+			// orphan RIDs are meaningless here, drop them.
+			s.gpu_orphans.clear();
+			return;
+		}
+		s.gpu_orphan_free_posted = true;
+		rs->call_on_render_thread(callable_mp_static(free_gpu_orphans_on_render_thread));
+	}
+}
+
+void DSPreloader::free_gpu_orphans_on_render_thread() {
+	std::vector<RID> orphans;
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		orphans.swap(s.gpu_orphans);
+		s.gpu_orphan_free_posted = false;
+	}
+	if (orphans.empty()) {
+		return;
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (rs == nullptr || !rs->is_on_render_thread()) {
+		// Wrong thread (should not happen): hand back for a later pump.
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		s.gpu_orphans.insert(s.gpu_orphans.begin(), orphans.begin(), orphans.end());
+		return;
+	}
+	RenderingDevice *rd = rs->get_rendering_device();
+	if (rd == nullptr) {
+		return;
+	}
+	for (size_t i = 0; i < orphans.size(); ++i) {
+		if (orphans[i].is_valid()) {
+			rd->free_rid(orphans[i]);
+		}
+	}
+}
+
+uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size, bool p_prefer_gpu) {
+	DSContext *ctx = DSContext::get_singleton();
+	if (ctx == nullptr) {
+		UtilityFunctions::push_error("DSPreloader: DSContext singleton unavailable; prewarm_gpu_async aborted.");
+		return 0;
+	}
+
+	std::vector<Payload> payloads;
+	int skipped_cached = 0;
+	int skipped_unresolvable = 0;
+	collect_prewarm_payloads(p_paths, payloads, skipped_cached, skipped_unresolvable);
+
+	// Evaluated once up front: render-side alloc re-validates per chunk, and
+	// anything ineligible (or late-unavailable GPU) stays on the memory path.
+	const bool gpu_ok = p_prefer_gpu && is_gpu_prewarm_available();
+	const int chunk_size = p_chunk_size > 0 ? p_chunk_size : 16;
+
+	// Tag first with an empty list (total 0); each stream enqueue bumps the
+	// total by exactly one on BOTH paths, so total == tracked request count.
+	uint64_t tag = ctx->prewarm_async(PackedStringArray());
+	int enqueued = 0;
+	int gpu_queued = 0;
+
+	// Memory path: identical stutter-guarded enqueue to prewarm_async
+	// (expand + stream-enqueue WITHOUT state().mutex held; one short
+	// publish section below).
+	std::vector<Tracked> ready;
+	ready.reserve(payloads.size());
+	std::vector<GpuChunkItem> gpu_items;
+	gpu_items.reserve(payloads.size());
+	{
+		Vector<Ref<DSRequest>> reqs;
+		for (size_t i = 0; i < payloads.size(); ++i) {
+			if (gpu_ok && is_gpu_prewarm_eligible(payloads[i])) {
+				GpuChunkItem item;
+				item.meta = payloads[i];
+				item.pending_id = 0; // assigned at publish below
+				gpu_items.push_back(item);
+				continue;
+			}
+			if (!expand_requests(payloads[i], tag, reqs)) {
+				skipped_unresolvable++;
+				continue;
+			}
+			bool all_queued = true;
+			for (int r = 0; r < reqs.size(); ++r) {
+				if (!ctx->enqueue_request(reqs[r], true)) {
+					all_queued = false;
+					break;
+				}
+			}
+			if (!all_queued) {
+				for (int r = 0; r < reqs.size(); ++r) {
+					if (reqs[r].is_valid() && reqs[r]->get_status() != DSRequest::STATUS_COMPLETED && reqs[r]->get_status() != DSRequest::STATUS_FAILED) {
+						reqs[r]->set_status(DSRequest::STATUS_FAILED);
+						reqs[r]->set_error_message("Prewarm enqueue rejected.");
+					}
+				}
+				UtilityFunctions::push_warning("DSPreloader: Stream enqueue rejected for '", payloads[i].engine_path, "'; skipping.");
+				skipped_unresolvable++;
+				continue;
+			}
+			Tracked tracked;
+			tracked.tag = tag;
+			tracked.meta = payloads[i];
+			tracked.requests = reqs;
+			ready.push_back(tracked);
+			enqueued += reqs.size();
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		for (size_t i = 0; i < ready.size(); ++i) {
+			int64_t id = s.next_id++;
+			if (s.next_id == 0) {
+				s.next_id = 1;
+			}
+			s.pending[id] = ready[i];
+			s.pending_paths[ready[i].meta.engine_path]++;
+			if (ready[i].meta.payload_key != ready[i].meta.engine_path) {
+				s.pending_paths[ready[i].meta.payload_key]++;
+			}
+		}
+		// GPU entries are published upfront (no requests yet); the
+		// render-thread chunk callback attaches RID + requests by id.
+		GpuChunk chunk;
+		chunk.tag = tag;
+		for (size_t i = 0; i < gpu_items.size(); ++i) {
+			int64_t id = s.next_id++;
+			if (s.next_id == 0) {
+				s.next_id = 1;
+			}
+			Tracked t;
+			t.tag = tag;
+			t.meta = gpu_items[i].meta;
+			t.is_gpu = true;
+			s.pending[id] = t;
+			s.pending_paths[t.meta.engine_path]++;
+			if (t.meta.payload_key != t.meta.engine_path) {
+				s.pending_paths[t.meta.payload_key]++;
+			}
+			gpu_items[i].pending_id = id;
+			chunk.items.push_back(gpu_items[i]);
+			gpu_queued++;
+		}
+		// Slice into chunks of at most chunk_size (bounded render-thread
+		// time per callback); leftovers ride as a final short chunk.
+		for (size_t base = 0; base < chunk.items.size(); base += (size_t)chunk_size) {
+			GpuChunk part;
+			part.tag = tag;
+			size_t end = base + (size_t)chunk_size;
+			if (end > chunk.items.size()) {
+				end = chunk.items.size();
+			}
+			part.items.assign(chunk.items.begin() + base, chunk.items.begin() + end);
+			s.gpu_chunks.push_back(part);
+		}
+	}
+	if (enqueued > 0) {
+		ctx->flush_stream_async();
+	}
+	// Kick the first GPU chunk without waiting for a batch-manager tick.
+	pump_gpu_prewarm();
+	UtilityFunctions::print_verbose("DSPreloader: gpu prewarm tag ", String::num_uint64(tag), " tracking ", (int64_t)payloads.size(), " textures (", (int64_t)enqueued, " memory requests, ", (int64_t)gpu_queued, " gpu textures, ", (int64_t)skipped_cached, " cached, ", (int64_t)skipped_unresolvable, " skipped).");
+	return tag;
+}
+
+void DSPreloader::pump_gpu_prewarm() {
+	bool have_chunk = false;
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		if (!s.gpu_chunk_in_flight && !s.gpu_chunks.empty() && is_gpu_prewarm_available()) {
+			s.gpu_current = s.gpu_chunks.front();
+			s.gpu_chunks.pop_front();
+			s.gpu_current_valid = true;
+			s.gpu_chunk_in_flight = true;
+			have_chunk = true;
+		}
+	}
+	if (have_chunk) {
+		// Post WITHOUT state().mutex held. Beyond classic lock-order
+		// hygiene this is load-bearing: posting call_on_render_thread
+		// while holding the preloader mutex throws (observed: unknown
+		// exception escaping the post on D3D12, green the moment the
+		// lock is released first).
+		RenderingServer *rs = RenderingServer::get_singleton();
+		if (rs != nullptr) {
+			Callable gpu_chunk_callable = callable_mp_static(process_gpu_chunk_on_render_thread);
+			rs->call_on_render_thread(gpu_chunk_callable);
+		} else {
+			std::lock_guard<std::mutex> lock(state().mutex);
+			State &s = state();
+			s.gpu_current_valid = false;
+			s.gpu_chunk_in_flight = false;
+		}
+	}
+	pump_gpu_orphans();
+}
+
+void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSContext *p_ctx, uint64_t p_tag, const GpuChunkItem &p_item) {
+	const Payload &m = p_item.meta;
+	// Re-validate: availability may have changed between pump and alloc.
+	if (!is_gpu_prewarm_eligible(m)) {
+		mark_gpu_item_failed(p_item.pending_id);
+		return;
+	}
+	const int img_fmt = DSTex::rd_format_to_godot_format((int)m.pixel_format);
+	if (img_fmt == Image::FORMAT_MAX || !DSTex::is_format_supported(img_fmt)) {
+		mark_gpu_item_failed(p_item.pending_id);
+		return;
+	}
+
+	// Mirror the loader can_attempt_gpu texture_create (Component 1 sRGB
+	// share included) so 3D PBR albedo sampling stays valid.
+	Ref<RDTextureFormat> rd_fmt;
+	rd_fmt.instantiate();
+	rd_fmt->set_width(static_cast<int32_t>(m.width));
+	rd_fmt->set_height(static_cast<int32_t>(m.height));
+	rd_fmt->set_format(static_cast<RenderingDevice::DataFormat>(m.pixel_format));
+	rd_fmt->set_mipmaps(static_cast<int32_t>(m.mip_count > 0 ? m.mip_count : 1));
+	rd_fmt->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);
+	rd_fmt->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
+	if (!DSTex::is_rd_format_srgb(static_cast<int>(m.pixel_format))) {
+		int srgb_fmt = DSTex::get_srgb_rd_format(static_cast<int>(m.pixel_format));
+		if (srgb_fmt != RenderingDevice::DATA_FORMAT_MAX && srgb_fmt != static_cast<int>(m.pixel_format)) {
+			rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(m.pixel_format));
+			rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(srgb_fmt));
+		}
+	}
+
+	Ref<RDTextureView> rd_view;
+	rd_view.instantiate();
+
+	RID tex_rid = p_rd->texture_create(rd_fmt, rd_view, TypedArray<PackedByteArray>());
+	if (!tex_rid.is_valid()) {
+		UtilityFunctions::push_warning("DSPreloader: GPU texture_create failed for '", m.engine_path, "'; sync load remains available.");
+		mark_gpu_item_failed(p_item.pending_id);
+		return;
+	}
+	uint64_t native = p_rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, tex_rid, 0);
+	if (native == 0) {
+		UtilityFunctions::push_warning("DSPreloader: GPU native format query failed for '", m.engine_path, "'; sync load remains available.");
+		p_rd->free_rid(tex_rid);
+		mark_gpu_item_failed(p_item.pending_id);
+		return;
+	}
+
+	// Loader-style single request spanning all mips (backend validates the
+	// subresource range against the freshly created texture).
+	const uint64_t start_offset = static_cast<uint64_t>(m.mip_offsets[0]);
+	const uint64_t last_idx = static_cast<uint64_t>(m.mip_count - 1);
+	const uint64_t total_span = (static_cast<uint64_t>(m.mip_offsets[last_idx]) + static_cast<uint64_t>(m.mip_sizes[last_idx])) - start_offset;
+	uint64_t total_uncomp = 0;
+	for (uint32_t i = 0; i < m.mip_count; ++i) {
+		total_uncomp += static_cast<uint64_t>(m.mip_uncompressed_sizes[i]);
+	}
+	if (total_span == 0 || total_span > UINT32_MAX || total_uncomp == 0 || total_uncomp > UINT32_MAX) {
+		UtilityFunctions::push_warning("DSPreloader: GPU payload span out of range for '", m.engine_path, "'; sync load remains available.");
+		p_rd->free_rid(tex_rid);
+		mark_gpu_item_failed(p_item.pending_id);
+		return;
+	}
+
+	Ref<DSRequest> req;
+	req.instantiate();
+	req->set_file_path(m.file_path);
+	req->set_offset(start_offset);
+	req->set_size(static_cast<uint32_t>(total_span));
+	req->set_uncompressed_size(static_cast<uint32_t>(total_uncomp));
+	req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+	req->set_cancellation_tag(p_tag);
+	req->set_destination_type(DSRequest::DESTINATION_GPU_TEXTURE);
+	req->set_destination_resource(tex_rid);
+	req->set_first_subresource(0);
+	req->set_subresource_count(m.mip_count);
+	req->set_texture_format(static_cast<uint32_t>(native));
+	if (!p_ctx->enqueue_request(req, true)) {
+		// Cancelled tag (already terminal-counted): release the texture,
+		// drop the pending entry via the failed flag.
+		p_rd->free_rid(tex_rid);
+		mark_gpu_item_failed(p_item.pending_id);
+		return;
+	}
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		std::unordered_map<int64_t, Tracked>::iterator it = state().pending.find(p_item.pending_id);
+		if (it == state().pending.end()) {
+			// Entry vanished (shutdown/rescan): release, nothing to attach.
+			p_rd->free_rid(tex_rid);
+			return;
+		}
+		it->second.gpu_tex_rid = tex_rid;
+		it->second.requests.push_back(req);
+	}
+}
+
+void DSPreloader::process_gpu_chunk_on_render_thread() {
+	RenderingServer *rs = RenderingServer::get_singleton();
+	GpuChunk chunk;
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		if (!s.gpu_current_valid) {
+			s.gpu_chunk_in_flight = false;
+			return;
+		}
+		chunk = s.gpu_current;
+		s.gpu_current.items.clear();
+		s.gpu_current_valid = false;
+	}
+	if (rs == nullptr || !rs->is_on_render_thread()) {
+		// Wrong thread (should not happen: posted via
+		// call_on_render_thread). Re-queue at front; pump retries.
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		s.gpu_chunks.push_front(chunk);
+		s.gpu_chunk_in_flight = false;
+		return;
+	}
+	RenderingDevice *rd = rs->get_rendering_device();
+	DSContext *ctx = DSContext::get_singleton();
+	if (rd == nullptr || ctx == nullptr || !ctx->is_d3d12_backend() || !ctx->is_gpu_decompression_enabled()) {
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		for (size_t i = 0; i < chunk.items.size(); ++i) {
+			std::unordered_map<int64_t, Tracked>::iterator it = s.pending.find(chunk.items[i].pending_id);
+			if (it != s.pending.end()) {
+				it->second.gpu_failed = true;
+			}
+		}
+		s.gpu_chunk_in_flight = false;
+		UtilityFunctions::push_warning("DSPreloader: GPU chunk dropped (D3D12 unavailable at alloc time); sync load remains available.");
+		return;
+	}
+	for (size_t i = 0; i < chunk.items.size(); ++i) {
+		alloc_gpu_item_on_render_thread(rd, ctx, chunk.tag, chunk.items[i]);
+	}
+	// Flush attempt on the render thread: backend destination queries run
+	// inline (zero rendezvous). ERR_BUSY keeps requests queued for the
+	// batch-manager retry on the main thread (slower rendezvous, rare).
+	ctx->flush_stream_async();
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		state().gpu_chunk_in_flight = false;
+	}
+}
+
+void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_cache, int &r_stored) {
+	if (p_entry.gpu_failed || !p_entry.gpu_tex_rid.is_valid()) {
+		if (p_entry.gpu_tex_rid.is_valid()) {
+			queue_gpu_orphan_rid(p_entry.gpu_tex_rid);
+		}
+		// Loud (not verbose): a GPU drop means DMA never filled VRAM and
+		// the scene falls back to a sync load; operators need to see it.
+		UtilityFunctions::push_warning("DSPreloader: GPU prewarm texture '", p_entry.meta.engine_path, "' did not complete; dropping (sync load remains available).");
+		return;
+	}
+	for (int r = 0; r < p_entry.requests.size(); ++r) {
+		if (p_entry.requests[r].is_null() || p_entry.requests[r]->get_status() != DSRequest::STATUS_COMPLETED) {
+			queue_gpu_orphan_rid(p_entry.gpu_tex_rid);
+			UtilityFunctions::push_warning("DSPreloader: GPU prewarm texture '", p_entry.meta.engine_path, "' did not complete; dropping (sync load remains available).");
+			return;
+		}
+	}
+	Ref<Texture2DRD> tex_rd;
+	tex_rd.instantiate();
+	tex_rd->set_texture_rd_rid(p_entry.gpu_tex_rid);
+	const String alias = (p_entry.meta.payload_key != p_entry.meta.engine_path) ? p_entry.meta.payload_key : String();
+	p_cache->store(p_entry.meta.engine_path, tex_rd, DSTextureCache::CACHE_MODE_REUSE, alias);
+	r_stored++;
 }
 
 bool DSPreloader::is_terminal(const Ref<DSRequest> &p_request) {
@@ -1132,6 +1603,9 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 
 	uint64_t start_usec = (p_max_usec > 0 && Time::get_singleton()) ? Time::get_singleton()->get_ticks_usec() : 0;
 	int stored = 0;
+	// GPU entries wrap Texture2DRD (main/render-thread-only): worker polls
+	// skip them in the scan below and leave them for the main-thread poll.
+	const bool can_build_gpu = main_or_render_thread();
 
 	// Single-scan collect: gather terminal entry IDs under one lock instead
 	// of re-scanning the full pending map after every build (O(N^2)).
@@ -1146,6 +1620,14 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 			const Tracked &cand = it->second;
 			if (p_tag != 0 && cand.tag != p_tag) {
 				continue;
+			}
+			if (cand.is_gpu) {
+				// Chunk not yet attached (no requests) or worker poll:
+				// leave for the main/render-thread poll. Failed entries
+				// are collected on any thread to drop them promptly.
+				if (!cand.gpu_failed && (cand.requests.is_empty() || !can_build_gpu)) {
+					continue;
+				}
 			}
 			bool all_terminal = true;
 			for (int i = 0; i < cand.requests.size(); ++i) {
@@ -1197,15 +1679,19 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 
 		bool ok = true;
 		std::vector<PackedByteArray> buffers;
-		for (int r = 0; r < t.requests.size(); ++r) {
-			if (t.requests[r].is_null() || t.requests[r]->get_status() != DSRequest::STATUS_COMPLETED) {
-				ok = false;
-				break;
+		if (!t.is_gpu) {
+			for (int r = 0; r < t.requests.size(); ++r) {
+				if (t.requests[r].is_null() || t.requests[r]->get_status() != DSRequest::STATUS_COMPLETED) {
+					ok = false;
+					break;
+				}
+				buffers.push_back(t.requests[r]->get_destination_buffer());
 			}
-			buffers.push_back(t.requests[r]->get_destination_buffer());
 		}
 
-		if (ok) {
+		if (t.is_gpu) {
+			complete_gpu_entry(t, cache, stored);
+		} else if (ok) {
 			Ref<Texture2D> tex = build_texture(t.meta, buffers);
 			if (tex.is_valid()) {
 				String alias = (t.meta.payload_key != t.meta.engine_path) ? t.meta.payload_key : String();
@@ -1291,6 +1777,14 @@ void DSPreloader::shutdown() {
 		std::lock_guard<std::mutex> lock(state().mutex);
 		state().pending.clear();
 		state().pending_paths.clear();
+		state().gpu_chunks.clear();
+		state().gpu_current.items.clear();
+		state().gpu_current_valid = false;
+		state().gpu_chunk_in_flight = false;
+		// RD is tearing down: destination RIDs die with it, drop orphans
+		// without freeing.
+		state().gpu_orphans.clear();
+		state().gpu_orphan_free_posted = false;
 		state().pending_cv.notify_all();
 	}
 	state().archive.unref();

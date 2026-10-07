@@ -253,6 +253,24 @@ if (-not $SkipVerify) {
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Device B verification failed ($ActiveHost) with no clean OK. Raw remote output:`n$detailLines" -Code 1
     }
     Write-VerboseHost "Source sync verified ($($ManifestEntries.Count) files)." -ForegroundColor Green
+    # [3c/6] Force test-source freshness on Device B: SCons has silently
+    # skipped recompiling changed/new tests/*.cpp (stale DLL, suite runs 0
+    # tests), so test TUs are touched to guarantee the next compile sees
+    # them. Quoteless invocation, same as [3b/6].
+    Write-VerboseHost "[3c/6] Touching test sources on Device B..." -ForegroundColor Cyan
+    $TouchOut = ssh $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -TouchTests 2>&1
+    $TouchCount = 0
+    foreach ($touchLine in @($TouchOut)) {
+        $touchText = $touchLine.ToString()
+        if ($touchText.StartsWith("TOUCHED_TESTS=")) {
+            [int]::TryParse($touchText.Substring(14), [ref]$TouchCount) | Out-Null
+        }
+    }
+    if ($TouchCount -eq 0) {
+        $touchDetail = @($TouchOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 10) -join "`n"
+        Show-BuildFailure -Step "Step [3/6] Test Source Refresh" -Message "Device B test-source touch reported zero files ($ActiveHost). Raw remote output:`n$touchDetail" -Code 1
+    }
+    Write-VerboseHost "Test sources refreshed ($TouchCount file(s))." -ForegroundColor Green
 }
 
 # 4. Trigger SCons build on Device B
@@ -263,26 +281,39 @@ $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
 # file written only after a successful scons is the reliable signal.
 $RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
 ssh $ActiveHost "if exist `"$RemoteMarkerWin`" del /q `"$RemoteMarkerWin`""
-if ($Verbose) {
-    ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`""
+# The deletion itself is verified: a stale marker fakes success (observed —
+# del silently failed on a locked file, scons then errored, and the
+# surviving marker passed the gate below with a SUCCESS banner).
+ssh $ActiveHost "if exist `"$RemoteMarkerWin`" (exit /b 1) else (exit /b 0)"
+if ($LASTEXITCODE -ne 0) {
+    Show-BuildFailure -Step "Step [4/6] Marker Reset" -Message "Stale success marker could not be deleted on Device B ($ActiveHost); refusing a build whose success cannot be verified." -Code $LASTEXITCODE
 }
-else {
-    $sconsOutput = ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`"" 2>&1
+# SCons output is always captured (printed live only in verbose mode) so a
+# failed compile can never hide behind the marker gate again: the gate
+# below fails on EITHER a missing marker OR unambiguous failure signatures
+# in the captured output (observed: "terminated because of errors" + Error
+# 2 followed by a SUCCESS banner and stale artifact pull).
+$sconsLines = @(ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`"" 2>&1)
+if ($Verbose -and $sconsLines) {
+    $sconsLines | ForEach-Object { Write-Host $_ }
 }
 ssh $ActiveHost "if exist `"$RemoteMarkerWin`" (exit /b 0) else (exit /b 1)"
-if ($LASTEXITCODE -ne 0) {
-    if (-not $Verbose -and $sconsOutput) {
-        $errorLines = $sconsOutput | Where-Object { $_ -match "error[:\s]|fatal|failed|exception" }
+$markerMissing = $LASTEXITCODE -ne 0
+$sconsFailed = @($sconsLines | Where-Object { $_ -match "terminated because of errors|scons: \*\*\* \[|error C[0-9]+|error LNK[0-9]+" }).Count -gt 0
+if ($markerMissing -or $sconsFailed) {
+    if ($sconsLines) {
+        $errorLines = $sconsLines | Where-Object { $_ -match "error[:\s]|fatal|failed|exception" }
         if ($errorLines) {
             Write-Host "--- SCons Compilation Errors ---" -ForegroundColor Red
             $errorLines | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
         }
         else {
             Write-Host "--- SCons Output (tail) ---" -ForegroundColor Red
-            $sconsOutput | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+            $sconsLines | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
         }
     }
-    Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost). Detected via missing success marker (ssh does not propagate the SCons exit code)." -Code 1
+    $why = if ($sconsFailed) { "SCons reported compilation errors" } else { "missing success marker (ssh does not propagate the SCons exit code)" }
+    Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost). Detected via $why." -Code 1
 }
 
 # 5. Pull back compiled binary and debug symbols to Device A

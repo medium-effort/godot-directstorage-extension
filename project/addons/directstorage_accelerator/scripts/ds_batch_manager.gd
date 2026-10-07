@@ -42,6 +42,7 @@ var _poll_task_id: int = -1
 var _cache_caps_probed: bool = false
 var _has_get_unbuilt: bool = false
 var _has_poll: bool = false
+var _has_pump_gpu: bool = false
 ## Adaptive slice backpressure (Rev1 plan: Q13/Q41).
 ## EMA of main-thread frame time; slice budgets passed by value to the
 ## worker via bind() so no cross-thread mutable read occurs.
@@ -153,7 +154,13 @@ func _process(delta: float) -> void:
 			if not _cache_caps_probed:
 				_has_get_unbuilt = cache.has_method("get_unbuilt_prewarm_count")
 				_has_poll = cache.has_method("poll_completed")
+				_has_pump_gpu = cache.has_method("pump_gpu_prewarm")
 				_cache_caps_probed = true
+			# Phase-2 GPU prewarm: at most one render-thread chunk per
+			# frame; no-op while idle, in flight, or without D3D12.
+			# Compatible with older builds lacking the method.
+			if _has_pump_gpu:
+				cache.pump_gpu_prewarm()
 			# Adaptive backpressure: EMA over clamped delta + 2-frame streak
 			# gate (Rev1: immediate delta is noisy under the 120-148ms clamp).
 			var frame_ms: float = delta * 1000.0

@@ -17,13 +17,13 @@
 //   (mip_offsets/sizes/uncompressed/row_pitch) from enqueue through to the
 //   build step ("v2 footprint passthrough"); the build unpads rows via
 //   DSTex::unpad_footprint_mip exactly like the sync loader CPU path.
-// - Texture OBJECT construction is ImageTexture-only (worker-safe by
-//   construction, no RenderingDevice thread affinity): build_texture()
-//   produces ImageTexture::create_from_image() on every thread. GPU-direct
-//   Texture2DRD upload was removed as the Q31 decision (CPU -> ImageTexture
-//   -> RenderingServer marshal replaces NVMe -> VRAM zero-copy; avoids the
-//   per-frame call_on_render_thread drain). as_image_texture sources take
-//   the same ImageTexture path.
+// - Texture OBJECT construction is ImageTexture-only on the memory path
+//   (worker-safe by construction, no RenderingDevice thread affinity):
+//   build_texture() produces ImageTexture::create_from_image() on every
+//   thread. The GPU path (prewarm_gpu_async, D3D12 only) allocates
+//   destination textures on the render thread and wraps them as Texture2DRD
+//   on completion; GPU entries are never built on worker threads.
+//   as_image_texture sources take the ImageTexture path on both paths.
 // - Each enqueued DSRequest Ref is held in the pending table until its status
 //   is finished (COMPLETED/FAILED, including cancelled) and poll_completed()
 //   has consumed it, so completion threads can never touch a freed request.
@@ -34,9 +34,10 @@
 //   (flush_stream_async reject path / finalize_completed_reports_locked /
 //   cancel_prewarm). This class never touches tag counters directly.
 // - GDScript reachability: this class is deliberately NOT a registered
-//   Godot class. The two GDScript-visible entry points live on the
-//   DSTextureCache singleton (prewarm_async / poll_completed) and delegate
-//   here; tag progress/cancel stay on DSContext's existing bindings.
+//   Godot class. The GDScript-visible entry points live on the
+//   DSTextureCache singleton (prewarm_async / prewarm_gpu_async /
+//   pump_gpu_prewarm / poll_completed) and delegate here; tag
+//   progress/cancel stay on DSContext's existing bindings.
 
 #include <godot_cpp/templates/hash_map.hpp>
 #include <godot_cpp/templates/vector.hpp>
@@ -50,6 +51,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -57,6 +59,9 @@
 namespace godot {
 
 class Texture2D;
+class RenderingDevice;
+class DSContext;
+class DSTextureCache;
 
 class DSPreloader {
 public:
@@ -144,6 +149,36 @@ public:
 	// until the batch manager drains them via flush_stream_async().
 	static uint64_t prewarm_async(const PackedStringArray &p_paths);
 
+	// GPU prewarm: same resolve/dedup/tag contract as prewarm_async, but
+	// GPU-eligible payloads (is_gpu_prewarm_eligible, D3D12 + GPU
+	// decompression active) are allocated as RenderingDevice textures on
+	// the render thread (one call_on_render_thread per chunk of
+	// p_chunk_size) and filled by DirectStorage DMA straight into VRAM.
+	// Ineligible payloads take the memory path under the SAME tag, and
+	// when the GPU path is unavailable everything degrades to the memory
+	// path, so the call is safe anywhere prewarm_async is (including
+	// headless CI, where it behaves identically to prewarm_async).
+	// Completion wraps Texture2DRD on the main/render thread only; worker
+	// poll_completed() calls skip GPU entries and leave them pending.
+	// Returns the DSContext stream tag, or 0 when DSContext is unavailable.
+	static uint64_t prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size = 16, bool p_prefer_gpu = true);
+
+	// True for payloads the GPU path accepts: v2 footprint metadata,
+	// worker-safe exclusion (as_image_texture == false), and a
+	// color-sampled format (linear formats carry an sRGB counterpart path,
+	// already-sRGB map to self; float/BC4/BC5/BC6H data formats are out).
+	static bool is_gpu_prewarm_eligible(const Payload &p_payload);
+
+	// True when a GPU prewarm can actually run: initialized D3D12 backend
+	// with GPU decompression enabled and a live RenderingDevice.
+	static bool is_gpu_prewarm_available();
+
+	// Main-thread pump: posts at most one pending GPU chunk to the render
+	// thread per call; no-op while idle, in flight, or GPU-unavailable.
+	// Called once per frame by the batch manager; also kicked once from
+	// prewarm_gpu_async so the first chunk starts without a manager tick.
+	static void pump_gpu_prewarm();
+
 	// Build textures for terminal requests and store them.
 	// p_tag == 0 consumes pending entries for ALL tags, otherwise only the
 	// given tag. Returns the number of textures stored into DSTextureCache
@@ -193,6 +228,26 @@ private:
 		uint64_t tag = 0;
 		Payload meta;
 		Vector<Ref<DSRequest>> requests;
+		// GPU-path fields: destination texture allocated on the render
+		// thread. is_gpu entries skip the memory build; completion wraps
+		// gpu_tex_rid as Texture2DRD. gpu_failed drops the entry (sync
+		// load remains available) and orphans the RID for render-thread
+		// release when one was allocated.
+		RID gpu_tex_rid;
+		bool is_gpu = false;
+		bool gpu_failed = false;
+	};
+
+	// One GPU chunk: pending-table ids + payloads, allocated + enqueued +
+	// flush-attempted inside a single render-thread callback so backend
+	// destination queries run inline (zero cross-thread rendezvous).
+	struct GpuChunkItem {
+		int64_t pending_id = 0;
+		Payload meta;
+	};
+	struct GpuChunk {
+		uint64_t tag = 0;
+		std::vector<GpuChunkItem> items;
 	};
 
 	struct State {
@@ -234,6 +289,18 @@ private:
 		String combined_index_path;
 		bool combined_index_probed = false;
 		bool combined_index_available = false;
+		// GPU prewarm chunk queue: pending chunks awaiting one
+		// render-thread callback each (pump_gpu_prewarm posts at most one
+		// per frame). gpu_current holds the chunk being processed;
+		// gpu_chunk_in_flight prevents pile-up. gpu_orphans holds
+		// destination RIDs whose requests failed, released on the render
+		// thread (free_rid is render-thread-only).
+		std::deque<GpuChunk> gpu_chunks;
+		GpuChunk gpu_current;
+		bool gpu_current_valid = false;
+		bool gpu_chunk_in_flight = false;
+		std::vector<RID> gpu_orphans;
+		bool gpu_orphan_free_posted = false;
 	};
 
 	static State &state();
@@ -297,6 +364,22 @@ private:
 
 	static bool is_terminal(const Ref<DSRequest> &p_request);
 	static Ref<Texture2D> build_texture(const Payload &p_meta, const std::vector<PackedByteArray> &p_buffers);
+
+	// GPU chunk pipeline (all render-thread-affine RD work happens in
+	// process_gpu_chunk_on_render_thread; pump/attach/orphan helpers run
+	// on the calling thread under State::mutex).
+	// Shared resolve+dedup core for prewarm_async/prewarm_gpu_async:
+	// boot-warmer index load, cache/engine dedup, payload resolve +
+	// validate. Fills r_payloads, r_skipped_cached, r_skipped_unresolvable.
+	static void collect_prewarm_payloads(const PackedStringArray &p_paths, std::vector<Payload> &r_payloads, int &r_skipped_cached, int &r_skipped_unresolvable);
+	static void process_gpu_chunk_on_render_thread();
+	static void free_gpu_orphans_on_render_thread();
+	static void queue_gpu_orphan_rid(const RID &p_rid);
+	static bool main_or_render_thread();
+	static void alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSContext *p_ctx, uint64_t p_tag, const GpuChunkItem &p_item);
+	static void mark_gpu_item_failed(int64_t p_pending_id);
+	static void complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_cache, int &r_stored);
+	static void pump_gpu_orphans();
 };
 
 } // namespace godot

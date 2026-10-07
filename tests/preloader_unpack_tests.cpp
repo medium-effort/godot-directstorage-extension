@@ -117,6 +117,57 @@ GDEX_TEST(preloader_unpack, truncated_payload_safe_under_copy) {
 	GDEX_EXPECT_TRUE(tex.is_valid());
 }
 
+GDEX_TEST(preloader_gpu, eligibility_matrix) {
+	// Base: v2 BC7 color, complete tables -> eligible.
+	godot::DSPreloader::Payload eligible;
+	eligible.engine_path = "res://test_gpu_eligible.png";
+	eligible.width = 64;
+	eligible.height = 64;
+	eligible.mip_count = 2;
+	eligible.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_BPTC_RGBA);
+	eligible.is_v2 = true;
+	eligible.mip_offsets.resize(2);
+	eligible.mip_sizes.resize(2);
+	eligible.mip_uncompressed_sizes.resize(2);
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(eligible));
+
+	// as_image_texture exclusion (projector/decal sources stay CPU).
+	godot::DSPreloader::Payload image_tex = eligible;
+	image_tex.as_image_texture = true;
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(image_tex));
+
+	// v1 single-stream has no footprint metadata.
+	godot::DSPreloader::Payload v1 = eligible;
+	v1.is_v2 = false;
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(v1));
+
+	// Float data format (maps to self, no sRGB counterpart path).
+	godot::DSPreloader::Payload data = eligible;
+	data.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RF);
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(data));
+
+	// Single-channel block data (BC4 maps to self).
+	godot::DSPreloader::Payload bc4 = eligible;
+	bc4.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGTC_R);
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(bc4));
+
+	// Already-sRGB base maps to self -> eligible.
+	godot::DSPreloader::Payload srgb = eligible;
+	srgb.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGBA8, true);
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(srgb));
+
+	// Incomplete mip tables.
+	godot::DSPreloader::Payload short_tables = eligible;
+	short_tables.mip_sizes.clear();
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(short_tables));
+}
+
+GDEX_TEST(preloader_gpu, pump_idle_is_noop) {
+	// No chunks queued anywhere: must not crash, post nothing, free nothing.
+	godot::DSPreloader::pump_gpu_prewarm();
+	GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(0), 0);
+}
+
 GDEX_TEST(preloader_unpack, partial_mip_chain_falls_back_to_base_no_mipmaps) {
 	// #0039: 64x64 needs a full chain of 7 for use_mipmaps=true.
 	// Supply only 2 mips -> base slice without mipmaps + warning, not failure.

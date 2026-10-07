@@ -116,6 +116,26 @@ $FixtureDll = Join-Path $FixtureBin $TestDll.Name
 Copy-Item -LiteralPath $TestDll.FullName -Destination $FixtureDll -Force
 Write-VerboseHost "Using test library: $($TestDll.FullName)" -ForegroundColor DarkGray
 
+# Stage the DirectStorage runtime beside the fixture's addon copy: without
+# dstorage*.dll the Win32Backend init fails and every GPU suite silently
+# skips (observed all-skip on D3D12 hardware). Refresh every run; a missing
+# local runtime warns once and keeps the old skip behavior.
+$RuntimeSrcDir = Join-Path $RepoRoot "project/addons/directstorage_accelerator/bin"
+$FixtureAddonBin = Join-Path $FixtureRoot "addons/directstorage_accelerator/bin"
+$RuntimeDlls = @(Get-ChildItem -Path $RuntimeSrcDir -Filter "dstorage*.dll" -File -ErrorAction SilentlyContinue)
+if ($RuntimeDlls.Count -eq 0) {
+    Write-Host "Warning: no dstorage*.dll in $RuntimeSrcDir; D3D12 GPU suites will skip." -ForegroundColor Yellow
+}
+else {
+    if (-not (Test-Path -LiteralPath $FixtureAddonBin)) {
+        New-Item -ItemType Directory -Force -Path $FixtureAddonBin | Out-Null
+    }
+    foreach ($runtimeDll in $RuntimeDlls) {
+        Copy-Item -LiteralPath $runtimeDll.FullName -Destination (Join-Path $FixtureAddonBin $runtimeDll.Name) -Force
+    }
+    Write-VerboseHost "Staged $($RuntimeDlls.Count) DirectStorage runtime DLL(s) into fixture." -ForegroundColor DarkGray
+}
+
 # Remove stale results so a crash cannot be masked by an old JSON.
 foreach ($f in @($JsonRel, $LogOut, $LogErr)) {
     if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
