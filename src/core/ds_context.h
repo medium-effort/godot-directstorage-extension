@@ -146,6 +146,7 @@ public:
 	bool is_prewarm_complete(uint64_t p_tag) const;
 	Vector2i get_prewarm_progress(uint64_t p_tag) const;
 	void cancel_prewarm(uint64_t p_tag);
+	bool is_tag_cancelled(uint64_t p_tag) const;
 	bool is_batch_complete() const;
 	bool has_pending_results() const;
 	void collect_completed_results();

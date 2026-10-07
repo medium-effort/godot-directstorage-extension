@@ -1043,6 +1043,15 @@ void DSContext::cancel_prewarm(uint64_t p_tag) {
 	}
 }
 
+bool DSContext::is_tag_cancelled(uint64_t p_tag) const {
+	if (p_tag == 0) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(stream_mutex);
+	std::unordered_map<uint64_t, StreamTagInfo>::const_iterator it = stream_tags.find(p_tag);
+	return it != stream_tags.end() && it->second.cancel_requested;
+}
+
 bool DSContext::is_batch_complete() const {
 	if (!active_backend) {
 		return true;
@@ -1249,6 +1258,7 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_prewarm_complete", "tag"), &DSContext::is_prewarm_complete);
 	ClassDB::bind_method(D_METHOD("get_prewarm_progress", "tag"), &DSContext::get_prewarm_progress);
 	ClassDB::bind_method(D_METHOD("cancel_prewarm", "tag"), &DSContext::cancel_prewarm);
+	ClassDB::bind_method(D_METHOD("is_tag_cancelled", "tag"), &DSContext::is_tag_cancelled);
 	ClassDB::bind_method(D_METHOD("is_batch_complete"), &DSContext::is_batch_complete);
 	ClassDB::bind_method(D_METHOD("has_pending_results"), &DSContext::has_pending_results);
 	ClassDB::bind_method(D_METHOD("collect_completed_results"), &DSContext::collect_completed_results);

@@ -189,6 +189,10 @@ GDEX_TEST_T(preloader_budget, empty_poll_budgets_return_zero, TAG_INTEGRATION) {
     GDEX_EXPECT_EQ(godot::DSPreloader::poll_completed(12345, 64, 4000), 0);
     GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(0), 0);
     GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(12345), 0);
+    GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_cpu_prewarm_count(0), 0);
+    GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_cpu_prewarm_count(12345), 0);
+    GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_gpu_prewarm_count(0), 0);
+    GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_gpu_prewarm_count(12345), 0);
     ctx.add_teardown([]() { (void)godot::DSPreloader::poll_completed(); });
 }
 
@@ -205,4 +209,8 @@ GDEX_TEST_T(preloader_budget, cache_delegates_budgets, TAG_INTEGRATION) {
     GDEX_EXPECT_EQ(cache->poll_completed(12345, 64, 4000), 0);
     GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(0), 0);
     GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(12345), 0);
+    GDEX_EXPECT_EQ(cache->get_unbuilt_cpu_prewarm_count(0), 0);
+    GDEX_EXPECT_EQ(cache->get_unbuilt_cpu_prewarm_count(12345), 0);
+    GDEX_EXPECT_EQ(cache->get_unbuilt_gpu_prewarm_count(0), 0);
+    GDEX_EXPECT_EQ(cache->get_unbuilt_gpu_prewarm_count(12345), 0);
 }

@@ -100,5 +100,58 @@ GDEX_TEST(dstex, srgb_counterpart_noncolor_returns_self_for_skip) {
     GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_R32_SFLOAT), (int)RD::DATA_FORMAT_R32_SFLOAT);
     GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_BC4_UNORM_BLOCK), (int)RD::DATA_FORMAT_BC4_UNORM_BLOCK);
     GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_BC6H_SFLOAT_BLOCK), (int)RD::DATA_FORMAT_BC6H_SFLOAT_BLOCK);
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_R8_UNORM), (int)RD::DATA_FORMAT_R8_UNORM);
+    GDEX_EXPECT_EQ(godot::DSTex::get_srgb_rd_format(RD::DATA_FORMAT_R8G8_UNORM), (int)RD::DATA_FORMAT_R8G8_UNORM);
     GDEX_EXPECT_FALSE(godot::DSTex::is_rd_format_srgb(RD::DATA_FORMAT_R32_SFLOAT));
+    GDEX_EXPECT_FALSE(godot::DSTex::is_rd_format_srgb(RD::DATA_FORMAT_R8_UNORM));
+    GDEX_EXPECT_FALSE(godot::DSTex::is_rd_format_srgb(RD::DATA_FORMAT_R8G8_UNORM));
+}
+
+GDEX_TEST(dstex, srgb_counterpart_exhaustive_image_formats_matrix) {
+    using RD = godot::RenderingDevice;
+    using Image = godot::Image;
+    for (int fmt = 0; fmt < Image::FORMAT_MAX; ++fmt) {
+        if (!godot::DSTex::is_format_supported(fmt)) {
+            continue;
+        }
+        int rd_linear = godot::DSTex::godot_format_to_rd_format(fmt, false);
+        int rd_srgb = godot::DSTex::godot_format_to_rd_format(fmt, true);
+
+        // Neither linear nor sRGB mapping must ever produce invalid D3D12 sRGB formats (Q44)
+        GDEX_EXPECT_NE(rd_linear, (int)RD::DATA_FORMAT_R8_SRGB);
+        GDEX_EXPECT_NE(rd_linear, (int)RD::DATA_FORMAT_R8G8_SRGB);
+        GDEX_EXPECT_NE(rd_linear, (int)RD::DATA_FORMAT_R8G8B8_SRGB);
+        GDEX_EXPECT_NE(rd_linear, (int)RD::DATA_FORMAT_B8G8R8_SRGB);
+
+        GDEX_EXPECT_NE(rd_srgb, (int)RD::DATA_FORMAT_R8_SRGB);
+        GDEX_EXPECT_NE(rd_srgb, (int)RD::DATA_FORMAT_R8G8_SRGB);
+        GDEX_EXPECT_NE(rd_srgb, (int)RD::DATA_FORMAT_R8G8B8_SRGB);
+        GDEX_EXPECT_NE(rd_srgb, (int)RD::DATA_FORMAT_B8G8R8_SRGB);
+
+        if (rd_linear != (int)RD::DATA_FORMAT_MAX) {
+            int counterpart = godot::DSTex::get_srgb_rd_format(rd_linear);
+            GDEX_EXPECT_NE(counterpart, (int)RD::DATA_FORMAT_R8_SRGB);
+            GDEX_EXPECT_NE(counterpart, (int)RD::DATA_FORMAT_R8G8_SRGB);
+            GDEX_EXPECT_NE(counterpart, (int)RD::DATA_FORMAT_R8G8B8_SRGB);
+            GDEX_EXPECT_NE(counterpart, (int)RD::DATA_FORMAT_B8G8R8_SRGB);
+
+            // If counterpart differs from rd_linear, it must be an allowed D3D12 sRGB format
+            if (counterpart != rd_linear && counterpart != (int)RD::DATA_FORMAT_MAX) {
+                bool is_allowed_d3d12_srgb = (
+                    counterpart == (int)RD::DATA_FORMAT_R8G8B8A8_SRGB ||
+                    counterpart == (int)RD::DATA_FORMAT_B8G8R8A8_SRGB ||
+                    counterpart == (int)RD::DATA_FORMAT_A8B8G8R8_SRGB_PACK32 ||
+                    counterpart == (int)RD::DATA_FORMAT_BC1_RGB_SRGB_BLOCK ||
+                    counterpart == (int)RD::DATA_FORMAT_BC1_RGBA_SRGB_BLOCK ||
+                    counterpart == (int)RD::DATA_FORMAT_BC2_SRGB_BLOCK ||
+                    counterpart == (int)RD::DATA_FORMAT_BC3_SRGB_BLOCK ||
+                    counterpart == (int)RD::DATA_FORMAT_BC7_SRGB_BLOCK ||
+                    counterpart == (int)RD::DATA_FORMAT_ETC2_R8G8B8_SRGB_BLOCK ||
+                    counterpart == (int)RD::DATA_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK ||
+                    counterpart == (int)RD::DATA_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK
+                );
+                GDEX_EXPECT_TRUE(is_allowed_d3d12_srgb);
+            }
+        }
+    }
 }

@@ -210,6 +210,8 @@ void DSTextureCache::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("poll_completed", "tag", "max_items", "max_usec"), &DSTextureCache::poll_completed, DEFVAL((uint64_t)0), DEFVAL(0), DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("get_pending_prewarm_count", "tag"), &DSTextureCache::get_pending_prewarm_count, DEFVAL((uint64_t)0));
 	ClassDB::bind_method(D_METHOD("get_unbuilt_prewarm_count", "tag"), &DSTextureCache::get_unbuilt_prewarm_count, DEFVAL((uint64_t)0));
+	ClassDB::bind_method(D_METHOD("get_unbuilt_cpu_prewarm_count", "tag"), &DSTextureCache::get_unbuilt_cpu_prewarm_count, DEFVAL((uint64_t)0));
+	ClassDB::bind_method(D_METHOD("get_unbuilt_gpu_prewarm_count", "tag"), &DSTextureCache::get_unbuilt_gpu_prewarm_count, DEFVAL((uint64_t)0));
 
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "enabled"), "set_enabled", "is_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_entries"), "set_max_entries", "get_max_entries");
@@ -540,6 +542,14 @@ int DSTextureCache::get_pending_prewarm_count(uint64_t p_tag) const {
 
 int DSTextureCache::get_unbuilt_prewarm_count(uint64_t p_tag) const {
 	return DSPreloader::get_unbuilt_prewarm_count(p_tag);
+}
+
+int DSTextureCache::get_unbuilt_cpu_prewarm_count(uint64_t p_tag) const {
+	return DSPreloader::get_unbuilt_cpu_prewarm_count(p_tag);
+}
+
+int DSTextureCache::get_unbuilt_gpu_prewarm_count(uint64_t p_tag) const {
+	return DSPreloader::get_unbuilt_gpu_prewarm_count(p_tag);
 }
 
 void DSTextureCache::evict(const String &p_path) {

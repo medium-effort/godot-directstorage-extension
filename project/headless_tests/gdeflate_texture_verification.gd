@@ -12,13 +12,28 @@ static func mip_extent(width: int, height: int, mip: int) -> Vector2i:
 static func is_block_compressed(format: int) -> bool:
 	return format == RenderingDevice.DATA_FORMAT_BC1_RGB_UNORM_BLOCK or format == RenderingDevice.DATA_FORMAT_BC3_UNORM_BLOCK or format == RenderingDevice.DATA_FORMAT_BC5_UNORM_BLOCK or format == RenderingDevice.DATA_FORMAT_BC6H_SFLOAT_BLOCK or format == RenderingDevice.DATA_FORMAT_BC7_UNORM_BLOCK
 
+static func bytes_per_pixel(format: int) -> int:
+	match format:
+		RenderingDevice.DATA_FORMAT_R8_UNORM, RenderingDevice.DATA_FORMAT_R8_UINT, RenderingDevice.DATA_FORMAT_R8_SINT:
+			return 1
+		RenderingDevice.DATA_FORMAT_R8G8_UNORM, RenderingDevice.DATA_FORMAT_R16_UNORM, RenderingDevice.DATA_FORMAT_R16_UINT, RenderingDevice.DATA_FORMAT_R16_SFLOAT:
+			return 2
+		RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM, RenderingDevice.DATA_FORMAT_R8G8B8A8_SRGB, RenderingDevice.DATA_FORMAT_R32_SFLOAT, RenderingDevice.DATA_FORMAT_R32_UINT:
+			return 4
+		RenderingDevice.DATA_FORMAT_R16G16B16A16_UNORM, RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT, RenderingDevice.DATA_FORMAT_R32G32_SFLOAT:
+			return 8
+		RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT:
+			return 16
+		_:
+			return 4
+
 static func row_layout(width: int, height: int, format: int) -> Array:
 	if is_block_compressed(format):
 		var blocks_x := maxi(1, (width + 3) / 4)
 		var blocks_y := maxi(1, (height + 3) / 4)
 		var block_bytes := 8 if format == RenderingDevice.DATA_FORMAT_BC1_RGB_UNORM_BLOCK else 16
 		return [blocks_x * block_bytes, blocks_y]
-	return [width * 4, height]
+	return [width * bytes_per_pixel(format), height]
 
 static func mip_footprints(width: int, height: int, format: int, mip_count: int) -> Array:
 	var result: Array = []

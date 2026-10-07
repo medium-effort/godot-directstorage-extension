@@ -354,10 +354,6 @@ int DSTex::rd_format_to_godot_format(int p_rd_format) {
 
 bool DSTex::is_rd_format_srgb(int p_rd_format) {
 	switch (p_rd_format) {
-		case RenderingDevice::DATA_FORMAT_R8_SRGB:
-		case RenderingDevice::DATA_FORMAT_R8G8_SRGB:
-		case RenderingDevice::DATA_FORMAT_R8G8B8_SRGB:
-		case RenderingDevice::DATA_FORMAT_B8G8R8_SRGB:
 		case RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB:
 		case RenderingDevice::DATA_FORMAT_B8G8R8A8_SRGB:
 		case RenderingDevice::DATA_FORMAT_A8B8G8R8_SRGB_PACK32:
@@ -377,14 +373,6 @@ bool DSTex::is_rd_format_srgb(int p_rd_format) {
 
 int DSTex::get_srgb_rd_format(int p_rd_format) {
 	switch (p_rd_format) {
-		case RenderingDevice::DATA_FORMAT_R8_UNORM:
-			return RenderingDevice::DATA_FORMAT_R8_SRGB;
-		case RenderingDevice::DATA_FORMAT_R8G8_UNORM:
-			return RenderingDevice::DATA_FORMAT_R8G8_SRGB;
-		case RenderingDevice::DATA_FORMAT_R8G8B8_UNORM:
-			return RenderingDevice::DATA_FORMAT_R8G8B8_SRGB;
-		case RenderingDevice::DATA_FORMAT_B8G8R8_UNORM:
-			return RenderingDevice::DATA_FORMAT_B8G8R8_SRGB;
 		case RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM:
 			return RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB;
 		case RenderingDevice::DATA_FORMAT_B8G8R8A8_UNORM:
@@ -423,6 +411,13 @@ int DSTex::get_srgb_rd_format(int p_rd_format) {
 		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
 		case RenderingDevice::DATA_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
 			return p_rd_format;
+		// Non-color / linear data formats: single/dual-channel (R8, RG8), floats,
+		// BC4/BC5/BC6, and R16 have no D3D12 sRGB variants (Q44) and return self
+		// so callers skip adding invalid shareable formats.
+		case RenderingDevice::DATA_FORMAT_R8_UNORM:
+		case RenderingDevice::DATA_FORMAT_R8G8_UNORM:
+		case RenderingDevice::DATA_FORMAT_R8G8B8_UNORM:
+		case RenderingDevice::DATA_FORMAT_B8G8R8_UNORM:
 		case RenderingDevice::DATA_FORMAT_R32_SFLOAT:
 		case RenderingDevice::DATA_FORMAT_R32G32_SFLOAT:
 		case RenderingDevice::DATA_FORMAT_R32G32B32_SFLOAT:

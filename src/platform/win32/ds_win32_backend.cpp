@@ -296,6 +296,16 @@ static String retrieve_queue_error(IDStorageQueue1 *p_queue) {
 		message += " [File: " + String(failure.Request.Filename) + ", RequestName: " + String(failure.Request.RequestName) + "]";
 	}
 
+#ifdef _WIN32
+	const HRESULT hr_aborted = HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
+	if (failure.HResult == hr_aborted) {
+		// Cancellation via CancelRequestsWithTag() is an intentional application event,
+		// not a fatal failure. Suppress push_error/report_error and log verbosely.
+		UtilityFunctions::print_verbose("[DirectStorage] Request aborted on queue: " + message);
+		return String();
+	}
+#endif
+
 	UtilityFunctions::push_error(message);
 	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 	if (err_handler) {

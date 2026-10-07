@@ -93,6 +93,8 @@ public:
 	int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, int p_max_usec = 0);
 	int get_pending_prewarm_count(uint64_t p_tag = 0) const;
 	int get_unbuilt_prewarm_count(uint64_t p_tag = 0) const;
+	int get_unbuilt_cpu_prewarm_count(uint64_t p_tag = 0) const;
+	int get_unbuilt_gpu_prewarm_count(uint64_t p_tag = 0) const;
 
 	void set_enabled(bool p_enabled);
 	bool is_enabled() const;

@@ -196,6 +196,8 @@ public:
 	// Diagnostic: number of tracked textures still residing in the preloader's
 	// pending state awaiting poll_completed(). p_tag == 0 counts all tags.
 	static int get_unbuilt_prewarm_count(uint64_t p_tag = 0);
+	static int get_unbuilt_cpu_prewarm_count(uint64_t p_tag = 0);
+	static int get_unbuilt_gpu_prewarm_count(uint64_t p_tag = 0);
 
 	// Release all held Refs + the archive handle. Called from
 	// ~DSTextureCache (module teardown) so no Ref outlives Godot.

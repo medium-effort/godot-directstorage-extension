@@ -4,16 +4,17 @@ extends RefCounted
 ## DirectStorage Async Prewarm Helpers.
 ##
 ## Static GDScript surface over the native async streaming pipeline:
-## [code]DSTextureCache.prewarm_async()[/code] (enqueue, engine paths only) +
+## [code]DSTextureCache.prewarm_gpu_async()[/code] (GPU DMA to VRAM) /
+## [code]DSTextureCache.prewarm_async()[/code] (CPU memory streaming) +
 ## [code]DSBatchManager[/code] autoload [code]_process[/code]
-## (collect -> [code]flush_stream_async()[/code] -> [code]poll_completed()[/code] ->
-## per-tag progress) + [code]DSContext[/code] tag queries.
+## (collect -> [code]flush_stream_async()[/code] -> [code]pump_gpu_prewarm()[/code] ->
+## [code]poll_completed()[/code] -> per-tag progress) + [code]DSContext[/code] tag queries.
 ##
 ## Canonical flow (see [method collect_scene_textures] and
 ## [method load_scene_with_loading_screen]):
 ## [codeblock]
 ## var deps: PackedStringArray = DSPreloader.collect_scene_textures("res://levels/level1.tscn")
-## var tag: int = DSPreloader.prewarm_async(deps)
+## var tag: int = DSPreloader.prewarm_gpu_async(deps)
 ## await DSPreloader.await_prewarm_finished(tag) # or poll get_prewarm_progress(tag) for a bar
 ## var packed := ResourceLoader.load("res://levels/level1.tscn", "PackedScene", ResourceLoader.CACHE_MODE_REUSE) as PackedScene
 ## [/codeblock]
@@ -219,6 +220,40 @@ static func prewarm_async(paths: PackedStringArray) -> int:
 	return tag
 
 
+## Returns [code]true[/code] when hardware GPU prewarming to VRAM is supported and active
+## (requires an initialized D3D12 DirectStorage backend with GPU decompression enabled and
+## a live D3D12 [RenderingDevice]).
+static func is_gpu_prewarm_available() -> bool:
+	if not ClassDB.class_exists("DSTextureCache"):
+		return false
+	var cache: Object = Engine.get_singleton("DSTextureCache")
+	return cache != null and cache.has_method("is_gpu_prewarm_available") and bool(cache.call("is_gpu_prewarm_available"))
+
+
+## Enqueues [param paths] for GPU-accelerated asynchronous streaming prewarm and returns
+## the stream tag. When running under the D3D12 rendering driver with GPU decompression enabled,
+## eligible color textures are allocated directly as [Texture2DRD] resources on the render thread
+## and filled via DirectStorage DMA decompression straight into VRAM. Ineligible textures or
+## non-D3D12 platforms automatically fall back to the CPU [ImageTexture] memory stream path.
+## Textures are allocated in render-thread chunks of [param chunk_size] to bound frame time.
+## Returns 0 when native singletons are unavailable.
+static func prewarm_gpu_async(paths: PackedStringArray, chunk_size: int = 16, prefer_gpu: bool = true) -> int:
+	if not ClassDB.class_exists("DSTextureCache"):
+		push_warning("[DirectStorage] DSPreloader: DSTextureCache class unavailable; prewarm_gpu_async aborted.")
+		return 0
+	var cache: Object = Engine.get_singleton("DSTextureCache")
+	if cache == null:
+		push_warning("[DirectStorage] DSPreloader: DSTextureCache singleton unavailable; prewarm_gpu_async aborted.")
+		return 0
+	var tag: int = 0
+	if cache.has_method("prewarm_gpu_async"):
+		tag = int(cache.call("prewarm_gpu_async", paths, chunk_size, prefer_gpu))
+	elif cache.has_method("prewarm_async"):
+		tag = int(cache.call("prewarm_async", paths))
+	_track_batch_manager_tag(tag)
+	return tag
+
+
 ## Polls [code]DSContext.get_prewarm_progress(tag)[/code] for progress-bar
 ## display. Returns [code]Vector2i(done, total)[/code]; [code](0, 0)[/code]
 ## when the context is unavailable or the tag is unknown.
@@ -278,8 +313,11 @@ static func await_prewarm_finished(tag: int, on_progress: Callable = Callable())
 		var manager: Node = (loop as SceneTree).root.get_node_or_null("DSBatchManager") if (loop is SceneTree) else null
 		if manager == null and ClassDB.class_exists("DSTextureCache"):
 			var cache: Object = Engine.get_singleton("DSTextureCache")
-			if cache != null and cache.has_method("poll_completed"):
-				cache.call("poll_completed", tag, 0, 2000)
+			if cache != null:
+				if cache.has_method("pump_gpu_prewarm"):
+					cache.call("pump_gpu_prewarm")
+				if cache.has_method("poll_completed"):
+					cache.call("poll_completed", tag, 0, 2000)
 		if on_progress.is_valid():
 			var progress: Vector2i = get_prewarm_progress(tag)
 			on_progress.call(progress.x, progress.y)
@@ -301,11 +339,11 @@ static func await_prewarm_finished(tag: int, on_progress: Callable = Callable())
 ## When stream prewarm is unavailable, falls back to the frame-budgeted
 ## sync [code]ResourceLoader.load()[/code] loop ([param frame_budget_usec]
 ## per frame, loading animation stays at 60 FPS).
-static func load_scene_with_loading_screen(tree: SceneTree, scene_path: String, loading_screen: CanvasItem, progress_bar: Range = null, extra_scan_dirs: PackedStringArray = PackedStringArray(), frame_budget_usec: int = FALLBACK_FRAME_BUDGET_USEC) -> Node:
+static func load_scene_with_loading_screen(tree: SceneTree, scene_path: String, loading_screen: CanvasItem, progress_bar: Range = null, extra_scan_dirs: PackedStringArray = PackedStringArray(), frame_budget_usec: int = FALLBACK_FRAME_BUDGET_USEC, prefer_gpu: bool = true) -> Node:
 	loading_screen.visible = true
 	var deps: PackedStringArray = collect_scene_textures(scene_path, extra_scan_dirs)
 	if is_stream_prewarm_available():
-		var tag: int = prewarm_async(deps)
+		var tag: int = prewarm_gpu_async(deps, 16, prefer_gpu) if prefer_gpu and is_gpu_prewarm_available() else prewarm_async(deps)
 		if progress_bar != null:
 			progress_bar.min_value = 0.0
 			progress_bar.max_value = 100.0

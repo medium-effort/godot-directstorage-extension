@@ -1055,7 +1055,14 @@ Always `add_shareable_format()` the base format itself first, then the sRGB coun
 rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(p_pixel_format));
 rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(srgb_fmt));
 ```
-Skip the list entirely when the format is already sRGB or has no sRGB counterpart (floats, BC4/BC5/BC6, R16 family — see Q31). Implemented in `src/integration/ds_resource_format_loader.cpp:303`.
+Skip the list entirely when the format is already sRGB or has no D3D12 sRGB counterpart (floats, BC4/BC5/BC6, R16 family, and single/dual-channel masks R8, RG8, R8G8B8 — see Q31).
+
+**D3D12 Driver Shareable Validation Trap**: In Godot's D3D12 driver (`rendering_device_driver_d3d12.cpp:1296`), every format in `shareable_formats` is checked against `RD_TO_D3D12_FORMAT[curr_format].family == DXGI_FORMAT_UNKNOWN`. DXGI does not support sRGB for 1- or 2-channel formats (`R8_SRGB` and `R8G8_SRGB` map to `{}` / unknown). If an invalid counterpart like `R8G8_SRGB` is added to `shareable_formats`, the driver fails with:
+```text
+ERROR: Format 'R8G8_Unorm' is not supported.
+ERROR: servers/rendering/rendering_device.cpp:1704 - Condition "!texture.driver_id" is true. Returning: RID()
+```
+Notice the error prints the *base format* name (`FORMAT_NAMES[p_format.format]`), masking that the failure was caused by the illegal shareable counterpart. Handled in `src/formats/dstex_format.cpp:378` and `src/integration/ds_resource_format_loader.cpp:323`.
 
 ## 45. CPU Fallback Rejects Partial Mip Chains
 
@@ -1109,3 +1116,19 @@ Followed by `has_texture()` false on a just-staged archive whose staging reporte
 
 ### The Rule
 In editor test runs, treat every `res://` write as suspect: remove + copy + reopen-verify + one 500 ms retry, never trust the copy return code alone; make removal failures loud (`push_warning`, never ignored). Implemented in `tests/gpu_prewarm_tests.cpp` (`stage_gpu_dspkg`, `remove_abs`).
+
+## 48. Background Ingestion Tasks Must Not Starve Main-Thread GPU Texture Completion
+
+### The Engine Reality
+In Godot 4.x, [Texture2DRD](https://docs.godotengine.org/en/stable/classes/class_texture2drd.html) wrappers around GPU texture RIDs cannot be instantiated on off-thread worker pools; they require main or render thread affinity (Q02 & Q25). In C++, `DSPreloader::poll_completed()` explicitly gates GPU textures with `can_build_gpu = main_or_render_thread()`. Background worker tasks skip all GPU items, leaving them to be completed by the main thread.
+
+### The Trap / Symptom
+In `DSBatchManager._process()`, delegating ingestion to `WorkerThreadPool` whenever `cache.get_unbuilt_prewarm_count() > 0` while guarding the main-thread poll behind `if _poll_task_id == -1` causes a permanent deadlock during GPU prewarm:
+1. `get_unbuilt_prewarm_count() > 0` spawns a background worker slice.
+2. The active worker task makes `_poll_task_id != -1`, starving the main thread from running `poll_completed()`.
+3. The worker task runs `poll_completed()` off-thread, skips all GPU textures, and finishes with 0 items built.
+4. Next frame, the task is reaped, but the unbuilt count is still non-zero, immediately re-spawning the worker task before the main-thread poll can execute.
+5. In game loading screens (e.g. `tps-demo`), loading hangs indefinitely at 60% (prewarm completion phase) with 0 errors.
+
+### The Rule
+Always drain completed GPU textures directly on the main thread in `DSBatchManager._process()` without gating on worker task idle state. Only spawn `WorkerThreadPool` ingestion tasks when unbuilt CPU textures actually exist (`get_unbuilt_cpu_prewarm_count() > 0`), and prioritize completed GPU entries first in `poll_completed()`. Handled in `ds_batch_manager.gd:166-204`, `ds_preloader.cpp:1640`, and `ds_texture_cache.cpp:212`.

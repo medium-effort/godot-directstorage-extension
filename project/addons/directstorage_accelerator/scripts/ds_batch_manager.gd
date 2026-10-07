@@ -41,6 +41,7 @@ var _poll_task_id: int = -1
 ## `get_unbuilt_prewarm_count` / `poll_completed`).
 var _cache_caps_probed: bool = false
 var _has_get_unbuilt: bool = false
+var _has_get_unbuilt_cpu: bool = false
 var _has_poll: bool = false
 var _has_pump_gpu: bool = false
 ## Adaptive slice backpressure (Rev1 plan: Q13/Q41).
@@ -153,6 +154,7 @@ func _process(delta: float) -> void:
 		if cache != null:
 			if not _cache_caps_probed:
 				_has_get_unbuilt = cache.has_method("get_unbuilt_prewarm_count")
+				_has_get_unbuilt_cpu = cache.has_method("get_unbuilt_cpu_prewarm_count")
 				_has_poll = cache.has_method("poll_completed")
 				_has_pump_gpu = cache.has_method("pump_gpu_prewarm")
 				_cache_caps_probed = true
@@ -161,6 +163,12 @@ func _process(delta: float) -> void:
 			# Compatible with older builds lacking the method.
 			if _has_pump_gpu:
 				cache.pump_gpu_prewarm()
+			# Main-thread texture drain: Texture2DRD wrappers must be
+			# instantiated on the main or render thread (GODOT_QUIRKS Sec02 & Sec25).
+			# Fast (<2us per texture): drain completed GPU textures within budget.
+			# Never gated on _poll_task_id so the main thread is never starved.
+			if _has_poll:
+				cache.poll_completed(0, 32, 2000)
 			# Adaptive backpressure: EMA over clamped delta + 2-frame streak
 			# gate (Rev1: immediate delta is noisy under the 120-148ms clamp).
 			var frame_ms: float = delta * 1000.0
@@ -199,7 +207,12 @@ func _process(delta: float) -> void:
 			if _poll_task_id != -1 and WorkerThreadPool.is_task_completed(_poll_task_id):
 				WorkerThreadPool.wait_for_task_completion(_poll_task_id)
 				_poll_task_id = -1
-			if _poll_task_id == -1 and _has_get_unbuilt and int(cache.get_unbuilt_prewarm_count(0)) > 0:
+			var has_cpu_unbuilt := false
+			if _has_get_unbuilt_cpu:
+				has_cpu_unbuilt = int(cache.get_unbuilt_cpu_prewarm_count(0)) > 0
+			elif _has_get_unbuilt:
+				has_cpu_unbuilt = int(cache.get_unbuilt_prewarm_count(0)) > 0
+			if _poll_task_id == -1 and has_cpu_unbuilt:
 				_poll_task_id = WorkerThreadPool.add_task(_background_poll_slice.bind(slice_items, slice_usec), false, "DS_PollCompleted")
 				if slice_label == "heavy":
 					_heavy_slices += 1
@@ -208,8 +221,6 @@ func _process(delta: float) -> void:
 				else:
 					_warm_slices += 1
 				_drain_reported = false
-			if _poll_task_id == -1 and _has_poll:
-				cache.poll_completed(0, 1, 2000)
 			if not _drain_reported and _poll_task_id == -1 and _has_get_unbuilt and int(cache.get_unbuilt_prewarm_count(0)) == 0:
 				if _slice_debug:
 					print("[DirectStorage] DSBatchManager prewarm drained: warm=%d mild=%d heavy=%d" % [_warm_slices, _mild_slices, _heavy_slices])

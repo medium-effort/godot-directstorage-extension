@@ -62,6 +62,16 @@
 			<param index="0" name="tag" type="int" default="0" />
 			<description>Returns the number of prewarm textures for [param tag] still held by the preloader and awaiting [method poll_completed]. Pass [code]0[/code] (the default) to count every tag. Reaching [code]0[/code] means every terminal request has been built and stored.</description>
 		</method>
+		<method name="get_unbuilt_cpu_prewarm_count" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="tag" type="int" default="0" />
+			<description>Returns the number of CPU memory prewarm textures for [param tag] awaiting background [method poll_completed] decompression into ImageTexture. Used by DSBatchManager to avoid scheduling worker ingestion tasks when all pending items are GPU textures.</description>
+		</method>
+		<method name="get_unbuilt_gpu_prewarm_count" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="tag" type="int" default="0" />
+			<description>Returns the number of direct GPU DMA prewarm textures for [param tag] awaiting main-thread [method poll_completed] wrapping into Texture2DRD.</description>
+		</method>
 		<method name="is_cache_mode_ignored" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="cache_mode" type="int" enum="DSTextureCache.CacheMode" />

@@ -1102,6 +1102,7 @@ void DSPreloader::queue_gpu_orphan_rid(const RID &p_rid) {
 }
 
 void DSPreloader::pump_gpu_orphans() {
+	bool need_post = false;
 	{
 		std::lock_guard<std::mutex> lock(state().mutex);
 		State &s = state();
@@ -1116,7 +1117,13 @@ void DSPreloader::pump_gpu_orphans() {
 			return;
 		}
 		s.gpu_orphan_free_posted = true;
-		rs->call_on_render_thread(callable_mp_static(free_gpu_orphans_on_render_thread));
+		need_post = true;
+	}
+	if (need_post) {
+		RenderingServer *rs = RenderingServer::get_singleton();
+		if (rs != nullptr) {
+			rs->call_on_render_thread(callable_mp_static(free_gpu_orphans_on_render_thread));
+		}
 	}
 }
 
@@ -1283,6 +1290,17 @@ void DSPreloader::pump_gpu_prewarm() {
 	{
 		std::lock_guard<std::mutex> lock(state().mutex);
 		State &s = state();
+		DSContext *ctx = DSContext::get_singleton();
+		while (!s.gpu_chunks.empty() && ctx != nullptr && ctx->is_tag_cancelled(s.gpu_chunks.front().tag)) {
+			GpuChunk dead_chunk = s.gpu_chunks.front();
+			s.gpu_chunks.pop_front();
+			for (size_t i = 0; i < dead_chunk.items.size(); ++i) {
+				std::unordered_map<int64_t, Tracked>::iterator it = s.pending.find(dead_chunk.items[i].pending_id);
+				if (it != s.pending.end()) {
+					it->second.gpu_failed = true;
+				}
+			}
+		}
 		if (!s.gpu_chunk_in_flight && !s.gpu_chunks.empty() && is_gpu_prewarm_available()) {
 			s.gpu_current = s.gpu_chunks.front();
 			s.gpu_chunks.pop_front();
@@ -1433,6 +1451,18 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 	}
 	RenderingDevice *rd = rs->get_rendering_device();
 	DSContext *ctx = DSContext::get_singleton();
+	if (ctx != nullptr && ctx->is_tag_cancelled(chunk.tag)) {
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		for (size_t i = 0; i < chunk.items.size(); ++i) {
+			std::unordered_map<int64_t, Tracked>::iterator it = s.pending.find(chunk.items[i].pending_id);
+			if (it != s.pending.end()) {
+				it->second.gpu_failed = true;
+			}
+		}
+		s.gpu_chunk_in_flight = false;
+		return;
+	}
 	if (rd == nullptr || ctx == nullptr || !ctx->is_d3d12_backend() || !ctx->is_gpu_decompression_enabled()) {
 		std::lock_guard<std::mutex> lock(state().mutex);
 		State &s = state();
@@ -1460,6 +1490,31 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 }
 
 void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_cache, int &r_stored) {
+	DSContext *ctx = DSContext::get_singleton();
+	bool is_cancelled = (ctx != nullptr && ctx->is_tag_cancelled(p_entry.tag));
+	if (!is_cancelled) {
+		for (int r = 0; r < p_entry.requests.size(); ++r) {
+			if (p_entry.requests[r].is_valid()) {
+				String err = p_entry.requests[r]->get_error_message();
+				if (err.begins_with("Prewarm cancelled") ||
+						err.begins_with("Request cancelled") ||
+						err.contains("0x800703e3") ||
+						err.to_lower().contains("aborted")) {
+					is_cancelled = true;
+					break;
+				}
+			}
+		}
+	}
+
+	if (is_cancelled) {
+		if (p_entry.gpu_tex_rid.is_valid()) {
+			queue_gpu_orphan_rid(p_entry.gpu_tex_rid);
+		}
+		UtilityFunctions::print_verbose("DSPreloader: GPU prewarm texture '", p_entry.meta.engine_path, "' cancelled; dropping.");
+		return;
+	}
+
 	if (p_entry.gpu_failed || !p_entry.gpu_tex_rid.is_valid()) {
 		if (p_entry.gpu_tex_rid.is_valid()) {
 			queue_gpu_orphan_rid(p_entry.gpu_tex_rid);
@@ -1609,13 +1664,17 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 
 	// Single-scan collect: gather terminal entry IDs under one lock instead
 	// of re-scanning the full pending map after every build (O(N^2)).
-	// Extraction stays per-item below so a usec-budget break leaves the
-	// remainder in pending instead of dropping them.
+	// Prioritize GPU entries first: on the main thread, wrapping Texture2DRD
+	// takes <2us per texture, draining VRAM DMA instantly without consuming
+	// the microsecond budget on heavier CPU builds.
 	std::vector<int64_t> terminal_ids;
 	{
+		std::vector<int64_t> gpu_terminal_ids;
+		std::vector<int64_t> cpu_terminal_ids;
 		std::lock_guard<std::mutex> lock(state().mutex);
 		State &s = state();
-		terminal_ids.reserve(s.pending.size());
+		gpu_terminal_ids.reserve(s.pending.size());
+		cpu_terminal_ids.reserve(s.pending.size());
 		for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
 			const Tracked &cand = it->second;
 			if (p_tag != 0 && cand.tag != p_tag) {
@@ -1637,12 +1696,19 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				}
 			}
 			if (all_terminal) {
-				terminal_ids.push_back(it->first);
-				if (p_max_items > 0 && (int)(terminal_ids.size() + stored) >= p_max_items) {
+				if (cand.is_gpu) {
+					gpu_terminal_ids.push_back(it->first);
+				} else {
+					cpu_terminal_ids.push_back(it->first);
+				}
+				if (p_max_items > 0 && (int)(gpu_terminal_ids.size() + cpu_terminal_ids.size() + stored) >= p_max_items) {
 					break;
 				}
 			}
 		}
+		terminal_ids.reserve(gpu_terminal_ids.size() + cpu_terminal_ids.size());
+		terminal_ids.insert(terminal_ids.end(), gpu_terminal_ids.begin(), gpu_terminal_ids.end());
+		terminal_ids.insert(terminal_ids.end(), cpu_terminal_ids.begin(), cpu_terminal_ids.end());
 	}
 
 	for (size_t ti = 0; ti < terminal_ids.size(); ++ti) {
@@ -1765,6 +1831,30 @@ int DSPreloader::get_unbuilt_prewarm_count(uint64_t p_tag) {
 	int count = 0;
 	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
 		if (it->second.tag == p_tag) {
+			count++;
+		}
+	}
+	return count;
+}
+
+int DSPreloader::get_unbuilt_cpu_prewarm_count(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	State &s = state();
+	int count = 0;
+	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+		if ((p_tag == 0 || it->second.tag == p_tag) && !it->second.is_gpu) {
+			count++;
+		}
+	}
+	return count;
+}
+
+int DSPreloader::get_unbuilt_gpu_prewarm_count(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	State &s = state();
+	int count = 0;
+	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+		if ((p_tag == 0 || it->second.tag == p_tag) && it->second.is_gpu) {
 			count++;
 		}
 	}
