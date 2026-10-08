@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 7 October 2026
+Last updated: 8 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -732,15 +732,15 @@ Submitting half-capacity chunks respects the SDK half-full auto-submit threshold
 
 ---
 
-## 31. `Texture2DRD` Pipeline Incompatibilities in Godot 4.7 Forward+
+## 31. `Texture2DRD` Pipeline Incompatibilities & Bifurcated Prewarm in Godot 4.7 Forward+
 
 ### The Architectural Reality
-[Texture2DRD](https://docs.godotengine.org/en/stable/classes/class_texture2drd.html) is an engine wrapper intended for raw compute shader output buffers and viewport textures. Wrapping prewarmed DirectStorage textures in `Texture2DRD` for general scene assets causes three distinct, fatal failures across Godot 4.7's rendering architecture:
+[Texture2DRD](https://docs.godotengine.org/en/stable/classes/class_texture2drd.html) is an engine wrapper originally intended for raw compute shader output buffers and viewport textures. Wrapping prewarmed DirectStorage textures in `Texture2DRD` without format provisioning and strict pipeline boundaries triggers three distinct, fatal failures across Godot 4.7's rendering architecture:
 
 1. **2D CanvasItem Batch Renderer Failure (`RendererCanvasRenderRD`)**:
    - In Godot 4.7 Forward+, all 2D canvas drawing (crosshairs, HUD, fonts, UI elements) is processed by `RendererCanvasRenderRD` (`servers/rendering/renderer_rd/renderer_canvas_render_rd.cpp:3017-3023`).
    - Batch uniform-set creation fails when a diffuse / normal / specular / sampler RID is null or invalid. CanvasTexture tracking (`:3029-3040`) is opt-in invalidation only.
-   - Raw `Texture2DRD` instances hit the failure below when their backing RIDs are not yet valid, not because tracking is missing:
+   - Raw `Texture2DRD` instances hit the failure below when their backing RIDs are not yet valid or bound as CanvasItem textures:
      ```text
      ERROR: Failed to create uniform set for batch.
         at: (servers/rendering/renderer_rd/renderer_canvas_render_rd.cpp:3023)
@@ -758,11 +758,19 @@ Submitting half-capacity chunks respects the SDK half-full auto-submit threshold
    - If a scene node or material queries `get_rid()` on the main thread before that callback executes, `texture_rd.cpp:57-60` detects `texture_rid.is_null()` and substitutes a temporary placeholder dummy (`texture_2d_placeholder_create()`).
    - Materials bound against the placeholder can then hit generic draw-list validation errors (invalid-texture at `rendering_device.cpp:4502`, or `Uniforms were never supplied for set (%d)` at `:6033,:6197,:6562,:6845,:6985` which fires when no set is bound at all). The placeholder masks the null but binds the wrong content/format.
 
-### The Solution: Prewarm into `ImageTexture`
-For general scene prewarming, wrap decompressed mip buffers in standard [ImageTexture](https://docs.godotengine.org/en/stable/classes/class_imagetexture.html):
-- DirectStorage still executes high-speed NVMe DMA transfers and GDeflate hardware/CPU decompression into memory.
-- `Image::create_from_data` wraps the contiguous natural mip buffer in microseconds without pixel copying.
-- `ImageTexture::create_from_image` delegates resource initialization to `RenderingServer`, which automatically provisions D3D12 typeless formats, sRGB views, 2D canvas batch proxies, and Decal atlas integration without a single pipeline error.
+### The Rule
+Bifurcate prewarm: wrap 3D PBR color textures in `Texture2DRD` with an sRGB shareable format; restrict `ImageTexture` to 2D UI, decals, and CPU readback paths.
+
+### The Solution: Bifurcated Asset Prewarm Policy
+Rather than abandoning GPU DirectStorage streaming entirely or applying `Texture2DRD` indiscriminately, Godot 4.7's architecture mandates a bifurcated pipeline:
+
+1. **3D PBR Color Textures (BC1/BC2/BC3/BC7, RGBA8 Family)**:
+   - Streamed via DirectStorage GPU GDeflate DMA directly into VRAM and wrapped in [Texture2DRD](https://docs.godotengine.org/en/stable/classes/class_texture2drd.html).
+   - **Fix for Failure #2 (sRGB share gate)**: Call `rd_fmt->add_shareable_format(base)` followed by `rd_fmt->add_shareable_format(srgb)` before `texture_create()` (see Section 44 / Q44).
+   - **Fix for Failure #3 (Async placeholder race)**: Allocate and wrap `Texture2DRD` during the batched prewarm step. When the scene later loads via `ResourceLoader.load(..., CACHE_MODE_REUSE)`, the render-thread RID assignment has already completed and cached textures bind without placeholders.
+2. **2D/UI, Decals, Light3D Projectors, and CPU Readback Assets**:
+   - Strictly prewarmed/loaded as standard [ImageTexture](https://docs.godotengine.org/en/stable/classes/class_imagetexture.html) (via `DSTEX_FLAG_AS_IMAGE_TEXTURE`).
+   - Eliminates Failure #1 (`RendererCanvasRenderRD` uniform set crashes) and completely avoids synchronous GPU staging readback stalls (`texture_get_data()`).
 
 ---
 

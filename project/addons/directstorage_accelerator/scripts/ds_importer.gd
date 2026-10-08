@@ -81,7 +81,7 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 			"name": "compatibility/as_image_texture",
 			"default_value": false,
 			"property_hint": PROPERTY_HINT_NONE,
-			"hint_string": "Loads texture into CPU memory as an ImageTexture instead of Texture2DRD. Required for Light3D projectors and Decals.",
+			"hint_string": "Forces ImageTexture CPU loading even during GPU prewarm. Required for Light3D projectors, Decals, and get_image() callers.",
 		}
 	]
 
