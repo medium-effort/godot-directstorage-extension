@@ -313,6 +313,12 @@ GDEX_TEST_T(gpu_prewarm, dma_fills_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
         GDEX_FAIL("prewarm_gpu_async threw an unknown exception.");
     }
     GDEX_ASSERT_TRUE(tag != 0);
+    // Denominator contract proof: the expected total must be established upfront
+    // at frame 0, before driving completion, so progress ratio never regresses.
+    {
+        godot::Vector2i initial_prog = ds->get_prewarm_progress(tag);
+        GDEX_EXPECT_GT((int64_t)initial_prog.y, (int64_t)0);
+    }
 
     const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() + 20000;
     bool settled = false;
@@ -476,6 +482,10 @@ GDEX_TEST_T(gpu_prewarm, graceful_memory_fallback, TAG_INTEGRATION | TAG_SLOW) {
     paths.push_back(godot::String(virtual_path));
     const uint64_t tag = cache->prewarm_gpu_async(paths, 16, false);
     GDEX_ASSERT_TRUE(tag != 0);
+    {
+        godot::Vector2i initial_prog = ds->get_prewarm_progress(tag);
+        GDEX_EXPECT_GT((int64_t)initial_prog.y, (int64_t)0);
+    }
     // Resolve proof: the payload must be tracked (not skipped as
     // unresolvable) before driving completion.
     GDEX_EXPECT_GT(godot::DSPreloader::get_unbuilt_prewarm_count(tag), 0);

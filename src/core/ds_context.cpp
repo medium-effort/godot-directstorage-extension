@@ -656,7 +656,9 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request, bool p_from_stream) {
 			return false;
 		}
 		stream_queue.push_back(p_request);
-		info.total++;
+		if (!info.fixed_total) {
+			info.total++;
+		}
 		return true;
 	}
 	return enqueue_request_internal(p_request);
@@ -775,7 +777,7 @@ void DSContext::flush_batch() {
 	active_backend->submit_batch();
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
-	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
+	if (active_backend->get_name() == "Win32DirectStorage") {
 		backend_fence = ds_win32_get_completion_fence(active_backend);
 	}
 #endif
@@ -821,7 +823,7 @@ Error DSContext::flush_batch_async() {
 	active_backend->submit_async();
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
-	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
+	if (is_win32_backend) {
 		backend_fence = ds_win32_get_completion_fence(active_backend);
 	}
 #endif
@@ -916,7 +918,7 @@ Error DSContext::flush_stream_async() {
 	active_backend->submit_async();
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
-	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
+	if (is_win32_backend) {
 		backend_fence = ds_win32_get_completion_fence(active_backend);
 	}
 #endif
@@ -972,6 +974,14 @@ bool DSContext::is_prewarm_complete(uint64_t p_tag) const {
 		return true; // unknown tag: nothing pending
 	}
 	const StreamTagInfo &info = it->second;
+	if (info.cancel_requested) {
+		for (std::deque<Ref<DSRequest>>::const_iterator qit = stream_queue.begin(); qit != stream_queue.end(); ++qit) {
+			if (qit->is_valid() && (*qit)->get_cancellation_tag() == p_tag) {
+				return false;
+			}
+		}
+		return true;
+	}
 	if (info.completed < info.total) {
 		return false;
 	}
@@ -991,6 +1001,22 @@ Vector2i DSContext::get_prewarm_progress(uint64_t p_tag) const {
 	}
 	int done = MIN(it->second.completed, it->second.total);
 	return Vector2i(done, it->second.total);
+}
+
+void DSContext::set_prewarm_total(uint64_t p_tag, int p_total) {
+	std::lock_guard<std::mutex> lock(stream_mutex);
+	StreamTagInfo &info = stream_tags[p_tag];
+	info.tag = p_tag;
+	info.total = MAX(0, p_total);
+	info.fixed_total = true;
+}
+
+void DSContext::count_stream_terminal_failure(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(stream_mutex);
+	std::unordered_map<uint64_t, StreamTagInfo>::iterator it = stream_tags.find(p_tag);
+	if (it != stream_tags.end()) {
+		it->second.completed++;
+	}
 }
 
 void DSContext::cancel_prewarm(uint64_t p_tag) {
@@ -1257,6 +1283,8 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("prewarm_async", "paths"), &DSContext::prewarm_async);
 	ClassDB::bind_method(D_METHOD("is_prewarm_complete", "tag"), &DSContext::is_prewarm_complete);
 	ClassDB::bind_method(D_METHOD("get_prewarm_progress", "tag"), &DSContext::get_prewarm_progress);
+	ClassDB::bind_method(D_METHOD("set_prewarm_total", "tag", "total"), &DSContext::set_prewarm_total);
+	ClassDB::bind_method(D_METHOD("count_stream_terminal_failure", "tag"), &DSContext::count_stream_terminal_failure);
 	ClassDB::bind_method(D_METHOD("cancel_prewarm", "tag"), &DSContext::cancel_prewarm);
 	ClassDB::bind_method(D_METHOD("is_tag_cancelled", "tag"), &DSContext::is_tag_cancelled);
 	ClassDB::bind_method(D_METHOD("is_batch_complete"), &DSContext::is_batch_complete);

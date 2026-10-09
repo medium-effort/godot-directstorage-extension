@@ -111,7 +111,7 @@ if ($LocalDriveLetter) {
 }
 
 # 1. Probe connectivity (Local Wi-Fi first, fallback to Tailscale)
-Write-VerboseHost "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
+Write-Host "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
 $ActiveHost = $null
 & ssh -4 -o BatchMode=yes -o ConnectTimeout=2 $RemoteHost "exit 0" 2>$null
 
@@ -135,7 +135,7 @@ else {
 }
 
 # 2. Ensure target directory exists on Device B
-Write-VerboseHost "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
+Write-Host "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
 ssh $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to ensure remote build directory exists on $ActiveHost." -Code $LASTEXITCODE
@@ -165,7 +165,7 @@ if ($RemoteDriveLetter.Length -eq 1) {
 }
 
 # 3. Stream source files via native tar over SSH (using cmd.exe for raw binary piping)
-Write-VerboseHost "[3/6] Syncing source files to Device B..." -ForegroundColor Cyan
+Write-Host "[3/6] Syncing source files to Device B..." -ForegroundColor Cyan
 $tarExcludes = @(
     "--exclude=.git",
     "--exclude=.vscode",
@@ -274,30 +274,53 @@ if (-not $SkipVerify) {
 }
 
 # 4. Trigger SCons build on Device B
-Write-VerboseHost "[4/6] Compiling target=$Target on Device B..." -ForegroundColor Cyan
+Write-Host "[4/6] Compiling target=$Target on Device B..." -ForegroundColor Cyan
 $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
 # Exit status cannot ride the ssh code: OpenSSH's cmd shell returns 0 even
 # when SCons fails, and %ERRORLEVEL% expands before SCons runs. A marker
 # file written only after a successful scons is the reliable signal.
 $RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
-ssh $ActiveHost "if exist `"$RemoteMarkerWin`" del /q `"$RemoteMarkerWin`""
+& ssh -n $ActiveHost "del /f /q `"$RemoteMarkerWin`" 2>nul"
 # The deletion itself is verified: a stale marker fakes success (observed —
 # del silently failed on a locked file, scons then errored, and the
 # surviving marker passed the gate below with a SUCCESS banner).
-ssh $ActiveHost "if exist `"$RemoteMarkerWin`" (exit /b 1) else (exit /b 0)"
-if ($LASTEXITCODE -ne 0) {
-    Show-BuildFailure -Step "Step [4/6] Marker Reset" -Message "Stale success marker could not be deleted on Device B ($ActiveHost); refusing a build whose success cannot be verified." -Code $LASTEXITCODE
+& ssh -n $ActiveHost "type `"$RemoteMarkerWin`" >nul 2>nul"
+if ($LASTEXITCODE -eq 0) {
+    Show-BuildFailure -Step "Step [4/6] Marker Reset" -Message "Stale success marker could not be deleted on Device B ($ActiveHost); refusing a build whose success cannot be verified." -Code 1
 }
-# SCons output is always captured (printed live only in verbose mode) so a
-# failed compile can never hide behind the marker gate again: the gate
-# below fails on EITHER a missing marker OR unambiguous failure signatures
-# in the captured output (observed: "terminated because of errors" + Error
-# 2 followed by a SUCCESS banner and stale artifact pull).
-$sconsLines = @(ssh $ActiveHost "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`"" 2>&1)
+# SCons output is captured and monitored. We use temporary output files with
+# Start-Process so the script can print a 1-minute heartbeat if compilation
+# is still in progress, preventing automated monitors from suspecting a hang.
+$sconsOutFile = Join-Path $env:TEMP ("scons_remote_out_" + [System.Guid]::NewGuid().ToString() + ".log")
+$sconsErrFile = Join-Path $env:TEMP ("scons_remote_err_" + [System.Guid]::NewGuid().ToString() + ".log")
+$remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`""
+
+$sconsProc = Start-Process -FilePath "ssh" -ArgumentList @("-n", $ActiveHost, $remoteCmd) -NoNewWindow -PassThru -RedirectStandardOutput $sconsOutFile -RedirectStandardError $sconsErrFile
+
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$lastHeartbeatMin = 0
+while (-not $sconsProc.WaitForExit(10000)) {
+    $elapsedMin = [int][Math]::Floor($stopwatch.Elapsed.TotalMinutes)
+    if ($elapsedMin -gt $lastHeartbeatMin) {
+        $lastHeartbeatMin = $elapsedMin
+        Write-Host "    [4/6 Still compiling on Device B... ($lastHeartbeatMin min elapsed)]" -ForegroundColor DarkCyan
+    }
+}
+$stopwatch.Stop()
+
+$sconsLines = @()
+if (Test-Path -LiteralPath $sconsOutFile) {
+    $sconsLines += @(Get-Content -LiteralPath $sconsOutFile)
+    Remove-Item -LiteralPath $sconsOutFile -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path -LiteralPath $sconsErrFile) {
+    $sconsLines += @(Get-Content -LiteralPath $sconsErrFile)
+    Remove-Item -LiteralPath $sconsErrFile -Force -ErrorAction SilentlyContinue
+}
 if ($Verbose -and $sconsLines) {
     $sconsLines | ForEach-Object { Write-Host $_ }
 }
-ssh $ActiveHost "if exist `"$RemoteMarkerWin`" (exit /b 0) else (exit /b 1)"
+& ssh -n $ActiveHost "type `"$RemoteMarkerWin`" >nul 2>nul"
 $markerMissing = $LASTEXITCODE -ne 0
 $sconsFailed = @($sconsLines | Where-Object { $_ -match "terminated because of errors|scons: \*\*\* \[|error C[0-9]+|error LNK[0-9]+" }).Count -gt 0
 if ($markerMissing -or $sconsFailed) {
@@ -317,7 +340,7 @@ if ($markerMissing -or $sconsFailed) {
 }
 
 # 5. Pull back compiled binary and debug symbols to Device A
-Write-VerboseHost "[5/6] Pulling artifacts back to Device A (compressed)..." -ForegroundColor Cyan
+Write-Host "[5/6] Pulling artifacts back to Device A (compressed)..." -ForegroundColor Cyan
 if (!(Test-Path $ArtifactLocalDir)) {
     New-Item -ItemType Directory -Force -Path $ArtifactLocalDir | Out-Null
 }
@@ -431,7 +454,7 @@ if ($ShouldSync) {
         Write-VerboseHost "Skipping post-build sync: Drive D: not found." -ForegroundColor DarkGray
     }
     else {
-        Write-VerboseHost "[6/6] Syncing addon to external project ($SyncTargetDir)..." -ForegroundColor Cyan
+        Write-Host "[6/6] Syncing addon to external project ($SyncTargetDir)..." -ForegroundColor Cyan
         $LocalAddonDir = (Resolve-Path (Join-Path $PSScriptRoot "..\project\addons\directstorage_accelerator")).Path
 
         if (Test-Path $LocalAddonDir) {

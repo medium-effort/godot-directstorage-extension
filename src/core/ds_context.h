@@ -79,6 +79,7 @@ private:
 		int completed = 0; // terminal (COMPLETED/FAILED, incl. cancelled)
 		int cancelled = 0;
 		bool cancel_requested = false;
+		bool fixed_total = false;
 	};
 	mutable std::mutex stream_mutex;
 	std::deque<Ref<DSRequest>> stream_queue; // pending, not yet submitted
@@ -145,6 +146,8 @@ public:
 	uint64_t prewarm_async(const PackedStringArray &p_paths);
 	bool is_prewarm_complete(uint64_t p_tag) const;
 	Vector2i get_prewarm_progress(uint64_t p_tag) const;
+	void set_prewarm_total(uint64_t p_tag, int p_total);
+	void count_stream_terminal_failure(uint64_t p_tag);
 	void cancel_prewarm(uint64_t p_tag);
 	bool is_tag_cancelled(uint64_t p_tag) const;
 	bool is_batch_complete() const;

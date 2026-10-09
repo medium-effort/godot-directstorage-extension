@@ -1276,6 +1276,7 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 			s.gpu_chunks.push_back(part);
 		}
 	}
+	ctx->set_prewarm_total(tag, enqueued + (int)gpu_items.size());
 	if (enqueued > 0) {
 		ctx->flush_stream_async();
 	}
@@ -1299,6 +1300,7 @@ void DSPreloader::pump_gpu_prewarm() {
 				if (it != s.pending.end()) {
 					it->second.gpu_failed = true;
 				}
+				ctx->count_stream_terminal_failure(dead_chunk.tag);
 			}
 		}
 		if (!s.gpu_chunk_in_flight && !s.gpu_chunks.empty() && is_gpu_prewarm_available()) {
@@ -1334,11 +1336,17 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 	// Re-validate: availability may have changed between pump and alloc.
 	if (!is_gpu_prewarm_eligible(m)) {
 		mark_gpu_item_failed(p_item.pending_id);
+		if (p_ctx != nullptr) {
+			p_ctx->count_stream_terminal_failure(p_tag);
+		}
 		return;
 	}
 	const int img_fmt = DSTex::rd_format_to_godot_format((int)m.pixel_format);
 	if (img_fmt == Image::FORMAT_MAX || !DSTex::is_format_supported(img_fmt)) {
 		mark_gpu_item_failed(p_item.pending_id);
+		if (p_ctx != nullptr) {
+			p_ctx->count_stream_terminal_failure(p_tag);
+		}
 		return;
 	}
 
@@ -1367,6 +1375,9 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 	if (!tex_rid.is_valid()) {
 		UtilityFunctions::push_warning("DSPreloader: GPU texture_create failed for '", m.engine_path, "'; sync load remains available.");
 		mark_gpu_item_failed(p_item.pending_id);
+		if (p_ctx != nullptr) {
+			p_ctx->count_stream_terminal_failure(p_tag);
+		}
 		return;
 	}
 	uint64_t native = p_rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, tex_rid, 0);
@@ -1374,6 +1385,9 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 		UtilityFunctions::push_warning("DSPreloader: GPU native format query failed for '", m.engine_path, "'; sync load remains available.");
 		p_rd->free_rid(tex_rid);
 		mark_gpu_item_failed(p_item.pending_id);
+		if (p_ctx != nullptr) {
+			p_ctx->count_stream_terminal_failure(p_tag);
+		}
 		return;
 	}
 
@@ -1390,6 +1404,9 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 		UtilityFunctions::push_warning("DSPreloader: GPU payload span out of range for '", m.engine_path, "'; sync load remains available.");
 		p_rd->free_rid(tex_rid);
 		mark_gpu_item_failed(p_item.pending_id);
+		if (p_ctx != nullptr) {
+			p_ctx->count_stream_terminal_failure(p_tag);
+		}
 		return;
 	}
 
@@ -1459,6 +1476,7 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 			if (it != s.pending.end()) {
 				it->second.gpu_failed = true;
 			}
+			ctx->count_stream_terminal_failure(chunk.tag);
 		}
 		s.gpu_chunk_in_flight = false;
 		return;
@@ -1470,6 +1488,9 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 			std::unordered_map<int64_t, Tracked>::iterator it = s.pending.find(chunk.items[i].pending_id);
 			if (it != s.pending.end()) {
 				it->second.gpu_failed = true;
+			}
+			if (ctx != nullptr) {
+				ctx->count_stream_terminal_failure(chunk.tag);
 			}
 		}
 		s.gpu_chunk_in_flight = false;

@@ -240,6 +240,10 @@ func _poll_prewarm_progress(ctx: Object) -> void:
 	for tag in _tracked_tags.keys():
 		var progress: Vector2i = ctx.get_prewarm_progress(tag)
 		var last: Vector2i = _tracked_tags[tag]
+		if last.x >= 0 and progress.x < last.x:
+			progress.x = last.x
+		if last.y >= 0 and progress.y < last.y:
+			progress.y = last.y
 		if progress != last:
 			_tracked_tags[tag] = progress
 			prewarm_progress.emit(tag, progress.x, progress.y)
