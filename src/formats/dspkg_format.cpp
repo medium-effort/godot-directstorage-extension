@@ -77,11 +77,13 @@ bool metadata_arrays_are_valid(const Dictionary &p_metadata, uint32_t p_mip_coun
 } // namespace
 
 void DSPkg::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("create", "output_path"), &DSPkg::create);
+	ClassDB::bind_method(D_METHOD("create", "output_path", "archive_fingerprint"), &DSPkg::create, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_archive_fingerprint", "archive_fingerprint"), &DSPkg::set_archive_fingerprint);
 	ClassDB::bind_method(D_METHOD("add_texture", "resource_path", "dstex_path", "mip_metadata"), &DSPkg::add_texture, DEFVAL(Dictionary()));
 	ClassDB::bind_method(D_METHOD("finalize"), &DSPkg::finalize);
 
-	ClassDB::bind_method(D_METHOD("open", "path"), &DSPkg::open);
+	ClassDB::bind_method(D_METHOD("open", "path", "expected_fingerprint"), &DSPkg::open, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_archive_fingerprint"), &DSPkg::get_archive_fingerprint);
 	ClassDB::bind_method(D_METHOD("has_texture", "resource_path"), &DSPkg::has_texture);
 	ClassDB::bind_method(D_METHOD("read_texture", "resource_path"), &DSPkg::read_texture);
 	ClassDB::bind_method(D_METHOD("get_entry_info", "resource_path"), &DSPkg::get_entry_info);
@@ -96,11 +98,18 @@ DSPkg::DSPkg() {
 DSPkg::~DSPkg() {
 }
 
-Error DSPkg::create(const String &p_output_path) {
+Error DSPkg::create(const String &p_output_path, uint64_t p_archive_fingerprint) {
 	build_output_path = p_output_path;
+	build_archive_fingerprint = p_archive_fingerprint;
 	staging_entries.clear();
 	is_building = true;
 	return OK;
+}
+
+void DSPkg::set_archive_fingerprint(uint64_t p_archive_fingerprint) {
+	if (is_building) {
+		build_archive_fingerprint = p_archive_fingerprint;
+	}
 }
 
 Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata) {
@@ -221,7 +230,7 @@ Error DSPkg::finalize() {
 	header.flags = write_gpu_metadata ? DSPKG_FLAG_GPU_MIP_METADATA : 0;
 	header.entry_count = count;
 	header.data_offset = total_data_offset;
-	header.reserved = 0;
+	header.archive_fingerprint = build_archive_fingerprint;
 
 	file->store_buffer(reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader));
 
@@ -427,7 +436,7 @@ Error DSPkg::finalize() {
 	return OK;
 }
 
-Error DSPkg::open(const String &p_path) {
+Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 	entries_by_path.clear();
 	entries_by_hash.clear();
 	entries_by_offset.clear();
@@ -480,9 +489,24 @@ Error DSPkg::open(const String &p_path) {
 			(loaded_header.flags & DSPKG_FLAG_GPU_MIP_METADATA) != 0;
 	if ((loaded_header.version == DSPKG_VERSION_GPU_METADATA && loaded_header.flags != DSPKG_FLAG_GPU_MIP_METADATA) ||
 			(loaded_header.version == DSPKG_VERSION_LEGACY && loaded_header.flags != 0) ||
-			(is_v3 && (loaded_header.flags & ~DSPKG_FLAG_GPU_MIP_METADATA) != 0) ||
-			loaded_header.reserved != 0) {
-		return fail(ERR_FILE_CORRUPT, "Invalid flags or reserved fields in header.");
+			(is_v3 && (loaded_header.flags & ~DSPKG_FLAG_GPU_MIP_METADATA) != 0)) {
+		return fail(ERR_FILE_CORRUPT, "Invalid flags in header.");
+	}
+
+	if (p_expected_fingerprint != 0 && loaded_header.archive_fingerprint != 0) {
+		uint32_t loaded_guid = static_cast<uint32_t>(loaded_header.archive_fingerprint >> 32);
+		uint32_t expected_guid = static_cast<uint32_t>(p_expected_fingerprint >> 32);
+		uint32_t loaded_hash = static_cast<uint32_t>(loaded_header.archive_fingerprint & 0xFFFFFFFFULL);
+		uint32_t expected_hash = static_cast<uint32_t>(p_expected_fingerprint & 0xFFFFFFFFULL);
+
+		if (loaded_guid != expected_guid) {
+			return fail(ERR_FILE_UNRECOGNIZED, String("Archive belongs to a different project (archive GUID: 0x") +
+					String::num_uint64(loaded_guid, 16) + ", expected GUID: 0x" + String::num_uint64(expected_guid, 16) + ").");
+		}
+		if (loaded_hash != expected_hash) {
+			return fail(ERR_FILE_UNRECOGNIZED, String("Archive texture manifest does not match current game build (archive hash: 0x") +
+					String::num_uint64(loaded_hash, 16) + ", expected hash: 0x" + String::num_uint64(expected_hash, 16) + ").");
+		}
 	}
 
 	const uint64_t entry_fields_size = is_v3 ? DSPKG_ENTRY_FIELDS_SIZE_V3 : DSPKG_ENTRY_FIELDS_SIZE_LEGACY;
@@ -858,6 +882,10 @@ int DSPkg::get_entry_count() const {
 		return 0;
 	}
 	return static_cast<int>(loaded_header.entry_count);
+}
+
+uint64_t DSPkg::get_archive_fingerprint() const {
+	return loaded_header.archive_fingerprint;
 }
 
 Array DSPkg::get_entries() const {

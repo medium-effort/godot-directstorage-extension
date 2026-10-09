@@ -695,7 +695,7 @@ Two measured costs on Windows (Godot 4.7.2, NVMe, ~100-path microbenches) domina
 
 ### The Rules
 - Never call `ResourceLoader.exists()` per path inside a hot loop. Probing the `.import` file directly with `FileAccess::file_exists()` measured ~7 usec with outcome-identical results and replaced the gate.
-- Budget cold-start I/O, not just parsing: 100 textures cost 1 bulk read instead of 100 cold opens only when their headers ride along in a combined sidecar index (`textures.headers.idx`) next to the archive. Cache both outcomes (found path *and* miss) so repeat prewarms serve failures with one stat and zero opens.
+- Budget cold-start I/O, not just parsing: 100 textures cost 1 bulk read instead of 100 cold opens when bundled into `textures.dspkg`. In early iterations, a sidecar index (`textures.headers.idx`) was used to cache loose `.dstex` headers; this was deprecated and removed once `DSPkg` consolidated all entry headers into its in-memory directory table loaded upon opening, giving instantaneous header resolution across all bundled textures without separate sidecars. Cache both outcomes (found path *and* miss) so repeat prewarms serve failures with one stat and zero opens.
 
 ---
 

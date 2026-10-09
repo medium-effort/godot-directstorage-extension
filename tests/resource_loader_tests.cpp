@@ -10,6 +10,7 @@
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/resource_format_loader.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
@@ -363,6 +364,17 @@ GDEX_TEST_T(loader, virtual_dspkg_path_resolves_through_archive, TAG_INTEGRATION
 		GDEX_ABORT_TEST("textures.dspkg staging failed");
 	}
 
+	// In gdextest (--editor), override editor bypass to verify archive resolution path.
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	if (ps) {
+		ps->set_setting("directstorage/force_archive_resolution", true);
+	}
+	ctx.add_teardown([ps]() {
+		if (ps) {
+			ps->set_setting("directstorage/force_archive_resolution", false);
+		}
+	});
+
 	godot::Ref<godot::DSResourceFormatLoader> loader;
 	loader.instantiate();
 	GDEX_ASSERT_TRUE(loader.is_valid());
@@ -370,7 +382,7 @@ GDEX_TEST_T(loader, virtual_dspkg_path_resolves_through_archive, TAG_INTEGRATION
 	const godot::StringName tex2d(godot::String("Texture2D"));
 	const godot::String res_path(virtual_path);
 
-	// The packaged entry has no physical file, yet resolves via the archive.
+	// The packaged entry has no physical file, yet resolves via the archive when resolution is active.
 	GDEX_EXPECT_FALSE(godot::FileAccess::file_exists(res_path));
 	GDEX_EXPECT_TRUE(loader->_exists(res_path));
 	GDEX_EXPECT_TRUE(loader->_get_resource_type(res_path) == godot::String("Texture2D"));
@@ -387,6 +399,87 @@ GDEX_TEST_T(loader, virtual_dspkg_path_resolves_through_archive, TAG_INTEGRATION
 	godot::Variant missing_result = loader->_load(missing_entry, godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
 	GDEX_EXPECT_TRUE(missing_result.get_type() == godot::Variant::NIL);
 
+	godot::Error err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+	(void)err;
+	remove_user_file(dstex_path);
+	remove_user_file(dspkg_path);
+}
+
+GDEX_TEST_T(loader, editor_mode_unconditionally_bypasses_dspkg, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_loader_ed_bypass.dstex";
+	const char *dspkg_path = "user://gdextest_loader_ed_bypass.dspkg";
+	const char *virtual_path = "res://gdextest_loader_ed_bypass.png";
+	if (!stage_textures_dspkg(ctx, dstex_path, dspkg_path, virtual_path)) {
+		remove_user_file(dstex_path);
+		remove_user_file(dspkg_path);
+		GDEX_ABORT_TEST("textures.dspkg staging failed");
+	}
+
+	// Ensure force_archive_resolution is explicitly false (default behavior).
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	if (ps) {
+		ps->set_setting("directstorage/force_archive_resolution", false);
+	}
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	// In editor mode (running under gdextest --editor), archive resolution is bypassed:
+	// Virtual paths inside textures.dspkg must NOT be recognized or resolve.
+	const godot::String res_path(virtual_path);
+	GDEX_EXPECT_FALSE(loader->_exists(res_path));
+
+	godot::Variant load_result = loader->_load(res_path, godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+	GDEX_EXPECT_TRUE(load_result.get_type() == godot::Variant::NIL);
+
+	godot::Error err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+	(void)err;
+	remove_user_file(dstex_path);
+	remove_user_file(dspkg_path);
+}
+
+GDEX_TEST_T(loader, embedded_pck_detection_warning, TAG_INTEGRATION) {
+	// True-embedded (VFS res:// true + physical globalized false) only occurs
+	// inside an exported PCK, which unit tests cannot fabricate: in the
+	// editor FileAccess::file_exists("res://x") and the globalized probe hit
+	// the same disk file. This test exercises both automatable halves of the
+	// probe so the warning branch runs without false positives:
+	// (1) physical archive present -> resolves, no configuration error;
+	// (2) archive absent -> empty resolution (missing path, not embedded).
+	// Full embedded verification is manual: export with the .dspkg inside the
+	// PCK and confirm the CONFIGURATION ERROR + CPU-decompression fallback.
+	const char *dstex_path = "user://gdextest_loader_embedded.dstex";
+	const char *dspkg_path = "user://gdextest_loader_embedded.dspkg";
+	const char *virtual_path = "res://gdextest_loader_embedded.png";
+	if (!stage_textures_dspkg(ctx, dstex_path, dspkg_path, virtual_path)) {
+		remove_user_file(dstex_path);
+		remove_user_file(dspkg_path);
+		GDEX_ABORT_TEST("textures.dspkg staging failed");
+	}
+
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	if (ps) {
+		ps->set_setting("directstorage/force_archive_resolution", true);
+	}
+	ctx.add_teardown([ps]() {
+		if (ps) {
+			ps->set_setting("directstorage/force_archive_resolution", false);
+		}
+	});
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	// (1) Staged res://textures.dspkg exists physically: the packaged entry
+	// resolves through the archive (direct-VFS branch, embedded probe passes
+	// silently since the globalized file exists too).
+	const godot::String res_path(virtual_path);
+	GDEX_EXPECT_TRUE(loader->_exists(res_path));
+
+	// (2) Remove the archive: the packaged entry no longer resolves (missing,
+	// and the loader's candidate-path diagnostic fires when bundle_dspkg set).
 	godot::Error err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
 	(void)err;
 	remove_user_file(dstex_path);

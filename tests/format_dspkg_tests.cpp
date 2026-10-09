@@ -355,3 +355,164 @@ GDEX_TEST_T(dspkg, v3_entry_flags_as_image_texture_roundtrip, TAG_INTEGRATION) {
 	remove_temp_file(dstex_path);
 	remove_temp_file(dspkg_path);
 }
+
+// --- Integration: archive fingerprint pairing (Option B) ----------------------
+
+GDEX_TEST_T(dspkg, archive_fingerprint_serialization, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_fp_ser.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_fp_ser.dspkg";
+	const char *virtual_path = "res://textures/test_fp_ser.dstex";
+	const uint64_t test_fingerprint = 0x12345678AABBCCDDULL;
+
+	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), test_fingerprint) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_ASSERT_TRUE(reader->open(godot::String(dspkg_path), test_fingerprint) == godot::OK);
+	GDEX_EXPECT_EQ(reader->get_archive_fingerprint(), test_fingerprint);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, archive_fingerprint_matching_success, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_fp_match.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_fp_match.dspkg";
+	const char *virtual_path = "res://textures/test_fp_match.dstex";
+	const uint64_t expected_fingerprint = 0xCAFEBABE11223344ULL;
+
+	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), expected_fingerprint) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_ASSERT_TRUE(reader->open(godot::String(dspkg_path), expected_fingerprint) == godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_TRUE(reader->has_texture(godot::String(virtual_path)));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, archive_fingerprint_project_guid_mismatch, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_guid_mismatch.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_guid_mismatch.dspkg";
+	const char *virtual_path = "res://textures/test_guid_mismatch.dstex";
+	const uint64_t archive_fingerprint = 0x11111111AABBCCDDULL;
+	const uint64_t wrong_guid_fingerprint = 0x22222222AABBCCDDULL;
+
+	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), archive_fingerprint) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	// Different project GUID must fail open with ERR_FILE_UNRECOGNIZED.
+	godot::Error err = reader->open(godot::String(dspkg_path), wrong_guid_fingerprint);
+	GDEX_EXPECT_EQ(err, godot::ERR_FILE_UNRECOGNIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, archive_fingerprint_manifest_hash_mismatch, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_manifest_mismatch.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_manifest_mismatch.dspkg";
+	const char *virtual_path = "res://textures/test_manifest_mismatch.dstex";
+	const uint64_t archive_fingerprint = 0x11111111AABBCCDDULL;
+	const uint64_t stale_manifest_fingerprint = 0x1111111199887766ULL;
+
+	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), archive_fingerprint) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	// Same GUID but stale manifest hash must fail open with ERR_FILE_UNRECOGNIZED.
+	godot::Error err = reader->open(godot::String(dspkg_path), stale_manifest_fingerprint);
+	GDEX_EXPECT_EQ(err, godot::ERR_FILE_UNRECOGNIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, archive_fingerprint_unpaired_legacy_bypass, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_unpaired.dstex";
+	const char *dspkg_unpaired = "user://gdextest_dspkg_unpaired.dspkg";
+	const char *dspkg_paired = "user://gdextest_dspkg_paired.dspkg";
+	const char *virtual_path = "res://textures/test_unpaired.dstex";
+
+	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	// 1. Unpaired archive (fingerprint = 0) opened by caller expecting non-zero.
+	godot::Ref<godot::DSPkg> builder1;
+	builder1.instantiate();
+	GDEX_ASSERT_TRUE(builder1.is_valid());
+	GDEX_ASSERT_TRUE(builder1->create(godot::String(dspkg_unpaired), 0ULL) == godot::OK);
+	GDEX_ASSERT_TRUE(builder1->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder1->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader1;
+	reader1.instantiate();
+	GDEX_ASSERT_TRUE(reader1.is_valid());
+	GDEX_EXPECT_EQ(reader1->open(godot::String(dspkg_unpaired), 0x12345678AABBCCDDULL), godot::OK);
+	GDEX_EXPECT_EQ(reader1->get_entry_count(), 1);
+
+	// 2. Paired archive (fingerprint != 0) opened with expected_fingerprint = 0 (check disabled).
+	godot::Ref<godot::DSPkg> builder2;
+	builder2.instantiate();
+	GDEX_ASSERT_TRUE(builder2.is_valid());
+	GDEX_ASSERT_TRUE(builder2->create(godot::String(dspkg_paired), 0x9999888877776666ULL) == godot::OK);
+	GDEX_ASSERT_TRUE(builder2->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder2->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader2;
+	reader2.instantiate();
+	GDEX_ASSERT_TRUE(reader2.is_valid());
+	GDEX_EXPECT_EQ(reader2->open(godot::String(dspkg_paired), 0ULL), godot::OK);
+	GDEX_EXPECT_EQ(reader2->get_entry_count(), 1);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_unpaired);
+	remove_temp_file(dspkg_paired);
+}
+

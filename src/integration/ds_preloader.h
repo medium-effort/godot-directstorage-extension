@@ -119,30 +119,7 @@ public:
 		int32_t mip_row_pitches[16] = {};
 	};
 
-	// Combined header index: one file (e.g. textures.headers.idx) next to
-	// textures.dspkg carries the header of every bundled .dstex, so 100
-	// texture paths cost 1 open + 1 bulk read instead of 100 cold opens.
-	//
-	// On-disk layout (all little-endian, written by the export plugin):
-	//   u32 magic (COMBINED_INDEX_MAGIC "HIDX"), u16 index_version (1),
-	//   u16 reserved (0), u32 entry_count, u32 crc32_ieee(entry payload).
-	//   Per entry: u32 key_len (1..1024) + key_len utf8 bytes (dstex res
-	//   path, exactly as .import remap yields it) + u32 width + u32 height
-	//   + u32 pixel_format + u32 flags + u16 dstex_version + u16 mip_count
-	//   (1..16) + u64 original_size + u64 compressed_size + u64 mtime +
-	//   u64 file_len + int64 mip_offsets[16] + int32 mip_sizes[16] +
-	//   int32 mip_uncompressed[16] + int32 row_pitches[16] (only
-	//   [0, mip_count) valid, rest zero). CRC is IEEE poly 0xEDB88320 over
-	//   the concatenated entry bytes (see crc32_ieee); the GDScript exporter
-	//   writer mirrors it exactly. Freshness mirrors the header-cache
-	//   contract: serve validates current mtime == stored mtime +
-	//   generation match (1 stat, 0 opens); mtime drift falls through to
-	//   the header-cache/miss path. Bundle rotation is picked up via
-	//   rescan_archive()/shutdown() (generation bump + clear).
-	static constexpr uint32_t COMBINED_INDEX_MAGIC = 0x58444948;
-	static constexpr uint16_t COMBINED_INDEX_VERSION = 1;
-	static constexpr uint32_t COMBINED_INDEX_MAX_ENTRIES = 8192;
-	static constexpr uint64_t COMBINED_INDEX_MAX_BYTES = 32ULL * 1024ULL * 1024ULL;
+
 
 	// Resolve + dedup + enqueue. Returns the DSContext stream tag, or 0 when
 	// DSContext is unavailable. Never blocks: requests sit in stream_queue
@@ -280,17 +257,7 @@ private:
 		// generation bump + clear (called from shutdown()/rescan_archive()).
 		HashMap<String, PayloadHeader> header_cache;
 		uint64_t header_cache_generation = 0;
-		// Combined header index: dstex res path -> PayloadHeader populated by
-		// ONE bulk load_combined_index() (1 open + 1 bulk). Served with zero
-		// opens after warm; per-serve freshness is an mtime + generation
-		// match, mirroring the header cache. Guarded by State::mutex. Invalidated together with
-		// header_cache by invalidate_header_cache() (generation bump +
-		// clear, called from shutdown()/rescan_archive()). probed remembers
-		// the miss so a missing index costs zero probes per path.
-		HashMap<String, PayloadHeader> combined_index;
-		String combined_index_path;
-		bool combined_index_probed = false;
-		bool combined_index_available = false;
+
 		// GPU prewarm chunk queue: pending chunks awaiting one
 		// render-thread callback each (pump_gpu_prewarm posts at most one
 		// per frame). gpu_current holds the chunk being processed;
@@ -314,24 +281,10 @@ private:
 	static bool fill_from_dstex_file(const String &p_engine_path, const String &p_dstex_path, Payload &r_out);
 	static bool validate_payload(const Payload &p_payload);
 
-	// Combined index reader (writer lives in the export plugin).
-	// load_combined_index(): idempotent once-per-generation bulk load
-	// (single FileAccess::open + single get_buffer). Returns true when the
-	// index is available. serve_from_index(): zero-open lookup (1 stat for
-	// mtime freshness, zero opens); true on generation+mtime match for a
-	// positive entry (build from it), false otherwise (miss, stale mtime,
-	// or failure entry). crc32_ieee(): IEEE (poly 0xEDB88320) helper shared
-	// by the loader validator and mirrored by the GDScript writer.
-	// C++-internal only, no ClassDB bindings by design.
-	static String resolve_combined_index_path();
-	static bool load_combined_index();
-	static bool serve_from_index(const String &p_dstex_path, PayloadHeader &r_out);
-	static uint32_t crc32_ieee(const uint8_t *p_data, uint64_t p_len);
+
 
 	// C++-internal header-cache plumbing (no ClassDB bindings by design —
 	// this class is deliberately not a registered Godot class).
-	// invalidate_header_cache() also bumps + clears the combined index
-	// (generation shared with header_cache_generation).
 	static void invalidate_header_cache();
 	// Tri-state lookup: returns true on a generation+mtime match for EITHER
 	// a positive entry (r_out.open_failed=false, build from it) or a

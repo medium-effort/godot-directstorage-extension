@@ -113,7 +113,55 @@ func _ready() -> void:
 			ctx.initialize_ds()
 			print("[DirectStorage] Autoload initialized. Active Backend: ", ctx.get_active_backend_name())
 	else:
-		push_warning("[DirectStorage] GDExtension ClassDB entry 'DSContext' not found. Ensure GDExtension library built.")
+		push_error("[DirectStorage] GDExtension ClassDB entry 'DSContext' not found. Ensure GDExtension library is built and deployed.")
+		if not OS.is_debug_build() and not OS.has_feature("editor"):
+			OS.alert(
+				"A required game component is missing:\n" +
+				"'directstorage_accelerator' library was not found.\n\n" +
+				"Please verify game file integrity.",
+				"Missing Component"
+			)
+			get_tree().quit(1)
+			return
+
+	# Verification of bundled texture archive when exported with bundle_dspkg.
+	# Deliberately loader-independent (no C++ popup during resource loads):
+	# the autoload owns the player-facing missing-archive UX at startup.
+	if not OS.has_feature("editor") and bool(ProjectSettings.get_setting("directstorage/export/bundle_dspkg", false)):
+		var archive_name := String(ProjectSettings.get_setting("directstorage/archive_name", "textures.dspkg"))
+		if archive_name.is_empty():
+			archive_name = "textures.dspkg"
+		var exe_dir := OS.get_executable_path().get_base_dir()
+		var candidates: Array[String] = ["res://" + archive_name]
+		if archive_name != "textures.dspkg":
+			candidates.append("res://textures.dspkg")
+		if not exe_dir.is_empty():
+			candidates.append(exe_dir.path_join(archive_name))
+			if archive_name != "textures.dspkg":
+				candidates.append(exe_dir.path_join("textures.dspkg"))
+		var glob_path := ProjectSettings.globalize_path("res://" + archive_name)
+		if not candidates.has(glob_path):
+			candidates.append(glob_path)
+		if archive_name != "textures.dspkg":
+			var glob_default := ProjectSettings.globalize_path("res://textures.dspkg")
+			if not candidates.has(glob_default):
+				candidates.append(glob_default)
+
+		var candidate_found := false
+		for candidate in candidates:
+			if not candidate.is_empty() and FileAccess.file_exists(candidate):
+				candidate_found = true
+				break
+
+		if not candidate_found:
+			var candidate_list := "'" + "', '".join(candidates) + "'"
+			print("[DirectStorage] Archive '", archive_name, "' not found. Searched candidates: ", candidate_list, ".")
+			var err_msg := "Missing required game asset archive: '" + archive_name + "'.\n\nPlease verify game file integrity or reinstall the game."
+			push_error("[DirectStorage] FATAL: " + err_msg)
+			if not OS.is_debug_build():
+				OS.alert(err_msg, "Missing Game Files")
+				get_tree().quit(1)
+				return
 
 
 ## Drives the async stream queue once per frame. Stream-only: never touches

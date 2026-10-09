@@ -7,6 +7,7 @@
 #include "../formats/dspkg_format.h"
 #include "../formats/dstex_format.h"
 
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/os.hpp>
@@ -19,10 +20,20 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 
 namespace godot {
+
+namespace {
+
+uint64_t resolve_expected_fingerprint(ProjectSettings *p_ps) {
+	if (p_ps && p_ps->has_setting("directstorage/expected_archive_fingerprint")) {
+		return static_cast<uint64_t>(p_ps->get_setting("directstorage/expected_archive_fingerprint"));
+	}
+	return 0;
+}
 
 // Loader-local archive-path cache. Has its own guard and generation and
 // shares no state with the preloader, so the sync and async queues stay
@@ -34,7 +45,6 @@ namespace godot {
 // cached is picked up on the next loader teardown (destructor invalidates
 // + bumps generation); the positive open-handle cache in
 // _get_or_open_archive is untouched.
-namespace {
 
 struct LoaderArchiveResolution {
 	std::mutex mutex;
@@ -136,11 +146,39 @@ String DSResourceFormatLoader::_get_resource_type(const String &p_path) const {
 }
 
 String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_path) const {
+	Engine *engine = Engine::get_singleton();
+	OS *os = OS::get_singleton();
+	ProjectSettings *project_settings = ProjectSettings::get_singleton();
+
+	bool force_resolution = project_settings && project_settings->has_setting("directstorage/force_archive_resolution") &&
+			static_cast<bool>(project_settings->get_setting("directstorage/force_archive_resolution"));
+
+	if (!force_resolution && ((engine && engine->is_editor_hint()) || (os && os->has_feature("editor")))) {
+		return String();
+	}
+
+	String archive_filename = "textures.dspkg";
+	if (project_settings && project_settings->has_setting("directstorage/archive_name")) {
+		String custom_name = project_settings->get_setting("directstorage/archive_name");
+		if (!custom_name.is_empty()) {
+			archive_filename = custom_name;
+		}
+	}
+	String canonical_logical = "res://" + archive_filename;
+
 	if (FileAccess::file_exists(p_logical_path)) {
+		if (project_settings && p_logical_path.begins_with("res://")) {
+			String globalized_probe = project_settings->globalize_path(p_logical_path);
+			if (!FileAccess::file_exists(globalized_probe)) {
+				UtilityFunctions::push_error("[DirectStorage] CONFIGURATION ERROR: Archive '", p_logical_path,
+						"' is embedded inside the Godot PCK pack! DirectStorage hardware DMA requires a standalone file on the physical disk. "
+						"DirectStorage DMA is disabled; degrading to CPU decompression.");
+			}
+		}
 		return p_logical_path;
 	}
 
-	if (p_logical_path != "res://textures.dspkg") {
+	if (p_logical_path != canonical_logical && p_logical_path != "res://textures.dspkg") {
 		return String();
 	}
 
@@ -156,21 +194,24 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 	}
 
 	String found;
-	OS *os = OS::get_singleton();
 	if (os) {
-		String executable_archive = os->get_executable_path().get_base_dir().path_join("textures.dspkg");
-		if (FileAccess::file_exists(executable_archive)) {
-			found = executable_archive;
+		String exe_dir = os->get_executable_path().get_base_dir();
+		String executable_custom = exe_dir.path_join(archive_filename);
+		String executable_default = exe_dir.path_join("textures.dspkg");
+		if (FileAccess::file_exists(executable_custom)) {
+			found = executable_custom;
+		} else if (FileAccess::file_exists(executable_default)) {
+			found = executable_default;
 		}
 	}
 
-	if (found.is_empty()) {
-		ProjectSettings *project_settings = ProjectSettings::get_singleton();
-		if (project_settings) {
-			String globalized_archive = project_settings->globalize_path(p_logical_path);
-			if (FileAccess::file_exists(globalized_archive)) {
-				found = globalized_archive;
-			}
+	if (found.is_empty() && project_settings) {
+		String globalized_custom = project_settings->globalize_path(canonical_logical);
+		String globalized_default = project_settings->globalize_path("res://textures.dspkg");
+		if (FileAccess::file_exists(globalized_custom)) {
+			found = globalized_custom;
+		} else if (FileAccess::file_exists(globalized_default)) {
+			found = globalized_default;
 		}
 	}
 
@@ -187,6 +228,18 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 		}
 	}
 
+	if (found.is_empty() && project_settings &&
+			static_cast<bool>(project_settings->get_setting("directstorage/export/bundle_dspkg", false))) {
+		String exe_dir = os ? os->get_executable_path().get_base_dir() : String();
+		String candidates_str = String("'res://") + archive_filename + String("', '") + exe_dir.path_join(archive_filename) +
+				String("', '") + project_settings->globalize_path(canonical_logical) + String("'");
+		if (archive_filename != "textures.dspkg") {
+			candidates_str += String(", 'res://textures.dspkg', '") + exe_dir.path_join("textures.dspkg") +
+					String("', '") + project_settings->globalize_path("res://textures.dspkg") + String("'");
+		}
+		UtilityFunctions::print("[DirectStorage] Archive '", archive_filename, "' not found. Searched candidates: ", candidates_str, ".");
+	}
+
 	return found;
 }
 
@@ -200,9 +253,11 @@ Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_
 		return cached_dspkg;
 	}
 
+	uint64_t expected_fingerprint = resolve_expected_fingerprint(ProjectSettings::get_singleton());
+
 	Ref<DSPkg> archive;
 	archive.instantiate();
-	if (archive->open(p_archive_path) != OK) {
+	if (archive->open(p_archive_path, expected_fingerprint) != OK) {
 		return Ref<DSPkg>();
 	}
 

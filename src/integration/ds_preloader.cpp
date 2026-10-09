@@ -6,6 +6,7 @@
 #include "../formats/dstex_format.h"
 
 #include <godot_cpp/classes/config_file.hpp>
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
@@ -25,6 +26,7 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace godot {
@@ -60,16 +62,12 @@ bool DSPreloader::is_engine_source_path(const String &p_path) {
 }
 
 String DSPreloader::resolve_archive_path() {
-	// Cached resolution: the 3-candidate probe below (res://textures.dspkg,
-	// exe-dir join, globalized) used to run once per prewarmed path — 300
-	// FileAccess::file_exists calls for a 100-path prewarm with only
-	// unresolvable names and no archive on disk. The result is now resolved
-	// once per generation and served from resolved_archive_path under
-	// archive_mutex: a cached miss returns empty with zero probes
-	// (false-fast), a cached hit skips straight to the open-cache check in
-	// fill_from_dspkg.
-	// Staleness contract: a textures.dspkg created/imported after a miss
-	// was cached is picked up only via rescan_archive() (or shutdown()).
+	Engine *engine = Engine::get_singleton();
+	OS *os = OS::get_singleton();
+	if ((engine && engine->is_editor_hint()) || (os && os->has_feature("editor"))) {
+		return String();
+	}
+
 	{
 		std::lock_guard<std::mutex> lock(state().archive_mutex);
 		State &s = state();
@@ -77,25 +75,40 @@ String DSPreloader::resolve_archive_path() {
 			return s.resolved_archive_path;
 		}
 	}
-	const String logical = "res://textures.dspkg";
+
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	String archive_filename = "textures.dspkg";
+	if (ps && ps->has_setting("directstorage/archive_name")) {
+		String custom_name = ps->get_setting("directstorage/archive_name");
+		if (!custom_name.is_empty()) {
+			archive_filename = custom_name;
+		}
+	}
+	String logical = "res://" + archive_filename;
+
 	String found;
 	if (FileAccess::file_exists(logical)) {
 		found = logical;
+	} else if (FileAccess::file_exists("res://textures.dspkg")) {
+		found = "res://textures.dspkg";
 	} else {
-		OS *os = OS::get_singleton();
 		if (os) {
-			String executable_archive = os->get_executable_path().get_base_dir().path_join("textures.dspkg");
-			if (FileAccess::file_exists(executable_archive)) {
-				found = executable_archive;
+			String exe_dir = os->get_executable_path().get_base_dir();
+			String exe_custom = exe_dir.path_join(archive_filename);
+			String exe_default = exe_dir.path_join("textures.dspkg");
+			if (FileAccess::file_exists(exe_custom)) {
+				found = exe_custom;
+			} else if (FileAccess::file_exists(exe_default)) {
+				found = exe_default;
 			}
 		}
-		if (found.is_empty()) {
-			ProjectSettings *ps = ProjectSettings::get_singleton();
-			if (ps) {
-				String globalized = ps->globalize_path(logical);
-				if (FileAccess::file_exists(globalized)) {
-					found = globalized;
-				}
+		if (found.is_empty() && ps) {
+			String globalized_custom = ps->globalize_path(logical);
+			String globalized_default = ps->globalize_path("res://textures.dspkg");
+			if (FileAccess::file_exists(globalized_custom)) {
+				found = globalized_custom;
+			} else if (FileAccess::file_exists(globalized_default)) {
+				found = globalized_default;
 			}
 		}
 	}
@@ -103,12 +116,9 @@ String DSPreloader::resolve_archive_path() {
 		std::lock_guard<std::mutex> lock(state().archive_mutex);
 		State &s = state();
 		if (!s.resolved_archive_probed) {
-			// First publisher wins; probes after this hit the fast path.
 			s.resolved_archive_path = found;
 			s.resolved_archive_probed = true;
 		} else {
-			// Lost a probe race while unlocked: honor the winner so every
-			// caller in this generation agrees on one resolution.
 			found = s.resolved_archive_path;
 		}
 	}
@@ -151,7 +161,12 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 		} else {
 			Ref<DSPkg> fresh;
 			fresh.instantiate();
-			if (fresh->open(archive_path) != OK) {
+			uint64_t expected_fingerprint = 0;
+			ProjectSettings *ps = ProjectSettings::get_singleton();
+			if (ps && ps->has_setting("directstorage/expected_archive_fingerprint")) {
+				expected_fingerprint = static_cast<uint64_t>(ps->get_setting("directstorage/expected_archive_fingerprint"));
+			}
+			if (fresh->open(archive_path, expected_fingerprint) != OK) {
 				return false;
 			}
 			s.archive_path = archive_path;
@@ -203,269 +218,6 @@ void DSPreloader::invalidate_header_cache() {
 	State &s = state();
 	s.header_cache_generation++;
 	s.header_cache.clear();
-	// Combined index shares the generation: bump + clear together so
-	// shutdown()/rescan_archive() drop stale bundle headers with the same
-	// single invalidation both caches observe.
-	s.combined_index.clear();
-	s.combined_index_path = String();
-	s.combined_index_probed = false;
-	s.combined_index_available = false;
-}
-
-uint32_t DSPreloader::crc32_ieee(const uint8_t *p_data, uint64_t p_len) {
-	// IEEE CRC32 (poly 0xEDB88320, init 0xFFFFFFFF, xorout 0xFFFFFFFF).
-	// Bitwise (no table) to keep the helper dependency-free; index payloads
-	// are tens of KB so the per-bit cost is negligible. The GDScript
-	// exporter writer mirrors this exact variant when emitting
-	// textures.headers.idx.
-	uint32_t crc = 0xFFFFFFFFU;
-	for (uint64_t i = 0; i < p_len; ++i) {
-		crc ^= (uint32_t)p_data[i];
-		for (int b = 0; b < 8; ++b) {
-			crc = (crc & 1U) ? (0xEDB88320U ^ (crc >> 1)) : (crc >> 1);
-		}
-	}
-	return crc ^ 0xFFFFFFFFU;
-}
-
-String DSPreloader::resolve_combined_index_path() {
-	// Sidecar sibling of the resolved archive (textures.dspkg ->
-	// textures.headers.idx), falling back to res://textures.headers.idx so
-	// editor dstex-direct runs without a dspkg still benefit. Probing here
-	// is amortized: load_combined_index() calls this once per generation,
-	// never per-path inside the hot loop.
-	String archive_path = resolve_archive_path();
-	if (!archive_path.is_empty()) {
-		String dir = archive_path.get_base_dir();
-		String file = archive_path.get_file();
-		String base = file.get_basename();
-		String sibling = dir.path_join(base + ".headers.idx");
-		if (FileAccess::file_exists(sibling)) {
-			return sibling;
-		}
-		// Archive-named fallback (e.g. custom bundle names): only when the
-		// sibling above is missing, try the canonical res:// name.
-	}
-	const String canonical = "res://textures.headers.idx";
-	if (FileAccess::file_exists(canonical)) {
-		return canonical;
-	}
-	return String();
-}
-
-bool DSPreloader::load_combined_index() {
-	{
-		std::lock_guard<std::mutex> lock(state().mutex);
-		if (state().combined_index_probed) {
-			return state().combined_index_available;
-		}
-	}
-	// Resolve + open + bulk read outside the critical section: the index
-	// for 100 entries is ~20KB, a single open + single bulk.
-	String idx_path = resolve_combined_index_path();
-	if (idx_path.is_empty()) {
-		std::lock_guard<std::mutex> lock(state().mutex);
-		State &s = state();
-		if (!s.combined_index_probed) {
-			s.combined_index_probed = true;
-			s.combined_index_available = false;
-			s.combined_index_path = String();
-		}
-		return false;
-	}
-	Ref<FileAccess> file = FileAccess::open(idx_path, FileAccess::READ);
-	if (file.is_null() || !file->is_open()) {
-		std::lock_guard<std::mutex> lock(state().mutex);
-		State &s = state();
-		if (!s.combined_index_probed) {
-			s.combined_index_probed = true;
-			s.combined_index_available = false;
-		}
-		return false;
-	}
-	uint64_t file_len = file->get_length();
-	if (file_len < 16 || file_len > COMBINED_INDEX_MAX_BYTES) {
-		file->close();
-		std::lock_guard<std::mutex> lock(state().mutex);
-		State &s = state();
-		if (!s.combined_index_probed) {
-			s.combined_index_probed = true;
-			s.combined_index_available = false;
-		}
-		return false;
-	}
-	PackedByteArray bulk = file->get_buffer((int64_t)file_len);
-	file->close();
-	if ((uint64_t)bulk.size() != file_len || file_len < 16) {
-		std::lock_guard<std::mutex> lock(state().mutex);
-		State &s = state();
-		if (!s.combined_index_probed) {
-			s.combined_index_probed = true;
-			s.combined_index_available = false;
-		}
-		return false;
-	}
-	const uint8_t *ptr = bulk.ptr();
-	uint32_t magic = 0;
-	uint16_t idx_version = 0;
-	uint32_t entry_count = 0;
-	uint32_t stored_crc = 0;
-	memcpy(&magic, ptr, 4);
-	memcpy(&idx_version, ptr + 4, 2);
-	memcpy(&entry_count, ptr + 8, 4);
-	memcpy(&stored_crc, ptr + 12, 4);
-	if (magic != COMBINED_INDEX_MAGIC || idx_version != COMBINED_INDEX_VERSION ||
-			entry_count == 0 || entry_count > COMBINED_INDEX_MAX_ENTRIES) {
-		std::lock_guard<std::mutex> lock(state().mutex);
-		State &s = state();
-		if (!s.combined_index_probed) {
-			s.combined_index_probed = true;
-			s.combined_index_available = false;
-		}
-		return false;
-	}
-	// CRC covers all entry bytes after the 16-byte header.
-	uint32_t calc = crc32_ieee(ptr + 16, file_len - 16);
-	if (calc != stored_crc) {
-		UtilityFunctions::push_warning("DSPreloader: Combined header index CRC mismatch; ignoring index.");
-		std::lock_guard<std::mutex> lock(state().mutex);
-		State &s = state();
-		if (!s.combined_index_probed) {
-			s.combined_index_probed = true;
-			s.combined_index_available = false;
-		}
-		return false;
-	}
-	// Parse entries into a local map, then publish first-publisher-wins.
-	HashMap<String, PayloadHeader> parsed;
-	uint64_t off = 16;
-	uint64_t gen = 0;
-	{
-		std::lock_guard<std::mutex> lock(state().mutex);
-		gen = state().header_cache_generation;
-	}
-	uint32_t parsed_count = 0;
-	for (uint32_t e = 0; e < entry_count; ++e) {
-		if (off + 4 > file_len) {
-			break;
-		}
-		uint32_t key_len = 0;
-		memcpy(&key_len, ptr + off, 4);
-		off += 4;
-		if (key_len == 0 || key_len > 1024 || off + key_len > file_len) {
-			break;
-		}
-		String key;
-		{
-			PackedByteArray key_bytes;
-			key_bytes.resize((int64_t)key_len);
-			memcpy(key_bytes.ptrw(), ptr + off, key_len);
-			key = key_bytes.get_string_from_utf8();
-		}
-		off += key_len;
-		// Fixed tail: 4*4 (w/h/fmt/flags) + 2+2 (version/mips) + 4*8
-		// (orig/comp/mtime/file_len) + 16*8 + 16*4*3 = 16+4+32+128+192.
-		constexpr uint64_t TAIL = 16ULL + 4ULL + 32ULL + 128ULL + 192ULL;
-		bool entry_ok = !key.is_empty() && off + TAIL <= file_len;
-		PayloadHeader h;
-		uint32_t w = 0, hh = 0, fmt = 0, flags = 0;
-		uint16_t dver = 0, mips = 0;
-		if (entry_ok) {
-			memcpy(&w, ptr + off, 4);
-			memcpy(&hh, ptr + off + 4, 4);
-			memcpy(&fmt, ptr + off + 8, 4);
-			memcpy(&flags, ptr + off + 12, 4);
-			memcpy(&dver, ptr + off + 16, 2);
-			memcpy(&mips, ptr + off + 18, 2);
-			off += 20;
-			memcpy(&h.original_size, ptr + off, 8);
-			memcpy(&h.compressed_size, ptr + off + 8, 8);
-			memcpy(&h.mtime, ptr + off + 16, 8);
-			memcpy(&h.file_len, ptr + off + 24, 8);
-			off += 32;
-			entry_ok = w != 0 && hh != 0 && mips != 0 && mips <= DSTEX_MAX_MIP_COUNT && (dver == 1 || dver == 2);
-		}
-		if (!entry_ok) {
-			UtilityFunctions::push_warning("DSPreloader: Combined header index entry corrupt; ignoring index.");
-			std::lock_guard<std::mutex> lock(state().mutex);
-			State &s = state();
-			if (!s.combined_index_probed) {
-				s.combined_index_probed = true;
-				s.combined_index_available = false;
-			}
-			return false;
-		}
-		h.width = w;
-		h.height = hh;
-		h.pixel_format = fmt;
-		h.flags = flags;
-		h.version = dver;
-		h.mip_count = mips;
-		h.open_failed = false;
-		h.generation = gen;
-		memcpy(h.mip_offsets, ptr + off, 16 * sizeof(int64_t));
-		off += 128;
-		memcpy(h.mip_sizes, ptr + off, 16 * sizeof(int32_t));
-		off += 64;
-		memcpy(h.mip_uncompressed_sizes, ptr + off, 16 * sizeof(int32_t));
-		off += 64;
-		memcpy(h.mip_row_pitches, ptr + off, 16 * sizeof(int32_t));
-		off += 64;
-		if (!parsed.has(key)) {
-			parsed[key] = h;
-		}
-		parsed_count++;
-	}
-	if (parsed_count != entry_count) {
-		UtilityFunctions::push_warning("DSPreloader: Combined header index truncated; ignoring index.");
-		std::lock_guard<std::mutex> lock(state().mutex);
-		State &s = state();
-		if (!s.combined_index_probed) {
-			s.combined_index_probed = true;
-			s.combined_index_available = false;
-		}
-		return false;
-	}
-	std::lock_guard<std::mutex> lock(state().mutex);
-	State &s = state();
-	if (s.combined_index_probed) {
-		return s.combined_index_available;
-	}
-	if (gen != s.header_cache_generation) {
-		// Generation bumped (shutdown/rescan) during our unlocked I/O:
-		// parsed entries carry a stale stamp. Discard without marking so
-		// the next serve retries under the new generation.
-		return false;
-	}
-	// Entries already stamped with gen == current; publish first-wins.
-	s.combined_index = parsed;
-	s.combined_index_path = idx_path;
-	s.combined_index_probed = true;
-	s.combined_index_available = true;
-	return true;
-}
-
-bool DSPreloader::serve_from_index(const String &p_dstex_path, PayloadHeader &r_out) {
-	// Lazy ensure: first caller in a generation pays the single amortized
-	// bulk load; the rest hit the probed map. No per-path open by design.
-	if (!load_combined_index()) {
-		return false;
-	}
-	// Freshness stat outside the lock (mirrors try_get_cached_header):
-	// 1 stat, 0 opens. Mtime drift (re-imported dstex after bundle) falls
-	// through to the header-cache/miss path instead of serving stale bytes.
-	uint64_t mtime = FileAccess::get_modified_time(p_dstex_path);
-	std::lock_guard<std::mutex> lock(state().mutex);
-	State &s = state();
-	const PayloadHeader *stored = s.combined_index.getptr(p_dstex_path);
-	if (stored == nullptr || stored->generation != s.header_cache_generation || stored->mtime != mtime) {
-		return false;
-	}
-	if (stored->open_failed) {
-		return false;
-	}
-	r_out = *stored;
-	return true;
 }
 
 bool DSPreloader::try_get_cached_header(const String &p_dstex_path, PayloadHeader &r_out) {
@@ -694,17 +446,6 @@ void DSPreloader::payload_from_header(const String &p_engine_path, const String 
 }
 
 bool DSPreloader::fill_from_dstex_file(const String &p_engine_path, const String &p_dstex_path, Payload &r_out) {
-	// Resolve order: combined-index hit zero-open -> header-cache hit
-	// 1 stat/0 opens -> miss single open + single bulk. The
-	// package hit stays ahead of ALL of this in resolve_payload(), so
-	// package-served textures never pay an index open.
-	// Index freshness mirrors the header cache (generation + mtime match,
-	// 1 stat, 0 opens); mtime drift falls through instead of serving stale.
-	PayloadHeader indexed;
-	if (serve_from_index(p_dstex_path, indexed)) {
-		payload_from_header(p_engine_path, p_dstex_path, indexed, r_out);
-		return true;
-	}
 	// Fast path: generation-keyed header cache. Positive hit costs one stat
 	// (get_modified_time) and zero opens, zero Dictionary allocs. Failure
 	// hit (open_failed) costs the same stat and fails without opening —
@@ -868,16 +609,6 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 void DSPreloader::collect_prewarm_payloads(const PackedStringArray &p_paths, std::vector<Payload> &r_payloads, int &r_skipped_cached, int &r_skipped_unresolvable) {
 	DSTextureCache *cache = DSTextureCache::get_singleton();
 	ResourceLoader *rl = ResourceLoader::get_singleton();
-
-	// Boot warmer: ONE amortized combined-index load (1 open + 1 bulk for
-	// up to MAX entries) before the resolve loop, instead of N cold
-	// per-file opens on the file-direct path. Called once per prewarm,
-	// never per-path inside the hot loop, so package-served hits stay
-	// zero-stat/zero-open. prefetch_headers() (file-path batch warmer for
-	// test/scene-collector callers) is deliberately NOT called here
-	// per-path for the same reason — its upfront per-engine-path stats
-	// would tax every package-served texture.
-	load_combined_index();
 
 	HashMap<String, bool> seen;
 	r_payloads.reserve((size_t)p_paths.size());

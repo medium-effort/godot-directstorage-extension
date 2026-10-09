@@ -15,7 +15,8 @@ param(
     [string]$RemoteDir = "",
     [string]$ManifestName = "",
     [switch]$Artifacts,
-    [switch]$TouchTests
+    [switch]$TouchTests,
+    [switch]$CleanOrphans
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +25,44 @@ if ([string]::IsNullOrEmpty($RemoteDir)) {
     Write-Output "VERIFY_ERROR:Missing -RemoteDir"
     exit 2
 }
+
+# Scoped process cleanup: kill any orphaned build processes whose CommandLine
+# explicitly contains this specific $RemoteDir. This prevents file lock conflicts
+# on .sconsign, object files, or DLLs caused by previous interrupted builds, while
+# strictly avoiding killing unrelated processes or builds in other directories.
+if ($CleanOrphans) {
+    $killed = 0
+    try {
+        $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+        $normRemoteDir = $RemoteDir.TrimEnd('\', '/')
+        $targetProcs = @($procs | Where-Object {
+            if (-not $_.CommandLine) { return $false }
+            $cmd = $_.CommandLine
+            $hasRemoteDir = $cmd.IndexOf($normRemoteDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            if (-not $hasRemoteDir) { return $false }
+
+            $name = $_.Name.ToLower()
+            $isBuildTool = ($name -in @("cl.exe", "link.exe", "scons.exe", "python.exe", "python3.exe", "cmd.exe")) -and
+                           ($cmd -like "*scons*" -or $name -in @("cl.exe", "link.exe"))
+            return $isBuildTool
+        })
+
+        foreach ($p in $targetProcs) {
+            if ($p.ProcessId -eq $PID -or $p.ProcessId -le 4) { continue }
+            try {
+                Start-Process "taskkill.exe" -ArgumentList @("/F", "/T", "/PID", $p.ProcessId) -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+                Write-Output ("KILLED_ORPHAN:" + $p.ProcessId + "|" + $p.Name)
+                $killed++
+            } catch {
+                $null = $_
+            }
+        }
+    } catch {
+        Write-Output ("CLEAN_ORPHANS_ERROR:" + $_.Exception.Message)
+    }
+    Write-Output ("CLEANED_ORPHANS_COUNT=" + $killed)
+}
+
 
 # Rebuild forcing: bump the mtime of every test source so SCons cannot
 # consider a changed/new tests/*.cpp up to date (observed: edited suites

@@ -93,19 +93,33 @@ static func _resolve_dependency_path(raw_dep: String) -> String:
 ## [code]compatibility/as_image_texture[/code] (for example Light3D projector
 ## or Decal textures that need a CPU [code]ImageTexture[/code]).
 ## Returns a sorted, de-duplicated [PackedStringArray] of engine paths.
-## Resolves the physical path of textures.dspkg in both editor (res://) and exported builds (exe dir).
+## Resolves the physical path of textures.dspkg in exported builds (exe dir).
+## In editor mode, returns empty string so live imported assets are crawled instead.
 static func _resolve_dspkg_path() -> String:
-	const logical := "res://textures.dspkg"
+	if OS.has_feature("editor") or Engine.is_editor_hint():
+		return ""
+	var archive_name := String(ProjectSettings.get_setting("directstorage/archive_name", "textures.dspkg"))
+	if archive_name.is_empty():
+		archive_name = "textures.dspkg"
+	var logical := "res://" + archive_name
 	if FileAccess.file_exists(logical):
 		return logical
+	if FileAccess.file_exists("res://textures.dspkg"):
+		return "res://textures.dspkg"
 	var exe_dir := OS.get_executable_path().get_base_dir()
 	if not exe_dir.is_empty():
-		var exe_archive := exe_dir.path_join("textures.dspkg")
-		if FileAccess.file_exists(exe_archive):
-			return exe_archive
-	var globalized := ProjectSettings.globalize_path(logical)
-	if FileAccess.file_exists(globalized):
-		return globalized
+		var exe_custom := exe_dir.path_join(archive_name)
+		if FileAccess.file_exists(exe_custom):
+			return exe_custom
+		var exe_default := exe_dir.path_join("textures.dspkg")
+		if FileAccess.file_exists(exe_default):
+			return exe_default
+	var globalized_custom := ProjectSettings.globalize_path(logical)
+	if FileAccess.file_exists(globalized_custom):
+		return globalized_custom
+	var globalized_default := ProjectSettings.globalize_path("res://textures.dspkg")
+	if FileAccess.file_exists(globalized_default):
+		return globalized_default
 	return ""
 
 
@@ -126,7 +140,8 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 	if not extra_scan_dirs.is_empty() and not pkg_path.is_empty() and ClassDB.class_exists("DSPkg"):
 		var dspkg: RefCounted = ClassDB.instantiate("DSPkg")
 		if dspkg != null and dspkg.has_method("open") and dspkg.has_method("get_entries"):
-			if dspkg.call("open", pkg_path) == OK:
+			var expected_fingerprint: int = int(ProjectSettings.get_setting("directstorage/expected_archive_fingerprint", 0))
+			if dspkg.call("open", pkg_path, expected_fingerprint) == OK:
 				var pkg_entries: Array = dspkg.call("get_entries")
 				for entry in pkg_entries:
 					var entry_str := String(entry)

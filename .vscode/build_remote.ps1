@@ -99,6 +99,27 @@ $RemoteDirTar = $RemoteDir.Replace('\', '/')
 
 $ArtifactRemoteDir = "$RemoteDirTar/project/addons/directstorage_accelerator/bin"
 $ArtifactLocalDir = "./project/addons/directstorage_accelerator/bin"
+$RemoteVerifyTar = "$RemoteDirTar/verify_remote.ps1"
+$RemoteVerifyWin = "$RemoteDirWin\verify_remote.ps1"
+
+function Invoke-ScpArtifactWithRetry {
+    param(
+        [string]$RemotePath,
+        [string]$LocalDest,
+        [int]$MaxRetries = 3
+    )
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        & scp -C -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$RemotePath" $LocalDest
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
+        if ($attempt -lt $MaxRetries) {
+            Write-VerboseHost "Failed to pull $RemotePath (attempt $attempt of $MaxRetries), retrying in 2s..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 2
+        }
+    }
+    return $false
+}
 
 # 0. Check local disk space on Device A
 $LocalDriveLetter = (Split-Path -Qualifier (Resolve-Path ".").Path).TrimEnd(':')
@@ -136,9 +157,15 @@ else {
 
 # 2. Ensure target directory exists on Device B
 Write-Host "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
-ssh $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
+& ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to ensure remote build directory exists on $ActiveHost." -Code $LASTEXITCODE
+}
+
+# Ensure helper script verify_remote.ps1 is always present on Device B early
+& scp -o BatchMode=yes -o ConnectTimeout=5 ".vscode/verify_remote.ps1" "$ActiveHost`:$RemoteVerifyTar"
+if ($LASTEXITCODE -ne 0) {
+    Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to upload helper script to Device B ($ActiveHost)." -Code $LASTEXITCODE
 }
 
 # Check remote disk space on Device B before syncing sources
@@ -197,10 +224,22 @@ $tarExcludes = @(
     "--exclude=./wavexecute_tasks"
 ) -join " "
 
-cmd.exe /c "tar -czf - $tarExcludes . | ssh $ActiveHost ""tar -xzf - -C $RemoteDirTar"""
+$tarCmd = "tar -czf - $tarExcludes . | ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost ""tar -xzf - -C $RemoteDirTar"""
+$syncSuccess = $false
+for ($syncAttempt = 1; $syncAttempt -le 2; $syncAttempt++) {
+    cmd.exe /c $tarCmd
+    if ($LASTEXITCODE -eq 0) {
+        $syncSuccess = $true
+        break
+    }
+    if ($syncAttempt -lt 2) {
+        Write-VerboseHost "Source sync failed on attempt $syncAttempt, retrying in 2 seconds..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
+    }
+}
 
-if ($LASTEXITCODE -ne 0) {
-    Show-BuildFailure -Step "Step [3/6] Source Sync" -Message "Failed to sync source files to Device B ($ActiveHost)." -Code $LASTEXITCODE
+if (-not $syncSuccess) {
+    Show-BuildFailure -Step "Step [3/6] Source Sync" -Message "Failed to sync source files to Device B ($ActiveHost)." -Code 1
 }
 
 # [3b/6] Verify the sync end-to-end: hash compiled inputs locally, re-hash
@@ -230,7 +269,7 @@ if (-not $SkipVerify) {
     $ManifestTmp = "sync_manifest.tmp"
     $ManifestEntries | Set-Content -LiteralPath $ManifestTmp -Encoding Ascii
     $RemoteManifestTar = "$RemoteDirTar/sync_manifest.txt"
-    scp "$ManifestTmp" "$ActiveHost`:$RemoteManifestTar"
+    & scp -o BatchMode=yes -o ConnectTimeout=5 "$ManifestTmp" "$ActiveHost`:$RemoteManifestTar"
     Remove-Item $ManifestTmp -Force -ErrorAction SilentlyContinue
     if ($LASTEXITCODE -ne 0) {
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Failed to upload sync manifest to Device B ($ActiveHost)." -Code $LASTEXITCODE
@@ -238,16 +277,8 @@ if (-not $SkipVerify) {
     if ($ManifestEntries.Count -eq 0) {
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Sync manifest is empty; nothing was hashed on Device A. Refusing vacuous pass." -Code 1
     }
-    # The verifier rides along via scp and runs with spaceless arguments only,
-    # so the ssh invocation needs no quoting (nested quoting through
-    # ssh -> cmd -> powershell is fragile and already caused one false red).
-    $RemoteVerifyTar = "$RemoteDirTar/verify_remote.ps1"
-    scp ".vscode/verify_remote.ps1" "$ActiveHost`:$RemoteVerifyTar"
-    if ($LASTEXITCODE -ne 0) {
-        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Failed to upload verifier script to Device B ($ActiveHost)." -Code $LASTEXITCODE
-    }
-    $RemoteVerifyWin = "$RemoteDirWin\verify_remote.ps1"
-    $VerifyOut = ssh $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -ManifestName sync_manifest.txt 2>&1
+    # The verifier runs with spaceless arguments only
+    $VerifyOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -ManifestName sync_manifest.txt 2>&1
     if ($VerifyOut -notcontains "SYNC_MANIFEST_OK") {
         $detailLines = @($VerifyOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 20) -join "`n"
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Device B verification failed ($ActiveHost) with no clean OK. Raw remote output:`n$detailLines" -Code 1
@@ -258,7 +289,7 @@ if (-not $SkipVerify) {
     # tests), so test TUs are touched to guarantee the next compile sees
     # them. Quoteless invocation, same as [3b/6].
     Write-VerboseHost "[3c/6] Touching test sources on Device B..." -ForegroundColor Cyan
-    $TouchOut = ssh $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -TouchTests 2>&1
+    $TouchOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -TouchTests 2>&1
     $TouchCount = 0
     foreach ($touchLine in @($TouchOut)) {
         $touchText = $touchLine.ToString()
@@ -276,15 +307,26 @@ if (-not $SkipVerify) {
 # 4. Trigger SCons build on Device B
 Write-Host "[4/6] Compiling target=$Target on Device B..." -ForegroundColor Cyan
 $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
+
+# [4a/6] Clean any orphaned SCons / cl.exe build processes from previous interrupted runs for this project
+Write-VerboseHost "Cleaning any stale/orphaned build processes for $RemoteDirWin on Device B..." -ForegroundColor Cyan
+$CleanOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -CleanOrphans 2>&1
+foreach ($cLine in @($CleanOut)) {
+    $cText = $cLine.ToString()
+    if ($cText.StartsWith("KILLED_ORPHAN:")) {
+        Write-VerboseHost "Terminated orphaned build process: $($cText.Substring(14))" -ForegroundColor Yellow
+    }
+}
+
 # Exit status cannot ride the ssh code: OpenSSH's cmd shell returns 0 even
 # when SCons fails, and %ERRORLEVEL% expands before SCons runs. A marker
 # file written only after a successful scons is the reliable signal.
 $RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
-& ssh -n $ActiveHost "del /f /q `"$RemoteMarkerWin`" 2>nul"
+& ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "del /f /q `"$RemoteMarkerWin`" 2>nul"
 # The deletion itself is verified: a stale marker fakes success (observed —
 # del silently failed on a locked file, scons then errored, and the
 # surviving marker passed the gate below with a SUCCESS banner).
-& ssh -n $ActiveHost "type `"$RemoteMarkerWin`" >nul 2>nul"
+& ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "type `"$RemoteMarkerWin`" >nul 2>nul"
 if ($LASTEXITCODE -eq 0) {
     Show-BuildFailure -Step "Step [4/6] Marker Reset" -Message "Stale success marker could not be deleted on Device B ($ActiveHost); refusing a build whose success cannot be verified." -Code 1
 }
@@ -295,7 +337,16 @@ $sconsOutFile = Join-Path $env:TEMP ("scons_remote_out_" + [System.Guid]::NewGui
 $sconsErrFile = Join-Path $env:TEMP ("scons_remote_err_" + [System.Guid]::NewGuid().ToString() + ".log")
 $remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`""
 
-$sconsProc = Start-Process -FilePath "ssh" -ArgumentList @("-n", $ActiveHost, $remoteCmd) -NoNewWindow -PassThru -RedirectStandardOutput $sconsOutFile -RedirectStandardError $sconsErrFile
+$sconsArgs = @(
+    "-n",
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=10",
+    "-o", "ServerAliveInterval=5",
+    "-o", "ServerAliveCountMax=3",
+    $ActiveHost,
+    $remoteCmd
+)
+$sconsProc = Start-Process -FilePath "ssh" -ArgumentList $sconsArgs -NoNewWindow -PassThru -RedirectStandardOutput $sconsOutFile -RedirectStandardError $sconsErrFile
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $lastHeartbeatMin = 0
@@ -320,7 +371,25 @@ if (Test-Path -LiteralPath $sconsErrFile) {
 if ($Verbose -and $sconsLines) {
     $sconsLines | ForEach-Object { Write-Host $_ }
 }
-& ssh -n $ActiveHost "type `"$RemoteMarkerWin`" >nul 2>nul"
+
+# Distinguish network/SSH drop (exit code 255 or host unreachable) from actual compilation error
+$sshDropped = ($sconsProc.ExitCode -eq 255)
+if (-not $sshDropped) {
+    & ssh -o BatchMode=yes -o ConnectTimeout=3 $ActiveHost "exit 0" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        $sshDropped = $true
+    }
+}
+
+if ($sshDropped) {
+    if ($sconsLines) {
+        Write-Host "--- SCons Output (before connection was lost) ---" -ForegroundColor Yellow
+        $sconsLines | Select-Object -Last 15 | ForEach-Object { Write-Host $_ }
+    }
+    Show-BuildFailure -Step "Step [4/6] SSH Disconnected" -Message "SSH connection to Device B ($ActiveHost) dropped or timed out during compilation (SSH Exit Code: $($sconsProc.ExitCode))." -Code 255
+}
+
+& ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "type `"$RemoteMarkerWin`" >nul 2>nul"
 $markerMissing = $LASTEXITCODE -ne 0
 $sconsFailed = @($sconsLines | Where-Object { $_ -match "terminated because of errors|scons: \*\*\* \[|error C[0-9]+|error LNK[0-9]+" }).Count -gt 0
 if ($markerMissing -or $sconsFailed) {
@@ -335,7 +404,7 @@ if ($markerMissing -or $sconsFailed) {
             $sconsLines | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
         }
     }
-    $why = if ($sconsFailed) { "SCons reported compilation errors" } else { "missing success marker (ssh does not propagate the SCons exit code)" }
+    $why = if ($sconsFailed) { "SCons reported compilation errors" } else { "missing success marker (SCons did not complete successfully)" }
     Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost). Detected via $why." -Code 1
 }
 
@@ -346,24 +415,24 @@ if (!(Test-Path $ArtifactLocalDir)) {
 }
 
 # Clean any remote hot-reload temporary DLLs before pulling
-ssh $ActiveHost "if exist `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`" del /q `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`"" 2>$null
+& ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if exist `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`" del /q `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`"" 2>$null
 
-# Pull runtime DLLs and manifest with on-the-fly compression (-C)
-scp -C "$ActiveHost`:$ArtifactRemoteDir/directstorage_accelerator*.dll" "$ArtifactLocalDir/"
-scp -C "$ActiveHost`:$ArtifactRemoteDir/dstorage*.dll" "$ArtifactLocalDir/"
-if ($LASTEXITCODE -ne 0) {
-    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy compiled .dll files from Device B ($ActiveHost)." -Code $LASTEXITCODE
+# Pull runtime DLLs and manifest with on-the-fly compression (-C) and bounded retries
+if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$ArtifactRemoteDir/directstorage_accelerator*.dll" -LocalDest "$ArtifactLocalDir/")) {
+    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy compiled directstorage_accelerator*.dll from Device B ($ActiveHost)." -Code 1
+}
+if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$ArtifactRemoteDir/dstorage*.dll" -LocalDest "$ArtifactLocalDir/")) {
+    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy dstorage*.dll from Device B ($ActiveHost)." -Code 1
 }
 if ($IncludeTests) {
     if (!(Test-Path "./bin")) {
         New-Item -ItemType Directory -Force -Path "./bin" | Out-Null
     }
-    scp -C "$ActiveHost`:$RemoteDirTar/bin/libdirectstorage_tests*.dll" "./bin/"
-    if ($LASTEXITCODE -ne 0) {
-        Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll (libdirectstorage_tests*.dll) from Device B ($ActiveHost). The remote test build likely failed." -Code $LASTEXITCODE
+    if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$RemoteDirTar/bin/libdirectstorage_tests*.dll" -LocalDest "./bin/")) {
+        Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll (libdirectstorage_tests*.dll) from Device B ($ActiveHost). The remote test build likely failed." -Code 1
     }
 }
-scp -C "$ActiveHost`:$ArtifactRemoteDir/build_manifest.json" "$ArtifactLocalDir/" 2>$null
+& scp -C -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$ArtifactRemoteDir/build_manifest.json" "$ArtifactLocalDir/" 2>$null
 
 # [5b/6] Verify pulled artifacts equal the Device B files (transfer
 # integrity). A truncated scp must never pass as a fresh build.
@@ -379,7 +448,7 @@ if (-not $SkipVerify) {
     }
     # Remote hashes come from the verifier script (quoteless invocation, same
     # as step [3b/6]) so no nested quoting is needed here either.
-    $ArtOut = ssh $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -Artifacts 2>&1
+    $ArtOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -Artifacts 2>&1
     $RemoteArtifacts = @{}
     foreach ($artLine in @($ArtOut)) {
         $artText = $artLine.ToString()
@@ -414,7 +483,7 @@ if (-not $SkipVerify) {
 # Pull large PDB debug symbols only when explicitly requested
 if ($IncludePdb) {
     Write-VerboseHost "Pulling debug symbols (.pdb) with compression..." -ForegroundColor Cyan
-    scp -C "$ActiveHost`:$ArtifactRemoteDir/*.pdb" "$ArtifactLocalDir/" 2>$null
+    & scp -C -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$ArtifactRemoteDir/*.pdb" "$ArtifactLocalDir/" 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-VerboseHost "Warning: Failed to download .pdb debug symbols." -ForegroundColor Yellow
     }

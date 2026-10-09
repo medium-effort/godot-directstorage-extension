@@ -17,12 +17,12 @@ namespace godot {
 
 #pragma pack(push, 1)
 struct DSPkgHeader {
-	uint32_t magic;       // 0x474B5044 ("DPKG" little-endian)
-	uint16_t version;     // 1 for legacy archives, 2 for GPU mip metadata, 3 for entry flags
-	uint16_t flags;       // DSPKG_FLAG_GPU_MIP_METADATA for version 2/3
-	uint32_t entry_count; // Number of entries
-	uint64_t data_offset; // Byte offset to start of data blob
-	uint64_t reserved;    // 0
+	uint32_t magic;               // 0x474B5044 ("DPKG" little-endian)
+	uint16_t version;             // 1 for legacy archives, 2 for GPU mip metadata, 3 for entry flags
+	uint16_t flags;               // DSPKG_FLAG_GPU_MIP_METADATA for version 2/3
+	uint32_t entry_count;         // Number of entries
+	uint64_t data_offset;         // Byte offset to start of data blob
+	uint64_t archive_fingerprint; // Two-tier fingerprint: (project_guid << 32) | manifest_hash, or 0 if unpaired
 };
 #pragma pack(pop)
 
@@ -62,6 +62,7 @@ class DSPkg : public Resource {
 private:
 	// Builder state
 	String build_output_path;
+	uint64_t build_archive_fingerprint = 0;
 	Array staging_entries;
 	bool is_building = false;
 
@@ -83,12 +84,14 @@ public:
 	~DSPkg();
 
 	// Archive Builder
-	Error create(const String &p_output_path);
+	Error create(const String &p_output_path, uint64_t p_archive_fingerprint = 0);
+	void set_archive_fingerprint(uint64_t p_archive_fingerprint);
 	Error add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata = Dictionary());
 	Error finalize();
 
 	// Archive Reader
-	Error open(const String &p_path);
+	Error open(const String &p_path, uint64_t p_expected_fingerprint = 0);
+	uint64_t get_archive_fingerprint() const;
 	bool has_texture(const String &p_resource_path) const;
 	Dictionary read_texture(const String &p_resource_path) const;
 	Dictionary get_entry_info(const String &p_resource_path) const;

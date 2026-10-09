@@ -9,15 +9,7 @@ extends EditorExportPlugin
 ## to the required addons/directstorage_accelerator/bin subdirectory.
 
 const OPTION_BUNDLE_DSPKG: StringName = &"directstorage/bundle_textures_dspkg"
-
-## During export a combined header index (textures.headers.idx) is written
-## next to textures.dspkg so the runtime can look up bundled texture headers
-## without opening every file.
-const COMBINED_INDEX_MAGIC: int = 0x58444948
-const COMBINED_INDEX_VERSION: int = 1
-const COMBINED_INDEX_MAX_ENTRIES: int = 8192
-const COMBINED_INDEX_MAX_KEY_BYTES: int = 1024
-const COMBINED_INDEX_MIP_SLOTS: int = 16
+const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"directstorage/enforce_archive_pairing"
 
 var _dspkg: RefCounted = null
 ## Staging/final archive paths. Both live in the target export directory so no
@@ -30,13 +22,18 @@ var _target_dspkg_path: String = ""
 ## clean up stale artifacts on C:.
 const LEGACY_TEMP_DSPKG_PATH: String = "user://temp_textures.dspkg"
 var _has_textures: bool = false
-## Texture paths bundled by this export run.
-var _bundled_entries: Array[Dictionary] = []
 var _archive_failed: bool = false
 var _target_export_dir: String = ""
 var _export_features: PackedStringArray = []
 var _is_debug_export: bool = false
 var _bundle_dspkg_enabled: bool = false
+var _enforce_pairing_enabled: bool = true
+var _current_fingerprint: int = 0
+var _archive_name: String = "textures.dspkg"
+## Manifest accumulator: dstex/archive entry path -> uncompressed size.
+## Deduplicated by path; hashed sorted (FNV-1a 32-bit) in _export_end so the
+## manifest hash is order-independent and code-only patches re-ship nothing.
+var _manifest_entries: Dictionary = {}
 
 ## Returns the stable export plugin name shown to Godot.
 func _get_name() -> String:
@@ -58,6 +55,16 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 		{
 			"option": {
 				"name": OPTION_BUNDLE_DSPKG,
+				"type": TYPE_BOOL,
+				"hint": PROPERTY_HINT_NONE,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT
+			},
+			"default_value": true,
+		},
+		{
+			"option": {
+				"name": OPTION_ENFORCE_ARCHIVE_PAIRING,
 				"type": TYPE_BOOL,
 				"hint": PROPERTY_HINT_NONE,
 				"hint_string": "",
@@ -92,36 +99,56 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_export_features = features
 	_is_debug_export = is_debug
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
+	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_has_textures = false
-	_bundled_entries.clear()
 	_archive_failed = false
 	_dspkg = null
 	_staging_dspkg_path = ""
 	_target_dspkg_path = ""
 
+	_archive_name = String(ProjectSettings.get_setting("directstorage/archive_name", "textures.dspkg"))
+	if _archive_name.is_empty():
+		_archive_name = "textures.dspkg"
+
+	# Ensure stable project GUID persisted to project.godot
+	_ensure_project_guid()
+	_manifest_entries.clear()
+	_current_fingerprint = 0
+
+	if _bundle_dspkg_enabled:
+		_precompute_manifest()
+		if _enforce_pairing_enabled and _has_textures:
+			var guid := _ensure_project_guid()
+			var manifest := _compute_manifest_hash()
+			_current_fingerprint = (guid << 32) | manifest
+
+	ProjectSettings.set_setting("directstorage/export/bundle_dspkg", _bundle_dspkg_enabled and _has_textures)
+	ProjectSettings.set_setting("directstorage/expected_archive_fingerprint", _current_fingerprint)
+	ProjectSettings.set_setting("directstorage/archive_name", _archive_name)
+
 	if not _bundle_dspkg_enabled:
 		print("[DirectStorage Exporter] Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK.")
 		return
 
-	print("[DirectStorage Exporter] Standalone DSPkg bundling is ENABLED. Textures will be bundled into textures.dspkg.")
+	print("[DirectStorage Exporter] Standalone DSPkg bundling is ENABLED. Target archive: ", _archive_name, " (pairing fingerprint: ", String.num_uint64(_current_fingerprint, 16), ")")
 
 	if not ClassDB.class_exists("DSPkg"):
 		push_warning("[DirectStorage Exporter] DSPkg class not found. Skipping archive bundling.")
 		return
 
 	if _target_export_dir.is_empty():
-		push_error("[DirectStorage Exporter] FATAL: no export directory resolved; textures.dspkg cannot be written. The export is incomplete and binaries will NOT be deployed.")
+		push_error("[DirectStorage Exporter] FATAL: no export directory resolved; " + _archive_name + " cannot be written. The export is incomplete and binaries will NOT be deployed.")
 		_archive_failed = true
 		return
 
-	_target_dspkg_path = _target_export_dir.path_join("textures.dspkg")
-	_staging_dspkg_path = _target_export_dir.path_join("textures.dspkg.tmp")
+	_target_dspkg_path = _target_export_dir.path_join(_archive_name)
+	_staging_dspkg_path = _target_export_dir.path_join(_archive_name + ".tmp")
 	_warn_if_low_disk_space(_target_export_dir)
 	_cleanup_staging()
 	_cleanup_legacy_user_temp()
 	_dspkg = ClassDB.instantiate("DSPkg")
 	if _dspkg != null:
-		var err: Error = _dspkg.create(_staging_dspkg_path)
+		var err: Error = _dspkg.create(_staging_dspkg_path, _current_fingerprint)
 		if err != OK:
 			push_error("[DirectStorage Exporter] Failed to create DSPkg staging archive at: " + _staging_dspkg_path + ": " + error_string(err))
 			_dspkg = null
@@ -150,6 +177,14 @@ func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
 
 ## Adds an imported .dstex resource to the archive when bundling is enabled.
 func _export_file(path: String, type: String, features: PackedStringArray) -> void:
+	# Standalone archives must never be embedded in the PCK (breaks Win32
+	# DirectStorage DMA). Exclude any .dspkg in the project tree regardless
+	# of the bundling option.
+	if path.ends_with(".dspkg"):
+		skip()
+		print("[DirectStorage Exporter] Excluded standalone archive from PCK: ", path)
+		return
+
 	if _dspkg == null or not _bundle_dspkg_enabled:
 		# When DSPkg bundling is disabled, let Godot export .dstex directly into PCK
 		return
@@ -192,7 +227,9 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 			return
 
 		_has_textures = true
-		_track_bundled_entry(dstex_path)
+		_track_manifest_entry(resource_path, dstex_path)
+		if dstex_path != resource_path:
+			_track_manifest_entry(dstex_path, dstex_path)
 		print("[DirectStorage Exporter] Added texture to archive: ", resource_path, " (from ", dstex_path, ")")
 		# Skip texture payload from PCK so it is only stored in textures.dspkg.
 		skip()
@@ -220,19 +257,18 @@ func _export_end() -> void:
 				_remove_file_silent(_target_dspkg_path)
 			elif _staging_dspkg_path.is_empty() or _target_dspkg_path.is_empty():
 				dspkg_ok = false
-				push_error("[DirectStorage Exporter] FATAL: export directory was lost before finalize; textures.dspkg was not deployed and binaries were NOT deployed.")
+				push_error("[DirectStorage Exporter] FATAL: export directory was lost before finalize; " + _archive_name + " was not deployed and binaries were NOT deployed.")
 			elif not FileAccess.file_exists(_staging_dspkg_path):
 				dspkg_ok = false
-				push_error("[DirectStorage Exporter] FATAL: finalized staging archive is missing at '" + _staging_dspkg_path + "'; textures.dspkg was not deployed and binaries were NOT deployed.")
+				push_error("[DirectStorage Exporter] FATAL: finalized staging archive is missing at '" + _staging_dspkg_path + "'; " + _archive_name + " was not deployed and binaries were NOT deployed.")
 			else:
 				_remove_file_silent(_target_dspkg_path)
 				var rename_err := DirAccess.rename_absolute(_staging_dspkg_path, _target_dspkg_path)
 				if rename_err == OK:
 					print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", _target_dspkg_path)
-					_write_combined_header_index(_target_dspkg_path.get_basename() + ".headers.idx")
 				else:
 					dspkg_ok = false
-					_report_storage_failure("rename textures.dspkg.tmp to textures.dspkg", rename_err, _target_dspkg_path)
+					_report_storage_failure("rename staging archive to " + _target_dspkg_path.get_file(), rename_err, _target_dspkg_path)
 					_cleanup_staging()
 					_remove_file_silent(_target_dspkg_path)
 		else:
@@ -392,145 +428,119 @@ func _deploy_windows_binaries(target_base_dir: String, is_debug: bool, features:
 			if remove_err == OK:
 				print("[DirectStorage Exporter] Cleaned up redundant root binary: ", dll_name)
 
-## Records a bundled dstex res path for the combined header index (deduped).
-func _track_bundled_entry(dstex_path: String) -> void:
-	for existing in _bundled_entries:
-		if String(existing.get("dstex_path", "")) == dstex_path:
-			return
-	_bundled_entries.append({"dstex_path": dstex_path})
+func _compute_project_guid() -> int:
+	var custom_guid = ProjectSettings.get_setting("directstorage/project_guid", 0)
+	if typeof(custom_guid) == TYPE_INT and int(custom_guid) != 0:
+		return int(custom_guid) & 0xFFFFFFFF
+	# Back-compat fallback for projects that never got a persisted GUID:
+	# hash the project name (stable for the same project, unlike random).
+	var project_name: String = ProjectSettings.get_setting("application/config/name", "game")
+	var h: int = 0x811c9dc5
+	for b in project_name.to_utf8_buffer():
+		h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+	if h == 0:
+		h = 1
+	return h
 
-## Writes the combined header index (e.g. textures.headers.idx) next
-## to the deployed textures.dspkg. Best-effort: any failure only
-## warns and never affects the deployed archive.
-func _write_combined_header_index(target_index_path: String) -> void:
-	if _bundled_entries.is_empty():
+## Generates and persists directstorage/project_guid once per project so the
+## upper 32 bits of the fingerprint are stable across exports (cross-game
+## collision protection). Existing projects keep their fallback hash until
+## this runs once; afterwards the stored value wins.
+func _ensure_project_guid() -> int:
+	var custom_guid = ProjectSettings.get_setting("directstorage/project_guid", 0)
+	if typeof(custom_guid) == TYPE_INT and int(custom_guid) != 0:
+		return int(custom_guid) & 0xFFFFFFFF
+	var guid := randi() & 0xFFFFFFFF
+	if guid == 0:
+		guid = 1
+	ProjectSettings.set_setting("directstorage/project_guid", guid)
+	var save_err := ProjectSettings.save()
+	if save_err != OK:
+		push_warning("[DirectStorage Exporter] Could not persist directstorage/project_guid to project.godot: " + error_string(save_err))
+	return guid
+
+## Records one bundled entry for the manifest hash (deduplicated by path).
+## Uses the uncompressed size per plan; falls back to reading the dstex
+## header when the size is unknown (0 passed by alias entries).
+func _track_manifest_entry(entry_path: String, dstex_path: String, original_size: int = 0) -> void:
+	if entry_path.is_empty():
 		return
-	if _bundled_entries.size() > COMBINED_INDEX_MAX_ENTRIES:
-		push_warning("[DirectStorage Exporter] Too many bundled textures for the combined header index (" + str(_bundled_entries.size()) + " > " + str(COMBINED_INDEX_MAX_ENTRIES) + "); skipping textures.headers.idx.")
+	if _manifest_entries.has(entry_path):
 		return
-	if not ClassDB.class_exists("DSTex"):
-		push_warning("[DirectStorage Exporter] DSTex class not found; skipping combined header index.")
+	var size_val := original_size
+	if size_val <= 0 and ClassDB.class_exists("DSTex") and FileAccess.file_exists(dstex_path):
+		var probe: RefCounted = ClassDB.instantiate("DSTex")
+		if probe != null and probe.has_method("read_header"):
+			var header: Dictionary = probe.call("read_header", dstex_path)
+			size_val = int(header.get("original_size", 0))
+	_manifest_entries[entry_path] = maxi(size_val, 0)
+
+## FNV-1a 32-bit over sorted (path, uncompressed size) pairs. Sorted so the
+## hash is independent of export-callback order; code-only patches produce
+## the identical hash and reuse the shipped archive.
+func _compute_manifest_hash() -> int:
+	var keys := _manifest_entries.keys()
+	keys.sort()
+	var h: int = 0x811c9dc5
+	for k in keys:
+		var path_str := String(k)
+		for b in path_str.to_utf8_buffer():
+			h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+		h ^= 0xFF
+		h = (h * 0x01000193) & 0xFFFFFFFF
+		var size_val := int(_manifest_entries[k])
+		for i in range(4):
+			h = ((h ^ ((size_val >> (i * 8)) & 0xFF)) * 0x01000193) & 0xFFFFFFFF
+	var manifest := h & 0xFFFFFFFF
+	if manifest == 0:
+		manifest = 1 # 0 means unpaired/legacy; paired builds must not alias it.
+	return manifest
+
+## Recursively crawls res:// for all textures that will be bundled into .dspkg
+## (either raw .dstex or source images with a directstorage_texture remap).
+## Computes the manifest entries ahead of time so the real fingerprint is known
+## in _export_begin() and baked directly into the PCK project settings.
+func _precompute_manifest() -> void:
+	_manifest_entries.clear()
+	_scan_dir_for_manifest("res://")
+	_has_textures = not _manifest_entries.is_empty()
+
+func _scan_dir_for_manifest(dir_path: String) -> void:
+	var dir := DirAccess.open(dir_path)
+	if dir == null:
 		return
-	var payload := PackedByteArray()
-	var entry_count := 0
-	for entry in _bundled_entries:
-		var entry_bytes := _build_combined_index_entry(String(entry.get("dstex_path", "")))
-		if entry_bytes.is_empty():
-			continue
-		payload.append_array(entry_bytes)
-		entry_count += 1
-	if entry_count == 0:
-		push_warning("[DirectStorage Exporter] No valid texture headers for the combined header index; skipping textures.headers.idx.")
+	dir.include_hidden = false
+	dir.include_navigational = false
+	if dir.list_dir_begin() != OK:
 		return
-	var blob := PackedByteArray()
-	blob.append_array(_idx_u32(COMBINED_INDEX_MAGIC))
-	blob.append_array(_idx_u16(COMBINED_INDEX_VERSION))
-	blob.append_array(_idx_u16(0))
-	blob.append_array(_idx_u32(entry_count))
-	blob.append_array(_idx_u32(_idx_crc32_ieee(payload)))
-	blob.append_array(payload)
-	var file := FileAccess.open(target_index_path, FileAccess.WRITE)
-	if file == null or not file.is_open():
-		push_warning("[DirectStorage Exporter] Could not write combined header index to '" + target_index_path + "'. The textures.dspkg archive is unaffected.")
-		return
-	file.store_buffer(blob)
-	file.close()
-	print("[DirectStorage Exporter] Wrote combined header index (", entry_count, " entries) to: ", target_index_path)
-
-## Serializes one combined-index entry for a bundled dstex path. Returns an
-## empty array when the header is missing/invalid (caller skips it).
-func _build_combined_index_entry(dstex_path: String) -> PackedByteArray:
-	var key_bytes := dstex_path.to_utf8_buffer()
-	if key_bytes.size() < 1 or key_bytes.size() > COMBINED_INDEX_MAX_KEY_BYTES:
-		push_warning("[DirectStorage Exporter] Skipping index entry with invalid key length: " + dstex_path)
-		return PackedByteArray()
-	var dstex: RefCounted = ClassDB.instantiate("DSTex")
-	if dstex == null:
-		return PackedByteArray()
-	var header: Dictionary = dstex.read_header(dstex_path)
-	var width := int(header.get("width", 0))
-	var height := int(header.get("height", 0))
-	var dstex_version := int(header.get("version", 0))
-	var mip_count := int(header.get("mip_count", 0))
-	if width <= 0 or height <= 0 or mip_count < 1 or mip_count > COMBINED_INDEX_MIP_SLOTS or (dstex_version != 1 and dstex_version != 2):
-		push_warning("[DirectStorage Exporter] Skipping index entry with invalid header: " + dstex_path)
-		return PackedByteArray()
-	var pixel_format := int(header.get("pixel_format", 0))
-	var flags := int(header.get("flags", 0))
-	var original_size := int(header.get("original_size", 0))
-	var compressed_size := int(header.get("compressed_size", 0))
-	var mtime := int(FileAccess.get_modified_time(dstex_path))
-	var file_len := 0
-	var probe := FileAccess.open(dstex_path, FileAccess.READ)
-	if probe != null and probe.is_open():
-		file_len = int(probe.get_length())
-		probe.close()
-	var mip_offsets: PackedInt64Array = header.get("mip_offsets", PackedInt64Array())
-	var mip_sizes: PackedInt32Array = header.get("mip_sizes", PackedInt32Array())
-	var mip_uncompressed: PackedInt32Array = header.get("mip_uncompressed_sizes", PackedInt32Array())
-	var row_pitches: PackedInt32Array = header.get("mip_row_pitches", PackedInt32Array())
-	if mip_offsets.size() < mip_count or mip_sizes.size() < mip_count or mip_uncompressed.size() < mip_count or row_pitches.size() < mip_count:
-		push_warning("[DirectStorage Exporter] Skipping index entry with incomplete mip tables: " + dstex_path)
-		return PackedByteArray()
-	var out := PackedByteArray()
-	out.append_array(_idx_u32(key_bytes.size()))
-	out.append_array(key_bytes)
-	out.append_array(_idx_u32(width))
-	out.append_array(_idx_u32(height))
-	out.append_array(_idx_u32(pixel_format))
-	out.append_array(_idx_u32(flags))
-	out.append_array(_idx_u16(dstex_version))
-	out.append_array(_idx_u16(mip_count))
-	out.append_array(_idx_u64(original_size))
-	out.append_array(_idx_u64(compressed_size))
-	out.append_array(_idx_u64(mtime))
-	out.append_array(_idx_u64(file_len))
-	for i in range(COMBINED_INDEX_MIP_SLOTS):
-		var off := 0
-		if i < mip_count:
-			off = int(mip_offsets[i])
-		out.append_array(_idx_i64(off))
-	for i in range(COMBINED_INDEX_MIP_SLOTS):
-		var sz := 0
-		if i < mip_count:
-			sz = int(mip_sizes[i])
-		out.append_array(_idx_i32(sz))
-	for i in range(COMBINED_INDEX_MIP_SLOTS):
-		var uncomp := 0
-		if i < mip_count:
-			uncomp = int(mip_uncompressed[i])
-		out.append_array(_idx_i32(uncomp))
-	for i in range(COMBINED_INDEX_MIP_SLOTS):
-		var pitch := 0
-		if i < mip_count:
-			pitch = int(row_pitches[i])
-		out.append_array(_idx_i32(pitch))
-	return out
-
-## IEEE CRC32 (poly 0xEDB88320, init/xorout 0xFFFFFFFF), bitwise to mirror
-## DSPreloader::crc32_ieee exactly.
-static func _idx_crc32_ieee(data: PackedByteArray) -> int:
-	var crc: int = 0xFFFFFFFF
-	for b in data:
-		crc ^= b
-		for i in range(8):
-			if (crc & 1) != 0:
-				crc = (0xEDB88320 ^ (crc >> 1)) & 0xFFFFFFFF
-			else:
-				crc = (crc >> 1) & 0xFFFFFFFF
-	return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
-
-static func _idx_u16(v: int) -> PackedByteArray:
-	return PackedByteArray([v & 0xFF, (v >> 8) & 0xFF])
-
-static func _idx_u32(v: int) -> PackedByteArray:
-	return PackedByteArray([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
-
-static func _idx_u64(v: int) -> PackedByteArray:
-	return PackedByteArray([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF, (v >> 32) & 0xFF, (v >> 40) & 0xFF, (v >> 48) & 0xFF, (v >> 56) & 0xFF])
-
-static func _idx_i32(v: int) -> PackedByteArray:
-	return _idx_u32(v & 0xFFFFFFFF)
-
-static func _idx_i64(v: int) -> PackedByteArray:
-	return _idx_u64(v)
+	var file_name := dir.get_next()
+	while not file_name.is_empty():
+		if dir.current_is_dir():
+			if not file_name.begins_with(".") and file_name != "addons":
+				_scan_dir_for_manifest(dir_path.path_join(file_name))
+			elif file_name == "addons":
+				var sub_dir_path := dir_path.path_join(file_name)
+				var sub_dir := DirAccess.open(sub_dir_path)
+				if sub_dir != null and sub_dir.list_dir_begin() == OK:
+					var sub_name := sub_dir.get_next()
+					while not sub_name.is_empty():
+						if sub_dir.current_is_dir() and sub_name != "directstorage_accelerator" and sub_name != "godot_ai" and not sub_name.begins_with("."):
+							_scan_dir_for_manifest(sub_dir_path.path_join(sub_name))
+						sub_name = sub_dir.get_next()
+					sub_dir.list_dir_end()
+		else:
+			var full_path := dir_path.path_join(file_name)
+			if file_name.ends_with(".dstex"):
+				_track_manifest_entry(full_path, full_path)
+			elif file_name.ends_with(".import"):
+				var config := ConfigFile.new()
+				if config.load(full_path) == OK:
+					var importer: String = config.get_value("remap", "importer", "")
+					var remap_path: String = config.get_value("remap", "path", "")
+					if importer == "directstorage_texture" or remap_path.ends_with(".dstex"):
+						var res_path := full_path.trim_suffix(".import")
+						_track_manifest_entry(res_path, remap_path)
+						if remap_path != res_path:
+							_track_manifest_entry(remap_path, remap_path)
+		file_name = dir.get_next()
+	dir.list_dir_end()
