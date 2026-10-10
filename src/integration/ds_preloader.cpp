@@ -64,7 +64,12 @@ bool DSPreloader::is_engine_source_path(const String &p_path) {
 String DSPreloader::resolve_archive_path() {
 	Engine *engine = Engine::get_singleton();
 	OS *os = OS::get_singleton();
-	if ((engine && engine->is_editor_hint()) || (os && os->has_feature("editor"))) {
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+
+	bool force_resolution = ps && ps->has_setting("directstorage/force_archive_resolution") &&
+			static_cast<bool>(ps->get_setting("directstorage/force_archive_resolution"));
+
+	if (!force_resolution && ((engine && engine->is_editor_hint()) || (os && os->has_feature("editor")))) {
 		return String();
 	}
 
@@ -76,7 +81,6 @@ String DSPreloader::resolve_archive_path() {
 		}
 	}
 
-	ProjectSettings *ps = ProjectSettings::get_singleton();
 	String archive_filename = "textures.dspkg";
 	if (ps && ps->has_setting("directstorage/archive_name")) {
 		String custom_name = ps->get_setting("directstorage/archive_name");

@@ -40,6 +40,7 @@
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/resource_format_loader.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
@@ -267,7 +268,14 @@ GDEX_TEST_T(gpu_prewarm, dma_fills_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
     const char *dstex_path = "user://gdextest_gpu_prewarm_dma.dstex";
     const char *dspkg_path = "user://gdextest_gpu_prewarm_dma.dspkg";
     const char *virtual_path = "res://gdextest_gpu_prewarm_dma.png";
-    ctx.add_teardown([ds]() {
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps) {
+        ps->set_setting("directstorage/force_archive_resolution", true);
+    }
+    ctx.add_teardown([ds, ps]() {
+        if (ps) {
+            ps->set_setting("directstorage/force_archive_resolution", false);
+        }
         // Shutdown FIRST: the Win32 backend persistently caches open
         // IDStorageFile handles, which lock res://textures.dspkg on
         // Windows until shutdown releases them. Removing first fails
@@ -368,7 +376,14 @@ GDEX_TEST_T(gpu_prewarm, graceful_memory_fallback, TAG_INTEGRATION | TAG_SLOW) {
     const char *dstex_path = "user://gdextest_gpu_prewarm_mem.dstex";
     const char *dspkg_path = "user://gdextest_gpu_prewarm_mem.dspkg";
     const char *virtual_path = "res://gdextest_gpu_prewarm_mem.png";
-    ctx.add_teardown([ds]() {
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps) {
+        ps->set_setting("directstorage/force_archive_resolution", true);
+    }
+    ctx.add_teardown([ds, ps]() {
+        if (ps) {
+            ps->set_setting("directstorage/force_archive_resolution", false);
+        }
         // Shutdown first (see dma test): release backend file handles
         // before deleting the archive they may hold open.
         ds->shutdown_ds();

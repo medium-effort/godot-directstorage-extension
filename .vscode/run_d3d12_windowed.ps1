@@ -100,9 +100,14 @@ $LogErr = Join-Path $PSScriptRoot "d3d12_stderr.log"
 
 # This runner does not regenerate the fixture. Refresh the test library
 # inside the last fixture so a rebuild is not masked by a stale DLL.
-$TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.dll" -ErrorAction SilentlyContinue |
+$TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.editor*.dll" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
+if (-not $TestDll) {
+    $TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.dll" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+}
 if (-not $TestDll) {
     Write-Error "No test library found at bin/libdirectstorage_tests*.dll. Build with .vscode/build_remote.ps1 -IncludeTests first."
     exit 1

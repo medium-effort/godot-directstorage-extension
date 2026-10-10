@@ -109,7 +109,7 @@ function Invoke-ScpArtifactWithRetry {
         [int]$MaxRetries = 3
     )
     for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
-        & scp -C -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$RemotePath" $LocalDest
+        & scp -4 -C -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$RemotePath" $LocalDest
         if ($LASTEXITCODE -eq 0) {
             return $true
         }
@@ -157,15 +157,38 @@ else {
 
 # 2. Ensure target directory exists on Device B
 Write-Host "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
-& ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
+& ssh -4 -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to ensure remote build directory exists on $ActiveHost." -Code $LASTEXITCODE
 }
 
 # Ensure helper script verify_remote.ps1 is always present on Device B early
-& scp -o BatchMode=yes -o ConnectTimeout=5 ".vscode/verify_remote.ps1" "$ActiveHost`:$RemoteVerifyTar"
-if ($LASTEXITCODE -ne 0) {
-    Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to upload helper script to Device B ($ActiveHost)." -Code $LASTEXITCODE
+$LocalVerifier = Join-Path $PSScriptRoot "verify_remote.ps1"
+if (-not (Test-Path -LiteralPath $LocalVerifier)) {
+    Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Helper script verify_remote.ps1 not found locally at $LocalVerifier." -Code 1
+}
+
+$uploadSuccess = $false
+$uploadErrDetail = ""
+for ($uploadAttempt = 1; $uploadAttempt -le 3; $uploadAttempt++) {
+    $uploadOut = & scp -4 -o BatchMode=yes -o ConnectTimeout=5 "$LocalVerifier" "$ActiveHost`:$RemoteVerifyTar" 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $uploadSuccess = $true
+        break
+    }
+    $uploadErrDetail = ($uploadOut | Out-String).Trim()
+    if ($uploadAttempt -lt 3) {
+        Write-VerboseHost "Failed to upload helper script (attempt $uploadAttempt of 3), retrying in 2s..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
+    }
+}
+
+if (-not $uploadSuccess) {
+    $errMessage = "Failed to upload helper script to Device B ($ActiveHost)."
+    if ($uploadErrDetail) {
+        $errMessage += " SCP Error: $uploadErrDetail"
+    }
+    Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message $errMessage -Code 1
 }
 
 # Check remote disk space on Device B before syncing sources
@@ -269,10 +292,11 @@ if (-not $SkipVerify) {
     $ManifestTmp = "sync_manifest.tmp"
     $ManifestEntries | Set-Content -LiteralPath $ManifestTmp -Encoding Ascii
     $RemoteManifestTar = "$RemoteDirTar/sync_manifest.txt"
-    & scp -o BatchMode=yes -o ConnectTimeout=5 "$ManifestTmp" "$ActiveHost`:$RemoteManifestTar"
+    $manifestOut = & scp -4 -o BatchMode=yes -o ConnectTimeout=5 "$ManifestTmp" "$ActiveHost`:$RemoteManifestTar" 2>&1
     Remove-Item $ManifestTmp -Force -ErrorAction SilentlyContinue
     if ($LASTEXITCODE -ne 0) {
-        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Failed to upload sync manifest to Device B ($ActiveHost)." -Code $LASTEXITCODE
+        $manifestErr = ($manifestOut | Out-String).Trim()
+        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Failed to upload sync manifest to Device B ($ActiveHost). SCP error: $manifestErr" -Code $LASTEXITCODE
     }
     if ($ManifestEntries.Count -eq 0) {
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Sync manifest is empty; nothing was hashed on Device A. Refusing vacuous pass." -Code 1
@@ -428,8 +452,10 @@ if ($IncludeTests) {
     if (!(Test-Path "./bin")) {
         New-Item -ItemType Directory -Force -Path "./bin" | Out-Null
     }
-    if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$RemoteDirTar/bin/libdirectstorage_tests*.dll" -LocalDest "./bin/")) {
-        Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll (libdirectstorage_tests*.dll) from Device B ($ActiveHost). The remote test build likely failed." -Code 1
+    $targetTestPattern = "libdirectstorage_tests*.$Target*.dll"
+    Get-ChildItem -Path "./bin" -Filter $targetTestPattern -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$RemoteDirTar/bin/$targetTestPattern" -LocalDest "./bin/")) {
+        Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll ($targetTestPattern) from Device B ($ActiveHost). The remote test build likely failed." -Code 1
     }
 }
 & scp -C -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$ArtifactRemoteDir/build_manifest.json" "$ArtifactLocalDir/" 2>$null
@@ -444,7 +470,8 @@ if (-not $SkipVerify) {
         @{ Pattern = "build_manifest.json"; LocalDir = $ArtifactLocalDir; Required = $false }
     )
     if ($IncludeTests) {
-        $PullChecks += @{ Pattern = "libdirectstorage_tests*.dll"; LocalDir = "./bin"; Required = $true }
+        $targetTestPattern = "libdirectstorage_tests*.$Target*.dll"
+        $PullChecks += @{ Pattern = $targetTestPattern; LocalDir = "./bin"; Required = $true }
     }
     # Remote hashes come from the verifier script (quoteless invocation, same
     # as step [3b/6]) so no nested quoting is needed here either.
