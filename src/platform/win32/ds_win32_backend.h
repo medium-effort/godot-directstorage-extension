@@ -124,6 +124,7 @@ private:
 	HANDLE completion_stop_event = nullptr;
 #endif
 	std::thread completion_thread;
+	std::atomic<bool> accepting_requests{true};
 	std::atomic<bool> batch_in_flight{false};
 	std::atomic<bool> sync_batch_in_flight{false};
 	std::atomic<bool> completion_thread_stop{false};
@@ -133,6 +134,7 @@ private:
 
 #ifdef _WIN32
 	void completion_thread_func();
+	bool drain_all_queues(uint32_t p_timeout_ms);
 	void poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value);
 	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch);
 	bool has_in_flight_batches_locked() const;

@@ -922,9 +922,13 @@ void Win32Backend::completion_thread_func() {
 					slot.requests[i]->set_error_message(p_message);
 				}
 			}
-			close_slot_files(slot);
+			bool fence_completed = queue.completion_fence &&
+					queue.completion_fence->GetCompletedValue() >= slot.fence_value;
+			if (fence_completed || !slot.submitted) {
+				close_slot_files(slot);
+				release_resource_guards(slot.requests);
+			}
 			complete_chunked_requests();
-			release_resource_guards(slot.requests);
 			slot.completed_count = count_completed_requests(slot.requests);
 			slot.error_code = -1;
 			slot.error_message = p_message;
@@ -1883,6 +1887,7 @@ bool Win32Backend::initialize(const String &p_path) {
 			clear_persistent_files();
 			return false;
 		}
+			accepting_requests.store(true);
 			completion_thread_stop.store(false);
 			batch_in_flight.store(false);
 			{
@@ -1914,8 +1919,86 @@ bool Win32Backend::initialize(const String &p_path) {
 #endif
 }
 
+bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
+#ifdef _WIN32
+	HANDLE wait_events[QUEUE_COUNT];
+	int event_count = 0;
+
+	for (int i = 0; i < QUEUE_COUNT; i++) {
+		QueueState &queue = priority_queues[i];
+		if (queue.completion_fence && queue.completion_fence_value != 0 && queue.completion_event) {
+			uint64_t completed = queue.completion_fence->GetCompletedValue();
+			if (completed != UINT64_MAX && completed < queue.completion_fence_value) {
+				if (SUCCEEDED(queue.completion_fence->SetEventOnCompletion(queue.completion_fence_value, queue.completion_event))) {
+					wait_events[event_count++] = queue.completion_event;
+				}
+			}
+		}
+	}
+
+	if (event_count == 0) {
+		return true;
+	}
+
+	DWORD wait_result = WaitForMultipleObjects(event_count, wait_events, TRUE, p_timeout_ms);
+	if (wait_result >= WAIT_OBJECT_0 && wait_result < WAIT_OBJECT_0 + event_count) {
+		for (int i = 0; i < QUEUE_COUNT; i++) {
+			if (priority_queues[i].completion_fence) {
+				priority_queues[i].completed_fence_value = priority_queues[i].completion_fence->GetCompletedValue();
+			}
+		}
+		return true;
+	}
+
+	return false;
+#else
+	return true;
+#endif
+}
+
 void Win32Backend::shutdown() {
 #ifdef _WIN32
+	// 1. Immediately refuse any new incoming work.
+	accepting_requests.store(false);
+
+	// 2. Drain all GPU DMA work across all priority queues concurrently BEFORE
+	// stopping the completion thread or touching any file handles or resource guards.
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	uint32_t timeout_ms = 10000;
+	if (ps && ps->has_setting("directstorage/shutdown_drain_timeout_ms")) {
+		timeout_ms = static_cast<uint32_t>(MAX(100, int64_t(ps->get_setting("directstorage/shutdown_drain_timeout_ms"))));
+	}
+	bool drained = drain_all_queues(timeout_ms);
+
+	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+	if (err_handler) {
+		err_handler->unregister_queue();
+	}
+
+	if (!drained) {
+		// Drain timed out (GPU hardware hang, TDR, or driver deadlock).
+		// Releasing guards, closing in-flight files, or unloading DirectStorage DLLs
+		// while hardware or driver DMA is active causes an immediate unhandled Access Violation.
+		// Instead: signal stop, detach completion_thread to avoid std::terminate(), leak handles,
+		// and skip unloading runtime modules. The OS kernel process teardown reclaims all resources cleanly.
+		UtilityFunctions::push_error("[DirectStorage] Shutdown drain timed out after " + String::num_uint64(timeout_ms) +
+				" ms (GPU/DMA hung); leaking handles and skipping DLL unload to avoid use-after-free.");
+		completion_thread_stop.store(true);
+		sync_batch_in_flight.store(false);
+		if (completion_stop_event) {
+			SetEvent(completion_stop_event);
+		}
+		batch_cv.notify_all();
+		if (completion_thread.joinable()) {
+			completion_thread.detach();
+		}
+		if (s_backend_instance == this) {
+			s_backend_instance = nullptr;
+		}
+		return;
+	}
+
+	// 3. Normal graceful path: all DMA is drained. Signal and join the completion thread.
 	completion_thread_stop.store(true);
 	sync_batch_in_flight.store(false);
 	if (completion_stop_event) {
@@ -1926,24 +2009,6 @@ void Win32Backend::shutdown() {
 		completion_thread.join();
 	}
 	batch_in_flight.store(false);
-
-	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
-	if (err_handler) {
-		err_handler->unregister_queue();
-	}
-
-	// Drain GPU work - wait on completion fences with bounded timeout before closing handles.
-	for (QueueState &queue : priority_queues) {
-		if (queue.completion_fence && queue.completion_fence_value != 0) {
-			uint64_t completed = queue.completion_fence->GetCompletedValue();
-			if (completed != UINT64_MAX && completed < queue.completion_fence_value && queue.completion_event) {
-				if (SUCCEEDED(queue.completion_fence->SetEventOnCompletion(queue.completion_fence_value, queue.completion_event))) {
-					WaitForSingleObject(queue.completion_event, 2000);
-					queue.completed_fence_value = queue.completion_fence->GetCompletedValue();
-				}
-			}
-		}
-	}
 
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
@@ -2039,10 +2104,10 @@ void Win32Backend::shutdown() {
 
 bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 #ifdef _WIN32
-	if (p_request.is_null() || !factory) {
+	if (!accepting_requests.load() || p_request.is_null() || !factory) {
 		if (p_request.is_valid()) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("Win32Backend not initialized.");
+			p_request->set_error_message(!accepting_requests.load() ? "Win32Backend is shutting down." : "Win32Backend not initialized.");
 		}
 		return false;
 	}
@@ -2604,7 +2669,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 
 void Win32Backend::submit_async() {
 #ifdef _WIN32
-	if (sync_batch_in_flight.load()) {
+	if (!accepting_requests.load() || sync_batch_in_flight.load()) {
 		return;
 	}
 	int submit_slot_index = active_batch_slot.load();
@@ -2771,6 +2836,9 @@ bool Win32Backend::collect_completed_batch(uint64_t &r_fence_value, int &r_compl
 
 void Win32Backend::submit_batch() {
 #ifdef _WIN32
+	if (!accepting_requests.load()) {
+		return;
+	}
 	int submit_slot_index = -1;
 	{
 		std::unique_lock<std::mutex> lock(batch_mutex);

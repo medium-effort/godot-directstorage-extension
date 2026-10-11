@@ -526,3 +526,48 @@ GDEX_TEST_T(gpu_prewarm, graceful_memory_fallback, TAG_INTEGRATION | TAG_SLOW) {
     GDEX_EXPECT_FALSE(img->has_mipmaps());
     GDEX_EXPECT_EQ(img->get_data().size(), kGpuBaseSize);
 }
+
+GDEX_TEST_T(gpu_prewarm, shutdown_while_prewarm_in_flight_drains_safely, TAG_INTEGRATION | TAG_SLOW) {
+    if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
+        GDEX_SKIP("DSContext/DSTextureCache classes unavailable");
+    }
+    godot::DSContext *ds = require_singleton_context(ctx);
+    if (!ds->initialize_ds() || !ds->is_initialized()) {
+        GDEX_SKIP("DSContext backend unavailable (initialize_ds failed)");
+    }
+    godot::DSTextureCache *cache = new_test_cache(ctx);
+    godot::DSPreloader::shutdown();
+
+    const char *dstex_path = "user://gdextest_gpu_prewarm_drain.dstex";
+    const char *dspkg_path = "user://gdextest_gpu_prewarm_drain.dspkg";
+    const char *virtual_path = "res://gdextest_gpu_prewarm_drain.png";
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps) {
+        ps->set_setting("directstorage/force_archive_resolution", true);
+        ps->set_setting("directstorage/shutdown_drain_timeout_ms", 5000);
+    }
+    ctx.add_teardown([ds, ps]() {
+        if (ps) {
+            ps->set_setting("directstorage/force_archive_resolution", false);
+        }
+        ds->shutdown_ds();
+        remove_abs("res://textures.dspkg");
+        remove_abs("user://gdextest_gpu_prewarm_drain.dstex");
+        remove_abs("user://gdextest_gpu_prewarm_drain.dspkg");
+        godot::DSPreloader::shutdown();
+    });
+    if (!stage_gpu_dspkg(dstex_path, dspkg_path, virtual_path, "res://gdextest_gpu_prewarm_drain_ctl.png")) {
+        GDEX_ABORT_TEST("textures.dspkg staging failed");
+    }
+
+    godot::PackedStringArray paths;
+    paths.push_back(godot::String(virtual_path));
+    const uint64_t tag = cache->prewarm_gpu_async(paths, 16, false);
+    GDEX_ASSERT_TRUE(tag != 0);
+
+    // Immediately trigger shutdown while prewarm batch is in flight / queued.
+    // Must drain queue safely without access violation, deadlock, or crash.
+    ds->shutdown_ds();
+    GDEX_EXPECT_FALSE(ds->is_initialized());
+}
+

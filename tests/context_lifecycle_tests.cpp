@@ -377,3 +377,31 @@ GDEX_TEST_T(context_lifecycle, fallback_gdeflate_truncated_header_fails_graceful
         GDEX_EXPECT_STR_CONTAINS(err, "CPU GDeflate decompression failed");
     }
 }
+
+GDEX_TEST_T(context_lifecycle, shutdown_drain_rejects_subsequent_enqueue,
+        TAG_INTEGRATION) {
+    godot::Object *ds = require_singleton(ctx, "DSContext");
+
+    // Explicitly call shutdown_ds to put backend into shutdown state
+    ds->call(godot::StringName("shutdown_ds"));
+    const int64_t init_status = static_cast<int64_t>(ds->call(godot::StringName("get_init_status")));
+    GDEX_EXPECT_EQ(init_status, 0);
+
+    // New request creation
+    godot::Ref<godot::RefCounted> req = make_request(ctx);
+    req->call(godot::StringName("set_file_path"), "user://dummy.bin");
+    req->call(godot::StringName("set_size"), 1024);
+    req->call(godot::StringName("set_destination_type"), DESTINATION_MEMORY);
+
+    // Enqueue must immediately reject and return false
+    const bool enqueued = static_cast<bool>(ds->call(
+        godot::StringName("enqueue_request"), godot::Variant(req)));
+    GDEX_EXPECT_FALSE(enqueued);
+
+    const int64_t status = static_cast<int64_t>(req->call(godot::StringName("get_status")));
+    GDEX_EXPECT_EQ(status, REQUEST_STATUS_FAILED);
+
+    // Re-initialize DSContext cleanly so subsequent tests have a valid state
+    ds->call(godot::StringName("initialize"));
+}
+
