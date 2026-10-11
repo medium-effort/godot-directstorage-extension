@@ -30,9 +30,25 @@
 				Polls and processes completed results from asynchronous batch submissions, updating request statuses and emitting [signal batch_completed] or [signal batch_failed].
 			</description>
 		</method>
+		<method name="count_stream_terminal_failure">
+			<return type="void" />
+			<param index="0" name="tag" type="int" />
+			<description>
+				Records a permanent/terminal failure for one item under prewarm batch [param tag], incrementing the completed progress count so [method is_prewarm_complete] can finish without stalling.
+			</description>
+		</method>
+		<method name="create_destination_texture">
+			<return type="RID" />
+			<param index="0" name="format" type="RDTextureFormat" />
+			<param index="1" name="view" type="RDTextureView" default="null" />
+			<description>
+				Creates a RenderingDevice destination texture resource with [param format] and optional [param view] suitable for DirectStorage direct-to-GPU copy operations. Returns the [RID] of the created texture.
+			</description>
+		</method>
 		<method name="enqueue_request">
 			<return type="bool" />
 			<param index="0" name="request" type="DSRequest" />
+			<param index="1" name="from_stream" type="bool" default="false" />
 			<description>
 				Enqueues a configured [DSRequest] into the active I/O queue. The request is not submitted until [method flush_batch] or [method flush_batch_async] is called. When targeting GPU textures with GDeflate compression, automatically splits requests larger than the configured staging buffer into per-mip requests. Returns [code]true[/code] if it was accepted; a null request or unavailable backend returns [code]false[/code].
 			</description>
@@ -199,6 +215,13 @@
 				Returns [code]true[/code] when the native Windows DirectStorage backend is available. A software fallback can still initialize on unsupported platforms, but this method remains [code]false[/code].
 			</description>
 		</method>
+		<method name="is_tag_cancelled" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="tag" type="int" />
+			<description>
+				Returns [code]true[/code] if prewarm or cancellation tag [param tag] has been marked as cancelled.
+			</description>
+		</method>
 		<method name="prewarm_async">
 			<return type="int" />
 			<param index="0" name="paths" type="PackedStringArray" />
@@ -210,6 +233,14 @@
 			<return type="void" />
 			<param index="0" name="disable" type="bool" />
 			<description>Enables or disables GPU decompression for subsequent initialization and requests.</description>
+		</method>
+		<method name="set_prewarm_total">
+			<return type="void" />
+			<param index="0" name="tag" type="int" />
+			<param index="1" name="total" type="int" />
+			<description>
+				Sets or overrides the total expected item count for async prewarm batch [param tag]. Used by the streaming manager when expanding discovery dependencies dynamically.
+			</description>
 		</method>
 		<method name="set_queue_capacity">
 			<return type="void" />

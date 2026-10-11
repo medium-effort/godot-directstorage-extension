@@ -16,7 +16,8 @@
 namespace godot {
 
 #ifdef _WIN32
-ID3D12Device *ds_win32_get_d3d12_device();
+#include <wrl/client.h>
+Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device();
 uint64_t ds_win32_get_completion_fence(PlatformBackend *p_backend);
 bool ds_win32_wait_for_completion(PlatformBackend *p_backend, uint64_t p_fence_value, uint32_t p_timeout_msec);
 #endif
@@ -42,12 +43,11 @@ static bool synchronize_rendering_device(const String &p_phase) {
 	//   on the main instance is prohibited (Condition "is_main_instance" is true).
 	// - DirectStorage SDK requirement: destination resources for GPU decompression
 	//   (DSTORAGE_DESTINATION_MULTIPLE_SUBRESOURCES / buffer destinations)
-	//   MUST be in D3D12_RESOURCE_STATE_COMMON. Enforcement (Win32Backend::enqueue_request):
-	//   (1) ID3D12Resource exposes no current-state query, so COMMON can only be
-	//       guaranteed by the barrier owner - Godot's RenderingDevice. This extension
-	//       therefore never records its own ResourceBarrier: a foreign barrier would
-	//       race Godot's per-frame command lists and corrupt RD state tracking.
-	//       Reject-with-clear-error is the safer option, documented here.
+	//   MUST be in D3D12_RESOURCE_STATE_COMMON.
+	//   (1) Destination textures must be in D3D12_RESOURCE_STATE_COMMON before
+	//       DirectStorage GPU decompression writes to them. The extension records
+	//       transitions on Godot's direct command queue and serializes them with
+	//       the render thread via call_on_render_thread() before DirectStorage submit.
 	//   (2) A destination owned by an in-flight DirectStorage batch (possibly
 	//       mid-decompression, post-render-target use, state unknowable) fails GPU
 	//       enqueue loudly instead of proceeding. No silent CPU fallback: re-targeting
@@ -242,7 +242,7 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 		return DSTORAGE_COMPRESSION_SUPPORT_NONE;
 	}
 
-	ID3D12Device *d3d12_device = ds_win32_get_d3d12_device();
+	Microsoft::WRL::ComPtr<ID3D12Device> d3d12_device = ds_win32_get_d3d12_device();
 	if (!d3d12_device) {
 		return DSTORAGE_COMPRESSION_SUPPORT_NONE;
 	}
@@ -280,7 +280,7 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 			queue_desc.Capacity = MIN(static_cast<uint16_t>(DSTORAGE_MAX_QUEUE_CAPACITY), queue_desc.Capacity);
 			queue_desc.Priority = DSTORAGE_PRIORITY_NORMAL;
 			queue_desc.Name = "DirectStorageCapabilityReport";
-			queue_desc.Device = d3d12_device;
+			queue_desc.Device = d3d12_device.Get();
 
 			IDStorageQueue1 *queue = nullptr;
 			if (SUCCEEDED(factory->CreateQueue(&queue_desc, __uuidof(IDStorageQueue1), reinterpret_cast<void **>(&queue))) && queue) {
@@ -473,6 +473,32 @@ bool DSContext::wait_for_completion(int p_timeout_msec) {
 		return false;
 	}
 	return true;
+}
+
+RID DSContext::create_destination_texture(const Ref<RDTextureFormat> &p_format, const Ref<RDTextureView> &p_view) {
+	if (p_format.is_null()) {
+		UtilityFunctions::push_error("[DirectStorage] create_destination_texture failed: format is null.");
+		return RID();
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	if (!rd) {
+		UtilityFunctions::push_error("[DirectStorage] create_destination_texture failed: RenderingDevice is not available.");
+		return RID();
+	}
+	Ref<RDTextureView> view = p_view;
+	if (view.is_null()) {
+		view.instantiate();
+	}
+	// DirectStorage GPU decompression requires destination textures to be in D3D12_RESOURCE_STATE_COMMON.
+	// Empty texture creation with an empty data array allocates committed resources on D3D12 DEFAULT heap,
+	// which inherently initializes in D3D12_RESOURCE_STATE_COMMON.
+	RID tex_rid = rd->texture_create(p_format, view, TypedArray<PackedByteArray>());
+	if (!tex_rid.is_valid()) {
+		UtilityFunctions::push_error("[DirectStorage] create_destination_texture failed: texture_create failed.");
+		return RID();
+	}
+	return tex_rid;
 }
 
 String DSContext::get_active_backend_name() const {
@@ -1326,6 +1352,7 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_completion_fence"), &DSContext::get_completion_fence);
 	ClassDB::bind_method(D_METHOD("wait_for_completion", "timeout_msec"), &DSContext::wait_for_completion);
 	ClassDB::bind_method(D_METHOD("cancel_requests_with_tag", "tag"), &DSContext::cancel_requests_with_tag);
+	ClassDB::bind_method(D_METHOD("create_destination_texture", "format", "view"), &DSContext::create_destination_texture, DEFVAL(Ref<RDTextureView>()));
 	ClassDB::bind_method(D_METHOD("get_async_batches_submitted"), &DSContext::get_async_batches_submitted);
 	ClassDB::bind_method(D_METHOD("get_in_flight_async_batch_count"), &DSContext::get_in_flight_async_batch_count);
 	ClassDB::bind_method(D_METHOD("get_request_execution_report", "request"), &DSContext::get_request_execution_report);

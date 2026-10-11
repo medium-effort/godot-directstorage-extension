@@ -23,6 +23,7 @@
 #include <string>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
@@ -368,6 +369,9 @@ static bool ds_win32_query_guard_resource_on_render_thread(bool p_is_buffer_requ
 // Render-thread destination query context for enqueue_request().
 // Marshals RenderingDevice::get_driver_resource() and ID3D12Resource::GetDesc()
 // to the render thread when called from main/worker threads.
+// Managed via std::shared_ptr so that if the calling thread times out after 250ms,
+// any late-arriving render-thread callback safely references a live heap object
+// rather than a destroyed stack frame (HIGH-01).
 struct DSGPUDestinationContext {
 	std::mutex mutex;
 	std::condition_variable cv;
@@ -379,11 +383,15 @@ struct DSGPUDestinationContext {
 	uint64_t native_format = 0;
 	bool rd_available = false;
 };
-static std::atomic<DSGPUDestinationContext *> s_gpu_dest_query_ctx{ nullptr };
+static std::shared_ptr<DSGPUDestinationContext> s_gpu_dest_query_ctx;
 static std::mutex s_dest_query_mutex;
 
 static void ds_win32_fetch_destination_resource_on_render_thread() {
-	DSGPUDestinationContext *ctx = s_gpu_dest_query_ctx.exchange(nullptr);
+	std::shared_ptr<DSGPUDestinationContext> ctx;
+	{
+		std::lock_guard<std::mutex> query_lock(s_dest_query_mutex);
+		ctx = std::move(s_gpu_dest_query_ctx);
+	}
 	if (!ctx) {
 		return;
 	}
@@ -414,8 +422,8 @@ static void ds_win32_fetch_destination_resource_on_render_thread() {
 		ctx->native_format = native_format;
 		ctx->rd_available = rd_available;
 		ctx->completed = true;
+		ctx->cv.notify_one(); // HIGH-01: Notify while holding mutex
 	}
-	ctx->cv.notify_one();
 }
 
 static bool ds_win32_query_destination_resource_on_render_thread(
@@ -454,26 +462,32 @@ static bool ds_win32_query_destination_resource_on_render_thread(
 		return true;
 	}
 
-	std::lock_guard<std::mutex> query_lock(s_dest_query_mutex);
-	DSGPUDestinationContext ctx;
-	ctx.is_buffer_request = p_is_buffer_request;
-	ctx.destination_rid = p_destination_rid;
-	s_gpu_dest_query_ctx.store(&ctx);
-	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_destination_resource_on_render_thread));
+	auto ctx = std::make_shared<DSGPUDestinationContext>();
+	ctx->is_buffer_request = p_is_buffer_request;
+	ctx->destination_rid = p_destination_rid;
+
 	{
-		std::unique_lock<std::mutex> lock(ctx.mutex);
+		std::lock_guard<std::mutex> query_lock(s_dest_query_mutex);
+		s_gpu_dest_query_ctx = ctx;
+	}
+	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_destination_resource_on_render_thread));
+
+	{
+		std::unique_lock<std::mutex> lock(ctx->mutex);
 		constexpr std::chrono::milliseconds kDestQueryTimeout(250);
-		bool signaled = ctx.cv.wait_for(lock, kDestQueryTimeout, [&ctx] { return ctx.completed; });
+		bool signaled = ctx->cv.wait_for(lock, kDestQueryTimeout, [&ctx] { return ctx->completed; });
 		if (!signaled) {
-			if (s_gpu_dest_query_ctx.exchange(nullptr) == &ctx) {
-				return false;
+			// HIGH-02: Bounded timeout with no secondary unbounded wait. Clear handoff slot if still pending.
+			std::lock_guard<std::mutex> query_lock(s_dest_query_mutex);
+			if (s_gpu_dest_query_ctx == ctx) {
+				s_gpu_dest_query_ctx.reset();
 			}
-			ctx.cv.wait(lock, [&ctx] { return ctx.completed; });
+			return false;
 		}
-		r_rd_available = ctx.rd_available;
-		r_resource = ctx.resource;
-		r_desc = ctx.desc;
-		r_native_format = ctx.native_format;
+		r_rd_available = ctx->rd_available;
+		r_resource = ctx->resource;
+		r_desc = ctx->desc;
+		r_native_format = ctx->native_format;
 		return true;
 	}
 }
@@ -692,57 +706,81 @@ bool Win32Backend::wait_for_completion(uint64_t p_fence_value, uint32_t p_timeou
 	if (p_fence_value == 0) {
 		return true;
 	}
-	ID3D12Fence *completion_fence = nullptr;
+	if (!factory) {
+		return false;
+	}
+	uint64_t start_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_msec() : 0;
+	std::vector<std::pair<ID3D12Fence *, uint64_t>> fences_to_wait;
+	uint64_t max_completion_fence = 0;
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
-		for (const QueueState &queue : priority_queues) {
-			if (queue.completion_fence && queue.completion_fence_value == p_fence_value) {
-				completion_fence = queue.completion_fence;
-				break;
+		for (int q = 0; q < QUEUE_COUNT; q++) {
+			const QueueState &queue = priority_queues[q];
+			max_completion_fence = MAX(max_completion_fence, queue.completion_fence_value);
+			if (queue.completion_fence && queue.completion_fence_value >= p_fence_value &&
+					queue.completed_fence_value < p_fence_value) {
+				fences_to_wait.push_back({ queue.completion_fence, queue.completion_fence_value });
 			}
 		}
-		if (!completion_fence) {
-			uint64_t selected_fence_value = UINT64_MAX;
-			for (const QueueState &queue : priority_queues) {
-				if (queue.completion_fence && queue.completion_fence_value >= p_fence_value &&
-						queue.completion_fence_value < selected_fence_value) {
-					completion_fence = queue.completion_fence;
-					selected_fence_value = queue.completion_fence_value;
+	}
+	if (p_fence_value > max_completion_fence) {
+		if (p_timeout_msec > 0) {
+			ID3D12Fence *fence = priority_queues[0].completion_fence;
+			if (fence) {
+				HANDLE wait_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+				if (wait_event) {
+					HRESULT hr = fence->SetEventOnCompletion(p_fence_value, wait_event);
+					if (SUCCEEDED(hr)) {
+						WaitForSingleObject(wait_event, p_timeout_msec);
+					}
+					CloseHandle(wait_event);
 				}
+			} else {
+				Sleep(p_timeout_msec);
 			}
 		}
-	}
-	if (!completion_fence) {
 		return false;
+	}
+	if (fences_to_wait.empty()) {
+		return true;
 	}
 
-	uint64_t completed_value = completion_fence->GetCompletedValue();
-	if (completed_value == UINT64_MAX) {
-		return false;
-	}
-	if (completed_value < p_fence_value) {
-		HANDLE wait_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-		if (!wait_event) {
+	for (size_t i = 0; i < fences_to_wait.size(); i++) {
+		ID3D12Fence *fence = fences_to_wait[i].first;
+		uint64_t target_value = fences_to_wait[i].second;
+		uint64_t completed_val = fence->GetCompletedValue();
+		if (completed_val == UINT64_MAX) {
 			return false;
 		}
-		HRESULT event_result = completion_fence->SetEventOnCompletion(p_fence_value, wait_event);
-		DWORD wait_result = SUCCEEDED(event_result) ? WaitForSingleObject(wait_event, p_timeout_msec) : WAIT_FAILED;
-		CloseHandle(wait_event);
-		if (FAILED(event_result) || wait_result != WAIT_OBJECT_0) {
+		if (completed_val < target_value) {
+			uint64_t now = Time::get_singleton() ? Time::get_singleton()->get_ticks_msec() : 0;
+			uint32_t elapsed = (now >= start_time) ? static_cast<uint32_t>(now - start_time) : 0;
+			if (elapsed >= p_timeout_msec) {
+				return false;
+			}
+			uint32_t remaining_ms = p_timeout_msec - elapsed;
+			HANDLE wait_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+			if (!wait_event) {
+				return false;
+			}
+			HRESULT hr = fence->SetEventOnCompletion(target_value, wait_event);
+			DWORD wait_result = SUCCEEDED(hr) ? WaitForSingleObject(wait_event, remaining_ms) : WAIT_FAILED;
+			CloseHandle(wait_event);
+			if (FAILED(hr) || wait_result != WAIT_OBJECT_0) {
+				return false;
+			}
+			completed_val = fence->GetCompletedValue();
+		}
+		if (completed_val < target_value || completed_val == UINT64_MAX) {
 			return false;
 		}
-		completed_value = completion_fence->GetCompletedValue();
-	}
-	if (completed_value < p_fence_value || completed_value == UINT64_MAX) {
-		return false;
-	}
-
-	{
-		std::lock_guard<std::mutex> lock(batch_mutex);
-		for (QueueState &queue : priority_queues) {
-			if (queue.completion_fence == completion_fence) {
-				queue.completed_fence_value = completed_value;
-				break;
+		{
+			std::lock_guard<std::mutex> lock(batch_mutex);
+			for (QueueState &queue : priority_queues) {
+				if (queue.completion_fence == fence) {
+					queue.completed_fence_value = completed_val;
+					break;
+				}
 			}
 		}
 	}
@@ -758,6 +796,26 @@ void Win32Backend::poll_batch_status() {
 	std::deque<BatchMetadata> completed_batches;
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
+		for (std::vector<ZombieBatchSlot>::iterator it = zombie_slots.begin(); it != zombie_slots.end(); ) {
+			ID3D12Fence *fence = priority_queues[it->queue_index].completion_fence;
+			if (!fence || fence->GetCompletedValue() >= it->fence_value) {
+				for (int r = 0; r < it->requests.size(); r++) {
+					if (it->requests[r].is_valid()) {
+						it->requests[r]->set_gpu_in_flight(false);
+					}
+				}
+				complete_chunked_requests();
+				release_resource_guards(it->requests);
+				for (int f = 0; f < it->files.size(); f++) {
+					if (it->files[f]) {
+						it->files[f]->Close();
+					}
+				}
+				it = zombie_slots.erase(it);
+			} else {
+				++it;
+			}
+		}
 		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
 			QueueState &queue = priority_queues[queue_index];
 			for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; slot_index++) {
@@ -1037,20 +1095,20 @@ void Win32Backend::completion_thread_func() {
 #endif
 
 #ifdef _WIN32
-static ID3D12Device *s_d3d12_device = nullptr;
-static ID3D12CommandQueue *s_d3d12_command_queue = nullptr;
+static Microsoft::WRL::ComPtr<ID3D12Device> s_d3d12_device;
+static Microsoft::WRL::ComPtr<ID3D12CommandQueue> s_d3d12_command_queue;
 static std::mutex s_device_mutex;
 
-// One-shot render-thread acquisition context. The waiting thread allocates
-// a context on its stack and publishes it via s_device_acquire_ctx; the
-// render-thread worker consumes it and signals completion. initialize() is
-// single-shot so a single atomic handoff slot is sufficient.
+// One-shot render-thread acquisition context.
+// Managed via std::shared_ptr so that if waiting times out, any late-running
+// render-thread worker accesses a live heap context without touching a destroyed stack frame (HIGH-01).
 struct DSDeviceAcquireContext {
 	std::mutex mutex;
 	std::condition_variable cv;
 	bool completed = false;
 };
-static std::atomic<DSDeviceAcquireContext *> s_device_acquire_ctx{ nullptr };
+static std::mutex s_device_acquire_mutex;
+static std::shared_ptr<DSDeviceAcquireContext> s_device_acquire_ctx;
 
 // Log-only adapter identity. Compares Godot's D3D12 adapter LUID against
 // the default DXGI adapter; a mismatch is informational only (multi-GPU)
@@ -1083,7 +1141,7 @@ static void ds_win32_log_d3d12_adapter_identity(ID3D12Device *p_device) {
 }
 
 // Direct fetch; the caller must already be on the render thread.
-static ID3D12Device *ds_win32_fetch_d3d12_device_direct() {
+static Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_fetch_d3d12_device_direct() {
 	RenderingServer *rs = RenderingServer::get_singleton();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		return nullptr;
@@ -1100,36 +1158,12 @@ static ID3D12Device *ds_win32_fetch_d3d12_device_direct() {
 	uint64_t queue_handle = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_COMMAND_QUEUE, RID(), 0);
 	ID3D12CommandQueue *queue = reinterpret_cast<ID3D12CommandQueue *>(queue_handle);
 	{
-		// D3D12-02: hold our own COM references so a Godot device recreation
-		// (TDR / driver update / adapter change) cannot leave a dangling raw
-		// pointer. AddRef the new pointers first, then Release the old ones.
-		if (device) {
-			device->AddRef();
-		}
-		if (queue) {
-			queue->AddRef();
-		}
 		std::lock_guard<std::mutex> lock(s_device_mutex);
-		ID3D12Device *old_device = s_d3d12_device;
-		ID3D12CommandQueue *old_queue = s_d3d12_command_queue;
 		s_d3d12_device = device;
 		s_d3d12_command_queue = queue;
-		if (old_device) {
-			old_device->Release();
-		}
-		if (old_queue && old_queue != queue) {
-			old_queue->Release();
-		} else if (old_queue && old_queue == queue && queue) {
-			// Same queue re-fetched: balance the extra AddRef above.
-			queue->Release();
-		}
-		if (old_device == device && device) {
-			// Same device re-fetched: balance the extra AddRef above.
-			device->Release();
-		}
 	}
 	ds_win32_log_d3d12_adapter_identity(device);
-	return device;
+	return s_d3d12_device;
 }
 
 // Render-thread worker posted via RenderingServer::call_on_render_thread().
@@ -1137,57 +1171,41 @@ static ID3D12Device *ds_win32_fetch_d3d12_device_direct() {
 // callable_mp on `this` is impossible and callable_mp_static is required.
 static void ds_win32_fetch_d3d12_device_on_render_thread() {
 	ds_win32_fetch_d3d12_device_direct();
-	DSDeviceAcquireContext *ctx = s_device_acquire_ctx.exchange(nullptr);
+	std::shared_ptr<DSDeviceAcquireContext> ctx;
+	{
+		std::lock_guard<std::mutex> lock(s_device_acquire_mutex);
+		ctx = std::move(s_device_acquire_ctx);
+	}
 	if (ctx) {
-		{
-			std::lock_guard<std::mutex> lock(ctx->mutex);
-			ctx->completed = true;
-		}
-		ctx->cv.notify_one();
+		std::lock_guard<std::mutex> lock(ctx->mutex);
+		ctx->completed = true;
+		ctx->cv.notify_one(); // HIGH-01: Notify while holding mutex
 	}
 }
 
-// D3D12-02: release owned COM references and clear the cache. Safe from any
+// D3D12-02 / HIGH-03: release owned COM references and clear the cache. Safe from any
 // thread; COM Release is thread-safe. Called on shutdown and on
 // device-removed detection so a stale pointer can never be returned.
 void ds_win32_invalidate_d3d12_device() {
-	ID3D12Device *old_device = nullptr;
-	ID3D12CommandQueue *old_queue = nullptr;
-	{
-		std::lock_guard<std::mutex> lock(s_device_mutex);
-		old_device = s_d3d12_device;
-		old_queue = s_d3d12_command_queue;
-		s_d3d12_device = nullptr;
-		s_d3d12_command_queue = nullptr;
-	}
-	if (old_device) {
-		old_device->Release();
-	}
-	if (old_queue) {
-		old_queue->Release();
-	}
+	std::lock_guard<std::mutex> lock(s_device_mutex);
+	s_d3d12_device.Reset();
+	s_d3d12_command_queue.Reset();
 }
 
-ID3D12Device *ds_win32_get_d3d12_device() {
-	// D3D12-02: validate the cached device against device-removed (TDR /
-	// driver update). Hold a temporary AddRef across the unlock so a
-	// concurrent invalidate cannot free the pointer mid-check.
-	ID3D12Device *cached = nullptr;
+Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device() {
+	// D3D12-02 / HIGH-03: validate cached device against device-removed (TDR / driver update).
+	Microsoft::WRL::ComPtr<ID3D12Device> cached;
 	{
 		std::lock_guard<std::mutex> lock(s_device_mutex);
 		cached = s_d3d12_device;
-		if (cached) {
-			cached->AddRef();
-		}
 	}
 	if (cached) {
 		HRESULT removed = cached->GetDeviceRemovedReason();
-		cached->Release();
 		if (FAILED(removed)) {
 			ds_win32_invalidate_d3d12_device();
+			cached.Reset();
 		} else {
-			std::lock_guard<std::mutex> lock(s_device_mutex);
-			return s_d3d12_device;
+			return cached;
 		}
 	}
 
@@ -1196,42 +1214,35 @@ ID3D12Device *ds_win32_get_d3d12_device() {
 		return nullptr;
 	}
 
-	// Fast path: already on the render thread, fetch directly (also avoids
-	// posting a callable to ourselves and self-deadlocking below).
+	// Fast path: already on the render thread, fetch directly.
 	if (rs->is_on_render_thread()) {
 		return ds_win32_fetch_d3d12_device_direct();
 	}
 
 	// Marshal acquisition to the render thread with a bounded wait.
-	// s_device_mutex is NOT held across the blocking wait; the worker takes
-	// it when caching the device.
-	DSDeviceAcquireContext ctx;
-	s_device_acquire_ctx.store(&ctx);
+	auto ctx = std::make_shared<DSDeviceAcquireContext>();
+	{
+		std::lock_guard<std::mutex> lock(s_device_acquire_mutex);
+		s_device_acquire_ctx = ctx;
+	}
 	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_d3d12_device_on_render_thread));
 	{
-		std::unique_lock<std::mutex> lock(ctx.mutex);
-		if (!ctx.cv.wait_for(lock, std::chrono::seconds(5), [&ctx] { return ctx.completed; })) {
-			// Bounded degradation: if the worker has not picked up the
-			// handoff yet, reclaim it so a late worker cannot touch this
-			// stack context; the nullptr return below preserves the existing
-			// "Could not acquire a usable D3D12 device." behavior. If the
-			// worker already picked it up, it is about to signal, so wait
-			// for that signal instead of destroying the context.
-			if (s_device_acquire_ctx.exchange(nullptr) == &ctx) {
-				UtilityFunctions::print("[DirectStorage] D3D12 device acquisition timed out waiting for the render thread; continuing without a device.");
-			} else {
-				ctx.cv.wait(lock, [&ctx] { return ctx.completed; });
+		std::unique_lock<std::mutex> lock(ctx->mutex);
+		if (!ctx->cv.wait_for(lock, std::chrono::seconds(5), [&ctx] { return ctx->completed; })) {
+			std::lock_guard<std::mutex> acq_lock(s_device_acquire_mutex);
+			if (s_device_acquire_ctx == ctx) {
+				s_device_acquire_ctx.reset();
 			}
+			UtilityFunctions::print("[DirectStorage] D3D12 device acquisition timed out waiting for the render thread; continuing without a device.");
+			return nullptr;
 		}
 	}
 
-	{
-		std::lock_guard<std::mutex> lock(s_device_mutex);
-		return s_d3d12_device;
-	}
+	std::lock_guard<std::mutex> lock(s_device_mutex);
+	return s_d3d12_device;
 }
 
-ID3D12CommandQueue *ds_win32_get_d3d12_command_queue() {
+Microsoft::WRL::ComPtr<ID3D12CommandQueue> ds_win32_get_d3d12_command_queue() {
 	{
 		std::lock_guard<std::mutex> lock(s_device_mutex);
 		if (s_d3d12_command_queue) {
@@ -1640,8 +1651,41 @@ void Win32Backend::cleanup_barrier_context() {
 		barrier_context.cmd_allocator->Release();
 		barrier_context.cmd_allocator = nullptr;
 	}
-	barrier_context.command_queue = nullptr;
+	barrier_context.command_queue.Reset();
 	barrier_context.fence_value = 0;
+}
+
+struct DSTransitionHandoffContext {
+	std::mutex mutex;
+	std::condition_variable cv;
+	bool completed = false;
+	bool success = false;
+	Win32Backend *backend = nullptr;
+	Vector<Win32Backend::GPUTargetTransition> transitions;
+	bool to_common = false;
+};
+static std::mutex s_transition_dispatch_mutex;
+static std::vector<std::shared_ptr<DSTransitionHandoffContext>> s_transition_queue;
+
+void ds_win32_execute_transitions_on_render_thread() {
+	std::shared_ptr<DSTransitionHandoffContext> ctx;
+	{
+		std::lock_guard<std::mutex> lock(s_transition_dispatch_mutex);
+		if (!s_transition_queue.empty()) {
+			ctx = s_transition_queue.front();
+			s_transition_queue.erase(s_transition_queue.begin());
+		}
+	}
+	if (!ctx || !ctx->backend) {
+		return;
+	}
+	bool ok = ctx->backend->execute_transitions_internal(ctx->transitions, ctx->to_common);
+	{
+		std::lock_guard<std::mutex> lock(ctx->mutex);
+		ctx->success = ok;
+		ctx->completed = true;
+		ctx->cv.notify_one();
+	}
 }
 
 bool Win32Backend::execute_transitions(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common) {
@@ -1653,16 +1697,57 @@ bool Win32Backend::execute_transitions(const Vector<GPUTargetTransition> &p_tran
 		return false;
 	}
 
+	if (!rs->is_on_render_thread()) {
+		auto ctx = std::make_shared<DSTransitionHandoffContext>();
+		ctx->backend = this;
+		ctx->transitions = p_transitions;
+		ctx->to_common = p_to_common;
+		{
+			std::lock_guard<std::mutex> lock(s_transition_dispatch_mutex);
+			s_transition_queue.push_back(ctx);
+		}
+		rs->call_on_render_thread(callable_mp_static(ds_win32_execute_transitions_on_render_thread));
+		{
+			std::unique_lock<std::mutex> lock(ctx->mutex);
+			constexpr std::chrono::milliseconds kTransitionTimeout(600);
+			bool signaled = ctx->cv.wait_for(lock, kTransitionTimeout, [&ctx] { return ctx->completed; });
+			if (!signaled) {
+				UtilityFunctions::push_error("[DirectStorage] Render-thread transition dispatch timed out.");
+				return false;
+			}
+			return ctx->success;
+		}
+	}
+
+	return execute_transitions_internal(p_transitions, p_to_common);
+}
+
+bool Win32Backend::execute_transitions_internal(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common) {
 	std::lock_guard<std::mutex> lock(barrier_context.mutex);
 	if (!barrier_context.cmd_allocator || !barrier_context.cmd_list || !barrier_context.transition_fence) {
 		return false;
 	}
 
-	ID3D12CommandQueue *godot_queue = barrier_context.command_queue ? barrier_context.command_queue : ds_win32_get_d3d12_command_queue();
+	Microsoft::WRL::ComPtr<ID3D12CommandQueue> godot_queue = barrier_context.command_queue ? barrier_context.command_queue : ds_win32_get_d3d12_command_queue();
 	if (!godot_queue) {
 		return false;
 	}
 	barrier_context.command_queue = godot_queue;
+
+	// HIGH-06: Guard allocator reset with a bounded wait on transition_fence if previous barrier list is still executing
+	if (barrier_context.fence_value > 0 &&
+			barrier_context.transition_fence->GetCompletedValue() < barrier_context.fence_value) {
+		if (barrier_context.fence_event) {
+			HRESULT wait_hr = barrier_context.transition_fence->SetEventOnCompletion(barrier_context.fence_value, barrier_context.fence_event);
+			if (SUCCEEDED(wait_hr)) {
+				WaitForSingleObject(barrier_context.fence_event, 100);
+			}
+		}
+		if (barrier_context.transition_fence->GetCompletedValue() < barrier_context.fence_value) {
+			UtilityFunctions::push_error("[DirectStorage] Previous barrier command list still running on GPU after bounded wait; aborting transition.");
+			return false;
+		}
+	}
 
 	HRESULT hr = barrier_context.cmd_allocator->Reset();
 	if (FAILED(hr)) return false;
@@ -1679,13 +1764,13 @@ bool Win32Backend::execute_transitions(const Vector<GPUTargetTransition> &p_tran
 
 		for (uint32_t s = 0; s < t.subresource_count; s++) {
 			uint32_t sub_idx = t.first_subresource + s;
-			if (!transitioned_subresources.insert(std::make_pair(t.resource, sub_idx)).second) {
+			if (!transitioned_subresources.insert(std::make_pair(t.resource.Get(), sub_idx)).second) {
 				continue;
 			}
 			D3D12_RESOURCE_BARRIER b = {};
 			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-			b.Transition.pResource = t.resource;
+			b.Transition.pResource = t.resource.Get();
 			b.Transition.Subresource = sub_idx;
 			b.Transition.StateBefore = state_before;
 			b.Transition.StateAfter = state_after;
@@ -1723,6 +1808,7 @@ bool Win32Backend::initialize(const String &p_path) {
 			slot.completed_count = 0;
 			slot.error_code = 0;
 			slot.error_message = String();
+			slot.closing = false;
 			slot.submitted = false;
 			slot.completion_ready = false;
 		}
@@ -1821,12 +1907,12 @@ bool Win32Backend::initialize(const String &p_path) {
 			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: A usable D3D12 RenderingDevice is not active.");
 			return false;
 		}
-		ID3D12Device *d3d12_device = ds_win32_get_d3d12_device();
+		Microsoft::WRL::ComPtr<ID3D12Device> d3d12_device = ds_win32_get_d3d12_device();
 		if (!d3d12_device) {
 			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Could not acquire a usable D3D12 device.");
 			return false;
 		}
-		queueDesc.Device = d3d12_device;
+		queueDesc.Device = d3d12_device.Get();
 
 		step_name = "CreateQueue";
 		for (int i = 0; i < QUEUE_COUNT && SUCCEEDED(hr); i++) {
@@ -1858,7 +1944,7 @@ bool Win32Backend::initialize(const String &p_path) {
 		queues_ready = queues_ready && queue.queue != nullptr && queue.completion_event != nullptr && queue.batch_slots[0].event != nullptr && queue.batch_slots[1].event != nullptr && queue.completion_fence != nullptr;
 	}
 	if (queues_ready) {
-		init_barrier_context(ds_win32_get_d3d12_device(), ds_win32_get_d3d12_command_queue());
+		init_barrier_context(ds_win32_get_d3d12_device().Get(), ds_win32_get_d3d12_command_queue().Get());
 		// Eager archive pre-open: move the first OpenFile + BypassIO
 		// negotiation for the exported texture archive off the first
 		// prewarm frame and into init (autoload _ready, behind the menu).
@@ -1964,6 +2050,22 @@ bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 				priority_queues[i].completed_fence_value = priority_queues[i].completion_fence->GetCompletedValue();
 			}
 		}
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		for (size_t z = 0; z < zombie_slots.size(); z++) {
+			for (int r = 0; r < zombie_slots[z].requests.size(); r++) {
+				if (zombie_slots[z].requests[r].is_valid()) {
+					zombie_slots[z].requests[r]->set_gpu_in_flight(false);
+				}
+			}
+			complete_chunked_requests();
+			release_resource_guards(zombie_slots[z].requests);
+			for (int f = 0; f < zombie_slots[z].files.size(); f++) {
+				if (zombie_slots[z].files[f]) {
+					zombie_slots[z].files[f]->Close();
+				}
+			}
+		}
+		zombie_slots.clear();
 		return true;
 	}
 
@@ -2166,7 +2268,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	}
 	int current_slot = active_batch_slot.load();
 	BatchSlot *slot_ptr = &queue.batch_slots[current_slot];
-	if (!slot_ptr->submitted && slot_ptr->completion_ready) {
+	if (!slot_ptr->submitted && !slot_ptr->closing && slot_ptr->completion_ready) {
 		close_slot_files(*slot_ptr);
 		slot_ptr->requests.clear();
 		slot_ptr->fence_value = 0;
@@ -2174,10 +2276,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		slot_ptr->error_code = 0;
 		slot_ptr->error_message = String();
 		slot_ptr->completion_ready = false;
-	} else if (slot_ptr->submitted) {
+	} else if (slot_ptr->submitted || slot_ptr->closing) {
 		int alternate_slot = 1 - current_slot;
 		BatchSlot &alt_slot = queue.batch_slots[alternate_slot];
-		if (!alt_slot.submitted && alt_slot.completion_ready) {
+		if (!alt_slot.submitted && !alt_slot.closing && alt_slot.completion_ready) {
 			close_slot_files(alt_slot);
 			alt_slot.requests.clear();
 			alt_slot.fence_value = 0;
@@ -2186,14 +2288,14 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			alt_slot.error_message = String();
 			alt_slot.completion_ready = false;
 		}
-		if (!alt_slot.submitted && !alt_slot.completion_ready) {
+		if (!alt_slot.submitted && !alt_slot.closing && !alt_slot.completion_ready) {
 			active_batch_slot.store(alternate_slot);
 			current_slot = alternate_slot;
 			slot_ptr = &queue.batch_slots[current_slot];
 		}
 	}
 	BatchSlot &slot = *slot_ptr;
-	if (slot.submitted || slot.completion_ready) {
+	if (slot.submitted || slot.closing || slot.completion_ready) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("Win32Backend batch slot is not available; collect completed results before enqueueing more requests.");
 		return false;
@@ -2206,11 +2308,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	// window where D3D12_RESOURCE_STATE_COMMON cannot be established by anyone but
 	// the barrier owner (Godot RD) and where sampling/reuse is undefined, so a new
 	// GPU enqueue against it is rejected loudly instead of proceeding silently.
-	// Design notes (why reject, not restore/fallback):
-	// - ID3D12Resource exposes no current-state query; only Godot's RenderingDevice
-	//   (the barrier owner) can guarantee COMMON. Recording our own ResourceBarrier
-	//   from this extension would race Godot's per-frame command lists and corrupt
-	//   RD state tracking, so the extension never transitions destination state.
+	// Design notes:
+	// - DirectStorage requires destination resources to be in D3D12_RESOURCE_STATE_COMMON
+	//   during GPU decompression. The extension transitions destination textures to COMMON
+	//   at submit time and restores them afterwards.
 	// - No silent CPU fallback: re-targeting to a memory destination behind the
 	//   caller's back would leave the GPU texture unwritten while the caller samples
 	//   it as if DirectStorage had filled it. The request fails with an error that
@@ -2469,7 +2570,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	if (gpu_texture_destination && destination_texture) {
 		GPUTargetTransition transition;
 		transition.resource = destination_texture;
-		transition.original_state = D3D12_RESOURCE_STATE_COPY_DEST;
+		transition.original_state = D3D12_RESOURCE_STATE_COMMON;
 		transition.first_subresource = p_child->get_first_subresource();
 		transition.subresource_count = p_child->get_subresource_count();
 		slot.gpu_transitions.push_back(transition);
@@ -2698,20 +2799,54 @@ void Win32Backend::submit_async() {
 	Vector<GPUTargetTransition> pre_transitions;
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
+		bool has_work = false;
 		for (const QueueState &queue : priority_queues) {
 			const BatchSlot &slot = queue.batch_slots[submit_slot_index];
-			if (slot.submitted || slot.completion_ready) {
+			if (slot.submitted || slot.closing || slot.completion_ready) {
 				return;
+			}
+			if (slot.requests.size() > 0) {
+				has_work = true;
 			}
 			for (int t = 0; t < slot.gpu_transitions.size(); t++) {
 				pre_transitions.push_back(slot.gpu_transitions[t]);
 			}
 		}
+		if (!has_work) {
+			return;
+		}
+		for (QueueState &queue : priority_queues) {
+			queue.batch_slots[submit_slot_index].closing = true;
+		}
+		active_batch_slot.store(1 - submit_slot_index);
 	}
 
 	if (!pre_transitions.is_empty()) {
 		if (!execute_transitions(pre_transitions, true)) {
-			UtilityFunctions::push_error("[DirectStorage] Failed to transition GPU destination textures to D3D12_RESOURCE_STATE_COMMON.");
+			UtilityFunctions::push_error("[DirectStorage] Failed to transition GPU destination textures to D3D12_RESOURCE_STATE_COMMON; aborting batch submit.");
+			std::lock_guard<std::mutex> lock(batch_mutex);
+			for (QueueState &queue : priority_queues) {
+				BatchSlot &slot = queue.batch_slots[submit_slot_index];
+				for (int i = 0; i < slot.requests.size(); i++) {
+					if (slot.requests[i].is_valid()) {
+						slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
+						slot.requests[i]->set_error_message("GPU resource barrier transition failed.");
+						slot.requests[i]->set_gpu_in_flight(false);
+					}
+				}
+				complete_chunked_requests();
+				release_resource_guards(slot.requests);
+				close_slot_files(slot);
+				slot.requests.clear();
+				slot.gpu_transitions.clear();
+				slot.closing = false;
+				slot.submitted = false;
+				slot.completion_ready = false;
+			}
+			batch_in_flight.store(has_in_flight_batches_locked());
+			update_profiler_queue_depth_locked();
+			batch_cv.notify_all();
+			return;
 		}
 	}
 	std::deque<BatchMetadata> submitted_batches;
@@ -2720,6 +2855,7 @@ void Win32Backend::submit_async() {
 		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
 		QueueState &queue = priority_queues[queue_index];
 		BatchSlot &slot = queue.batch_slots[submit_slot_index];
+		slot.closing = false;
 		if (!queue.queue || slot.requests.size() == 0) {
 			continue;
 		}
@@ -2787,9 +2923,6 @@ void Win32Backend::submit_async() {
 
 	for (BatchMetadata &batch : submitted_batches) {
 		completion_queue.push_back(batch);
-	}
-	if (!submitted_batches.empty()) {
-		active_batch_slot.store(1 - submit_slot_index);
 	}
 	batch_in_flight.store(has_in_flight_batches_locked());
 	update_profiler_queue_depth_locked();
@@ -2916,15 +3049,41 @@ void Win32Backend::submit_batch() {
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
-			const BatchSlot &slot = priority_queues[queue_index].batch_slots[submit_slot_index];
+			BatchSlot &slot = priority_queues[queue_index].batch_slots[submit_slot_index];
+			slot.closing = true;
 			for (int t = 0; t < slot.gpu_transitions.size(); t++) {
 				pre_transitions.push_back(slot.gpu_transitions[t]);
 			}
 		}
+		active_batch_slot.store(1 - submit_slot_index);
 	}
 	if (!pre_transitions.is_empty()) {
 		if (!execute_transitions(pre_transitions, true)) {
-			UtilityFunctions::push_error("[DirectStorage] Failed to transition GPU destination textures to D3D12_RESOURCE_STATE_COMMON.");
+			UtilityFunctions::push_error("[DirectStorage] Failed to transition GPU destination textures to D3D12_RESOURCE_STATE_COMMON; aborting batch submit.");
+			std::lock_guard<std::mutex> lock(batch_mutex);
+			for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
+				BatchSlot &slot = priority_queues[queue_index].batch_slots[submit_slot_index];
+				for (int i = 0; i < slot.requests.size(); i++) {
+					if (slot.requests[i].is_valid()) {
+						slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
+						slot.requests[i]->set_error_message("GPU resource barrier transition failed.");
+						slot.requests[i]->set_gpu_in_flight(false);
+					}
+				}
+				complete_chunked_requests();
+				release_resource_guards(slot.requests);
+				close_slot_files(slot);
+				slot.requests.clear();
+				slot.gpu_transitions.clear();
+				slot.closing = false;
+				slot.submitted = false;
+				slot.completion_ready = false;
+			}
+			sync_batch_in_flight.store(false);
+			batch_in_flight.store(has_in_flight_batches_locked());
+			update_profiler_queue_depth_locked();
+			batch_cv.notify_all();
+			return;
 		}
 	}
 
@@ -2934,6 +3093,7 @@ void Win32Backend::submit_batch() {
 		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
 			QueueState &queue = priority_queues[queue_index];
 			BatchSlot &slot = queue.batch_slots[submit_slot_index];
+			slot.closing = false;
 			if (!queue.queue || !queue.completion_fence || slot.requests.size() == 0) {
 				continue;
 			}
@@ -2981,7 +3141,6 @@ void Win32Backend::submit_batch() {
 			batch_cv.notify_all();
 			return;
 		}
-		active_batch_slot.store(1 - submit_slot_index);
 		batch_in_flight.store(!completion_queue.empty());
 		update_profiler_queue_depth_locked();
 	}
@@ -3010,6 +3169,7 @@ void Win32Backend::submit_batch() {
 				slot.completed_count = 0;
 				slot.error_code = 0;
 				slot.error_message = String();
+				slot.closing = false;
 				slot.completion_ready = false;
 			}
 		} else {
@@ -3025,30 +3185,47 @@ void Win32Backend::submit_batch() {
 				int q_idx = submitted_queues[i];
 				BatchSlot &slot = priority_queues[q_idx].batch_slots[submit_slot_index];
 				if (slot.submitted || !slot.completion_ready) {
+					std::unordered_set<uint64_t> tags;
 					for (int r = 0; r < slot.requests.size(); r++) {
 						if (slot.requests[r].is_valid()) {
+							tags.insert(slot.requests[r]->get_cancellation_tag());
 							slot.requests[r]->set_status(DSRequest::STATUS_FAILED);
 							slot.requests[r]->set_error_message("Batch submission timed out.");
 						}
 					}
-					complete_chunked_requests();
-					release_resource_guards(slot.requests);
-					close_slot_files(slot);
+					if (priority_queues[q_idx].queue) {
+						for (uint64_t tag : tags) {
+							priority_queues[q_idx].queue->CancelRequestsWithTag(UINT64_MAX, tag);
+						}
+					}
+					ZombieBatchSlot zombie;
+					zombie.queue_index = q_idx;
+					zombie.fence_value = slot.fence_value;
+					zombie.requests = slot.requests;
+					zombie.files = slot.files;
+					zombie.gpu_transitions = slot.gpu_transitions;
+					zombie_slots.push_back(zombie);
+
 					slot.requests.clear();
+					slot.files.clear();
+					slot.file_cache.clear();
 					slot.gpu_transitions.clear();
 					slot.fence_value = 0;
 					slot.completed_count = 0;
 					slot.error_code = -1;
 					slot.error_message = "Batch submission timed out.";
+					slot.closing = false;
 					slot.submitted = false;
 					slot.completion_ready = false;
 				} else {
+					close_slot_files(slot);
 					slot.requests.clear();
 					slot.gpu_transitions.clear();
 					slot.fence_value = 0;
 					slot.completed_count = 0;
 					slot.error_code = 0;
 					slot.error_message = String();
+					slot.closing = false;
 					slot.completion_ready = false;
 				}
 			}
@@ -3116,7 +3293,7 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 					}
 				}
 				for (int t = 0; t < slot.gpu_transitions.size(); t++) {
-					if (remaining_resources.count(slot.gpu_transitions[t].resource) > 0) {
+					if (remaining_resources.count(slot.gpu_transitions[t].resource.Get()) > 0) {
 						remaining_transitions.push_back(slot.gpu_transitions[t]);
 					}
 				}

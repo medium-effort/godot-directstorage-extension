@@ -14,16 +14,21 @@
 			<param index="0" name="resource_path" type="String" />
 			<param index="1" name="dstex_path" type="String" />
 			<param index="2" name="mip_metadata" type="Dictionary" default="{}" />
-			<description>Adds an existing [code].dstex[/code] file to an archive currently being built. [param mip_metadata] can provide per-mip footprint metadata ([code]mip_sizes[/code], [code]mip_uncompressed_sizes[/code], [code]mip_row_pitches[/code]) for GPU mip metadata archive generation; if empty, metadata is read automatically from the source [code].dstex[/code] file. Call [method create] first.</description>
+			<description>Adds an existing [code].dstex[/code] file to an archive currently being built. [param mip_metadata] can provide per-mip footprint metadata ([code]mip_sizes[/code], [code]mip_uncompressed_sizes[/code], [code]mip_row_pitches[/code]) for GPU mip metadata archive generation; if empty, metadata is read automatically from the source [code].dstex[/code] file. Call [method create] first. Returns [constant OK] on success, [constant ERR_UNCONFIGURED] if not building, or [constant ERR_CANT_OPEN] if [param dstex_path] cannot be opened.</description>
 		</method>
 		<method name="create">
 			<return type="Error" />
 			<param index="0" name="output_path" type="String" />
-			<description>Starts building a new archive at [param output_path]. Call [method add_texture] for each entry, then call [method finalize].</description>
+			<param index="1" name="archive_fingerprint" type="int" default="0" />
+			<description>Starts building a new archive at [param output_path] with optional validation [param archive_fingerprint]. Call [method add_texture] for each entry, then call [method finalize].</description>
 		</method>
 		<method name="finalize">
 			<return type="Error" />
-			<description>Writes the archive header, entry table, and staged payloads as a version 3 archive. If entries have GPU mip metadata, writes [code]DSPkgMipEntry[/code] tables. Each entry also serializes 32-bit entry flags (such as sRGB and ImageTexture compatibility). Returns an error if the archive is not being built or contains no textures.</description>
+			<description>Writes the archive header, entry table, and staged payloads as a version 3 archive. If entries have GPU mip metadata, writes [code]DSPkgMipEntry[/code] tables. Each entry also serializes 32-bit entry flags (such as sRGB and ImageTexture compatibility). Returns [constant OK] on success, [constant ERR_UNCONFIGURED] if not building, [constant ERR_INVALID_DATA] if no entries were staged, or [constant ERR_INVALID_PARAMETER] on file write failure.</description>
+		</method>
+		<method name="get_archive_fingerprint" qualifiers="const">
+			<return type="int" />
+			<description>Returns the 64-bit validation fingerprint embedded in the opened archive's header, or [code]0[/code] if no archive is open or no fingerprint was recorded.</description>
 		</method>
 		<method name="get_entries" qualifiers="const">
 			<return type="Array" />
@@ -51,12 +56,18 @@
 		<method name="open">
 			<return type="Error" />
 			<param index="0" name="path" type="String" />
-			<description>Opens and validates a [code].dspkg[/code] archive (version 1, version 2, or version 3) for reading. A failed open clears any previously loaded archive state.</description>
+			<param index="1" name="expected_fingerprint" type="int" default="0" />
+			<description>Opens and validates a [code].dspkg[/code] archive (version 1, version 2, or version 3) for reading. If [param expected_fingerprint] is non-zero, opening fails if the archive's embedded fingerprint does not match. A failed open clears any previously loaded archive state.</description>
 		</method>
 		<method name="read_texture" qualifiers="const">
 			<return type="Dictionary" />
 			<param index="0" name="resource_path" type="String" />
 			<description>Reads an entry's compressed payload and metadata. The result contains [code]path[/code] ([String]), [code]compressed_data[/code] ([PackedByteArray]), [code]width[/code] ([int]), [code]height[/code] ([int]), [code]pixel_format[/code] ([int]), [code]mip_count[/code] ([int]), [code]original_size[/code] ([int]), [code]compressed_size[/code] ([int]), [code]has_gpu_metadata[/code] ([bool]), [code]mip_offsets[/code] ([PackedInt64Array]), [code]mip_sizes[/code] ([PackedInt32Array]), [code]mip_uncompressed_sizes[/code] ([PackedInt32Array]), and [code]mip_row_pitches[/code] ([PackedInt32Array]). When [code]has_gpu_metadata[/code] is [code]true[/code], [code]mip_data[/code] ([Array] of [PackedByteArray]) is also provided containing individual mip slices.</description>
+		</method>
+		<method name="set_archive_fingerprint">
+			<return type="void" />
+			<param index="0" name="archive_fingerprint" type="int" />
+			<description>Sets or overrides the 64-bit validation fingerprint written into the archive header during [method finalize]. Must be called while building an archive.</description>
 		</method>
 	</methods>
 </class>

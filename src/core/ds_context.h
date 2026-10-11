@@ -8,6 +8,8 @@
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
 #include <godot_cpp/variant/vector2i.hpp>
+#include <godot_cpp/classes/rd_texture_format.hpp>
+#include <godot_cpp/classes/rd_texture_view.hpp>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -157,6 +159,7 @@ public:
 	uint64_t get_completion_fence() const;
 	bool wait_for_completion(int p_timeout_msec);
 	void cancel_requests_with_tag(uint64_t p_tag);
+	RID create_destination_texture(const Ref<RDTextureFormat> &p_format, const Ref<RDTextureView> &p_view = Ref<RDTextureView>());
 	// GDScript-visible batching counters. No queue merge; the sync and async
 	// queues stay separate.
 	uint64_t get_async_batches_submitted() const;

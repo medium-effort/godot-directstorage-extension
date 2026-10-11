@@ -13,6 +13,10 @@
 			<return type="int" />
 			<description>Returns the tag used to cancel this request with [method DSContext.cancel_requests_with_tag].</description>
 		</method>
+		<method name="get_cancel_timestamp_usec" qualifiers="const">
+			<return type="int" />
+			<description>Returns the timestamp in microseconds when this request was marked as cancelled, or [code]0[/code] if active.</description>
+		</method>
 		<method name="get_compression_format" qualifiers="const">
 			<return type="int" enum="DSRequest.CompressionFormat" />
 			<description>Returns the compression format expected for the source bytes.</description>
@@ -72,6 +76,10 @@
 		<method name="get_uncompressed_size" qualifiers="const">
 			<return type="int" />
 			<description>Returns the expected output size in bytes for a compressed request.</description>
+		</method>
+		<method name="is_gpu_in_flight" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if this request is currently submitted and in flight on the GPU queue.</description>
 		</method>
 		<method name="set_cancellation_tag">
 			<return type="void" />

@@ -60,7 +60,8 @@
 			<param index="5" name="mip_count" type="int" default="1" />
 			<param index="6" name="compression_level" type="int" default="1" />
 			<param index="7" name="is_srgb" type="bool" default="false" />
-			<description>Compresses [param raw_data] with GDeflate and writes a version 2 [code].dstex[/code] file. Calculates D3D12 footprint metadata (256-byte aligned row pitch and 512-byte aligned mip data placements) for hardware GPU decompression. [param format] is an [Image] format value. If [param is_srgb] is [code]true[/code], sets the sRGB format flag in the header and encodes the format as sRGB. Returns [constant OK] on success or a Godot [Error] code on invalid data, compression failure, or file access failure.</description>
+			<param index="8" name="as_image_texture" type="bool" default="false" />
+			<description>Compresses [param raw_data] with GDeflate and writes a version 2 [code].dstex[/code] file. Calculates D3D12 footprint metadata (256-byte aligned row pitch and 512-byte aligned mip data placements) for hardware GPU decompression. [param format] is an [Image] format value. If [param is_srgb] is [code]true[/code], sets the sRGB format flag in the header and encodes the format as sRGB. If [param as_image_texture] is [code]true[/code], flags the texture for ImageTexture CPU compatibility. Returns [constant OK] on success, [constant ERR_INVALID_PARAMETER] on invalid dimensions, [constant ERR_INVALID_DATA] on compression failure, or [constant ERR_UNAVAILABLE] if the format is unsupported.</description>
 		</method>
 	</methods>
 </class>

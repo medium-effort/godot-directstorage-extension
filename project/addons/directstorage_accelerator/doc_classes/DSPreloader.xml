@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSPreloader" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Static helper utility for collecting and prewarming scene texture assets.
+	</brief_description>
+	<description>
+		[DSPreloader] provides a high-level static GDScript API over DirectStorage streaming and GPU decompression. It walks scene dependencies to discover texture paths, issues stream prewarm requests through [DSTextureCache], and coordinates with the [code]DSBatchManager[/code] autoload for non-blocking scene loading.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="await_prewarm_finished" qualifiers="static">
+			<return type="void" />
+			<param index="0" name="tag" type="int" />
+			<param index="1" name="on_progress" type="Callable" default="Callable()" />
+			<description>Awaits completion of prewarm batch [param tag] across frame updates without blocking the main thread, optionally invoking [param on_progress] with [code](done, total)[/code] each frame.</description>
+		</method>
+		<method name="cancel_prewarm" qualifiers="static">
+			<return type="void" />
+			<param index="0" name="tag" type="int" />
+			<description>Marks prewarm batch [param tag] as cancelled so pending requests terminate and [method is_prewarm_complete] evaluates to [code]true[/code].</description>
+		</method>
+		<method name="collect_scene_textures" qualifiers="static">
+			<return type="PackedStringArray" />
+			<param index="0" name="scene_path" type="String" />
+			<param index="1" name="extra_scan_dirs" type="PackedStringArray" default="PackedStringArray()" />
+			<description>Recursively collects all prewarmable texture dependencies for [param scene_path], also sweeping [param extra_scan_dirs] for dynamically loaded assets.</description>
+		</method>
+		<method name="get_prewarm_progress" qualifiers="static">
+			<return type="Vector2i" />
+			<param index="0" name="tag" type="int" />
+			<description>Returns [code]Vector2i(completed, total)[/code] items processed for prewarm batch [param tag].</description>
+		</method>
+		<method name="is_gpu_prewarm_available" qualifiers="static">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if Direct3D 12 hardware GPU decompression prewarm directly into VRAM is supported and active.</description>
+		</method>
+		<method name="is_prewarm_complete" qualifiers="static">
+			<return type="bool" />
+			<param index="0" name="tag" type="int" />
+			<description>Returns [code]true[/code] if all requests for prewarm batch [param tag] have finished and all textures are cached.</description>
+		</method>
+		<method name="is_stream_prewarm_available" qualifiers="static">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if the native DirectStorage streaming pipeline singletons are active and available.</description>
+		</method>
+		<method name="load_scene_with_loading_screen" qualifiers="static">
+			<return type="Node" />
+			<param index="0" name="tree" type="SceneTree" />
+			<param index="1" name="scene_path" type="String" />
+			<param index="2" name="loading_screen" type="CanvasItem" />
+			<param index="3" name="progress_bar" type="Range" default="null" />
+			<param index="4" name="extra_scan_dirs" type="PackedStringArray" default="PackedStringArray()" />
+			<param index="5" name="frame_budget_usec" type="int" default="8000" />
+			<param index="6" name="prefer_gpu" type="bool" default="true" />
+			<description>Orchestrates asynchronous prewarm, scene loading, instantiation, tree attachment, and frame settling under an active loading screen overlay.</description>
+		</method>
+		<method name="prewarm_async" qualifiers="static">
+			<return type="int" />
+			<param index="0" name="paths" type="PackedStringArray" />
+			<description>Enqueues texture [param paths] for asynchronous CPU memory streaming prewarm and returns the assigned batch tag.</description>
+		</method>
+		<method name="prewarm_gpu_async" qualifiers="static">
+			<return type="int" />
+			<param index="0" name="paths" type="PackedStringArray" />
+			<param index="1" name="chunk_size" type="int" default="16" />
+			<param index="2" name="prefer_gpu" type="bool" default="true" />
+			<description>Enqueues texture [param paths] for direct-to-GPU VRAM DMA streaming prewarm in chunks of [param chunk_size] and returns the batch tag.</description>
+		</method>
+	</methods>
+	<constants>
+		<constant name="PREWARMABLE_EXTENSIONS" value='["png", "jpg", "jpeg", "webp"]'>
+			List of image source file extensions supported for DirectStorage prewarming.
+		</constant>
+		<constant name="EXCLUDED_EXTENSIONS" value='["exr", "hdr"]'>
+			List of image extensions excluded from prewarming due to format incompatibility.
+		</constant>
+		<constant name="TRAVERSABLE_EXTENSIONS" value='["tscn", "scn", "tres", "res", "material", "godot", "glb", "gltf"]'>
+			List of resource container extensions inspected during recursive dependency traversal.
+		</constant>
+		<constant name="FALLBACK_FRAME_BUDGET_USEC" value="8000">
+			Default per-frame processing budget in microseconds used during main-thread fallback loading.
+		</constant>
+	</constants>
+</class>

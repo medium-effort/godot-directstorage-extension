@@ -12,17 +12,20 @@
 #include <thread>
 #include <unordered_map>
 
+#include <vector>
+
 #ifdef _WIN32
 #include <windows.h>
 #include <d3d12.h>
 #include <dstorage.h>
+#include <wrl/client.h>
 #endif
 
 namespace godot {
 
 #ifdef _WIN32
-ID3D12Device *ds_win32_get_d3d12_device();
-ID3D12CommandQueue *ds_win32_get_d3d12_command_queue();
+Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device();
+Microsoft::WRL::ComPtr<ID3D12CommandQueue> ds_win32_get_d3d12_command_queue();
 void ds_win32_invalidate_d3d12_device();
 #endif
 
@@ -30,8 +33,8 @@ class Win32Backend : public PlatformBackend {
 public:
 #ifdef _WIN32
 	struct GPUTargetTransition {
-		ID3D12Resource *resource = nullptr;
-		D3D12_RESOURCE_STATES original_state = D3D12_RESOURCE_STATE_COPY_DEST;
+		Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+		D3D12_RESOURCE_STATES original_state = D3D12_RESOURCE_STATE_COMMON;
 		uint32_t first_subresource = 0;
 		uint32_t subresource_count = 1;
 	};
@@ -41,7 +44,7 @@ public:
 		ID3D12Fence *transition_fence = nullptr;
 		uint64_t fence_value = 0;
 		HANDLE fence_event = nullptr;
-		ID3D12CommandQueue *command_queue = nullptr;
+		Microsoft::WRL::ComPtr<ID3D12CommandQueue> command_queue;
 		std::mutex mutex;
 	};
 #endif
@@ -67,6 +70,7 @@ private:
 		int completed_count = 0;
 		int error_code = 0;
 		String error_message;
+		bool closing = false;
 		bool submitted = false;
 		bool completion_ready = false;
 	};
@@ -121,6 +125,14 @@ private:
 		Vector<BatchTagCount> tag_counts;
 	};
 	std::deque<BatchMetadata> completion_queue;
+	struct ZombieBatchSlot {
+		int queue_index = 0;
+		uint64_t fence_value = 0;
+		Vector<Ref<DSRequest>> requests;
+		Vector<IDStorageFile *> files;
+		Vector<GPUTargetTransition> gpu_transitions;
+	};
+	std::vector<ZombieBatchSlot> zombie_slots;
 	HANDLE completion_stop_event = nullptr;
 #endif
 	std::thread completion_thread;
@@ -148,6 +160,8 @@ private:
 	bool init_barrier_context(ID3D12Device *p_device, ID3D12CommandQueue *p_queue = nullptr);
 	void cleanup_barrier_context();
 	bool execute_transitions(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common);
+	bool execute_transitions_internal(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common);
+	friend void ds_win32_execute_transitions_on_render_thread();
 #endif
 
 public:
