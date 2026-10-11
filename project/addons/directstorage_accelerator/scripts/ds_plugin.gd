@@ -29,6 +29,15 @@ func _enter_tree() -> void:
 		"[DirectStorage] Plugin enabled by MediumEffort. Autoload, Importer, and Exporter registered."
 	)
 
+	for internal_setting in [
+		"directstorage/export/bundle_dspkg",
+		"directstorage/expected_archive_fingerprint",
+		"directstorage/project_guid",
+		"directstorage/archive_name",
+	]:
+		if ProjectSettings.has_setting(internal_setting):
+			ProjectSettings.set_as_internal(internal_setting, true)
+
 	if _importer == null:
 		var importer_script = load("res://addons/directstorage_accelerator/scripts/ds_importer.gd")
 		if importer_script:

@@ -27,3 +27,17 @@ The native classes are documented in Godot's Editor Help and support Ctrl-click 
 - `DSErrorHandler` and `DSProfiler`: monitor asynchronous DirectStorage kernel errors, measure physical storage throughput, and inspect logical decompression metrics.
 
 The extension registers `DSContext`, `DSErrorHandler`, `DSProfiler`, and `DSTextureCache` as Engine singletons. Access them via `Engine.get_singleton("DSContext")` or the corresponding singleton name.
+
+## Project Settings
+
+The addon exposes configurable project settings under the `directstorage/` namespace in Godot's Project Settings (`Project -> Project Settings... -> General -> DirectStorage`):
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `directstorage/staging_buffer_size_mb` | `int` | `128` | Staging buffer size in megabytes allocated by DirectStorage for unbuffered DMA transfers (range: `16`–`1024` MiB). Increase this if loading very large textures or high-resolution mip streams whose compressed payloads exceed the buffer. |
+| `directstorage/disable_gpu_decompression` | `bool` | `false` | When `true`, disables D3D12 GPU compute decompression and forces fallback to multi-threaded CPU software decompression. Useful for debugging, compatibility testing, or profiling. |
+| `directstorage/queue_capacity` | `int` | `512` | Maximum request capacity allocated for the hardware DirectStorage queue (range: `64`–`8192`). Dictates the upper bound of simultaneous in-flight storage requests. |
+| `directstorage/texture_cache_enabled` | `bool` | `true` | Enables or disables the internal runtime texture LRU cache (`DSTextureCache`). When disabled, loaded textures bypass the resident cache. |
+| `directstorage/texture_cache_max_entries` | `int` | `128` | Maximum number of texture entries held in the LRU cache (range: `16`–`2048`). When the limit is reached, oldest unreferenced textures are evicted to reclaim VRAM. |
+| `directstorage/shutdown_drain_timeout_ms` | `int` | `10000` | Maximum time in milliseconds (clamped to a minimum of `100` ms) to wait during application exit or module shutdown for active NVMe DMA and GPU requests to drain before fail-safe cleanup, preventing device-removed crashes or driver hangs. |
+

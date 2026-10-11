@@ -123,8 +123,11 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 			_current_fingerprint = (guid << 32) | manifest
 
 	ProjectSettings.set_setting("directstorage/export/bundle_dspkg", _bundle_dspkg_enabled and _has_textures)
+	ProjectSettings.set_as_internal("directstorage/export/bundle_dspkg", true)
 	ProjectSettings.set_setting("directstorage/expected_archive_fingerprint", _current_fingerprint)
+	ProjectSettings.set_as_internal("directstorage/expected_archive_fingerprint", true)
 	ProjectSettings.set_setting("directstorage/archive_name", _archive_name)
+	ProjectSettings.set_as_internal("directstorage/archive_name", true)
 
 	if not _bundle_dspkg_enabled:
 		print("[DirectStorage Exporter] Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK and loaded via CPU decompression at runtime.")
@@ -449,11 +452,13 @@ func _compute_project_guid() -> int:
 func _ensure_project_guid() -> int:
 	var custom_guid = ProjectSettings.get_setting("directstorage/project_guid", 0)
 	if typeof(custom_guid) == TYPE_INT and int(custom_guid) != 0:
+		ProjectSettings.set_as_internal("directstorage/project_guid", true)
 		return int(custom_guid) & 0xFFFFFFFF
 	var guid := randi() & 0xFFFFFFFF
 	if guid == 0:
 		guid = 1
 	ProjectSettings.set_setting("directstorage/project_guid", guid)
+	ProjectSettings.set_as_internal("directstorage/project_guid", true)
 	var save_err := ProjectSettings.save()
 	if save_err != OK:
 		push_warning("[DirectStorage Exporter] Could not persist directstorage/project_guid to project.godot: " + error_string(save_err))
