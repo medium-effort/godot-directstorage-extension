@@ -32,6 +32,9 @@
 
 #include <cstdint>
 #include <string>
+#include <thread>
+#include <vector>
+#include <atomic>
 
 namespace {
 
@@ -403,5 +406,69 @@ GDEX_TEST_T(context_lifecycle, shutdown_drain_rejects_subsequent_enqueue,
 
     // Re-initialize DSContext cleanly so subsequent tests have a valid state
     ds->call(godot::StringName("initialize_ds"));
+}
+
+GDEX_TEST_T(context_lifecycle, concurrent_lazy_initialization_stress, TAG_INTEGRATION) {
+    godot::Object *ds = require_singleton(ctx, "DSContext");
+    ds->call(godot::StringName("shutdown_ds"));
+
+    // Spawn 16 threads attempting to initialize concurrently
+    constexpr int NUM_THREADS = 16;
+    std::vector<std::thread> workers;
+    workers.reserve(NUM_THREADS);
+    std::atomic<int> success_count{0};
+
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        workers.emplace_back([ds, &success_count]() {
+            bool ok = static_cast<bool>(ds->call(godot::StringName("initialize_ds")));
+            if (ok) {
+                success_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (auto &t : workers) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
+    GDEX_EXPECT_EQ(success_count.load(), NUM_THREADS);
+    GDEX_EXPECT_TRUE(static_cast<bool>(ds->call(godot::StringName("is_initialized"))));
+}
+
+GDEX_TEST_T(context_lifecycle, concurrent_reader_queries_during_shutdown_stress, TAG_INTEGRATION) {
+    godot::Object *ds = require_singleton(ctx, "DSContext");
+
+    std::atomic<bool> stop_flag{false};
+    constexpr int NUM_READERS = 8;
+    std::vector<std::thread> readers;
+    readers.reserve(NUM_READERS);
+
+    for (int i = 0; i < NUM_READERS; ++i) {
+        readers.emplace_back([ds, &stop_flag]() {
+            while (!stop_flag.load(std::memory_order_relaxed)) {
+                ds->call(godot::StringName("get_async_batches_submitted"));
+                ds->call(godot::StringName("get_in_flight_async_batch_count"));
+                ds->call(godot::StringName("get_completion_fence"));
+                ds->call(godot::StringName("wait_for_completion"), 0);
+            }
+        });
+    }
+
+    // Main test thread alternates shutdown and initialization 20 times
+    for (int cycle = 0; cycle < 20; ++cycle) {
+        ds->call(godot::StringName("shutdown_ds"));
+        ds->call(godot::StringName("initialize_ds"));
+    }
+
+    stop_flag.store(true, std::memory_order_relaxed);
+    for (auto &t : readers) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
+    GDEX_EXPECT_TRUE(static_cast<bool>(ds->call(godot::StringName("is_initialized"))));
 }
 

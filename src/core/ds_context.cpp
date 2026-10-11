@@ -184,8 +184,11 @@ void DSContext::finalize_completed_reports_locked() {
 }
 
 bool DSContext::is_supported() const {
-	if (active_backend) {
-		return active_backend->get_name() == "Win32DirectStorage";
+	{
+		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		if (active_backend) {
+			return active_backend->get_name() == "Win32DirectStorage";
+		}
 	}
 	std::call_once(support_probe_once, []() {
 #ifdef _WIN32
@@ -215,11 +218,11 @@ bool DSContext::is_d3d12_backend() const {
 }
 
 bool DSContext::is_initialized() const {
-	return initialized;
+	return initialized.load(std::memory_order_acquire);
 }
 
 DSContext::InitStatus DSContext::get_init_status() const {
-	return init_status;
+	return init_status.load(std::memory_order_acquire);
 }
 
 namespace {
@@ -403,7 +406,8 @@ uint64_t DSContext::get_async_batches_submitted() const {
 	// Counts submitted batches so callers can verify batching efficiency
 	// (many textures per submit). No queue merge; the sync and async
 	// queues stay separate.
-	if (!initialized || !active_backend) {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return 0;
 	}
 	if (active_backend->get_name() != "Win32DirectStorage") {
@@ -415,7 +419,8 @@ uint64_t DSContext::get_async_batches_submitted() const {
 }
 
 uint64_t DSContext::get_in_flight_async_batch_count() const {
-	if (!initialized || !active_backend) {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return 0;
 	}
 	if (active_backend->get_name() != "Win32DirectStorage") {
@@ -429,10 +434,14 @@ uint64_t DSContext::get_in_flight_async_batch_count() const {
 
 uint64_t DSContext::get_completion_fence() const {
 #ifdef _WIN32
-	if (active_backend && active_backend->get_name() == "Win32DirectStorage") {
-		uint64_t backend_fence = ds_win32_get_completion_fence(active_backend);
-		if (backend_fence != 0) {
-			return backend_fence;
+	{
+		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		if (initialized.load(std::memory_order_acquire) && !shut_down.load(std::memory_order_acquire) &&
+				active_backend && active_backend->get_name() == "Win32DirectStorage") {
+			uint64_t backend_fence = ds_win32_get_completion_fence(active_backend);
+			if (backend_fence != 0) {
+				return backend_fence;
+			}
 		}
 	}
 #endif
@@ -461,17 +470,24 @@ bool DSContext::wait_for_completion(int p_timeout_msec) {
 	}
 
 #ifdef _WIN32
-	if (active_backend && active_backend->get_name() == "Win32DirectStorage" &&
-			!ds_win32_wait_for_completion(active_backend, fence_value, static_cast<uint32_t>(p_timeout_msec))) {
-		UtilityFunctions::push_error("[DirectStorage] Completion fence wait timed out or failed.");
-		return false;
+	{
+		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
+			UtilityFunctions::push_error("[DirectStorage] Completion fence wait failed: context not initialized or already shut down.");
+			return false;
+		}
+		if (active_backend->get_name() == "Win32DirectStorage" &&
+				!ds_win32_wait_for_completion(active_backend, fence_value, static_cast<uint32_t>(p_timeout_msec))) {
+			UtilityFunctions::push_error("[DirectStorage] Completion fence wait timed out or failed.");
+			return false;
+		}
+		if (active_backend->get_name() == "Win32DirectStorage" &&
+				!synchronize_rendering_device("DirectStorage completion")) {
+			return false;
+		}
 	}
 #endif
 
-	if (active_backend && active_backend->get_name() == "Win32DirectStorage" &&
-			!synchronize_rendering_device("DirectStorage completion")) {
-		return false;
-	}
 	return true;
 }
 
@@ -502,6 +518,7 @@ RID DSContext::create_destination_texture(const Ref<RDTextureFormat> &p_format, 
 }
 
 String DSContext::get_active_backend_name() const {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 	if (active_backend) {
 		return active_backend->get_name();
 	}
@@ -540,57 +557,69 @@ Dictionary DSContext::get_drive_info(const String &p_path) const {
 }
 
 Error DSContext::initialize_ds_for_path(const String &p_path) {
+	std::lock_guard<std::mutex> lock(init_mutex);
 	if (p_path.strip_edges().is_empty()) {
 		UtilityFunctions::push_warning("[DirectStorage] Empty path supplied; falling back to res:// initialization.");
-		return initialize_ds() ? OK : ERR_CANT_CREATE;
+		return initialize_ds_locked() ? OK : ERR_CANT_CREATE;
 	}
 
 #ifdef _WIN32
 	if (!Win32Backend::is_path_valid(p_path)) {
 		UtilityFunctions::push_warning("[DirectStorage] Path '" + p_path + "' is invalid; falling back to res:// initialization.");
-		if (initialized) {
-			shutdown_ds();
+		if (initialized.load(std::memory_order_acquire)) {
+			shutdown_ds_locked();
 		}
-		return initialize_ds() ? OK : ERR_CANT_CREATE;
+		return initialize_ds_locked() ? OK : ERR_CANT_CREATE;
 	}
 
 	Dictionary drive_info = Win32Backend::get_drive_info_for_path(p_path);
 	if (!drive_info.get("directstorage_supported", false)) {
 		UtilityFunctions::push_warning("[DirectStorage] Path '" + p_path + "' is on an unsupported volume; falling back to res:// initialization.");
-		if (initialized) {
-			shutdown_ds();
+		if (initialized.load(std::memory_order_acquire)) {
+			shutdown_ds_locked();
 		}
-		return initialize_ds() ? OK : ERR_CANT_CREATE;
+		return initialize_ds_locked() ? OK : ERR_CANT_CREATE;
 	}
 
-	if (initialized) {
-		shutdown_ds();
+	if (initialized.load(std::memory_order_acquire)) {
+		shutdown_ds_locked();
 	}
 
 	initialization_path = p_path;
-	bool path_initialized = initialize_ds();
+	bool path_initialized = initialize_ds_locked();
 	initialization_path = "";
-	if (path_initialized && active_backend && active_backend->get_name() == "Win32DirectStorage") {
-		UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized for path '" + p_path + "'.");
-		return OK;
+	{
+		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		if (path_initialized && active_backend && active_backend->get_name() == "Win32DirectStorage") {
+			UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized for path '" + p_path + "'.");
+			return OK;
+		}
 	}
 
-	if (initialized) {
-		shutdown_ds();
+	if (initialized.load(std::memory_order_acquire)) {
+		shutdown_ds_locked();
 	}
 	UtilityFunctions::push_warning("[DirectStorage] Path-aware DirectStorage initialization failed; falling back to res:// initialization.");
-	return initialize_ds() ? OK : ERR_CANT_CREATE;
+	return initialize_ds_locked() ? OK : ERR_CANT_CREATE;
 #else
 	UtilityFunctions::push_warning("[DirectStorage] Path-aware initialization is unavailable on this platform; falling back to res:// initialization.");
-	return initialize_ds() ? OK : ERR_CANT_CREATE;
+	return initialize_ds_locked() ? OK : ERR_CANT_CREATE;
 #endif
 }
 
 bool DSContext::initialize_ds() {
-	if (initialized) {
+	if (initialized.load(std::memory_order_acquire)) {
 		return true;
 	}
-	shut_down = false;
+	std::lock_guard<std::mutex> lock(init_mutex);
+	return initialize_ds_locked();
+}
+
+bool DSContext::initialize_ds_locked() {
+	if (initialized.load(std::memory_order_acquire)) {
+		return true;
+	}
+	shut_down.store(false, std::memory_order_release);
 
 	// Load settings from ProjectSettings or set defaults
 	ProjectSettings *ps = ProjectSettings::get_singleton();
@@ -609,46 +638,70 @@ bool DSContext::initialize_ds() {
 
 #ifdef _WIN32
 	Win32Backend *backend = memnew(Win32Backend);
-	active_backend = backend;
+	{
+		std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		active_backend = backend;
+	}
 	bool backend_initialized = initialization_path.is_empty() ? backend->initialize() : backend->initialize(initialization_path);
 	if (backend_initialized) {
-		initialized = true;
-		init_status = INIT_STATUS_DIRECTSTORAGE_D3D12;
+		init_status.store(INIT_STATUS_DIRECTSTORAGE_D3D12, std::memory_order_release);
+		initialized.store(true, std::memory_order_release);
 		UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with Win32Backend.");
 		return true;
 	} else {
-		memdelete(active_backend);
-		active_backend = nullptr;
+		{
+			std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+			active_backend = nullptr;
+		}
+		memdelete(backend);
 		UtilityFunctions::print("[DirectStorage] Win32DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
 	}
 #endif
 
 	// Fallback backend for non-Windows or if Win32 DirectStorage initialization failed
-	active_backend = memnew(FallbackBackend);
-	if (!active_backend->initialize()) {
-		memdelete(active_backend);
-		active_backend = nullptr;
-		init_status = INIT_STATUS_FAILED;
+	FallbackBackend *fallback_backend = memnew(FallbackBackend);
+	{
+		std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		active_backend = fallback_backend;
+	}
+	if (!fallback_backend->initialize()) {
+		{
+			std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+			active_backend = nullptr;
+		}
+		memdelete(fallback_backend);
+		init_status.store(INIT_STATUS_FAILED, std::memory_order_release);
 		UtilityFunctions::push_error("[DirectStorage] DirectStorage Context initialization failed: FallbackBackend could not start.");
 		return false;
 	}
-	initialized = true;
-	init_status = INIT_STATUS_SOFTWARE_FALLBACK;
+	init_status.store(INIT_STATUS_SOFTWARE_FALLBACK, std::memory_order_release);
+	initialized.store(true, std::memory_order_release);
 	UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with FallbackBackend.");
 	return true;
 }
 
 void DSContext::shutdown_ds() {
-	shut_down = true;
-	init_status = INIT_STATUS_UNINITIALIZED;
-	if (!initialized) {
+	std::lock_guard<std::mutex> lock(init_mutex);
+	shutdown_ds_locked();
+}
+
+void DSContext::shutdown_ds_locked() {
+	shut_down.store(true, std::memory_order_release);
+	init_status.store(INIT_STATUS_UNINITIALIZED, std::memory_order_release);
+	if (!initialized.load(std::memory_order_acquire)) {
 		return;
 	}
 
-	if (active_backend) {
-		active_backend->shutdown();
-		memdelete(active_backend);
+	PlatformBackend *backend_to_delete = nullptr;
+	{
+		std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		backend_to_delete = active_backend;
 		active_backend = nullptr;
+	}
+
+	if (backend_to_delete) {
+		backend_to_delete->shutdown();
+		memdelete(backend_to_delete);
 	}
 
 	{
@@ -673,7 +726,7 @@ void DSContext::shutdown_ds() {
 			it->second.cancel_requested = true;
 		}
 	}
-	initialized = false;
+	initialized.store(false, std::memory_order_release);
 	UtilityFunctions::print("[DirectStorage] DirectStorage Context shut down.");
 }
 
@@ -733,17 +786,18 @@ bool DSContext::enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maint
 		return false;
 	}
 
-	if (shut_down) {
+	if (shut_down.load(std::memory_order_acquire)) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("DirectStorage Context is shut down.");
 		return false;
 	}
 
-	if (!initialized) {
+	if (!initialized.load(std::memory_order_acquire)) {
 		initialize_ds();
 	}
 
-	if (!initialized || !active_backend) {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("DirectStorage Context not initialized.");
 		return false;
@@ -819,7 +873,8 @@ int DSContext::get_pending_request_count() const {
 }
 
 void DSContext::flush_batch() {
-	if (!initialized || !active_backend) {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return;
 	}
 	collect_completed_results();
@@ -858,7 +913,8 @@ void DSContext::flush_batch() {
 }
 
 Error DSContext::flush_batch_async() {
-	if (!initialized || !active_backend) {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return ERR_UNCONFIGURED;
 	}
 	int submitted_request_count = 0;
@@ -909,7 +965,8 @@ Error DSContext::flush_stream_async() {
 	// via the stream internal enqueue (validation + tracking + Ref holding;
 	// per-request collect/finalize hoisted to once per flush),
 	// then submits non-blocking via submit_async().
-	if (!initialized || !active_backend) {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return ERR_UNCONFIGURED;
 	}
 	std::deque<Ref<DSRequest>> to_submit;
@@ -1107,10 +1164,13 @@ void DSContext::cancel_prewarm(uint64_t p_tag) {
 		}
 		stream_queue.swap(remaining);
 	}
-	if (!initialized || !active_backend) {
-		return;
+	{
+		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
+			return;
+		}
+		active_backend->cancel_requests_with_tag(p_tag);
 	}
-	active_backend->cancel_requests_with_tag(p_tag);
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
 		for (std::unordered_map<int64_t, Ref<DSRequest>>::iterator it = tracked_requests.begin(); it != tracked_requests.end(); ++it) {
@@ -1138,6 +1198,7 @@ bool DSContext::is_tag_cancelled(uint64_t p_tag) const {
 }
 
 bool DSContext::is_batch_complete() const {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 	if (!active_backend) {
 		return true;
 	}
@@ -1152,7 +1213,8 @@ bool DSContext::is_batch_complete() const {
 }
 
 bool DSContext::has_pending_results() const {
-	if (!initialized || !active_backend) {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return false;
 	}
 #ifdef _WIN32
@@ -1165,7 +1227,8 @@ bool DSContext::has_pending_results() const {
 }
 
 void DSContext::collect_completed_results() {
-	if (!initialized || !active_backend) {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return;
 	}
 
@@ -1248,7 +1311,8 @@ void DSContext::collect_completed_results() {
 }
 
 void DSContext::cancel_requests_with_tag(uint64_t p_tag) {
-	if (!initialized || !active_backend) {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return;
 	}
 	std::unordered_set<int64_t> cancelled_pending_request_ids;

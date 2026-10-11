@@ -12,7 +12,9 @@
 #include <godot_cpp/classes/rd_texture_view.hpp>
 #include <cstdint>
 #include <deque>
+#include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include "ds_profiler.h"
@@ -36,15 +38,17 @@ private:
 	static DSContext *singleton;
 	static std::once_flag support_probe_once;
 	static bool supported_probe_result;
-	bool initialized = false;
-	InitStatus init_status = INIT_STATUS_UNINITIALIZED;
-	bool shut_down = false;
+	std::atomic<bool> initialized{ false };
+	std::atomic<InitStatus> init_status{ INIT_STATUS_UNINITIALIZED };
+	std::atomic<bool> shut_down{ false };
 
 	uint32_t staging_buffer_size_mb = 128;
 	bool disable_gpu_decompression = false;
 	uint16_t queue_capacity = 2000;
 
 	PlatformBackend *active_backend = nullptr;
+	mutable std::mutex init_mutex;
+	mutable std::shared_mutex backend_lifecycle_mutex;
 	String initialization_path;
 	bool gpu_requests_pending = false;
 	uint64_t completion_fence = 0;
@@ -105,6 +109,9 @@ private:
 	// p_skip_maintenance=true selects the stream behavior (no per-request
 	// collect/finalize); report bookkeeping is identical either way.
 	bool enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maintenance);
+
+	bool initialize_ds_locked();
+	void shutdown_ds_locked();
 
 protected:
 	static void _bind_methods();

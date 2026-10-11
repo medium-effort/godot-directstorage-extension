@@ -296,3 +296,53 @@ GDEX_TEST_T(preloader_cancellation_retirement, context_cancelled_stream_progress
     ds->count_stream_terminal_failure(tag);
     GDEX_EXPECT_TRUE(ds->is_prewarm_complete(tag));
 }
+
+GDEX_TEST_T(request_payload_immutability, setters_rejected_when_submitted_or_gpu_in_flight, TAG_UNIT) {
+    godot::Ref<godot::DSRequest> req;
+    req.instantiate();
+
+    // 1. Initial state: STATUS_PENDING and !gpu_in_flight -> mutable
+    GDEX_EXPECT_TRUE(req->is_mutable());
+    req->set_file_path("res://initial_path.bin");
+    req->set_offset(1024);
+    req->set_size(4096);
+    req->set_uncompressed_size(4096);
+
+    godot::PackedByteArray initial_buf;
+    initial_buf.resize(4096);
+    initial_buf[0] = 0xAA;
+    req->set_destination_buffer(initial_buf);
+
+    GDEX_EXPECT_TRUE(req->get_file_path() == "res://initial_path.bin");
+    GDEX_EXPECT_EQ(req->get_offset(), static_cast<uint64_t>(1024));
+    GDEX_EXPECT_EQ(req->get_size(), static_cast<uint32_t>(4096));
+    GDEX_EXPECT_EQ(req->get_destination_buffer().size(), static_cast<int64_t>(4096));
+
+    // 2. Submit the request -> is_mutable() must become false
+    req->set_status(godot::DSRequest::STATUS_SUBMITTED);
+    GDEX_EXPECT_FALSE(req->is_mutable());
+
+    // 3. Attempt mutations while submitted -> must be rejected without mutating fields
+    req->set_file_path("res://tampered_path.bin");
+    req->set_offset(9999);
+    req->set_size(8888);
+
+    godot::PackedByteArray tampered_buf;
+    tampered_buf.resize(16);
+    tampered_buf[0] = 0xFF;
+    req->set_destination_buffer(tampered_buf);
+
+    GDEX_EXPECT_TRUE(req->get_file_path() == "res://initial_path.bin");
+    GDEX_EXPECT_EQ(req->get_offset(), static_cast<uint64_t>(1024));
+    GDEX_EXPECT_EQ(req->get_size(), static_cast<uint32_t>(4096));
+    GDEX_EXPECT_EQ(req->get_destination_buffer().size(), static_cast<int64_t>(4096));
+    GDEX_EXPECT_EQ(static_cast<int>(req->get_destination_buffer()[0]), 0xAA);
+
+    // 4. Test gpu_in_flight gate independently
+    req->set_status(godot::DSRequest::STATUS_PENDING);
+    req->set_gpu_in_flight(true);
+    GDEX_EXPECT_FALSE(req->is_mutable());
+
+    req->set_file_path("res://gpu_tampered.bin");
+    GDEX_EXPECT_TRUE(req->get_file_path() == "res://initial_path.bin");
+}

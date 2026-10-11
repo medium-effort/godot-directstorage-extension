@@ -29,6 +29,7 @@
 #include <unordered_set>
 #include <set>
 #include <utility>
+#include <algorithm>
 
 namespace godot {
 
@@ -1697,6 +1698,24 @@ bool Win32Backend::execute_transitions(const Vector<GPUTargetTransition> &p_tran
 		return false;
 	}
 
+	// Fast-path: Check if any transition actually changes resource state.
+	// In the common case (e.g. textures created in COMMON state), state_before == state_after
+	// and no barrier is required. Skipping dispatch avoids unnecessary thread marshaling and CV wait.
+	bool has_effective_transitions = false;
+	for (int i = 0; i < p_transitions.size(); i++) {
+		const GPUTargetTransition &t = p_transitions[i];
+		if (!t.resource) continue;
+		D3D12_RESOURCE_STATES state_before = p_to_common ? t.original_state : D3D12_RESOURCE_STATE_COMMON;
+		D3D12_RESOURCE_STATES state_after = p_to_common ? D3D12_RESOURCE_STATE_COMMON : t.original_state;
+		if (state_before != state_after) {
+			has_effective_transitions = true;
+			break;
+		}
+	}
+	if (!has_effective_transitions) {
+		return true;
+	}
+
 	if (!rs->is_on_render_thread()) {
 		auto ctx = std::make_shared<DSTransitionHandoffContext>();
 		ctx->backend = this;
@@ -1709,9 +1728,16 @@ bool Win32Backend::execute_transitions(const Vector<GPUTargetTransition> &p_tran
 		rs->call_on_render_thread(callable_mp_static(ds_win32_execute_transitions_on_render_thread));
 		{
 			std::unique_lock<std::mutex> lock(ctx->mutex);
-			constexpr std::chrono::milliseconds kTransitionTimeout(600);
+			constexpr std::chrono::milliseconds kTransitionTimeout(1000);
 			bool signaled = ctx->cv.wait_for(lock, kTransitionTimeout, [&ctx] { return ctx->completed; });
 			if (!signaled) {
+				{
+					std::lock_guard<std::mutex> lock_q(s_transition_dispatch_mutex);
+					auto it = std::find(s_transition_queue.begin(), s_transition_queue.end(), ctx);
+					if (it != s_transition_queue.end()) {
+						s_transition_queue.erase(it);
+					}
+				}
 				UtilityFunctions::push_error("[DirectStorage] Render-thread transition dispatch timed out.");
 				return false;
 			}
@@ -2549,13 +2575,11 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		request.Destination.MultipleSubresourcesRange.FirstSubresource = p_child->get_first_subresource();
 		request.Destination.MultipleSubresourcesRange.NumSubresources = p_child->get_subresource_count();
 	} else {
-		PackedByteArray &dest = p_child->get_destination_buffer_ref();
-		if (dest.size() < static_cast<int64_t>(uncompressed_size)) {
-			dest.resize(static_cast<int64_t>(uncompressed_size));
-		}
+		p_child->ensure_destination_buffer_capacity(uncompressed_size);
 
-		// PackedByteArray is copy-on-write. Resize before acquiring the writable pointer,
-		// then keep this request's storage stable while DirectStorage owns the async write.
+		// Transition status to STATUS_SUBMITTED before acquiring the writable pointer
+		// so is_mutable() returns false and prevents any concurrent script mutations/reallocations.
+		p_child->set_status(DSRequest::STATUS_SUBMITTED);
 		request.Destination.Memory.Buffer = p_child->get_destination_buffer_ptrw();
 		request.Destination.Memory.Size = uncompressed_size;
 	}
@@ -2575,15 +2599,14 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		transition.subresource_count = p_child->get_subresource_count();
 		slot.gpu_transitions.push_back(transition);
 	}
+	if (gpu_buffer_destination || gpu_texture_destination) {
+		p_child->set_gpu_in_flight(true);
+		p_child->set_status(DSRequest::STATUS_SUBMITTED);
+	}
+	slot.requests.push_back(p_child);
 	queue.queue->EnqueueRequest(&request);
 	// slot.files push happens once at open time in the cache-miss branch
 	// above; cache hits reuse the already-tracked handle.
-
-	if (gpu_buffer_destination || gpu_texture_destination) {
-		p_child->set_gpu_in_flight(true);
-	}
-	p_child->set_status(DSRequest::STATUS_SUBMITTED);
-	slot.requests.push_back(p_child);
 	return true;
 	};
 

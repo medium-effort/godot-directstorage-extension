@@ -1,4 +1,5 @@
 #include "ds_request.h"
+#include <godot_cpp/variant/utility_functions.hpp>
 
 namespace godot {
 
@@ -7,6 +8,10 @@ DSRequest::DSRequest() {}
 DSRequest::~DSRequest() {}
 
 void DSRequest::set_file_path(const String &p_path) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	file_path = p_path;
 }
 
@@ -15,6 +20,10 @@ String DSRequest::get_file_path() const {
 }
 
 void DSRequest::set_offset(uint64_t p_offset) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	offset = p_offset;
 }
 
@@ -23,6 +32,10 @@ uint64_t DSRequest::get_offset() const {
 }
 
 void DSRequest::set_size(uint32_t p_size) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	size = p_size;
 }
 
@@ -31,6 +44,10 @@ uint32_t DSRequest::get_size() const {
 }
 
 void DSRequest::set_uncompressed_size(uint32_t p_size) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	uncompressed_size = p_size;
 }
 
@@ -39,6 +56,10 @@ uint32_t DSRequest::get_uncompressed_size() const {
 }
 
 void DSRequest::set_cancellation_tag(uint64_t p_tag) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	cancellation_tag = p_tag;
 }
 
@@ -47,6 +68,10 @@ uint64_t DSRequest::get_cancellation_tag() const {
 }
 
 void DSRequest::set_compression_format(CompressionFormat p_format) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	compression_format = p_format;
 }
 
@@ -55,6 +80,10 @@ DSRequest::CompressionFormat DSRequest::get_compression_format() const {
 }
 
 void DSRequest::set_destination_buffer(const PackedByteArray &p_buffer) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	destination_buffer = p_buffer;
 }
 
@@ -70,7 +99,25 @@ uint8_t *DSRequest::get_destination_buffer_ptrw() {
 	return destination_buffer.ptrw();
 }
 
+bool DSRequest::ensure_destination_buffer_capacity(uint64_t p_required_size) {
+	if (destination_buffer.size() < static_cast<int64_t>(p_required_size)) {
+		destination_buffer.resize(static_cast<int64_t>(p_required_size));
+	}
+	return true;
+}
+
+bool DSRequest::resize_destination_buffer(uint64_t p_size) {
+	if (destination_buffer.size() != static_cast<int64_t>(p_size)) {
+		destination_buffer.resize(static_cast<int64_t>(p_size));
+	}
+	return true;
+}
+
 void DSRequest::set_destination_type(DSDestinationType p_type) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	destination_type = p_type;
 }
 
@@ -79,6 +126,10 @@ DSRequest::DSDestinationType DSRequest::get_destination_type() const {
 }
 
 void DSRequest::set_priority(DSPriority p_priority) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	priority = p_priority;
 }
 
@@ -87,6 +138,10 @@ DSRequest::DSPriority DSRequest::get_priority() const {
 }
 
 void DSRequest::set_destination_resource(const RID &p_resource) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	destination_resource = p_resource;
 }
 
@@ -95,6 +150,10 @@ RID DSRequest::get_destination_resource() const {
 }
 
 void DSRequest::set_first_subresource(uint32_t p_subresource) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	first_subresource = p_subresource;
 }
 
@@ -103,6 +162,10 @@ uint32_t DSRequest::get_first_subresource() const {
 }
 
 void DSRequest::set_subresource_count(uint32_t p_count) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	subresource_count = p_count;
 }
 
@@ -111,6 +174,10 @@ uint32_t DSRequest::get_subresource_count() const {
 }
 
 void DSRequest::set_texture_format(uint32_t p_format) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	texture_format = p_format;
 }
 
@@ -119,6 +186,10 @@ uint32_t DSRequest::get_texture_format() const {
 }
 
 void DSRequest::set_texture_layout(uint32_t p_layout) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
 	texture_layout = p_layout;
 }
 
@@ -187,7 +258,6 @@ void DSRequest::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_texture_layout", "layout"), &DSRequest::set_texture_layout);
 	ClassDB::bind_method(D_METHOD("get_texture_layout"), &DSRequest::get_texture_layout);
 
-	ClassDB::bind_method(D_METHOD("set_status", "status"), &DSRequest::set_status);
 	ClassDB::bind_method(D_METHOD("get_status"), &DSRequest::get_status);
 
 	ClassDB::bind_method(D_METHOD("set_error_message", "message"), &DSRequest::set_error_message);
@@ -210,7 +280,7 @@ void DSRequest::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "subresource_count"), "set_subresource_count", "get_subresource_count");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_format"), "set_texture_format", "get_texture_format");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "texture_layout"), "set_texture_layout", "get_texture_layout");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "status"), "set_status", "get_status");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "status"), "", "get_status");
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "error_message"), "set_error_message", "get_error_message");
 
 	BIND_ENUM_CONSTANT(STATUS_PENDING);

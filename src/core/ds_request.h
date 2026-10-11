@@ -90,6 +90,9 @@ public:
 	PackedByteArray &get_destination_buffer_ref();
 	uint8_t *get_destination_buffer_ptrw();
 
+	bool ensure_destination_buffer_capacity(uint64_t p_required_size);
+	bool resize_destination_buffer(uint64_t p_size);
+
 	void set_destination_type(DSDestinationType p_type);
 	DSDestinationType get_destination_type() const;
 
@@ -117,6 +120,7 @@ public:
 	void set_error_message(const String &p_msg);
 	String get_error_message() const;
 
+	bool is_mutable() const { return status.load(std::memory_order_acquire) == STATUS_PENDING && !gpu_in_flight.load(std::memory_order_acquire); }
 	bool is_gpu_in_flight() const { return gpu_in_flight.load(std::memory_order_acquire); }
 	void set_gpu_in_flight(bool p_in_flight) { gpu_in_flight.store(p_in_flight, std::memory_order_release); }
 

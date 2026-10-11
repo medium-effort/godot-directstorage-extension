@@ -136,11 +136,6 @@
 			<param index="0" name="size" type="int" />
 			<description>Sets the number of source bytes to read.</description>
 		</method>
-		<method name="set_status">
-			<return type="void" />
-			<param index="0" name="status" type="int" enum="DSRequest.Status" />
-			<description>Sets the request status. This is primarily used by the active backend; user code should normally only read [member status].</description>
-		</method>
 		<method name="set_subresource_count">
 			<return type="void" />
 			<param index="0" name="count" type="int" />
@@ -208,7 +203,7 @@
 		<member name="uncompressed_size" type="int" setter="set_uncompressed_size" getter="get_uncompressed_size" default="0">
 			The expected decompressed size in bytes for compressed requests.
 		</member>
-		<member name="status" type="int" setter="set_status" getter="get_status" enum="DSRequest.Status" default="0">
+		<member name="status" type="int" getter="get_status" enum="DSRequest.Status" default="0">
 			The current status of this request ([code]STATUS_PENDING[/code], [code]STATUS_SUBMITTED[/code], [code]STATUS_COMPLETED[/code], or [code]STATUS_FAILED[/code]).
 		</member>
 	</members>
