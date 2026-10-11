@@ -10,6 +10,7 @@
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 namespace godot {
@@ -149,6 +150,22 @@ void DSContext::finalize_completed_reports_locked() {
 		if (status != DSRequest::STATUS_COMPLETED && status != DSRequest::STATUS_FAILED) {
 			++it;
 			continue;
+		}
+		if (request->is_gpu_in_flight()) {
+			uint64_t cancel_time = request->get_cancel_timestamp_usec();
+			if (cancel_time > 0 && Time::get_singleton()) {
+				uint64_t now_us = Time::get_singleton()->get_ticks_usec();
+				if (now_us > cancel_time && (now_us - cancel_time) > 5000000ULL) {
+					UtilityFunctions::push_error("[DirectStorage] Context: GPU cancellation retirement timed out (>5.0s, GPU hang/TDR). Force-finalizing request.");
+					request->set_gpu_in_flight(false);
+				} else {
+					++it;
+					continue;
+				}
+			} else {
+				++it;
+				continue;
+			}
 		}
 
 		int64_t request_id = it->first;
@@ -992,6 +1009,9 @@ bool DSContext::is_prewarm_complete(uint64_t p_tag) const {
 			if (qit->is_valid() && (*qit)->get_cancellation_tag() == p_tag) {
 				return false;
 			}
+		}
+		if (info.completed < info.total) {
+			return false;
 		}
 		return true;
 	}

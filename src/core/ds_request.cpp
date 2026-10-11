@@ -193,6 +193,9 @@ void DSRequest::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_error_message", "message"), &DSRequest::set_error_message);
 	ClassDB::bind_method(D_METHOD("get_error_message"), &DSRequest::get_error_message);
 
+	ClassDB::bind_method(D_METHOD("is_gpu_in_flight"), &DSRequest::is_gpu_in_flight);
+	ClassDB::bind_method(D_METHOD("get_cancel_timestamp_usec"), &DSRequest::get_cancel_timestamp_usec);
+
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "file_path"), "set_file_path", "get_file_path");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "offset"), "set_offset", "get_offset");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "size"), "set_size", "get_size");

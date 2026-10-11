@@ -618,10 +618,17 @@ static void complete_chunked_requests() {
 			}
 		}
 
+		bool any_child_gpu_in_flight = false;
 		for (int i = 0; i < state.children.size(); i++) {
 			if (state.children[i].is_valid()) {
+				if (state.children[i]->is_gpu_in_flight()) {
+					any_child_gpu_in_flight = true;
+				}
 				s_chunk_parents.erase(state.children[i].ptr());
 			}
+		}
+		if (!any_child_gpu_in_flight && state.parent.is_valid()) {
+			state.parent->set_gpu_in_flight(false);
 		}
 		it = s_chunked_requests.erase(it);
 	}
@@ -851,6 +858,11 @@ void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, c
 			break;
 		}
 	}
+	for (int i = 0; i < p_slot.requests.size(); i++) {
+		if (p_slot.requests[i].is_valid()) {
+			p_slot.requests[i]->set_gpu_in_flight(false);
+		}
+	}
 	release_resource_guards(p_slot.requests);
 	close_slot_files(p_slot);
 	p_slot.submitted = false;
@@ -927,6 +939,11 @@ void Win32Backend::completion_thread_func() {
 			if (fence_completed || !slot.submitted) {
 				close_slot_files(slot);
 				release_resource_guards(slot.requests);
+				for (int i = 0; i < slot.requests.size(); i++) {
+					if (slot.requests[i].is_valid()) {
+						slot.requests[i]->set_gpu_in_flight(false);
+					}
+				}
 			}
 			complete_chunked_requests();
 			slot.completed_count = count_completed_requests(slot.requests);
@@ -2463,6 +2480,9 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	// slot.files push happens once at open time in the cache-miss branch
 	// above; cache hits reuse the already-tracked handle.
 
+	if (gpu_buffer_destination || gpu_texture_destination) {
+		p_child->set_gpu_in_flight(true);
+	}
 	p_child->set_status(DSRequest::STATUS_SUBMITTED);
 	slot.requests.push_back(p_child);
 	return true;
@@ -2657,6 +2677,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			s_chunk_parents[child.ptr()] = p_request.ptr();
 		}
 		s_chunked_requests[p_request.ptr()] = state;
+		if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER ||
+				p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE) {
+			p_request->set_gpu_in_flight(true);
+		}
 		p_request->set_status(DSRequest::STATUS_SUBMITTED);
 		return true;
 	}
@@ -3051,8 +3075,10 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 		for (BatchSlot &slot : queue.batch_slots) {
 			Vector<Ref<DSRequest>> remaining;
 			Vector<Ref<DSRequest>> dropped;
+			uint64_t now_usec = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
 			for (int i = 0; i < slot.requests.size(); i++) {
 				if (slot.requests[i].is_valid() && slot.requests[i]->get_cancellation_tag() == p_tag) {
+					slot.requests[i]->set_cancel_timestamp_usec(now_usec);
 					slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
 					slot.requests[i]->set_error_message("Request cancelled by tag.");
 					if (slot.submitted) {
@@ -3061,6 +3087,7 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 						// release, file close, counts). It is already terminal
 						// FAILED, so poll_batch_status() leaves it dropped and
 						// never promotes it to COMPLETED.
+						// gpu_in_flight remains true until the batch fence retires.
 						remaining.push_back(slot.requests[i]);
 					} else {
 						// Never submitted: drop from the slot so a later
@@ -3070,6 +3097,7 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 						// release the AddRef'd guard (no leak, freed RIDs stay
 						// unwritten) and detach chunk tracking. Parent
 						// reconciliation runs below via complete_chunked_requests().
+						slot.requests[i]->set_gpu_in_flight(false);
 						dropped.push_back(slot.requests[i]);
 					}
 				} else {
@@ -3078,6 +3106,24 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 			}
 			slot.requests = remaining;
 			if (!dropped.is_empty()) {
+				// HIGH-07 guard: purge transitions whose requests were dropped
+				Vector<GPUTargetTransition> remaining_transitions;
+				std::unordered_set<ID3D12Resource *> remaining_resources;
+				for (int r = 0; r < remaining.size(); r++) {
+					if (remaining[r].is_valid()) {
+						std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard_it = s_resource_guards.find(remaining[r].ptr());
+						if (guard_it != s_resource_guards.end()) {
+							remaining_resources.insert(guard_it->second);
+						}
+					}
+				}
+				for (int t = 0; t < slot.gpu_transitions.size(); t++) {
+					if (remaining_resources.count(slot.gpu_transitions[t].resource) > 0) {
+						remaining_transitions.push_back(slot.gpu_transitions[t]);
+					}
+				}
+				slot.gpu_transitions = remaining_transitions;
+
 				release_resource_guards(dropped);
 				for (int i = 0; i < dropped.size(); i++) {
 					if (dropped[i].is_valid()) {

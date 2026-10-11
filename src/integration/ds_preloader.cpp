@@ -1295,12 +1295,31 @@ void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 	r_stored++;
 }
 
-bool DSPreloader::is_terminal(const Ref<DSRequest> &p_request) {
+bool DSPreloader::is_terminal(const Ref<DSRequest> &p_request, uint64_t p_timeout_usec) {
 	if (p_request.is_null() || !p_request.is_valid()) {
 		return true;
 	}
 	DSRequest::Status status = p_request->get_status();
-	return status == DSRequest::STATUS_COMPLETED || status == DSRequest::STATUS_FAILED;
+	if (status == DSRequest::STATUS_COMPLETED) {
+		return true;
+	}
+	if (status == DSRequest::STATUS_FAILED) {
+		if (!p_request->is_gpu_in_flight()) {
+			return true;
+		}
+		// Bounded fallback timeout (default 5.0s) against steady-state GPU hangs / TDR
+		uint64_t cancel_time = p_request->get_cancel_timestamp_usec();
+		if (cancel_time > 0 && Time::get_singleton()) {
+			uint64_t now_us = Time::get_singleton()->get_ticks_usec();
+			if (now_us > cancel_time && (now_us - cancel_time) > p_timeout_usec) {
+				UtilityFunctions::push_error("[DirectStorage] Preloader: GPU cancellation retirement timed out (>5.0s, GPU hang/TDR). Force-retiring request.");
+				p_request->set_gpu_in_flight(false);
+				return true;
+			}
+		}
+		return false;
+	}
+	return false;
 }
 
 Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vector<PackedByteArray> &p_buffers) {

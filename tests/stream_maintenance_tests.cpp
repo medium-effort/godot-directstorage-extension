@@ -31,6 +31,7 @@
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
@@ -213,4 +214,85 @@ GDEX_TEST_T(preloader_budget, cache_delegates_budgets, TAG_INTEGRATION) {
     GDEX_EXPECT_EQ(cache->get_unbuilt_cpu_prewarm_count(12345), 0);
     GDEX_EXPECT_EQ(cache->get_unbuilt_gpu_prewarm_count(0), 0);
     GDEX_EXPECT_EQ(cache->get_unbuilt_gpu_prewarm_count(12345), 0);
+}
+
+GDEX_TEST_T(preloader_cancellation_retirement, request_in_flight_lifecycle, TAG_INTEGRATION) {
+    godot::Ref<godot::DSRequest> req;
+    req.instantiate();
+    GDEX_EXPECT_FALSE(req->is_gpu_in_flight());
+    GDEX_EXPECT_EQ(req->get_cancel_timestamp_usec(), static_cast<uint64_t>(0));
+
+    req->set_gpu_in_flight(true);
+    GDEX_EXPECT_TRUE(req->is_gpu_in_flight());
+
+    req->set_cancel_timestamp_usec(1234567ULL);
+    GDEX_EXPECT_EQ(req->get_cancel_timestamp_usec(), 1234567ULL);
+
+    req->set_gpu_in_flight(false);
+    GDEX_EXPECT_FALSE(req->is_gpu_in_flight());
+}
+
+GDEX_TEST_T(preloader_cancellation_retirement, preloader_is_terminal_gate_and_fallback, TAG_INTEGRATION) {
+    godot::Ref<godot::DSRequest> req;
+    req.instantiate();
+
+    // 1. Pending request is not terminal
+    req->set_status(godot::DSRequest::STATUS_PENDING);
+    GDEX_EXPECT_FALSE(godot::DSPreloader::is_terminal(req));
+
+    // 2. Completed request is always terminal
+    req->set_status(godot::DSRequest::STATUS_COMPLETED);
+    req->set_gpu_in_flight(true);
+    GDEX_EXPECT_TRUE(godot::DSPreloader::is_terminal(req));
+
+    // 3. Failed request with gpu_in_flight == true must NOT be terminal (VRAM protection gate)
+    req->set_status(godot::DSRequest::STATUS_FAILED);
+    req->set_gpu_in_flight(true);
+    req->set_cancel_timestamp_usec(0);
+    GDEX_EXPECT_FALSE(godot::DSPreloader::is_terminal(req));
+
+    // 4. Failed request with gpu_in_flight == false IS terminal (clean hardware retirement)
+    req->set_gpu_in_flight(false);
+    GDEX_EXPECT_TRUE(godot::DSPreloader::is_terminal(req));
+
+    // 5. Bounded fallback timeout: simulate a cancelled request that has hung past the timeout
+    req->set_gpu_in_flight(true);
+    godot::Time *time = godot::Time::get_singleton();
+    if (time != nullptr) {
+        uint64_t now_us = time->get_ticks_usec();
+        uint64_t past_timestamp = (now_us > 10000ULL) ? (now_us - 10000ULL) : 1ULL;
+        req->set_cancel_timestamp_usec(past_timestamp);
+
+        // Before timeout (with 5.0s timeout budget), must NOT be terminal (VRAM protected)
+        GDEX_EXPECT_FALSE(godot::DSPreloader::is_terminal(req, 5000000ULL));
+        GDEX_EXPECT_TRUE(req->is_gpu_in_flight());
+
+        // Past timeout (with 5000us timeout budget when >=10000us has elapsed), trips fallback:
+        // force clears gpu_in_flight, returns true
+        GDEX_EXPECT_TRUE(godot::DSPreloader::is_terminal(req, 5000ULL));
+        GDEX_EXPECT_FALSE(req->is_gpu_in_flight());
+    }
+}
+
+GDEX_TEST_T(preloader_cancellation_retirement, context_cancelled_stream_progress_gate, TAG_INTEGRATION) {
+    godot::DSContext *ds = require_initialized_context(ctx);
+    godot::PackedStringArray paths;
+    paths.push_back("res://dummy_tex_1.dstex");
+    paths.push_back("res://dummy_tex_2.dstex");
+    uint64_t tag = ds->prewarm_async(paths);
+    ds->set_prewarm_total(tag, 2);
+
+    GDEX_EXPECT_FALSE(ds->is_prewarm_complete(tag));
+
+    // Cancel tag
+    ds->cancel_prewarm(tag);
+
+    // Cancelled tag with completed < total must NOT report complete prematurely
+    GDEX_EXPECT_FALSE(ds->is_prewarm_complete(tag));
+
+    // Once both terminal failures are counted (retired), it completes
+    ds->count_stream_terminal_failure(tag);
+    GDEX_EXPECT_FALSE(ds->is_prewarm_complete(tag));
+    ds->count_stream_terminal_failure(tag);
+    GDEX_EXPECT_TRUE(ds->is_prewarm_complete(tag));
 }

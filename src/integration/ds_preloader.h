@@ -200,6 +200,10 @@ public:
 	// On render thread, pumps completions immediately to avoid deadlocks. On worker threads, waits on condition variable.
 	static Ref<Texture2D> await_pending_texture(const String &p_path, uint32_t p_timeout_ms = 3000);
 
+	// Check if a request has reached a terminal state (completed or retired from failure/cancellation).
+	// Bounded fallback timeout (default 5.0s) protects against GPU hangs / TDR.
+	static bool is_terminal(const Ref<DSRequest> &p_request, uint64_t p_timeout_usec = 5000000ULL);
+
 	friend struct PreloaderUnpackTest;
 
 private:
@@ -317,7 +321,6 @@ private:
 	// compressed footprints). Mirrors _load_texture_payload's split.
 	static bool expand_requests(const Payload &p_payload, uint64_t p_tag, Vector<Ref<DSRequest>> &r_out);
 
-	static bool is_terminal(const Ref<DSRequest> &p_request);
 	static Ref<Texture2D> build_texture(const Payload &p_meta, const std::vector<PackedByteArray> &p_buffers);
 
 	// GPU chunk pipeline (all render-thread-affine RD work happens in

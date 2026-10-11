@@ -55,6 +55,8 @@ private:
 	uint32_t texture_layout = 0;
 	DSPriority priority = PRIORITY_NORMAL;
 	std::atomic<Status> status{ STATUS_PENDING };
+	std::atomic<bool> gpu_in_flight{ false };
+	std::atomic<uint64_t> cancel_timestamp_usec{ 0 };
 	mutable std::mutex error_mutex;
 	String error_message;
 
@@ -114,6 +116,12 @@ public:
 
 	void set_error_message(const String &p_msg);
 	String get_error_message() const;
+
+	bool is_gpu_in_flight() const { return gpu_in_flight.load(std::memory_order_acquire); }
+	void set_gpu_in_flight(bool p_in_flight) { gpu_in_flight.store(p_in_flight, std::memory_order_release); }
+
+	uint64_t get_cancel_timestamp_usec() const { return cancel_timestamp_usec.load(std::memory_order_acquire); }
+	void set_cancel_timestamp_usec(uint64_t p_usec) { cancel_timestamp_usec.store(p_usec, std::memory_order_release); }
 };
 
 } // namespace godot

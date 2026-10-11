@@ -571,3 +571,58 @@ GDEX_TEST_T(gpu_prewarm, shutdown_while_prewarm_in_flight_drains_safely, TAG_INT
     GDEX_EXPECT_FALSE(ds->is_initialized());
 }
 
+GDEX_TEST_T(gpu_prewarm, cancellation_while_gpu_in_flight_retires_safely, TAG_INTEGRATION | TAG_SLOW) {
+    if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
+        GDEX_SKIP("DSContext/DSTextureCache classes unavailable");
+    }
+    godot::DSContext *ds = require_singleton_context(ctx);
+    if (!ds->initialize_ds() || !ds->is_initialized()) {
+        GDEX_SKIP("DSContext backend unavailable (initialize_ds failed)");
+    }
+    godot::DSTextureCache *cache = new_test_cache(ctx);
+    godot::DSPreloader::shutdown();
+
+    const char *dstex_path = "user://gdextest_gpu_cancel_drain.dstex";
+    const char *dspkg_path = "user://gdextest_gpu_cancel_drain.dspkg";
+    const char *virtual_path = "res://gdextest_gpu_cancel_drain.png";
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps) {
+        ps->set_setting("directstorage/force_archive_resolution", true);
+    }
+    ctx.add_teardown([ds, ps]() {
+        if (ps) {
+            ps->set_setting("directstorage/force_archive_resolution", false);
+        }
+        ds->shutdown_ds();
+        remove_abs("res://textures.dspkg");
+        remove_abs("user://gdextest_gpu_cancel_drain.dstex");
+        remove_abs("user://gdextest_gpu_cancel_drain.dspkg");
+        godot::DSPreloader::shutdown();
+    });
+    if (!stage_gpu_dspkg(dstex_path, dspkg_path, virtual_path, "res://gdextest_gpu_cancel_drain_ctl.png")) {
+        GDEX_ABORT_TEST("textures.dspkg staging failed");
+    }
+
+    godot::PackedStringArray paths;
+    paths.push_back(godot::String(virtual_path));
+    const uint64_t tag = cache->prewarm_gpu_async(paths, 16, true);
+    GDEX_ASSERT_TRUE(tag != 0);
+
+    // Immediately cancel the in-flight GPU prewarm
+    ds->cancel_prewarm(tag);
+
+    // Drive frames to pump completion and orphan collection
+    const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() + 10000;
+    while (godot::Time::get_singleton()->get_ticks_msec() < deadline) {
+        cache->poll_completed(tag, 16, 4000);
+        if (ds->is_prewarm_complete(tag) && godot::DSPreloader::get_unbuilt_prewarm_count(tag) == 0) {
+            break;
+        }
+        godot::OS::get_singleton()->delay_usec(2000);
+    }
+
+    // Must have settled without leaking pending entries or hanging
+    GDEX_EXPECT_TRUE(ds->is_prewarm_complete(tag));
+    GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(tag), 0);
+}
+
