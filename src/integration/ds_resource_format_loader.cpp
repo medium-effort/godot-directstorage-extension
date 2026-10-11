@@ -345,9 +345,26 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	// CPU fallback below unpads rows to natural image data via DSTex::get_mip_layout().
 	// ResourceLoader sub-thread loads stay on the CPU path because GPU texture
 	// resources are render-thread-affine.
+	bool is_physical_source = true;
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	OS *os = OS::get_singleton();
+	if (p_file_path.begins_with("res://")) {
+		if (os && !os->has_feature("editor") && ps && !static_cast<bool>(ps->get_setting("directstorage/export/bundle_dspkg", false))) {
+			is_physical_source = false;
+		} else {
+			String global_path = ps ? ps->globalize_path(p_file_path) : p_file_path;
+			is_physical_source = FileAccess::file_exists(global_path);
+		}
+	} else if (p_file_path.begins_with("user://")) {
+		String global_path = ps ? ps->globalize_path(p_file_path) : p_file_path;
+		is_physical_source = FileAccess::file_exists(global_path);
+	}
+
 	bool can_attempt_gpu = false;
 	if (p_as_image_texture) {
 		UtilityFunctions::print_verbose("DSResourceFormatLoader: Texture requested as ImageTexture for '" + p_cache_key + "'; bypassing GPU direct upload.");
+	} else if (!is_physical_source) {
+		UtilityFunctions::print_verbose("DSResourceFormatLoader: Source file is embedded in PCK archive for '" + p_cache_key + "'; bypassing DirectStorage GPU upload.");
 	} else if (gpu_active && p_is_v2 && !p_use_sub_threads) {
 		if (!rs || !rs->is_on_render_thread()) {
 			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression unavailable off render thread for '" + p_cache_key + "' (thread affinity fallback); using CPU memory decompression.");
@@ -474,7 +491,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		PackedByteArray natural_texture_data;
 		if (p_is_v2 && p_mip_offsets.size() >= static_cast<int64_t>(mip_count) && p_mip_sizes.size() >= static_cast<int64_t>(mip_count)) {
 			// Decompress each mip independently and unpad from 256-byte pitch footprint to natural image data
-			bool ds_usable = ds_ctx && ds_ctx->is_initialized();
+			bool ds_usable = is_physical_source && ds_ctx && ds_ctx->is_initialized();
 			if (p_use_sub_threads && ds_usable) {
 				if (!ds_ctx->is_batch_complete() || ds_ctx->has_stream_pending()) {
 					ds_usable = false;
@@ -588,7 +605,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		} else {
 			// Legacy v1 path (single continuous stream, not footprint padded)
 			PackedByteArray decompressed_data;
-			bool ds_usable = ds_ctx && ds_ctx->is_initialized();
+			bool ds_usable = is_physical_source && ds_ctx && ds_ctx->is_initialized();
 			if (p_use_sub_threads && ds_usable) {
 				if (!ds_ctx->is_batch_complete() || ds_ctx->has_stream_pending()) {
 					ds_usable = false;

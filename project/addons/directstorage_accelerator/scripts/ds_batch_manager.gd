@@ -114,7 +114,9 @@ func _ready() -> void:
 			print("[DirectStorage] Autoload initialized. Active Backend: ", ctx.get_active_backend_name())
 	else:
 		push_error("[DirectStorage] GDExtension ClassDB entry 'DSContext' not found. Ensure GDExtension library is built and deployed.")
-		if not OS.is_debug_build() and not OS.has_feature("editor"):
+		if not OS.has_feature("editor"):
+			if get_tree() and get_tree().root:
+				get_tree().root.hide()
 			OS.alert(
 				"A required game component is missing:\n" +
 				"'directstorage_accelerator' library was not found.\n\n" +
@@ -158,10 +160,14 @@ func _ready() -> void:
 			print("[DirectStorage] Archive '", archive_name, "' not found. Searched candidates: ", candidate_list, ".")
 			var err_msg := "Missing required game asset archive: '" + archive_name + "'.\n\nPlease verify game file integrity or reinstall the game."
 			push_error("[DirectStorage] FATAL: " + err_msg)
-			if not OS.is_debug_build():
+			if not OS.has_feature("editor"):
+				if get_tree() and get_tree().root:
+					get_tree().root.hide()
 				OS.alert(err_msg, "Missing Game Files")
 				get_tree().quit(1)
 				return
+	elif not OS.has_feature("editor"):
+		print("[DirectStorage] Textures are packaged in PCK (bundle_dspkg disabled); operating in CPU decompression mode.")
 
 
 ## Drives the async stream queue once per frame. Stream-only: never touches

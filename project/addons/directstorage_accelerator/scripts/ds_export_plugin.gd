@@ -127,7 +127,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	ProjectSettings.set_setting("directstorage/archive_name", _archive_name)
 
 	if not _bundle_dspkg_enabled:
-		print("[DirectStorage Exporter] Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK.")
+		print("[DirectStorage Exporter] Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK and loaded via CPU decompression at runtime.")
 		return
 
 	print("[DirectStorage Exporter] Standalone DSPkg bundling is ENABLED. Target archive: ", _archive_name, " (pairing fingerprint: ", String.num_uint64(_current_fingerprint, 16), ")")
