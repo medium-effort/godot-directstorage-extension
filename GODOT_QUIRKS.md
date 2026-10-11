@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 8 October 2026
+Last updated: 11 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1140,3 +1140,17 @@ In `DSBatchManager._process()`, delegating ingestion to `WorkerThreadPool` whene
 
 ### The Rule
 Always drain completed GPU textures directly on the main thread in `DSBatchManager._process()` without gating on worker task idle state. Only spawn `WorkerThreadPool` ingestion tasks when unbuilt CPU textures actually exist (`get_unbuilt_cpu_prewarm_count() > 0`), and prioritize completed GPU entries first in `poll_completed()`. Handled in `ds_batch_manager.gd:166-204`, `ds_preloader.cpp:1640`, and `ds_texture_cache.cpp:212`.
+
+## 49. Internal ProjectSettings & 64-Bit Integers Cause Inspector Warnings
+
+### The Engine Reality
+Godot 4's Inspector UI for integer properties (`EditorPropertyInteger` in `editor/inspector/editor_properties.cpp`) uses `EditorSpinSlider`, which stores and edits numerical values internally using IEEE-754 64-bit `double` floats. The maximum integer that can be represented with exact precision in a 64-bit float is `2^53 - 1` (`9,007,199,254,740,991`). When an integer setting exceeds this range, Godot warns about float truncation. Furthermore, calling `ProjectSettings.set_setting()` registers properties as user-visible in the Project Settings dialog by default.
+
+### The Trap / Symptom
+```
+WARNING: editor/inspector/editor_properties.cpp:1611 - Cannot reliably represent '282234329283682123' in the inspector, value is too large.
+```
+When an addon or export plugin injects 64-bit hashes, bitmasks, or handoff flags (such as `(guid << 32) | manifest` archive pairing fingerprints or `bundle_dspkg` export booleans) into `ProjectSettings`, opening **Project -> Project Settings...** emits this warning spam. In addition, internal exporter state pollutes the settings tree and confuses developers about whether settings should be configured in Project Settings or in Export Presets.
+
+### The Rule
+Always call `ProjectSettings.set_as_internal(name, true)` for runtime handoff keys, export artifacts, and 64-bit integer values; Godot's Inspector represents integers with `double` floats and warns when values exceed 2^53 - 1 (`9,007,199,254,740,991`). Handled in `ds_export_plugin.gd:126-130` and `ds_plugin.gd:32-38`.

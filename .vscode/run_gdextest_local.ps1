@@ -299,6 +299,7 @@ if ((-not $?) -or ($null -eq $ReportCode)) { $ReportCode = 1 }
 # Concise totals line: the gtest-style console report buries pass/fail/skip
 # in per-test lines, so print one summary from the merged JSON (JSON was
 # written back to $ReportJson, not stdout).
+$doc = $null
 try {
     $doc = Get-Content -LiteralPath $ReportJson -Raw | ConvertFrom-Json
     $t = $doc.totals
@@ -312,8 +313,33 @@ try {
 }
 if ($ReportCode -ne 0) {
     if (-not $Verbose -and $reportOut) {
-        Write-Host "--- Test Failure Details ---" -ForegroundColor Red
+        Write-Host "--- Full Test Report ---" -ForegroundColor DarkGray
         $reportOut | ForEach-Object { Write-Host $_ }
+    }
+    if ($doc -and $doc.results) {
+        $failedResults = @($doc.results | Where-Object { $_.status -in @("fail", "crashed") })
+        if ($failedResults.Count -gt 0) {
+            Write-Host ""
+            Write-Host "================================================================================" -ForegroundColor Red
+            Write-Host " Failed Test Details ($($failedResults.Count))" -ForegroundColor White -BackgroundColor DarkRed
+            Write-Host "================================================================================" -ForegroundColor Red
+            foreach ($res in $failedResults) {
+                Write-Host " [FAIL] $($res.suite).$($res.name)" -ForegroundColor Red
+                if ($res.failures -and $res.failures.Count -gt 0) {
+                    foreach ($f in $res.failures) {
+                        $loc = if ($f.file) { "$($f.file):$($f.line): " } else { "" }
+                        $lines = if ($f.message) { @($f.message -split "`r?`n") } else { @("failed without a recorded message") }
+                        Write-Host "     $loc$($lines[0])" -ForegroundColor Red
+                        for ($i = 1; $i -lt $lines.Count; $i++) {
+                            Write-Host "       $($lines[$i])" -ForegroundColor Yellow
+                        }
+                    }
+                } else {
+                    Write-Host "     failed or crashed without a recorded assertion failure" -ForegroundColor Red
+                }
+            }
+            Write-Host "================================================================================" -ForegroundColor Red
+        }
     }
     Show-StepFailure -Step "Step [5/5] Report" -Message "Tests failed or report could not be generated (see console report above)." -Code $ReportCode
 }

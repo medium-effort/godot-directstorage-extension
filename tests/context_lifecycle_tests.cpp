@@ -402,6 +402,6 @@ GDEX_TEST_T(context_lifecycle, shutdown_drain_rejects_subsequent_enqueue,
     GDEX_EXPECT_EQ(status, REQUEST_STATUS_FAILED);
 
     // Re-initialize DSContext cleanly so subsequent tests have a valid state
-    ds->call(godot::StringName("initialize"));
+    ds->call(godot::StringName("initialize_ds"));
 }
 

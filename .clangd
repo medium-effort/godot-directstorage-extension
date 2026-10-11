@@ -1,0 +1,36 @@
+# clangd configuration for godot-directstorage-extension
+
+# Treat thirdparty and godot-cpp include paths as system headers to suppress
+# warnings originating inside external headers when included by src/ files.
+CompileFlags:
+  Add:
+    - -isystem
+    - godot-cpp/include
+    - -isystem
+    - godot-cpp/gen/include
+    - -isystem
+    - thirdparty/directstorage/include
+    - -isystem
+    - thirdparty/gdeflate
+    - -isystem
+    - thirdparty/libdeflate
+
+---
+# Suppress all diagnostics and warnings for files inside godot-cpp/
+If:
+  PathMatch: .*/godot-cpp/.*
+Diagnostics:
+  Suppress: "*"
+CompileFlags:
+  Add:
+    - -w
+
+---
+# Suppress all diagnostics and warnings for files inside thirdparty/
+If:
+  PathMatch: .*/thirdparty/.*
+Diagnostics:
+  Suppress: "*"
+CompileFlags:
+  Add:
+    - -w

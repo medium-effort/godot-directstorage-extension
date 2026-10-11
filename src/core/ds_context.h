@@ -36,6 +36,7 @@ private:
 	static bool supported_probe_result;
 	bool initialized = false;
 	InitStatus init_status = INIT_STATUS_UNINITIALIZED;
+	bool shut_down = false;
 
 	uint32_t staging_buffer_size_mb = 128;
 	bool disable_gpu_decompression = false;

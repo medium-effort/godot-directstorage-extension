@@ -547,6 +547,7 @@ bool DSContext::initialize_ds() {
 	if (initialized) {
 		return true;
 	}
+	shut_down = false;
 
 	// Load settings from ProjectSettings or set defaults
 	ProjectSettings *ps = ProjectSettings::get_singleton();
@@ -595,6 +596,7 @@ bool DSContext::initialize_ds() {
 }
 
 void DSContext::shutdown_ds() {
+	shut_down = true;
 	init_status = INIT_STATUS_UNINITIALIZED;
 	if (!initialized) {
 		return;
@@ -644,6 +646,11 @@ bool DSContext::enqueue_request(Ref<DSRequest> p_request, bool p_from_stream) {
 		if (p_request.is_null()) {
 			return false;
 		}
+		if (shut_down) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("DirectStorage Context is shut down.");
+			return false;
+		}
 		uint64_t tag = p_request->get_cancellation_tag();
 		std::lock_guard<std::mutex> lock(stream_mutex);
 		StreamTagInfo &info = stream_tags[tag]; // auto-create ad-hoc tags
@@ -680,6 +687,12 @@ bool DSContext::enqueue_stream_request_internal(Ref<DSRequest> p_request) {
 // (including report_order) is identical for both paths.
 bool DSContext::enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maintenance) {
 	if (p_request.is_null()) {
+		return false;
+	}
+
+	if (shut_down) {
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message("DirectStorage Context is shut down.");
 		return false;
 	}
 

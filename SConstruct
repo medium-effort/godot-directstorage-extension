@@ -29,7 +29,7 @@ def _prevent_build_flag_set():
 
 
 if _prevent_build_flag_set():
-    _sync_only = {"sync", "sync-all", "sync-addon", "sync-test", "sync-copyable", "sync-tps"}
+    _sync_only = {"sync", "sync-all", "sync-addon", "sync-test", "sync-copyable", "sync-tps", "compiledb"}
     _cmd_targets = set(SCons.Script.COMMAND_LINE_TARGETS)
     _non_build = (
         SCons.Script.GetOption("no_exec")
