@@ -23,6 +23,7 @@ public:
 	virtual bool is_batch_complete() const = 0;
 	virtual void collect_completed_results() = 0;
 	virtual void cancel_requests_with_tag(uint64_t p_tag) = 0;
+	virtual bool is_resource_in_flight(const RID &p_rid) const { return false; }
 };
 
 } // namespace godot

@@ -570,7 +570,9 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 			return fail(ERR_FILE_CORRUPT, "Entry fixed fields offset overflow.");
 		}
 
-		if (entry.width == 0 || entry.height == 0 || entry.mip_count == 0) {
+		if (entry.width == 0 || entry.height == 0 || entry.mip_count == 0 ||
+				entry.mip_count > DSTEX_MAX_MIP_COUNT ||
+				!dstex_sizes_are_sane(entry.width, entry.height, entry.original_size, entry.compressed_size)) {
 			return fail(ERR_FILE_CORRUPT, "Invalid entry dimensions or mip count.");
 		}
 

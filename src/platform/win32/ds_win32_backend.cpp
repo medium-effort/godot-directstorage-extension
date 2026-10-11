@@ -98,6 +98,24 @@ static struct DSPkgCache {
 	Ref<DSPkg> package;
 } *s_dspkg_cache = nullptr;
 
+bool Win32Backend::validate_dstex_chunk_range(uint64_t p_source_offset, uint64_t p_source_size, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t &r_resolved_offset) {
+	if (p_source_size == 0 || p_payload_size > UINT64_MAX - p_payload_offset) {
+		return false;
+	}
+	bool relative_range = (p_source_offset <= p_payload_size) && (p_source_size <= p_payload_size - p_source_offset);
+	bool absolute_range = (p_source_offset >= p_payload_offset) &&
+			(p_payload_size >= p_source_size) &&
+			((p_source_offset - p_payload_offset) <= (p_payload_size - p_source_size));
+	if (!relative_range && absolute_range) {
+		r_resolved_offset = p_source_offset - p_payload_offset;
+		return true;
+	} else if (relative_range) {
+		r_resolved_offset = p_source_offset;
+		return true;
+	}
+	return false;
+}
+
 static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t p_capacity, Vector<DSChunkBoundary> &r_chunks) {
 	if (p_path.get_extension().to_lower() != "dstex") {
 		return false;
@@ -132,15 +150,16 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 		uint64_t source_offset = mip_entry.offset;
 		uint64_t source_size = mip_entry.compressed_size;
 		uint64_t destination_size = mip_entry.uncompressed_size;
-		bool relative_range = source_offset + source_size <= p_payload_size;
-		bool absolute_range = source_offset >= p_payload_offset && source_offset + source_size <= p_payload_offset + p_payload_size;
-		if (!relative_range && absolute_range) {
-			source_offset -= p_payload_offset;
-		}
-		if (source_size == 0 || destination_size == 0 || source_offset + source_size > p_payload_size || destination_size > p_capacity) {
+		if (source_size == 0 || destination_size == 0 || destination_size > p_capacity) {
 			r_chunks.clear();
 			return false;
 		}
+		uint64_t resolved_offset = 0;
+		if (!Win32Backend::validate_dstex_chunk_range(source_offset, source_size, p_payload_offset, p_payload_size, resolved_offset)) {
+			r_chunks.clear();
+			return false;
+		}
+		source_offset = resolved_offset;
 
 		DSChunkBoundary boundary;
 		boundary.source_offset = source_offset;
@@ -270,7 +289,7 @@ static std::unordered_map<DSRequest *, DSRequest *> s_chunk_parents;
 static std::unordered_map<DSRequest *, ID3D12Resource *> s_resource_guards;
 static std::unordered_set<std::string> s_staging_buffer_warnings;
 
-static String retrieve_queue_error(IDStorageQueue1 *p_queue) {
+static String retrieve_queue_error(IDStorageQueue1 *p_queue, String *r_failed_request_name = nullptr) {
 	if (!p_queue) {
 		return String();
 	}
@@ -295,7 +314,11 @@ static String retrieve_queue_error(IDStorageQueue1 *p_queue) {
 			hresult_desc;
 
 	if (failure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST) {
-		message += " [File: " + String(failure.Request.Filename) + ", RequestName: " + String(failure.Request.RequestName) + "]";
+		String req_name_str = String(failure.Request.RequestName);
+		message += " [File: " + String(failure.Request.Filename) + ", RequestName: " + req_name_str + "]";
+		if (r_failed_request_name) {
+			*r_failed_request_name = req_name_str;
+		}
 	}
 
 #ifdef _WIN32
@@ -857,32 +880,188 @@ void Win32Backend::poll_batch_status() {
 }
 
 #ifdef _WIN32
-void Win32Backend::poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value) {
+void Win32Backend::attribute_batch_error_records(Vector<Ref<DSRequest>> &p_requests, const std::unordered_map<std::string, Ref<DSRequest>> &p_name_map, const String &p_failed_request_name, const String &p_queue_error) {
+	Ref<DSRequest> failed_root_req;
+	if (!p_failed_request_name.is_empty()) {
+		std::string key = p_failed_request_name.utf8().get_data();
+		auto it = p_name_map.find(key);
+		if (it != p_name_map.end()) {
+			failed_root_req = it->second;
+		}
+	}
+
+	for (int i = 0; i < p_requests.size(); i++) {
+		Ref<DSRequest> req = p_requests[i];
+		if (req.is_valid()) {
+			// If request already failed due to resource guard validation (or prior specific failure),
+			// preserve its specific guard error message unless it was the root hardware failure.
+			if (req->get_status() == DSRequest::STATUS_FAILED && !req->get_error_message().is_empty() && req != failed_root_req) {
+				continue;
+			}
+			req->set_status(DSRequest::STATUS_FAILED);
+			if (failed_root_req.is_valid() && req == failed_root_req) {
+				req->set_error_message(p_queue_error);
+			} else if (!p_failed_request_name.is_empty()) {
+				req->set_error_message("DirectStorage batch aborted due to failure in request [" + p_failed_request_name + "]: " + p_queue_error);
+			} else {
+				req->set_error_message(p_queue_error);
+			}
+		}
+	}
+}
+
+Ref<DSRequest> Win32Backend::get_chunked_child_request(DSRequest *p_parent, int p_index) {
+#ifdef _WIN32
+	if (!p_parent) {
+		return Ref<DSRequest>();
+	}
+	auto it = s_chunked_requests.find(p_parent);
+	if (it != s_chunked_requests.end()) {
+		if (p_index >= 0 && p_index < it->second.children.size()) {
+			return it->second.children[p_index];
+		}
+	}
+	return Ref<DSRequest>();
+#else
+	return Ref<DSRequest>();
+#endif
+}
+
+void Win32Backend::rollback_staged_requests(Vector<Ref<DSRequest>> &p_slot_requests,
+		std::vector<std::string> &p_slot_request_names,
+		std::unordered_map<std::string, Ref<DSRequest>> &p_slot_request_name_map,
+		const std::vector<Ref<DSRequest>> &p_staged_children,
+		size_t p_failed_index,
+		Ref<DSRequest> p_parent
+#ifdef _WIN32
+		, std::vector<DSTORAGE_REQUEST> *p_dstorage_requests
+#endif
+) {
+#ifdef _WIN32
+	if (p_parent.is_valid()) {
+		p_parent->set_status(DSRequest::STATUS_FAILED);
+		if (p_failed_index < p_staged_children.size() && p_staged_children[p_failed_index].is_valid() &&
+				!p_staged_children[p_failed_index]->get_error_message().is_empty()) {
+			p_parent->set_error_message(p_staged_children[p_failed_index]->get_error_message());
+		} else {
+			p_parent->set_error_message("DirectStorage batch staging failed.");
+		}
+	}
+
+	for (size_t r = p_failed_index; r > 0; --r) {
+		size_t idx = r - 1;
+		if (idx < p_staged_children.size() && p_staged_children[idx].is_valid()) {
+			Ref<DSRequest> child = p_staged_children[idx];
+			child->set_status(DSRequest::STATUS_FAILED);
+			child->set_gpu_in_flight(false);
+			s_chunk_parents.erase(child.ptr());
+			if (!p_slot_requests.is_empty() && p_slot_requests[p_slot_requests.size() - 1] == child) {
+				p_slot_requests.remove_at(p_slot_requests.size() - 1);
+			}
+			if (!p_slot_request_names.empty()) {
+				std::string req_name = p_slot_request_names.back();
+				p_slot_request_names.pop_back();
+				p_slot_request_name_map.erase(req_name);
+			}
+			if (p_dstorage_requests && !p_dstorage_requests->empty()) {
+				p_dstorage_requests->pop_back();
+			}
+			std::unordered_map<DSRequest *, ID3D12Resource *>::iterator g_it = s_resource_guards.find(child.ptr());
+			if (g_it != s_resource_guards.end()) {
+				if (g_it->second) {
+					g_it->second->Release();
+				}
+				s_resource_guards.erase(g_it);
+			}
+		}
+	}
+#endif
+}
+
+bool Win32Backend::build_single_mip_child_request(Ref<DSRequest> p_parent, const DSTexMipEntryV2 &p_mip_entry, Ref<DSRequest> &r_child) {
+#ifdef _WIN32
+	if (p_parent.is_null()) {
+		return false;
+	}
+	r_child.instantiate();
+	r_child->set_file_path(p_parent->get_file_path());
+	r_child->set_offset(p_mip_entry.offset);
+	r_child->set_size(p_mip_entry.compressed_size);
+	r_child->set_uncompressed_size(p_mip_entry.uncompressed_size);
+	r_child->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+	r_child->set_destination_type(p_parent->get_destination_type());
+	r_child->set_priority(p_parent->get_priority());
+	r_child->set_cancellation_tag(p_parent->get_cancellation_tag());
+	r_child->set_destination_resource(p_parent->get_destination_resource());
+	r_child->set_first_subresource(p_parent->get_first_subresource());
+	r_child->set_subresource_count(1);
+	r_child->set_texture_format(p_parent->get_texture_format());
+	r_child->set_texture_layout(p_parent->get_texture_layout());
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool Win32Backend::stage_single_mip_request(Ref<DSRequest> p_parent, Ref<DSRequest> &r_child) {
+#ifdef _WIN32
+	if (p_parent.is_null()) {
+		return false;
+	}
+	Vector<DSTexMipEntryV2> texture_mip_entries;
+	if (!get_texture_mip_entries(p_parent->get_file_path(), p_parent->get_offset(), texture_mip_entries)) {
+		return false;
+	}
+	uint32_t first_subresource = p_parent->get_first_subresource();
+	if (first_subresource >= static_cast<uint32_t>(texture_mip_entries.size())) {
+		return false;
+	}
+	const DSTexMipEntryV2 &mip_entry = texture_mip_entries[first_subresource];
+	return build_single_mip_child_request(p_parent, mip_entry, r_child);
+#else
+	return false;
+#endif
+}
+
+void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uint64_t p_fence_value) {
 	if (!p_queue.completion_fence || p_fence_value == 0 ||
 			p_queue.completion_fence->GetCompletedValue() < p_fence_value) {
 		return;
 	}
 
 	p_queue.completed_fence_value = p_queue.completion_fence->GetCompletedValue();
-	String queue_error = retrieve_queue_error(p_queue.queue);
+	String failed_request_name;
+	String queue_error = retrieve_queue_error(p_queue.queue, &failed_request_name);
 
 	std::unordered_map<int64_t, ID3D12Resource *> rid_cache;
-	for (int i = 0; i < p_requests.size(); i++) {
-		if (p_requests[i].is_valid()) {
+	for (int i = 0; i < p_slot.requests.size(); i++) {
+		Ref<DSRequest> req = p_slot.requests[i];
+		if (req.is_valid()) {
 			String resource_error;
-			if (!validate_resource_guard(p_requests[i], resource_error, &rid_cache)) {
+			if (!validate_resource_guard(req, resource_error, &rid_cache)) {
 				UtilityFunctions::push_warning(resource_error);
-				p_requests[i]->set_status(DSRequest::STATUS_FAILED);
-				p_requests[i]->set_error_message(resource_error);
-			} else if (!queue_error.is_empty()) {
-				p_requests[i]->set_status(DSRequest::STATUS_FAILED);
-				p_requests[i]->set_error_message(queue_error);
-			} else if (p_requests[i]->get_status() != DSRequest::STATUS_FAILED) {
-				p_requests[i]->set_status(DSRequest::STATUS_COMPLETED);
+				req->set_status(DSRequest::STATUS_FAILED);
+				req->set_error_message(resource_error);
+			} else if (queue_error.is_empty() && req->get_status() != DSRequest::STATUS_FAILED) {
+				req->set_status(DSRequest::STATUS_COMPLETED);
 			}
 		}
 	}
+	if (!queue_error.is_empty()) {
+		attribute_batch_error_records(p_slot.requests, p_slot.request_name_map, failed_request_name, queue_error);
+	}
+	for (int i = 0; i < p_slot.requests.size(); i++) {
+		if (p_slot.requests[i].is_valid()) {
+			p_slot.requests[i]->set_gpu_in_flight(false);
+		}
+	}
 	complete_chunked_requests();
+}
+
+void Win32Backend::poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value) {
+	BatchSlot dummy_slot;
+	dummy_slot.requests = p_requests;
+	poll_batch_status(p_queue, dummy_slot, p_fence_value);
 }
 #endif
 
@@ -903,7 +1082,7 @@ void Win32Backend::update_profiler_queue_depth_locked() {
 }
 
 void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &) {
-	poll_batch_status(p_queue, p_slot.requests, p_slot.fence_value);
+	poll_batch_status(p_queue, p_slot, p_slot.fence_value);
 	p_slot.completed_count = count_completed_requests(p_slot.requests);
 	p_slot.error_code = 0;
 	p_slot.error_message = String();
@@ -944,6 +1123,7 @@ void Win32Backend::close_slot_files(BatchSlot &p_slot) {
 	p_slot.files.clear();
 	p_slot.file_cache.clear();
 	p_slot.gpu_transitions.clear();
+	p_slot.dstorage_requests.clear();
 }
 
 // Releases every backend-level cached file handle. Caller must hold
@@ -1917,7 +2097,11 @@ bool Win32Backend::initialize(const String &p_path) {
 #else
 		factory->SetDebugFlags(DSTORAGE_DEBUG_NONE);
 #endif
-		factory->SetStagingBufferSize(staging_mb * 1024 * 1024);
+		uint64_t staging_bytes = static_cast<uint64_t>(staging_mb) * 1024ULL * 1024ULL;
+		if (staging_bytes > UINT32_MAX) {
+			staging_bytes = UINT32_MAX;
+		}
+		factory->SetStagingBufferSize(static_cast<UINT32>(staging_bytes));
 
 		DSTORAGE_QUEUE_DESC queueDesc = {};
 		queueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
@@ -2286,6 +2470,83 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 	}
 
+	uint32_t src_size = p_request->get_size();
+	uint32_t uncompressed_size = p_request->get_uncompressed_size();
+	if (p_request->get_compression_format() == DSRequest::COMPRESSION_NONE && uncompressed_size == 0) {
+		uncompressed_size = src_size;
+	}
+	if (src_size == 0 || uncompressed_size == 0) {
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message("Win32Backend: Invalid size parameters (src_size=" + String::num_uint64(src_size) + ", uncompressed_size=" + String::num_uint64(uncompressed_size) + ").");
+		return false;
+	}
+
+	Vector<DSTexMipEntryV2> texture_mip_entries;
+	bool gpu_texture_gdeflate = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE &&
+			p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE;
+	bool has_texture_mip_entries = gpu_texture_gdeflate && get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries);
+	uint64_t texture_footprint = 0;
+	uint32_t texture_first_subresource = p_request->get_first_subresource();
+	uint32_t texture_subresource_count = p_request->get_subresource_count();
+	if (has_texture_mip_entries) {
+		if (texture_first_subresource >= static_cast<uint32_t>(texture_mip_entries.size()) ||
+				texture_subresource_count == 0 ||
+				texture_subresource_count > static_cast<uint32_t>(texture_mip_entries.size()) - texture_first_subresource) {
+			has_texture_mip_entries = false;
+		} else {
+			for (uint32_t mip_index = 0; mip_index < texture_subresource_count; mip_index++) {
+				const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource + mip_index];
+				if (mip_entry.compressed_size == 0 || mip_entry.uncompressed_size == 0 ||
+						texture_footprint > UINT64_MAX - mip_entry.uncompressed_size) {
+					has_texture_mip_entries = false;
+					break;
+				}
+				texture_footprint += mip_entry.uncompressed_size;
+			}
+		}
+	}
+
+	if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE && !has_texture_mip_entries) {
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message("Win32Backend: GPU texture destinations require v2 footprint-padded formats.");
+		return false;
+	}
+
+	String req_raw_path = p_request->get_file_path();
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (ps && (req_raw_path.begins_with("res://") || req_raw_path.begins_with("user://"))) {
+		req_raw_path = ps->globalize_path(req_raw_path);
+	}
+	String norm_file_path = req_raw_path.replace("/", "\\");
+	std::wstring wpath(reinterpret_cast<const wchar_t *>(norm_file_path.utf16().get_data()));
+
+	IDStorageFile *pre_opened_file = nullptr;
+	{
+		std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
+		std::unordered_map<std::wstring, IDStorageFile *>::const_iterator persistent_handle = persistent_file_cache.find(wpath);
+		if (persistent_handle != persistent_file_cache.end()) {
+			pre_opened_file = persistent_handle->second;
+		}
+	}
+	if (!pre_opened_file && factory) {
+		HRESULT hr = factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&pre_opened_file));
+		if (FAILED(hr) || !pre_opened_file) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("Win32Backend: Failed to open file '" + p_request->get_file_path() + "'.");
+			return false;
+		}
+		std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
+		std::unordered_map<std::wstring, IDStorageFile *>::const_iterator persistent_handle = persistent_file_cache.find(wpath);
+		if (persistent_handle != persistent_file_cache.end()) {
+			pre_opened_file->Close();
+			pre_opened_file->Release();
+			pre_opened_file = persistent_handle->second;
+		} else {
+			persistent_file_cache[wpath] = pre_opened_file;
+			persistent_files.push_back(pre_opened_file);
+		}
+	}
+
 	std::lock_guard<std::mutex> lock(batch_mutex);
 	if (sync_batch_in_flight.load()) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
@@ -2297,6 +2558,9 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	if (!slot_ptr->submitted && !slot_ptr->closing && slot_ptr->completion_ready) {
 		close_slot_files(*slot_ptr);
 		slot_ptr->requests.clear();
+		slot_ptr->request_names.clear();
+		slot_ptr->request_name_map.clear();
+		slot_ptr->dstorage_requests.clear();
 		slot_ptr->fence_value = 0;
 		slot_ptr->completed_count = 0;
 		slot_ptr->error_code = 0;
@@ -2308,6 +2572,9 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		if (!alt_slot.submitted && !alt_slot.closing && alt_slot.completion_ready) {
 			close_slot_files(alt_slot);
 			alt_slot.requests.clear();
+			alt_slot.request_names.clear();
+			alt_slot.request_name_map.clear();
+			alt_slot.dstorage_requests.clear();
 			alt_slot.fence_value = 0;
 			alt_slot.completed_count = 0;
 			alt_slot.error_code = 0;
@@ -2378,51 +2645,18 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	};
 
 	auto enqueue_one = [&](const Ref<DSRequest> &p_child, uint64_t p_destination_offset) -> bool {
-		String path = p_child->get_file_path();
-		ProjectSettings *ps = ProjectSettings::get_singleton();
-		if (ps && (path.begins_with("res://") || path.begins_with("user://"))) {
-			path = ps->globalize_path(path);
-		}
-		String norm_file_path = path.replace("/", "\\");
-		std::wstring wpath(reinterpret_cast<const wchar_t *>(norm_file_path.utf16().get_data()));
-
-		IDStorageFile *file = nullptr;
-		// Backend-level cache first: survives batch-slot recycling, so the
-		// shared archive pays OpenFile once per process instead of once per
-		// slot. Persistent handles are owned by persistent_files and must
-		// never be pushed into slot.files (close_slot_files would close a
-		// handle this map still serves). batch_mutex is held by the caller.
-		std::unordered_map<std::wstring, IDStorageFile *>::const_iterator persistent_handle = persistent_file_cache.find(wpath);
-		if (persistent_handle != persistent_file_cache.end()) {
-			file = persistent_handle->second;
-		} else {
-			std::unordered_map<std::wstring, IDStorageFile *>::const_iterator cached_handle = slot.file_cache.find(wpath);
-			if (cached_handle != slot.file_cache.end()) {
-				file = cached_handle->second;
-			} else {
-				HRESULT hr = factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&file));
-				if (FAILED(hr) || !file) {
-					p_child->set_status(DSRequest::STATUS_FAILED);
-					p_child->set_error_message("Win32Backend: Failed to open file '" + path + "'.");
-					return false;
-				}
-				// New opens join the persistent cache (slot files stay for
-				// legacy slot-owned handles only).
-				if (!cache_file_handle(wpath, file)) {
-					// Duplicate race: another path cached it first — use the
-					// winner and release ours.
-					file->Close();
-					file->Release();
-					persistent_handle = persistent_file_cache.find(wpath);
-					if (persistent_handle != persistent_file_cache.end()) {
-						file = persistent_handle->second;
-					} else {
-						p_child->set_status(DSRequest::STATUS_FAILED);
-						p_child->set_error_message("Win32Backend: Failed to cache file '" + path + "'.");
-						return false;
-					}
-				}
+		IDStorageFile *file = pre_opened_file;
+		if (!file) {
+			std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
+			std::unordered_map<std::wstring, IDStorageFile *>::const_iterator persistent_handle = persistent_file_cache.find(wpath);
+			if (persistent_handle != persistent_file_cache.end()) {
+				file = persistent_handle->second;
 			}
+		}
+		if (!file) {
+			p_child->set_status(DSRequest::STATUS_FAILED);
+			p_child->set_error_message("Win32Backend: Failed to resolve file handle for '" + p_child->get_file_path() + "'.");
+			return false;
 		}
 
 	uint32_t src_size = p_child->get_size();
@@ -2586,6 +2820,13 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	request.UncompressedSize = uncompressed_size;
 	request.CancellationTag = p_child->get_cancellation_tag();
 
+	static std::atomic<uint64_t> s_global_req_counter{ 0 };
+	uint64_t req_counter = ++s_global_req_counter;
+	std::string req_name = "REQ_" + std::to_string(req_counter) + "_" + std::to_string(reinterpret_cast<uintptr_t>(p_child.ptr()));
+	slot.request_names.push_back(req_name);
+	request.Name = slot.request_names.back().c_str();
+	slot.request_name_map[req_name] = p_child;
+
 	ID3D12Resource *resource_guard = gpu_buffer_destination ? destination_buffer : destination_texture;
 	if (resource_guard) {
 		resource_guard->AddRef();
@@ -2604,56 +2845,15 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		p_child->set_status(DSRequest::STATUS_SUBMITTED);
 	}
 	slot.requests.push_back(p_child);
-	queue.queue->EnqueueRequest(&request);
+	slot.dstorage_requests.push_back(request);
 	// slot.files push happens once at open time in the cache-miss branch
 	// above; cache hits reuse the already-tracked handle.
 	return true;
 	};
 
-	uint32_t src_size = p_request->get_size();
-	uint32_t uncompressed_size = p_request->get_uncompressed_size();
-	if (p_request->get_compression_format() == DSRequest::COMPRESSION_NONE && uncompressed_size == 0) {
-		uncompressed_size = src_size;
-	}
-	if (src_size == 0 || uncompressed_size == 0) {
-		p_request->set_status(DSRequest::STATUS_FAILED);
-		p_request->set_error_message("Win32Backend: Invalid size parameters (src_size=" + String::num_uint64(src_size) + ", uncompressed_size=" + String::num_uint64(uncompressed_size) + ").");
-		return false;
-	}
-
 	DSContext *ctx = DSContext::get_singleton();
 	uint64_t staging_size = ctx ? static_cast<uint64_t>(ctx->get_staging_buffer_size_mb()) * 1024ULL * 1024ULL : 0;
 	uint64_t request_size = MAX(static_cast<uint64_t>(src_size), static_cast<uint64_t>(uncompressed_size));
-	Vector<DSTexMipEntryV2> texture_mip_entries;
-	bool gpu_texture_gdeflate = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE &&
-			p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE;
-	bool has_texture_mip_entries = gpu_texture_gdeflate && get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries);
-	uint64_t texture_footprint = 0;
-	uint32_t texture_first_subresource = p_request->get_first_subresource();
-	uint32_t texture_subresource_count = p_request->get_subresource_count();
-	if (has_texture_mip_entries) {
-		if (texture_first_subresource >= static_cast<uint32_t>(texture_mip_entries.size()) ||
-				texture_subresource_count == 0 ||
-				texture_subresource_count > static_cast<uint32_t>(texture_mip_entries.size()) - texture_first_subresource) {
-			has_texture_mip_entries = false;
-		} else {
-			for (uint32_t mip_index = 0; mip_index < texture_subresource_count; mip_index++) {
-				const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource + mip_index];
-				if (mip_entry.compressed_size == 0 || mip_entry.uncompressed_size == 0 ||
-						texture_footprint > UINT64_MAX - mip_entry.uncompressed_size) {
-					has_texture_mip_entries = false;
-					break;
-				}
-				texture_footprint += mip_entry.uncompressed_size;
-			}
-		}
-	}
-
-	if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE && !has_texture_mip_entries) {
-		p_request->set_status(DSRequest::STATUS_FAILED);
-		p_request->set_error_message("Win32Backend: GPU texture destinations require v2 footprint-padded formats.");
-		return false;
-	}
 
 	if (gpu_texture_gdeflate && has_texture_mip_entries && texture_subresource_count > 1) {
 		// Multi-mip .dstex files store each mip level as an independent GDeflate compressed stream.
@@ -2683,6 +2883,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 
 		DSChunkedRequestState state;
 		state.parent = p_request;
+		// Pass 1: Pre-validation of all mips against staging size and offsets
 		for (uint32_t mip_index = 0; mip_index < texture_subresource_count; mip_index++) {
 			const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource + mip_index];
 			if (staging_size > 0 && (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size ||
@@ -2691,7 +2892,13 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
 				return false;
 			}
+		}
 
+		// Pass 2: Atomic staging and enqueue
+		std::vector<Ref<DSRequest>> staged_children;
+		staged_children.reserve(texture_subresource_count);
+		for (uint32_t mip_index = 0; mip_index < texture_subresource_count; mip_index++) {
+			const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource + mip_index];
 			Ref<DSRequest> child;
 			child.instantiate();
 			child->set_file_path(p_request->get_file_path());
@@ -2707,14 +2914,28 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			child->set_subresource_count(1);
 			child->set_texture_format(p_request->get_texture_format());
 			child->set_texture_layout(p_request->get_texture_layout());
-			if (!enqueue_one(child, 0)) {
-				p_request->set_status(DSRequest::STATUS_FAILED);
-				p_request->set_error_message("DirectStorage failed to enqueue a GDeflate texture mip.");
+			staged_children.push_back(child);
+		}
+
+		uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
+		if (slot.requests.size() + staged_children.size() > queue_capacity) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + ") exceeded for active batch slot.");
+			return false;
+		}
+
+		int transitions_before = slot.gpu_transitions.size();
+		for (size_t c = 0; c < staged_children.size(); ++c) {
+			if (!enqueue_one(staged_children[c], 0)) {
+				rollback_staged_requests(slot.requests, slot.request_names, slot.request_name_map, staged_children, c, p_request, &slot.dstorage_requests);
+				while (slot.gpu_transitions.size() > transitions_before) {
+					slot.gpu_transitions.remove_at(slot.gpu_transitions.size() - 1);
+				}
 				return false;
 			}
-			state.children.push_back(child);
+			state.children.push_back(staged_children[c]);
 			state.destination_offsets.push_back(0);
-			s_chunk_parents[child.ptr()] = p_request.ptr();
+			s_chunk_parents[staged_children[c].ptr()] = p_request.ptr();
 		}
 		s_chunked_requests[p_request.ptr()] = state;
 		p_request->set_status(DSRequest::STATUS_SUBMITTED);
@@ -2732,7 +2953,42 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
 			return false;
 		}
-		return enqueue_one(p_request, 0);
+
+		uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
+		if (slot.requests.size() + 1 > queue_capacity) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + ") exceeded for active batch slot.");
+			return false;
+		}
+
+		// Build child request with parsed mip entries to preserve p_request immutability and submit exact offsets/sizes.
+		// Note: Uses already-parsed mip_entry from pre-lock phase; does NOT perform disk I/O under batch_mutex.
+		Ref<DSRequest> child;
+		if (!build_single_mip_child_request(p_request, mip_entry, child)) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("DirectStorage failed to build single-mip texture child request.");
+			return false;
+		}
+
+		DSChunkedRequestState state;
+		state.parent = p_request;
+		int transitions_before = slot.gpu_transitions.size();
+		if (!enqueue_one(child, 0)) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message(child->get_error_message().is_empty() ?
+					"DirectStorage failed to enqueue single-mip GDeflate texture." :
+					child->get_error_message());
+			while (slot.gpu_transitions.size() > transitions_before) {
+				slot.gpu_transitions.remove_at(slot.gpu_transitions.size() - 1);
+			}
+			return false;
+		}
+		state.children.push_back(child);
+		state.destination_offsets.push_back(0);
+		s_chunk_parents[child.ptr()] = p_request.ptr();
+		s_chunked_requests[p_request.ptr()] = state;
+		p_request->set_status(DSRequest::STATUS_SUBMITTED);
+		return true;
 	}
 
 	if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE && staging_size > 0 && request_size > staging_size) {
@@ -2755,23 +3011,34 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			return false;
 		}
 		uint64_t chunk_count = dstex_chunks.size();
-		DSChunkedRequestState state;
-		state.parent = p_request;
+
+		// Pass 1: Pre-validation of all chunk ranges
 		for (uint64_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
-			uint64_t src_begin = 0;
-			uint64_t src_end = 0;
-			uint64_t destination_begin = 0;
-			uint64_t destination_end = 0;
 			const DSChunkBoundary &boundary = dstex_chunks[chunk_index];
-			src_begin = boundary.source_offset;
-			src_end = boundary.source_offset + boundary.source_size;
-			destination_begin = boundary.destination_offset;
-			destination_end = boundary.destination_offset + boundary.destination_size;
+			uint64_t src_begin = boundary.source_offset;
+			uint64_t src_end = boundary.source_offset + boundary.source_size;
+			uint64_t destination_begin = boundary.destination_offset;
+			uint64_t destination_end = boundary.destination_offset + boundary.destination_size;
 			if (src_end <= src_begin || destination_end <= destination_begin || src_end - src_begin > chunk_capacity || destination_end - destination_begin > chunk_capacity) {
 				p_request->set_status(DSRequest::STATUS_FAILED);
 				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
 				return false;
 			}
+		}
+
+		// Pass 2: Atomic staging and enqueue
+		DSChunkedRequestState state;
+		state.parent = p_request;
+		std::vector<Ref<DSRequest>> staged_children;
+		std::vector<uint64_t> staged_destination_offsets;
+		staged_children.reserve(chunk_count);
+		staged_destination_offsets.reserve(chunk_count);
+		for (uint64_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+			const DSChunkBoundary &boundary = dstex_chunks[chunk_index];
+			uint64_t src_begin = boundary.source_offset;
+			uint64_t src_end = boundary.source_offset + boundary.source_size;
+			uint64_t destination_begin = boundary.destination_offset;
+			uint64_t destination_end = boundary.destination_offset + boundary.destination_size;
 
 			Ref<DSRequest> child;
 			child.instantiate();
@@ -2789,14 +3056,29 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			child->set_texture_format(p_request->get_texture_format());
 			child->set_texture_layout(p_request->get_texture_layout());
 			child->get_destination_buffer_ref().resize(static_cast<int64_t>(destination_end - destination_begin));
-			if (!enqueue_one(child, destination_begin)) {
-				p_request->set_status(DSRequest::STATUS_FAILED);
-				p_request->set_error_message("DirectStorage failed to enqueue an oversized GDeflate chunk.");
+			staged_children.push_back(child);
+			staged_destination_offsets.push_back(destination_begin);
+		}
+
+		uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
+		if (slot.requests.size() + staged_children.size() > queue_capacity) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + ") exceeded for active batch slot.");
+			return false;
+		}
+
+		int transitions_before = slot.gpu_transitions.size();
+		for (size_t c = 0; c < staged_children.size(); ++c) {
+			if (!enqueue_one(staged_children[c], staged_destination_offsets[c])) {
+				rollback_staged_requests(slot.requests, slot.request_names, slot.request_name_map, staged_children, c, p_request, &slot.dstorage_requests);
+				while (slot.gpu_transitions.size() > transitions_before) {
+					slot.gpu_transitions.remove_at(slot.gpu_transitions.size() - 1);
+				}
 				return false;
 			}
-			state.children.push_back(child);
-			state.destination_offsets.push_back(destination_begin);
-			s_chunk_parents[child.ptr()] = p_request.ptr();
+			state.children.push_back(staged_children[c]);
+			state.destination_offsets.push_back(staged_destination_offsets[c]);
+			s_chunk_parents[staged_children[c].ptr()] = p_request.ptr();
 		}
 		s_chunked_requests[p_request.ptr()] = state;
 		if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER ||
@@ -2807,6 +3089,12 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		return true;
 	}
 
+	uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
+	if (slot.requests.size() + 1 > queue_capacity) {
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + ") exceeded for active batch slot.");
+		return false;
+	}
 	return enqueue_one(p_request, 0);
 #else
 	return false;
@@ -2861,6 +3149,7 @@ void Win32Backend::submit_async() {
 				release_resource_guards(slot.requests);
 				close_slot_files(slot);
 				slot.requests.clear();
+				slot.dstorage_requests.clear();
 				slot.gpu_transitions.clear();
 				slot.closing = false;
 				slot.submitted = false;
@@ -2872,6 +3161,24 @@ void Win32Backend::submit_async() {
 			return;
 		}
 	}
+
+	// Dispatch EnqueueRequest to DirectStorage outside batch_mutex to prevent
+	// queue back-pressure deadlocks with completion polling.
+	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
+		QueueState &queue = priority_queues[queue_index];
+		BatchSlot &slot = queue.batch_slots[submit_slot_index];
+		if (!queue.queue || slot.dstorage_requests.empty() || !slot.closing || slot.submitted) {
+			continue;
+		}
+		for (size_t i = 0; i < slot.dstorage_requests.size(); i++) {
+			if (i < slot.request_names.size()) {
+				slot.dstorage_requests[i].Name = slot.request_names[i].c_str();
+			}
+			queue.queue->EnqueueRequest(&slot.dstorage_requests[i]);
+		}
+		slot.dstorage_requests.clear();
+	}
+
 	std::deque<BatchMetadata> submitted_batches;
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
@@ -3018,9 +3325,16 @@ void Win32Backend::submit_batch() {
 		return;
 	}
 	int submit_slot_index = -1;
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	uint32_t sync_timeout_ms = 3000;
+	if (ps && ps->has_setting("directstorage/sync_flush_timeout_ms")) {
+		sync_timeout_ms = static_cast<uint32_t>(std::clamp<int64_t>(int64_t(ps->get_setting("directstorage/sync_flush_timeout_ms")), 500, 10000));
+	}
+	uint32_t half_timeout_ms = sync_timeout_ms / 2;
+	auto sync_start_time = std::chrono::steady_clock::now();
 	{
 		std::unique_lock<std::mutex> lock(batch_mutex);
-		if (!batch_cv.wait_for(lock, std::chrono::milliseconds(5000), [this]() {
+		if (!batch_cv.wait_for(lock, std::chrono::milliseconds(half_timeout_ms), [this]() {
 				return !has_in_flight_batches_locked() && !sync_batch_in_flight.load();
 			})) {
 			UtilityFunctions::push_error("[DirectStorage] Timed out waiting for the previous batch to complete.");
@@ -3043,6 +3357,8 @@ void Win32Backend::submit_batch() {
 				if (!slot.submitted && slot.completion_ready) {
 					close_slot_files(slot);
 					slot.requests.clear();
+					slot.request_names.clear();
+					slot.request_name_map.clear();
 					slot.fence_value = 0;
 					slot.completed_count = 0;
 					slot.error_code = 0;
@@ -3097,6 +3413,7 @@ void Win32Backend::submit_batch() {
 				release_resource_guards(slot.requests);
 				close_slot_files(slot);
 				slot.requests.clear();
+				slot.dstorage_requests.clear();
 				slot.gpu_transitions.clear();
 				slot.closing = false;
 				slot.submitted = false;
@@ -3108,6 +3425,23 @@ void Win32Backend::submit_batch() {
 			batch_cv.notify_all();
 			return;
 		}
+	}
+
+	// Dispatch EnqueueRequest to DirectStorage outside batch_mutex to prevent
+	// queue back-pressure deadlocks with completion polling.
+	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
+		QueueState &queue = priority_queues[queue_index];
+		BatchSlot &slot = queue.batch_slots[submit_slot_index];
+		if (!queue.queue || slot.dstorage_requests.empty() || !slot.closing || slot.submitted) {
+			continue;
+		}
+		for (size_t i = 0; i < slot.dstorage_requests.size(); i++) {
+			if (i < slot.request_names.size()) {
+				slot.dstorage_requests[i].Name = slot.request_names[i].c_str();
+			}
+			queue.queue->EnqueueRequest(&slot.dstorage_requests[i]);
+		}
+		slot.dstorage_requests.clear();
 	}
 
 	Vector<int> submitted_queues;
@@ -3171,7 +3505,7 @@ void Win32Backend::submit_batch() {
 
 	{
 		std::unique_lock<std::mutex> lock(batch_mutex);
-		bool completed = batch_cv.wait_for(lock, std::chrono::milliseconds(5000), [this, submit_slot_index, &submitted_queues]() {
+		bool completed = batch_cv.wait_for(lock, std::chrono::milliseconds(sync_timeout_ms), [this, submit_slot_index, &submitted_queues]() {
 			for (int i = 0; i < submitted_queues.size(); i++) {
 				int q_idx = submitted_queues[i];
 				const BatchSlot &slot = priority_queues[q_idx].batch_slots[submit_slot_index];
@@ -3187,6 +3521,8 @@ void Win32Backend::submit_batch() {
 				int q_idx = submitted_queues[i];
 				BatchSlot &slot = priority_queues[q_idx].batch_slots[submit_slot_index];
 				slot.requests.clear();
+				slot.request_names.clear();
+				slot.request_name_map.clear();
 				slot.gpu_transitions.clear();
 				slot.fence_value = 0;
 				slot.completed_count = 0;
@@ -3194,6 +3530,10 @@ void Win32Backend::submit_batch() {
 				slot.error_message = String();
 				slot.closing = false;
 				slot.completion_ready = false;
+			}
+			auto sync_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sync_start_time).count();
+			if (sync_elapsed_ms > 100) {
+				UtilityFunctions::print_verbose("[DirectStorage] Synchronous flush stalled for " + String::num_int64(sync_elapsed_ms) + " ms; avoid calling sync flushes from gameplay loops.");
 			}
 		} else {
 			UtilityFunctions::push_error("[DirectStorage] Win32Backend priority queue submit wait timed out or failed.");
@@ -3273,37 +3613,52 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 		for (BatchSlot &slot : queue.batch_slots) {
 			Vector<Ref<DSRequest>> remaining;
 			Vector<Ref<DSRequest>> dropped;
+			std::vector<std::string> remaining_names;
+			std::vector<DSTORAGE_REQUEST> remaining_dstorage;
 			uint64_t now_usec = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
 			for (int i = 0; i < slot.requests.size(); i++) {
 				if (slot.requests[i].is_valid() && slot.requests[i]->get_cancellation_tag() == p_tag) {
 					slot.requests[i]->set_cancel_timestamp_usec(now_usec);
 					slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
 					slot.requests[i]->set_error_message("Request cancelled by tag.");
-					if (slot.submitted) {
-						// In-flight batch: keep the request in the slot so the
+					if (slot.submitted || slot.closing) {
+						// In-flight or closing batch: keep the request in the slot so the
 						// completion thread tears it down uniformly (guard
 						// release, file close, counts). It is already terminal
 						// FAILED, so poll_batch_status() leaves it dropped and
 						// never promotes it to COMPLETED.
 						// gpu_in_flight remains true until the batch fence retires.
 						remaining.push_back(slot.requests[i]);
+						if (i < static_cast<int>(slot.request_names.size())) {
+							remaining_names.push_back(slot.request_names[i]);
+						}
+						if (i < static_cast<int>(slot.dstorage_requests.size())) {
+							remaining_dstorage.push_back(slot.dstorage_requests[i]);
+						}
 					} else {
-						// Never submitted: drop from the slot so a later
-						// Submit() cannot pick up a cancelled request. The
-						// DirectStorage-level request was already cancelled
-						// above, so the GPU will never write the destination:
-						// release the AddRef'd guard (no leak, freed RIDs stay
-						// unwritten) and detach chunk tracking. Parent
-						// reconciliation runs below via complete_chunked_requests().
+						// Staged but unsubmitted and not closing: purge from the slot so a later
+						// Submit() cannot pick up a cancelled request. Release the AddRef'd guard
+						// (no leak, freed RIDs stay unwritten) and detach chunk tracking.
 						slot.requests[i]->set_gpu_in_flight(false);
 						dropped.push_back(slot.requests[i]);
+						if (i < static_cast<int>(slot.request_names.size())) {
+							slot.request_name_map.erase(slot.request_names[i]);
+						}
 					}
 				} else {
 					remaining.push_back(slot.requests[i]);
+					if (i < static_cast<int>(slot.request_names.size())) {
+						remaining_names.push_back(slot.request_names[i]);
+					}
+					if (i < static_cast<int>(slot.dstorage_requests.size())) {
+						remaining_dstorage.push_back(slot.dstorage_requests[i]);
+					}
 				}
 			}
 			slot.requests = remaining;
 			if (!dropped.is_empty()) {
+				slot.request_names = std::move(remaining_names);
+				slot.dstorage_requests = std::move(remaining_dstorage);
 				// HIGH-07 guard: purge transitions whose requests were dropped
 				Vector<GPUTargetTransition> remaining_transitions;
 				std::unordered_set<ID3D12Resource *> remaining_resources;
@@ -3337,6 +3692,33 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 	// destinations — no render/scene APIs, safe on the calling thread under
 	// batch_mutex (same discipline as every other call site).
 	complete_chunked_requests();
+#endif
+}
+
+bool Win32Backend::is_resource_in_flight(const RID &p_rid) const {
+#ifdef _WIN32
+	if (!p_rid.is_valid()) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	for (int q = 0; q < QUEUE_COUNT; q++) {
+		const QueueState &queue = priority_queues[q];
+		for (int s = 0; s < BATCH_SLOT_COUNT; s++) {
+			const BatchSlot &slot = queue.batch_slots[s];
+			if (!slot.submitted || slot.completion_ready) {
+				continue;
+			}
+			for (int r = 0; r < slot.requests.size(); r++) {
+				const Ref<DSRequest> &req = slot.requests[r];
+				if (req.is_valid() && req->get_destination_resource() == p_rid && req->is_gpu_in_flight()) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+#else
+	return false;
 #endif
 }
 

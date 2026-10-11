@@ -625,14 +625,17 @@ bool DSContext::initialize_ds_locked() {
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (ps) {
 		if (ps->has_setting("directstorage/staging_buffer_size_mb")) {
-			uint32_t configured_size = ps->get_setting("directstorage/staging_buffer_size_mb");
-			staging_buffer_size_mb = configured_size > 0 ? configured_size : DEFAULT_STAGING_BUFFER_SIZE_MB;
+			Variant v = ps->get_setting("directstorage/staging_buffer_size_mb");
+			uint32_t configured_size = static_cast<uint32_t>(v);
+			staging_buffer_size_mb = clamp_staging_buffer_size_mb(configured_size > 0 ? configured_size : DEFAULT_STAGING_BUFFER_SIZE_MB);
 		}
 		if (ps->has_setting("directstorage/disable_gpu_decompression")) {
 			disable_gpu_decompression = ps->get_setting("directstorage/disable_gpu_decompression");
 		}
 		if (ps->has_setting("directstorage/queue_capacity")) {
-			queue_capacity = ps->get_setting("directstorage/queue_capacity");
+			Variant v = ps->get_setting("directstorage/queue_capacity");
+			uint32_t configured_cap = static_cast<uint32_t>(v);
+			queue_capacity = clamp_queue_capacity(configured_cap > 0 ? configured_cap : DEFAULT_QUEUE_CAPACITY);
 		}
 	}
 
@@ -993,17 +996,29 @@ Error DSContext::flush_stream_async() {
 			return ERR_BUSY;
 		}
 		uint16_t cap = get_queue_capacity();
-		size_t max_batch_requests = (cap > 64) ? (cap / 2) : 64;
-		if (max_batch_requests > 256) {
-			max_batch_requests = 256;
+		size_t subresource_budget = (cap > 64) ? (cap / 2) : 64;
+		if (subresource_budget > 1024) {
+			subresource_budget = 1024;
 		}
-		size_t count_to_pop = std::min(stream_queue.size(), max_batch_requests);
-		for (size_t i = 0; i < count_to_pop; ++i) {
-			to_submit.push_back(stream_queue.front());
+		size_t max_logical_requests = std::min<size_t>(subresource_budget, 128);
+		size_t accumulated_subresources = 0;
+		while (!stream_queue.empty() && to_submit.size() < max_logical_requests) {
+			Ref<DSRequest> next_req = stream_queue.front();
+			uint32_t req_cost = 1;
+			if (next_req.is_valid()) {
+				uint32_t subs = next_req->get_subresource_count();
+				req_cost = (subs > 0) ? std::min(subs, 16u) : 1u;
+			}
+			if (!to_submit.empty() && accumulated_subresources + req_cost > subresource_budget) {
+				break;
+			}
+			accumulated_subresources += req_cost;
+			to_submit.push_back(next_req);
 			stream_queue.pop_front();
 		}
 	}
 	int submitted_request_count = 0;
+	std::deque<Ref<DSRequest>> unsubmitted_requests;
 	for (std::deque<Ref<DSRequest>>::iterator it = to_submit.begin(); it != to_submit.end(); ++it) {
 		Ref<DSRequest> request = *it;
 		if (!request.is_valid()) {
@@ -1019,13 +1034,36 @@ Error DSContext::flush_stream_async() {
 		if (enqueue_stream_request_internal(request)) {
 			submitted_request_count++;
 		} else {
-			// Backend rejected: request is terminal (FAILED); count it so tag
-			// progress cannot stall waiting for a request that will never run.
-			count_stream_request_terminal(request);
+			String err = request->get_error_message();
+			bool is_transient = err.contains("queue capacity") ||
+					err.contains("batch slot is not available") ||
+					err.contains("synchronous batch submission is in progress") ||
+					err.contains("owned by an in-flight DirectStorage batch");
+			if (is_transient) {
+				request->set_status(DSRequest::Status(0));
+				request->set_error_message(String());
+				unsubmitted_requests.push_back(request);
+				for (++it; it != to_submit.end(); ++it) {
+					if (it->is_valid() && (*it)->get_status() != DSRequest::STATUS_FAILED) {
+						unsubmitted_requests.push_back(*it);
+					}
+				}
+				break;
+			} else {
+				// Backend rejected: request is terminal (FAILED); count it so tag
+				// progress cannot stall waiting for a request that will never run.
+				count_stream_request_terminal(request);
+			}
+		}
+	}
+	if (!unsubmitted_requests.empty()) {
+		std::lock_guard<std::mutex> lock(stream_mutex);
+		for (auto rit = unsubmitted_requests.rbegin(); rit != unsubmitted_requests.rend(); ++rit) {
+			stream_queue.push_front(*rit);
 		}
 	}
 	if (submitted_request_count == 0) {
-		return OK;
+		return unsubmitted_requests.empty() ? OK : ERR_BUSY;
 	}
 	bool is_win32_backend = active_backend->get_name() == "Win32DirectStorage";
 	active_backend->submit_async();
@@ -1197,6 +1235,17 @@ bool DSContext::is_tag_cancelled(uint64_t p_tag) const {
 	return it != stream_tags.end() && it->second.cancel_requested;
 }
 
+bool DSContext::is_resource_in_flight(const RID &p_rid) const {
+	if (!p_rid.is_valid()) {
+		return false;
+	}
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
+		return false;
+	}
+	return active_backend->is_resource_in_flight(p_rid);
+}
+
 bool DSContext::is_batch_complete() const {
 	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 	if (!active_backend) {
@@ -1356,7 +1405,7 @@ void DSContext::cancel_requests_with_tag(uint64_t p_tag) {
 }
 
 void DSContext::set_staging_buffer_size_mb(uint32_t p_size_mb) {
-	staging_buffer_size_mb = p_size_mb > 0 ? p_size_mb : DEFAULT_STAGING_BUFFER_SIZE_MB;
+	staging_buffer_size_mb = clamp_staging_buffer_size_mb(p_size_mb > 0 ? p_size_mb : DEFAULT_STAGING_BUFFER_SIZE_MB);
 }
 
 uint32_t DSContext::get_staging_buffer_size_mb() const {
@@ -1372,7 +1421,7 @@ bool DSContext::get_disable_gpu_decompression() const {
 }
 
 void DSContext::set_queue_capacity(uint16_t p_capacity) {
-	queue_capacity = p_capacity;
+	queue_capacity = clamp_queue_capacity(p_capacity > 0 ? p_capacity : DEFAULT_QUEUE_CAPACITY);
 }
 
 uint16_t DSContext::get_queue_capacity() const {

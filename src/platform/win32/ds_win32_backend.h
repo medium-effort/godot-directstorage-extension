@@ -23,6 +23,8 @@
 
 namespace godot {
 
+struct DSTexMipEntryV2;
+
 #ifdef _WIN32
 Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device();
 Microsoft::WRL::ComPtr<ID3D12CommandQueue> ds_win32_get_d3d12_command_queue();
@@ -56,6 +58,9 @@ private:
 	struct BatchSlot {
 		HANDLE event = nullptr;
 		Vector<Ref<DSRequest>> requests;
+		std::vector<std::string> request_names;
+		std::vector<DSTORAGE_REQUEST> dstorage_requests;
+		std::unordered_map<std::string, Ref<DSRequest>> request_name_map;
 		Vector<IDStorageFile *> files;
 		Vector<GPUTargetTransition> gpu_transitions;
 		// Open-file cache: normalized path -> slot-owned handle. Exported
@@ -97,6 +102,7 @@ private:
 	// contract matches the preloader's archive handle (rescan_archive keeps
 	// the open handle on unchanged path): a file replaced on disk mid-run
 	// is picked up on restart, which is fine for immutable exported builds.
+	std::mutex persistent_file_mutex;
 	std::unordered_map<std::wstring, IDStorageFile *> persistent_file_cache;
 	Vector<IDStorageFile *> persistent_files;
 	HMODULE dstoragecore_module = nullptr;
@@ -147,6 +153,7 @@ private:
 #ifdef _WIN32
 	void completion_thread_func();
 	bool drain_all_queues(uint32_t p_timeout_ms);
+	void poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uint64_t p_fence_value);
 	void poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value);
 	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch);
 	bool has_in_flight_batches_locked() const;
@@ -186,9 +193,25 @@ public:
 	void cancel_requests_with_tag(uint64_t p_tag) override;
 	uint64_t get_completion_fence() const;
 	bool wait_for_completion(uint64_t p_fence_value, uint32_t p_timeout_msec);
+	bool is_resource_in_flight(const RID &p_rid) const override;
 
 	static bool is_path_valid(const String &p_path);
 	static Dictionary get_drive_info_for_path(const String &p_path);
+	static bool validate_dstex_chunk_range(uint64_t p_source_offset, uint64_t p_source_size, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t &r_resolved_offset);
+	static void attribute_batch_error_records(Vector<Ref<DSRequest>> &p_requests, const std::unordered_map<std::string, Ref<DSRequest>> &p_name_map, const String &p_failed_request_name, const String &p_queue_error);
+	static Ref<DSRequest> get_chunked_child_request(DSRequest *p_parent, int p_index = 0);
+	static void rollback_staged_requests(Vector<Ref<DSRequest>> &p_slot_requests,
+			std::vector<std::string> &p_slot_request_names,
+			std::unordered_map<std::string, Ref<DSRequest>> &p_slot_request_name_map,
+			const std::vector<Ref<DSRequest>> &p_staged_children,
+			size_t p_failed_index,
+			Ref<DSRequest> p_parent
+#ifdef _WIN32
+			, std::vector<DSTORAGE_REQUEST> *p_dstorage_requests = nullptr
+#endif
+	);
+	static bool build_single_mip_child_request(Ref<DSRequest> p_parent, const DSTexMipEntryV2 &p_mip_entry, Ref<DSRequest> &r_child);
+	static bool stage_single_mip_request(Ref<DSRequest> p_parent, Ref<DSRequest> &r_child);
 };
 
 } // namespace godot

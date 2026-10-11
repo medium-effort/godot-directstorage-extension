@@ -11,6 +11,7 @@
 #include <godot_cpp/classes/rd_texture_format.hpp>
 #include <godot_cpp/classes/rd_texture_view.hpp>
 #include <cstdint>
+#include <algorithm>
 #include <deque>
 #include <atomic>
 #include <mutex>
@@ -118,6 +119,18 @@ protected:
 
 public:
 	static constexpr uint32_t DEFAULT_STAGING_BUFFER_SIZE_MB = 128;
+	static constexpr uint32_t MIN_STAGING_BUFFER_SIZE_MB = 1;
+	static constexpr uint32_t MAX_STAGING_BUFFER_SIZE_MB = 2048;
+	static constexpr uint16_t DEFAULT_QUEUE_CAPACITY = 2000;
+	static constexpr uint16_t MIN_QUEUE_CAPACITY = 128;
+	static constexpr uint16_t MAX_QUEUE_CAPACITY = 8192;
+
+	static uint32_t clamp_staging_buffer_size_mb(uint32_t p_size_mb) {
+		return std::clamp<uint32_t>(p_size_mb, MIN_STAGING_BUFFER_SIZE_MB, MAX_STAGING_BUFFER_SIZE_MB);
+	}
+	static uint16_t clamp_queue_capacity(uint32_t p_capacity) {
+		return static_cast<uint16_t>(std::clamp<uint32_t>(p_capacity, MIN_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY));
+	}
 
 	static DSContext *get_singleton();
 
@@ -160,6 +173,7 @@ public:
 	void count_stream_terminal_failure(uint64_t p_tag);
 	void cancel_prewarm(uint64_t p_tag);
 	bool is_tag_cancelled(uint64_t p_tag) const;
+	bool is_resource_in_flight(const RID &p_rid) const;
 	bool is_batch_complete() const;
 	bool has_pending_results() const;
 	void collect_completed_results();

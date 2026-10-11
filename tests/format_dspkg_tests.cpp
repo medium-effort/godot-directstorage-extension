@@ -516,3 +516,40 @@ GDEX_TEST_T(dspkg, archive_fingerprint_unpaired_legacy_bypass, TAG_INTEGRATION) 
 	remove_temp_file(dspkg_paired);
 }
 
+GDEX_TEST_T(dspkg, med09_corrupt_entry_caps_rejected, TAG_INTEGRATION) {
+	// MED-09: Packages with mip_count > DSTEX_MAX_MIP_COUNT or insane dimensions
+	// must be rejected with ERR_FILE_CORRUPT.
+	const char *dstex_path = "user://temp_med09_test.dstex";
+	const char *dspkg_path = "user://temp_med09_test.dspkg";
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), 0ULL) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture("test.png", godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	// Read file and mutate the entry's mip_count to 32 (> DSTEX_MAX_MIP_COUNT = 16)
+	godot::Ref<godot::FileAccess> fa = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ_WRITE);
+	GDEX_ASSERT_TRUE(fa.is_valid());
+	// Header is 28 bytes. Path length is 4 bytes + "test.png" (8 bytes).
+	// Fixed fields: original_size(8), compressed_size(8), offset(8), format(4), width(4), height(4), pixel_format(4), mip_count(4)
+	fa->seek(28 + 4 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4);
+	fa->store_32(32);
+	fa->close();
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	godot::Error err = reader->open(godot::String(dspkg_path), 0ULL);
+	GDEX_EXPECT_EQ(err, godot::ERR_FILE_CORRUPT);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+

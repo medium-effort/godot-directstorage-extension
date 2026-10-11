@@ -2,6 +2,7 @@
 #include "gdextest/registry.h"
 
 #include "integration/ds_texture_cache.h"
+#include "core/ds_context.h"
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
@@ -458,3 +459,65 @@ GDEX_TEST_T(cache, clear_unused_all_held_or_empty, TAG_INTEGRATION) {
     GDEX_EXPECT_TRUE(cache->get_cached("res://held0.png").is_valid());
     GDEX_EXPECT_TRUE(cache->get_cached("res://held1.png").is_valid());
 }
+
+GDEX_TEST_T(cache, evict_and_clear_preserves_externally_held_refs, TAG_INTEGRATION) {
+    // MED-10: evict() and clear() must remove entries from cache lookups
+    // without destroying GPU resources of externally held textures.
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+
+    godot::Ref<godot::Texture2D> ext_tex = make_test_texture(0.8f);
+    cache->store("res://my_active_mat_tex.png", ext_tex);
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 1);
+
+    // Evicting while externally held removes from cache but preserves external reference
+    cache->evict("res://my_active_mat_tex.png");
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+    GDEX_EXPECT_TRUE(cache->get_cached("res://my_active_mat_tex.png").is_null());
+    GDEX_EXPECT_TRUE(ext_tex.is_valid());
+
+    // Re-store and test clear()
+    cache->store("res://my_active_mat_tex.png", ext_tex);
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 1);
+
+    cache->clear();
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+    GDEX_EXPECT_TRUE(cache->get_cached("res://my_active_mat_tex.png").is_null());
+    GDEX_EXPECT_TRUE(ext_tex.is_valid());
+}
+
+GDEX_TEST_T(cache, med10_in_flight_gpu_resource_query, TAG_INTEGRATION) {
+    // MED-10: In-flight GPU resources must be safely queried via DSContext and PlatformBackend.
+    godot::DSContext *ds_ctx = godot::DSContext::get_singleton();
+    if (!ds_ctx) {
+        GDEX_SKIP("DSContext singleton unavailable.");
+    }
+    godot::RID invalid_rid;
+    GDEX_EXPECT_FALSE(ds_ctx->is_resource_in_flight(invalid_rid));
+
+    // Valid texture RID that is not queued/in-flight must return false
+    godot::Ref<godot::Texture2D> test_tex = make_test_texture(0.7f);
+    GDEX_ASSERT_TRUE(test_tex.is_valid());
+    godot::RID valid_rid = test_tex->get_rid();
+    GDEX_EXPECT_TRUE(valid_rid.is_valid());
+    GDEX_EXPECT_FALSE(ds_ctx->is_resource_in_flight(valid_rid));
+
+    // Different valid texture RID must also be false
+    godot::Ref<godot::Texture2D> other_tex = make_test_texture(0.3f);
+    GDEX_ASSERT_TRUE(other_tex.is_valid());
+    godot::RID other_rid = other_tex->get_rid();
+    GDEX_EXPECT_TRUE(other_rid.is_valid());
+    GDEX_EXPECT_TRUE(valid_rid != other_rid);
+    GDEX_EXPECT_FALSE(ds_ctx->is_resource_in_flight(other_rid));
+
+    // Cache operations preserve externally held textures without corrupting RID
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+    cache->store("res://test_flight_tex.png", test_tex);
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 1);
+    cache->evict("res://test_flight_tex.png");
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+    GDEX_EXPECT_TRUE(test_tex.is_valid());
+    GDEX_EXPECT_TRUE(test_tex->get_rid() == valid_rid);
+    GDEX_EXPECT_FALSE(ds_ctx->is_resource_in_flight(valid_rid));
+}
+
+

@@ -1,5 +1,6 @@
 #include "ds_texture_cache.h"
 #include "ds_preloader.h"
+#include "../core/ds_context.h"
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
@@ -57,13 +58,22 @@ static void ds_texture_cache_drain_evict_frees_on_render_thread() {
 	if (rd == nullptr) {
 		return; // Device gone (shutdown/teardown); RIDs die with it.
 	}
+	DSContext *ctx = DSContext::get_singleton();
+	std::vector<RID> still_in_flight;
 	for (size_t i = 0; i < pending.size(); ++i) {
-		// Liveness check: a re-stored evicted texture still carries its stale
-		// handle, and the engine never frees it itself, so a second free of
-		// the same value would spam "Attempted to free invalid ID".
-		if (pending[i].is_valid() && rd->texture_is_valid(pending[i])) {
-			rd->free_rid(pending[i]);
+		if (pending[i].is_valid()) {
+			if (ctx && ctx->is_resource_in_flight(pending[i])) {
+				still_in_flight.push_back(pending[i]);
+				continue;
+			}
+			if (rd->texture_is_valid(pending[i])) {
+				rd->free_rid(pending[i]);
+			}
 		}
+	}
+	if (!still_in_flight.empty()) {
+		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+		s_evict_free_queue.insert(s_evict_free_queue.end(), still_in_flight.begin(), still_in_flight.end());
 	}
 }
 
@@ -71,6 +81,31 @@ static void ds_texture_cache_free_texture_rids(const std::vector<RID> &p_rids) {
 	if (p_rids.empty()) {
 		return;
 	}
+	DSContext *ctx = DSContext::get_singleton();
+	std::vector<RID> immediate_rids;
+	std::vector<RID> deferred_rids;
+	for (size_t i = 0; i < p_rids.size(); ++i) {
+		if (!p_rids[i].is_valid()) {
+			continue;
+		}
+		if (ctx && ctx->is_resource_in_flight(p_rids[i])) {
+			deferred_rids.push_back(p_rids[i]);
+		} else {
+			immediate_rids.push_back(p_rids[i]);
+		}
+	}
+
+	if (!deferred_rids.empty()) {
+		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+		for (size_t i = 0; i < deferred_rids.size(); ++i) {
+			s_evict_free_queue.push_back(deferred_rids[i]);
+		}
+	}
+
+	if (immediate_rids.empty()) {
+		return;
+	}
+
 	RenderingServer *rs = RenderingServer::get_singleton();
 	if (rs == nullptr) {
 		return;
@@ -80,19 +115,17 @@ static void ds_texture_cache_free_texture_rids(const std::vector<RID> &p_rids) {
 		if (rd == nullptr) {
 			return;
 		}
-		for (size_t i = 0; i < p_rids.size(); ++i) {
-			if (p_rids[i].is_valid() && rd->texture_is_valid(p_rids[i])) {
-				rd->free_rid(p_rids[i]);
+		for (size_t i = 0; i < immediate_rids.size(); ++i) {
+			if (rd->texture_is_valid(immediate_rids[i])) {
+				rd->free_rid(immediate_rids[i]);
 			}
 		}
 		return;
 	}
 	{
 		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
-		for (size_t i = 0; i < p_rids.size(); ++i) {
-			if (p_rids[i].is_valid()) {
-				s_evict_free_queue.push_back(p_rids[i]);
-			}
+		for (size_t i = 0; i < immediate_rids.size(); ++i) {
+			s_evict_free_queue.push_back(immediate_rids[i]);
 		}
 	}
 	rs->call_on_render_thread(callable_mp_static(ds_texture_cache_drain_evict_frees_on_render_thread));
@@ -563,8 +596,11 @@ void DSTextureCache::evict(const String &p_path) {
 			return;
 		}
 
-		evicted.push_back(cache_map[canonical].texture);
+		Ref<Texture2D> victim = cache_map[canonical].texture;
 		_remove_entry(canonical);
+		if (!ds_texture_cache_is_externally_held(victim)) {
+			evicted.push_back(victim);
+		}
 
 		std::vector<const Texture2D *> live_refs;
 		live_refs.reserve(cache_map.size());
@@ -584,7 +620,9 @@ void DSTextureCache::clear() {
 		std::lock_guard<std::mutex> lock(cache_mutex);
 
 		for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-			evicted.push_back(kv.value.texture);
+			if (!ds_texture_cache_is_externally_held(kv.value.texture)) {
+				evicted.push_back(kv.value.texture);
+			}
 		}
 		cache_map.clear();
 		alias_map.clear();
@@ -649,7 +687,9 @@ void DSTextureCache::set_enabled(bool p_enabled) {
 		enabled = p_enabled;
 		if (!enabled) {
 			for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-				evicted.push_back(kv.value.texture);
+				if (!ds_texture_cache_is_externally_held(kv.value.texture)) {
+					evicted.push_back(kv.value.texture);
+				}
 			}
 			cache_map.clear();
 			alias_map.clear();
