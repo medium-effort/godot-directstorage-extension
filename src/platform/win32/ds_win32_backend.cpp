@@ -1936,8 +1936,8 @@ bool Win32Backend::initialize(const String &p_path) {
 #endif
 }
 
-bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 #ifdef _WIN32
+bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 	HANDLE wait_events[QUEUE_COUNT];
 	int event_count = 0;
 
@@ -1968,10 +1968,8 @@ bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 	}
 
 	return false;
-#else
-	return true;
-#endif
 }
+#endif
 
 void Win32Backend::shutdown() {
 #ifdef _WIN32
