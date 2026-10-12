@@ -107,6 +107,7 @@ jobs:
             scons-${{ matrix.os }}-
 
       - name: Build extension and tests
+        id: build
         # Do not hardcode arch= here: macos-latest is arm64 and passing x86_64
         # causes gdextest.py test to trigger a second full rebuild (it uses the
         # TOML build.args which have no arch, defaulting to universal on macOS).
@@ -120,8 +121,9 @@ jobs:
         # a SCons option, not part of the signature.
         shell: bash
         run: |
+          set -o pipefail
           NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-          scons -j "$NPROC" target=editor tests=true
+          scons -j "$NPROC" target=editor tests=true 2>&1 | tee scons-build.log
         env:
           GODOT: ${{ env.GODOT }}
           SCONS_CACHE: ${{ github.workspace }}/.scons-cache
@@ -137,6 +139,11 @@ jobs:
         with:
           path: ${{ github.workspace }}/.scons-cache
           key: scons-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}-run-${{ github.run_id }}-${{ github.run_attempt }}
+          
+      - name: Publish build failure summary
+        if: failure() && steps.build.outcome == 'failure'
+        shell: bash
+        run: python .github/scripts/extract_build_errors.py scons-build.log
           
       - name: Run gdextest
         shell: bash
@@ -192,6 +199,7 @@ jobs:
             test-results.json
             test-results.xml
             godot-raw.log
+            scons-build.log
           if-no-files-found: ignore
             
       - name: Publish test report (GitHub Annotations)

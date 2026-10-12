@@ -18,11 +18,11 @@
 
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
+#include "core/ds_context.h"
 
 #ifdef _WIN32
 #include "platform/win32/ds_win32_backend.h"
 #include "core/ds_request.h"
-#include "core/ds_context.h"
 #include "formats/dstex_format.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
@@ -118,6 +118,7 @@ GDEX_TEST_T(win32_remediation, d3d12_comptr_concurrency_and_invalidation, TAG_IN
     // Must complete safely without memory violation or access faults.
     GDEX_EXPECT_TRUE(true);
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
@@ -139,6 +140,7 @@ GDEX_TEST_T(win32_remediation, gpu_target_transition_comptr_lifetime, TAG_UNIT) 
     godot::Win32Backend::GPUTargetTransition moved = std::move(copied);
     GDEX_EXPECT_TRUE(moved.resource.Get() == nullptr);
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
@@ -172,6 +174,7 @@ GDEX_TEST_T(win32_remediation, uninitialized_backend_contracts, TAG_UNIT) {
     // Bounded timeout: should finish within reasonable margin (not hang indefinitely)
     GDEX_EXPECT_TRUE(elapsed < 1000);
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
@@ -209,6 +212,7 @@ GDEX_TEST_T(win32_remediation, multi_queue_wait_for_completion_bounded_timeout, 
     GDEX_EXPECT_TRUE(d1 >= (kTimeoutMs - 5));
     GDEX_EXPECT_TRUE(d1 < 1000); // Must not hang indefinitely
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
@@ -262,6 +266,7 @@ GDEX_TEST_T(win32_remediation, tag_cancellation_and_poll_drain_safe, TAG_INTEGRA
     GDEX_EXPECT_TRUE(backend->is_batch_complete());
     GDEX_EXPECT_FALSE(backend->has_pending_results());
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
@@ -290,11 +295,13 @@ GDEX_TEST_T(win32_remediation, slot_divert_and_closing_state, TAG_INTEGRATION) {
     GDEX_EXPECT_EQ(static_cast<int64_t>(req->get_status()),
             static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
 
 GDEX_TEST(win32_remediation, med05_staging_and_queue_capacity_clamping) {
+    (void)ctx;
     // MED-05: Staging buffer size and queue capacity bounds clamping.
     GDEX_EXPECT_EQ(godot::DSContext::clamp_staging_buffer_size_mb(0), 1u);
     GDEX_EXPECT_EQ(godot::DSContext::clamp_staging_buffer_size_mb(128), 128u);
@@ -360,6 +367,7 @@ GDEX_TEST_T(win32_remediation, med07_submit_batch_sync_bounded_wait, TAG_INTEGRA
     // Neither thread should stall beyond bounded timeout (< 1500ms)
     GDEX_EXPECT_LT(t2_elapsed.load(), 1500);
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
@@ -389,6 +397,7 @@ GDEX_TEST(win32_remediation, med01_chunk_range_overflow_validation) {
     // 6. Out of bounds relative range
     GDEX_EXPECT_FALSE(godot::Win32Backend::validate_dstex_chunk_range(150, 100, 0, 200, resolved));
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
@@ -476,6 +485,7 @@ GDEX_TEST_T(win32_remediation, med03_atomic_child_staging_no_orphans, TAG_INTEGR
         GDEX_EXPECT_TRUE(backend->is_batch_complete());
     }
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
@@ -580,6 +590,7 @@ GDEX_TEST(win32_remediation, med06_exact_error_attribution_and_abortion_message)
             static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
     GDEX_EXPECT_TRUE(req_guard_fail->get_error_message() == guard_err);
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
@@ -633,6 +644,7 @@ GDEX_TEST_T(win32_remediation, med08_single_mip_parsed_values_preserved, TAG_INT
     GDEX_EXPECT_EQ(parent->get_uncompressed_size(), 200u);
     GDEX_EXPECT_EQ(parent->get_cancellation_tag(), 999u);
 #else
+    (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }

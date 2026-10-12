@@ -298,6 +298,8 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		int32_t p_cache_mode,
 		bool p_use_sub_threads,
 		bool p_as_image_texture) const {
+	(void)p_is_srgb;
+	(void)p_mip_row_pitches;
 	if (p_width == 0 || p_height == 0 || p_mip_count == 0) {
 		UtilityFunctions::push_error("DSResourceFormatLoader: Invalid 2D texture dimensions or mip count for '", p_cache_key, "' (width=", p_width, ", height=", p_height, ", mips=", p_mip_count, ").");
 		return Variant();
