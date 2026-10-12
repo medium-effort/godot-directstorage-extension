@@ -42,13 +42,11 @@ namespace GDeflate
     {
         if (!header->IsValid())
         {
-            printf("Malformed stream encountered.\n");
             return false;
         }
 
         if (header->id != kGDeflateId)
         {
-            printf("Unknown stream format: %d\n", header->id);
             return false;
         }
 

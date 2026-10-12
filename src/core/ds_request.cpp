@@ -31,24 +31,32 @@ uint64_t DSRequest::get_offset() const {
 	return offset;
 }
 
-void DSRequest::set_size(uint32_t p_size) {
+void DSRequest::set_size(int64_t p_size) {
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
-	size = p_size;
+	if (p_size < 0 || p_size > static_cast<int64_t>(UINT32_MAX)) {
+		UtilityFunctions::push_error("DSRequest: Request size " + String::num_int64(p_size) + " exceeds maximum supported DirectStorage size (4 GiB).");
+		return;
+	}
+	size = static_cast<uint32_t>(p_size);
 }
 
 uint32_t DSRequest::get_size() const {
 	return size;
 }
 
-void DSRequest::set_uncompressed_size(uint32_t p_size) {
+void DSRequest::set_uncompressed_size(int64_t p_size) {
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
-	uncompressed_size = p_size;
+	if (p_size < 0 || p_size > static_cast<int64_t>(UINT32_MAX)) {
+		UtilityFunctions::push_error("DSRequest: Request uncompressed_size " + String::num_int64(p_size) + " exceeds maximum supported DirectStorage size (4 GiB).");
+		return;
+	}
+	uncompressed_size = static_cast<uint32_t>(p_size);
 }
 
 uint32_t DSRequest::get_uncompressed_size() const {

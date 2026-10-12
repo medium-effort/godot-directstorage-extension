@@ -176,6 +176,17 @@ Error DSPkg::finalize() {
 		}
 	}
 
+	HashSet<String> seen_staging_paths;
+	for (int i = 0; i < count; ++i) {
+		Dictionary item = staging_entries[i];
+		String res_path = item["resource_path"];
+		if (seen_staging_paths.has(res_path)) {
+			UtilityFunctions::push_error("DSPkg: Duplicate entry path encountered during finalization: " + res_path);
+			return ERR_ALREADY_EXISTS;
+		}
+		seen_staging_paths.insert(res_path);
+	}
+
 	uint64_t header_size = sizeof(DSPkgHeader);
 	uint64_t entry_table_size = 0;
 
@@ -371,6 +382,16 @@ Error DSPkg::finalize() {
 		}
 	}
 
+	static const uint8_t ZERO_PADDING[4096] = {0};
+	auto write_zero_padding = [&](uint64_t p_current, uint64_t p_aligned) -> void {
+		uint64_t rem = p_aligned - p_current;
+		while (rem > 0) {
+			uint64_t chunk = std::min<uint64_t>(rem, sizeof(ZERO_PADDING));
+			file->store_buffer(ZERO_PADDING, chunk);
+			rem -= chunk;
+		}
+	};
+
 	uint64_t payload_offset = table_end_offset;
 	for (int i = 0; i < count; ++i) {
 		Dictionary item = staging_entries[i];
@@ -381,9 +402,7 @@ Error DSPkg::finalize() {
 			file->close();
 			return ERR_INVALID_PARAMETER;
 		}
-		for (uint64_t padding = payload_offset; padding < aligned_payload_offset; ++padding) {
-			file->store_8(0);
-		}
+		write_zero_padding(payload_offset, aligned_payload_offset);
 		payload_offset = aligned_payload_offset;
 
 		Dictionary dstex_header = item["header"];
@@ -402,12 +421,15 @@ Error DSPkg::finalize() {
 						file->close();
 						return ERR_INVALID_PARAMETER;
 					}
-					for (uint64_t padding = payload_offset; padding < aligned_mip_offset; ++padding) {
-						file->store_8(0);
-					}
+					write_zero_padding(payload_offset, aligned_mip_offset);
 					payload_offset = aligned_mip_offset;
 				}
 				if (mip_size > 0) {
+					if (slice_offset < 0 || static_cast<uint64_t>(slice_offset) + mip_size > static_cast<uint64_t>(data.size())) {
+						UtilityFunctions::push_error("DSPkg: Mip slice offset exceeds compressed data size.");
+						file->close();
+						return ERR_INVALID_DATA;
+					}
 					file->store_buffer(data.ptr() + slice_offset, mip_size);
 					slice_offset += mip_size;
 				}
@@ -657,6 +679,9 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 				mip_entry.row_pitch = static_cast<uint32_t>(entry.mip_row_pitches[mip]);
 				mip_entry.reserved = 0;
 			}
+			if (entries_by_offset.has(abs_payload_offset)) {
+				return fail(ERR_FILE_CORRUPT, "Duplicate entry payload offset in archive.");
+			}
 			entries_by_offset[abs_payload_offset] = mip_vector;
 		}
 			if (!checked_add(current_pos, metadata_size, current_pos)) {
@@ -664,6 +689,9 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 			}
 		}
 
+		if (entries_by_path.has(entry.path)) {
+			return fail(ERR_FILE_CORRUPT, "Duplicate entry path in archive: " + entry.path);
+		}
 		entries_by_path[entry.path] = entry;
 		entries_by_hash[entry.path_hash].push_back(entry);
 	}

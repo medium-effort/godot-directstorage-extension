@@ -22,50 +22,32 @@ uint64_t ds_win32_get_completion_fence(PlatformBackend *p_backend);
 bool ds_win32_wait_for_completion(PlatformBackend *p_backend, uint64_t p_fence_value, uint32_t p_timeout_msec);
 #endif
 
-static bool synchronize_rendering_device(const String &p_phase) {
+static bool validate_d3d12_rendering_device_active(const String &p_phase) {
 #ifdef _WIN32
 	RenderingServer *rs = RenderingServer::get_singleton();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
-		UtilityFunctions::push_error("[DirectStorage] RenderingDevice synchronization unavailable during " + p_phase + ": D3D12 is not active.");
+		UtilityFunctions::push_error("[DirectStorage] D3D12 RenderingDevice validation unavailable during " + p_phase + ": D3D12 is not active.");
 		return false;
 	}
 
 	RenderingDevice *rd = rs->get_rendering_device();
 	if (!rd) {
-		UtilityFunctions::push_error("[DirectStorage] RenderingDevice synchronization unavailable during " + p_phase + ": no RenderingDevice is active.");
+		UtilityFunctions::push_error("[DirectStorage] D3D12 RenderingDevice validation unavailable during " + p_phase + ": no RenderingDevice is active.");
 		return false;
 	}
 
-	// DirectStorage GPU synchronization contract (enforced, not advisory):
-	// - Transfers write directly into D3D12 resources on the DirectStorage queue and are
-	//   synchronized via ID3D12Fence / IDStorageQueue completion fences.
-	// - Godot's main RenderingDevice submits command buffers per-frame; manual submit()/sync()
-	//   on the main instance is prohibited (Condition "is_main_instance" is true).
+	// DirectStorage GPU synchronization contract:
+	// - Note: This function validates D3D12 driver presence and active RenderingDevice.
+	//   It does NOT submit or synchronize GPU command lists; command list synchronization
+	//   is managed via ID3D12Fence / DirectStorage completion fences and call_on_render_thread().
 	// - DirectStorage SDK requirement: destination resources for GPU decompression
 	//   (DSTORAGE_DESTINATION_MULTIPLE_SUBRESOURCES / buffer destinations)
-	//   MUST be in D3D12_RESOURCE_STATE_COMMON.
-	//   (1) Destination textures must be in D3D12_RESOURCE_STATE_COMMON before
-	//       DirectStorage GPU decompression writes to them. The extension records
-	//       transitions on Godot's direct command queue and serializes them with
-	//       the render thread via call_on_render_thread() before DirectStorage submit.
-	//   (2) A destination owned by an in-flight DirectStorage batch (possibly
-	//       mid-decompression, post-render-target use, state unknowable) fails GPU
-	//       enqueue loudly instead of proceeding. No silent CPU fallback: re-targeting
-	//       to memory behind the caller's back would leave the GPU texture unwritten
-	//       while the caller samples it as success.
-	// - Async no-sample-before-batch_completed is enforced the same way: destinations
-	//   stay flagged in-flight until the completion fence confirms and results are
-	//   collected, so any sample/reuse-before-complete surfaces as a loud enqueue
-	//   error pointing at batch_completed / wait_for_completion, and batch_completed
-	//   itself only fires after fence-confirmed collection. This gate below (reject
-	//   GPU work when D3D12 is not active) plus the fence wait in wait_for_completion
-	//   are the context-level halves of that contract.
-	// - Hazard note: CPU fence wait orders the DS copy before subsequently submitted
-	//   Godot command lists (safe for sync flush_batch, exposed for async
-	//   flush_batch_async until collect_completed_results).
+	//   MUST be in D3D12_RESOURCE_STATE_COMMON before DirectStorage writes to them.
+	// - Transfers write directly into D3D12 resources on the DirectStorage queue and are
+	//   synchronized via ID3D12Fence / IDStorageQueue completion fences.
 	return true;
 #else
-	UtilityFunctions::push_error("[DirectStorage] RenderingDevice synchronization unavailable during " + p_phase + ": platform is not Windows.");
+	UtilityFunctions::push_error("[DirectStorage] D3D12 RenderingDevice validation unavailable during " + p_phase + ": platform is not Windows.");
 	return false;
 #endif
 }
@@ -486,7 +468,7 @@ bool DSContext::wait_for_completion(int p_timeout_msec) {
 			return false;
 		}
 		if (active_backend->get_name() == "Win32DirectStorage" &&
-				!synchronize_rendering_device("DirectStorage completion")) {
+				!validate_d3d12_rendering_device_active("DirectStorage completion")) {
 			return false;
 		}
 	}
@@ -829,7 +811,7 @@ bool DSContext::enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maint
 		std::lock_guard<std::mutex> lock(context_mutex);
 		needs_sync = gpu_destination && !gpu_requests_pending;
 	}
-	if (needs_sync && !synchronize_rendering_device("DirectStorage GPU request")) {
+	if (needs_sync && !validate_d3d12_rendering_device_active("DirectStorage GPU request")) {
 		String error_message = "GPU destination request rejected: RenderingDevice could not be synchronized.";
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message(error_message);
@@ -1296,7 +1278,7 @@ void DSContext::collect_completed_results() {
 				std::lock_guard<std::mutex> lock(context_mutex);
 				has_gpu_pending = gpu_requests_pending;
 			}
-			if (has_gpu_pending && !synchronize_rendering_device("DirectStorage async completion")) {
+			if (has_gpu_pending && !validate_d3d12_rendering_device_active("DirectStorage async completion")) {
 				return;
 			}
 			uint64_t fence_value = 0;
@@ -1356,7 +1338,7 @@ void DSContext::collect_completed_results() {
 		has_gpu_pending = gpu_requests_pending;
 	}
 	if (has_gpu_pending) {
-		if (!synchronize_rendering_device("DirectStorage async completion")) {
+		if (!validate_d3d12_rendering_device_active("DirectStorage async completion")) {
 			return;
 		}
 		std::lock_guard<std::mutex> lock(context_mutex);

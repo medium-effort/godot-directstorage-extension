@@ -73,10 +73,10 @@ public:
 	void set_offset(uint64_t p_offset);
 	uint64_t get_offset() const;
 
-	void set_size(uint32_t p_size);
+	void set_size(int64_t p_size);
 	uint32_t get_size() const;
 
-	void set_uncompressed_size(uint32_t p_size);
+	void set_uncompressed_size(int64_t p_size);
 	uint32_t get_uncompressed_size() const;
 
 	void set_cancellation_tag(uint64_t p_tag);

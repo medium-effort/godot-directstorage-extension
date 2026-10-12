@@ -3,6 +3,7 @@
 #include "../formats/dstex_format.h"
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
+#include <algorithm>
 #include "GDeflate.h"
 #include "TileStream.h"
 
@@ -106,12 +107,18 @@ PackedByteArray GDeflateDecompressor::decompress(const PackedByteArray &p_compre
 	PackedByteArray output;
 	output.resize(p_original_size);
 
+	const GDeflate::TileStream *header = reinterpret_cast<const GDeflate::TileStream *>(p_compressed.ptr());
+	uint32_t effective_workers = 1;
+	if (header && header->numTiles > 2) {
+		effective_workers = std::min<uint32_t>(static_cast<uint32_t>(worker_count), header->numTiles / 2u);
+	}
+
 	bool ok = GDeflate::Decompress(
 			output.ptrw(),
 			static_cast<size_t>(p_original_size),
 			p_compressed.ptr(),
 			p_compressed.size(),
-			static_cast<uint32_t>(worker_count));
+			effective_workers);
 
 	if (!ok) {
 		report_decompression_error("GDeflateDecompressor: Decompression failed.");

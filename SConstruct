@@ -73,6 +73,12 @@ if env["platform"] == "windows":
             env.Append(CXXFLAGS=["/std:c++20"])
         if "/EHsc" not in env["CXXFLAGS"]:
             env.Append(CXXFLAGS=["/EHsc"])
+        if "/guard:cf" not in env["CXXFLAGS"]:
+            env.Append(CXXFLAGS=["/guard:cf"])
+        if "/guard:cf" not in env["LINKFLAGS"]:
+            env.Append(LINKFLAGS=["/guard:cf"])
+        if "/Qspectre" not in env["CXXFLAGS"]:
+            env.Append(CXXFLAGS=["/Qspectre"])
 
 # Source files (GDExtension C++ code + GDeflate & libdeflate sources).
 # Keep the Windows backend out of non-Windows builds; its implementation uses

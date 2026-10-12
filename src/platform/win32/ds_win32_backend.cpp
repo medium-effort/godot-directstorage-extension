@@ -17,6 +17,9 @@
 #ifdef _WIN32
 #include <winioctl.h>
 #include <dxgi.h>
+#if defined(_MSC_VER)
+#include <delayimp.h>
+#endif
 #endif
 
 #include <cstdio>
@@ -62,18 +65,17 @@ static void unload_runtime_modules(HMODULE p_core, HMODULE p_dstorage) {
 	}
 }
 
-struct DllDirectoryScope {
-	wchar_t previous[MAX_PATH] = {0};
-	bool had_previous = false;
-
-	DllDirectoryScope() {
-		had_previous = GetDllDirectoryW(MAX_PATH, previous) > 0;
+#if defined(_WIN32) && defined(_MSC_VER)
+static FARPROC WINAPI ds_delay_load_failure_hook(unsigned dliNotify, PDelayLoadInfo pdli) {
+	if (dliNotify == dliFailLoadLib || dliNotify == dliFailGetProc) {
+		UtilityFunctions::push_error(
+				String("[DirectStorage] Delay-load failed for: ") +
+				(pdli && pdli->szDll ? pdli->szDll : "unknown"));
 	}
-
-	~DllDirectoryScope() {
-		SetDllDirectoryW(had_previous ? previous : nullptr);
-	}
-};
+	return nullptr;
+}
+extern "C" const PfnDliHook __pfnDliFailureHook2 = ds_delay_load_failure_hook;
+#endif
 
 static Win32Backend *s_backend_instance = nullptr;
 
@@ -804,7 +806,7 @@ bool Win32Backend::wait_for_completion(uint64_t p_fence_value, uint32_t p_timeou
 			std::lock_guard<std::mutex> lock(batch_mutex);
 			for (QueueState &queue : priority_queues) {
 				if (queue.completion_fence == fence) {
-					queue.completed_fence_value = completed_val;
+					queue.completed_fence_value = std::max(queue.completed_fence_value, completed_val);
 					break;
 				}
 			}
@@ -1031,7 +1033,7 @@ void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uin
 		return;
 	}
 
-	p_queue.completed_fence_value = p_queue.completion_fence->GetCompletedValue();
+	p_queue.completed_fence_value = std::max(p_queue.completed_fence_value, p_queue.completion_fence->GetCompletedValue());
 	String failed_request_name;
 	String queue_error = retrieve_queue_error(p_queue.queue, &failed_request_name);
 
@@ -1476,14 +1478,12 @@ static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_ca
 	std::wstring w_core_path(reinterpret_cast<const wchar_t *>(core_path.utf16().get_data()));
 	std::wstring w_dstorage_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
 
-	DllDirectoryScope dll_directory_scope;
-	SetDllDirectoryW(w_bin_dir.c_str());
-	core = LoadLibraryW(w_core_path.c_str());
+	core = LoadLibraryExW(w_core_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 	if (!core) {
 		result.reason = "DirectStorage runtime DLL 'dstoragecore.dll' could not be loaded from '" + p_bin_dir + "'.";
 		return result;
 	}
-	dstorage = LoadLibraryW(w_dstorage_path.c_str());
+	dstorage = LoadLibraryExW(w_dstorage_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 	if (!dstorage) {
 		result.reason = "DirectStorage runtime DLL 'dstorage.dll' could not be loaded from '" + p_bin_dir + "'.";
 		unload_runtime_modules(core, nullptr);
@@ -1568,6 +1568,16 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	}
 
 	String norm_path = global_path.replace("/", "\\");
+	if (norm_path.begins_with("\\\\?\\UNC\\") || norm_path.begins_with("\\\\")) {
+		res["drive"] = norm_path;
+		res["bus_type"] = "Network";
+		res["file_system"] = "SMB";
+		res["bypassio_state"] = "Unsupported";
+		res["directstorage_supported"] = false;
+		res["reason"] = "DirectStorage and BypassIO are not supported on UNC network shares.";
+		return res;
+	}
+
 	std::wstring w_norm_path(reinterpret_cast<const wchar_t *>(norm_path.utf16().get_data()));
 	wchar_t volume_path[MAX_PATH] = {0};
 	String drive_root;
@@ -1593,7 +1603,19 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	}
 
 	// 4. Query Storage BusType & BypassIO State
-	String volume_device = "\\\\.\\" + drive_root.substr(0, 2);
+	String volume_device;
+	wchar_t volume_name_guid[MAX_PATH] = {0};
+	if (GetVolumeNameForVolumeMountPointW(w_drive_root.c_str(), volume_name_guid, MAX_PATH)) {
+		String guid_str = String(reinterpret_cast<const char16_t *>(volume_name_guid));
+		if (guid_str.ends_with("\\")) {
+			guid_str = guid_str.substr(0, guid_str.length() - 1);
+		}
+		volume_device = guid_str;
+	} else if (drive_root.length() >= 2 && drive_root[1] == ':') {
+		volume_device = "\\\\.\\" + drive_root.substr(0, 2);
+	} else {
+		volume_device = "\\\\.\\C:";
+	}
 	std::wstring w_volume_device(reinterpret_cast<const wchar_t *>(volume_device.utf16().get_data()));
 
 	HANDLE hDevice = CreateFileW(
@@ -2089,14 +2111,12 @@ bool Win32Backend::initialize(const String &p_path) {
 			std::wstring w_core_path(reinterpret_cast<const wchar_t *>(dstoragecore_path.utf16().get_data()));
 			std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
 
-			DllDirectoryScope dll_scope;
-			SetDllDirectoryW(w_bin_dir.c_str());
-			dstoragecore_module = LoadLibraryW(w_core_path.c_str());
+			dstoragecore_module = LoadLibraryExW(w_core_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 			if (!dstoragecore_module) {
 				UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstoragecore.dll' could not be loaded from '" + bin_dir + "'.");
 				return false;
 			}
-			dstorage_module = LoadLibraryW(w_ds_path.c_str());
+			dstorage_module = LoadLibraryExW(w_ds_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 			if (!dstorage_module) {
 				UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstorage.dll' could not be loaded from '" + bin_dir + "'.");
 				unload_runtime_modules(dstoragecore_module, dstorage_module);
@@ -2124,6 +2144,7 @@ bool Win32Backend::initialize(const String &p_path) {
 #endif
 		uint64_t staging_bytes = static_cast<uint64_t>(staging_mb) * 1024ULL * 1024ULL;
 		if (staging_bytes > UINT32_MAX) {
+			UtilityFunctions::push_warning("[DirectStorage] Configured staging buffer size (" + String::num_uint64(staging_mb) + " MiB) exceeds DirectStorage 4 GiB maximum; clamping to 4095 MiB.");
 			staging_bytes = UINT32_MAX;
 		}
 		factory->SetStagingBufferSize(static_cast<UINT32>(staging_bytes));
@@ -2729,7 +2750,9 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		} else {
 			destination_buffer = dest_res;
 			const D3D12_RESOURCE_DESC &buffer_desc = dest_desc;
-			if (buffer_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || p_destination_offset + uncompressed_size > buffer_desc.Width) {
+			if (buffer_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+					p_destination_offset > buffer_desc.Width ||
+					static_cast<uint64_t>(uncompressed_size) > (buffer_desc.Width - p_destination_offset)) {
 				destination_error = "Win32Backend: GPU buffer destination size exceeds the mapped D3D12 buffer resource.";
 			} else if (gpu_destination_in_flight(destination_buffer)) {
 				// COMMON cannot be established while DirectStorage owns this

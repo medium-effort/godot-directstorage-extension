@@ -3,7 +3,9 @@
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
+#include <algorithm>
 #include "GDeflate.h"
+#include "TileStream.h"
 
 namespace godot {
 
@@ -221,12 +223,20 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 			return false;
 		}
 
+		uint32_t effective_workers = 1;
+		if (raw_bytes.size() >= static_cast<int64_t>(sizeof(GDeflate::TileStream))) {
+			const GDeflate::TileStream *header = reinterpret_cast<const GDeflate::TileStream *>(raw_bytes.ptr());
+			if (header && header->numTiles > 2) {
+				effective_workers = std::min(num_workers, static_cast<uint32_t>(header->numTiles / 2u));
+			}
+		}
+
 		bool ok = GDeflate::Decompress(
 				dest.ptrw(),
 				static_cast<size_t>(uncompressed_size),
 				raw_bytes.ptr(),
 				raw_bytes.size(),
-				num_workers);
+				effective_workers);
 
 		if (!ok) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
