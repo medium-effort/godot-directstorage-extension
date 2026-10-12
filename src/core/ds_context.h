@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <deque>
+#include <list>
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
@@ -58,7 +59,8 @@ private:
 	Dictionary request_execution_reports;
 	std::unordered_map<int64_t, Ref<DSRequest>> tracked_requests;
 	std::unordered_set<int64_t> pending_request_ids;
-	std::deque<int64_t> report_order;
+	std::list<int64_t> report_order;
+	std::unordered_map<int64_t, std::list<int64_t>::iterator> report_order_map;
 	int pending_request_count = 0;
 	std::deque<int> pending_batch_request_counts;
 

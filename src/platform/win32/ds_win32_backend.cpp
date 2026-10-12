@@ -30,6 +30,7 @@
 #include <set>
 #include <utility>
 #include <algorithm>
+#include <mutex>
 
 namespace godot {
 
@@ -524,8 +525,8 @@ static bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_e
 
 	std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard = s_resource_guards.find(p_request.ptr());
 	RID destination_rid = p_request->get_destination_resource();
-	if (guard == s_resource_guards.end() || !guard->second || !destination_rid.is_valid()) {
-		r_error = "DirectStorage GPU resource RID was freed before batch completion.";
+	if (guard == s_resource_guards.end() || !guard->second || !destination_rid.is_valid() || !p_request->is_gpu_in_flight()) {
+		r_error = "DirectStorage GPU resource RID was freed or cancelled before batch completion.";
 		return false;
 	}
 
@@ -536,12 +537,13 @@ static bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_e
 		return false;
 	}
 
-	// get_driver_resource() is render-thread-affine but this runs on the
-	// completion (or polling) thread, so the re-query is marshalled above.
-	// When the render thread cannot answer, fall back to the cached guard
-	// only: the AddRef'd ID3D12Resource captured at enqueue time is still
-	// alive, so the DirectStorage write landed in the right memory and only
-	// the RID-replacement check is skipped as unverifiable.
+	// Split validation contract (MED-12):
+	// - Off-render-thread (completion thread): Calling RenderingDevice queries (texture_is_valid,
+	//   get_driver_resource) violates thread affinity and asserts (Q02). Validation is conservative:
+	//   the COM ID3D12Resource AddRef retention invariant guarantees the GPU allocation remains
+	//   physically valid for DMA write, while is_gpu_in_flight() above confirms the request was not cancelled.
+	// - On-render-thread (sync flush / main poll): Queries the live driver resource to confirm
+	//   the RID still points to the exact same ID3D12Resource pointer.
 	bool is_buffer_request = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER;
 	ID3D12Resource *current_resource = nullptr;
 	bool has_cached = false;
@@ -1503,6 +1505,8 @@ static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_ca
 		return result;
 	}
 
+	Win32Backend::apply_dstorage_configuration_once();
+
 	IDStorageFactory *probe_factory = nullptr;
 	HRESULT hr = DStorageGetFactory(IID_PPV_ARGS(&probe_factory));
 	if (FAILED(hr) || !probe_factory) {
@@ -1689,8 +1693,30 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	return res;
 }
 
-bool Win32Backend::is_available() const {
 #ifdef _WIN32
+static std::once_flag s_dstorage_config_once;
+
+void Win32Backend::apply_dstorage_configuration_once() {
+	std::call_once(s_dstorage_config_once, []() {
+		DSContext *ctx = DSContext::get_singleton();
+		bool disable_gpu = ctx ? ctx->get_disable_gpu_decompression() : false;
+
+		DSTORAGE_CONFIGURATION config = {};
+		config.DisableTelemetry = TRUE;
+		config.DisableGpuDecompression = disable_gpu;
+		config.DisableGpuDecompressionMetacommand = disable_gpu;
+
+		HRESULT hr = DStorageSetConfiguration(&config);
+		if (FAILED(hr)) {
+			UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration returned 0x" +
+					String::num_uint64(static_cast<uint32_t>(hr), 16) + " (configuration may already be active).");
+		} else {
+			UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration applied successfully.");
+		}
+	});
+}
+
+bool Win32Backend::probe_system_support() {
 	Dictionary drive_info = get_drive_info_for_path("res://");
 	if (!drive_info.get("directstorage_supported", false)) {
 		UtilityFunctions::print("[DirectStorage] Backend unavailable: " + String(drive_info["reason"]));
@@ -1708,9 +1734,14 @@ bool Win32Backend::is_available() const {
 		UtilityFunctions::print("[DirectStorage] Backend unavailable: " + probe.reason);
 	}
 	return probe.available;
+}
 #else
-	return false;
+void Win32Backend::apply_dstorage_configuration_once() {}
+bool Win32Backend::probe_system_support() { return false; }
 #endif
+
+bool Win32Backend::is_available() const {
+	return probe_system_support();
 }
 
 String Win32Backend::get_name() const {
@@ -2080,13 +2111,7 @@ bool Win32Backend::initialize(const String &p_path) {
 	bool disable_gpu = ctx->get_disable_gpu_decompression();
 	uint16_t capacity = ctx->get_queue_capacity();
 
-	DSTORAGE_CONFIGURATION config = {};
-	config.DisableTelemetry = TRUE;
-	config.DisableGpuDecompression = disable_gpu;
-	config.DisableGpuDecompressionMetacommand = disable_gpu;
-
-	// DStorageSetConfiguration is optional. Ignore non-fatal configuration errors.
-	DStorageSetConfiguration(&config);
+	apply_dstorage_configuration_once();
 
 	String step_name = "DStorageGetFactory";
 	HRESULT hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
@@ -3298,6 +3323,9 @@ bool Win32Backend::collect_completed_batch(uint64_t &r_fence_value, int &r_compl
 			if (!slot.completion_ready) {
 				continue;
 			}
+			if (slot.is_sync_submission) {
+				continue;
+			}
 			r_fence_value = slot.fence_value;
 			r_completed_count = slot.completed_count;
 			r_error_code = slot.error_code;
@@ -3483,6 +3511,7 @@ void Win32Backend::submit_batch() {
 			batch.fence_value = completion_value;
 			slot.fence_value = completion_value;
 			slot.submitted = true;
+			slot.is_sync_submission = true;
 			slot.completion_ready = false;
 			slot.error_code = 0;
 			slot.error_message = String();
@@ -3530,6 +3559,7 @@ void Win32Backend::submit_batch() {
 				slot.error_message = String();
 				slot.closing = false;
 				slot.completion_ready = false;
+				slot.is_sync_submission = false;
 			}
 			auto sync_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sync_start_time).count();
 			if (sync_elapsed_ms > 100) {
@@ -3547,6 +3577,7 @@ void Win32Backend::submit_batch() {
 			for (int i = 0; i < submitted_queues.size(); i++) {
 				int q_idx = submitted_queues[i];
 				BatchSlot &slot = priority_queues[q_idx].batch_slots[submit_slot_index];
+				slot.is_sync_submission = false;
 				if (slot.submitted || !slot.completion_ready) {
 					std::unordered_set<uint64_t> tags;
 					for (int r = 0; r < slot.requests.size(); r++) {

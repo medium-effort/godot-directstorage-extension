@@ -104,12 +104,13 @@ void DSContext::evict_old_reports_if_needed_locked() {
 				break;
 			}
 		}
+		report_order_map.erase(request_id);
 		report_order.pop_front();
 		request_execution_reports.erase(request_id);
 		tracked_requests.erase(request_id);
 	}
 	// Observability for the 32768-cap risk: eviction legitimately blocks on
-	// pending/in-flight IDs (they must not be freed). If the deque is still
+	// pending/in-flight IDs (they must not be freed). If the list is still
 	// over capacity here, growth is unbounded until those requests terminate.
 	// Verbose-only to avoid spamming the main-thread flush path per request.
 	if (request_execution_reports.size() > (int)MAX_EXECUTION_REPORTS) {
@@ -120,12 +121,10 @@ void DSContext::evict_old_reports_if_needed_locked() {
 void DSContext::remove_report_locked(int64_t p_request_id) {
 	request_execution_reports.erase(p_request_id);
 	tracked_requests.erase(p_request_id);
-	for (std::deque<int64_t>::iterator it = report_order.begin(); it != report_order.end();) {
-		if (*it == p_request_id) {
-			it = report_order.erase(it);
-		} else {
-			++it;
-		}
+	auto map_it = report_order_map.find(p_request_id);
+	if (map_it != report_order_map.end()) {
+		report_order.erase(map_it->second);
+		report_order_map.erase(map_it);
 	}
 }
 
@@ -178,8 +177,13 @@ void DSContext::finalize_completed_reports_locked() {
 			request_execution_reports[request_id] = report;
 		}
 		count_stream_request_terminal(request);
-		remove_report_locked(request_id);
-		it = tracked_requests.begin();
+		request_execution_reports.erase(request_id);
+		auto map_it = report_order_map.find(request_id);
+		if (map_it != report_order_map.end()) {
+			report_order.erase(map_it->second);
+			report_order_map.erase(map_it);
+		}
+		it = tracked_requests.erase(it);
 	}
 }
 
@@ -192,8 +196,7 @@ bool DSContext::is_supported() const {
 	}
 	std::call_once(support_probe_once, []() {
 #ifdef _WIN32
-		Win32Backend backend;
-		DSContext::supported_probe_result = backend.is_available();
+		DSContext::supported_probe_result = Win32Backend::probe_system_support();
 #else
 		DSContext::supported_probe_result = false;
 #endif
@@ -273,6 +276,7 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 
 	DSTORAGE_COMPRESSION_SUPPORT support = DSTORAGE_COMPRESSION_SUPPORT_NONE;
 	if (dstorage_module) {
+		Win32Backend::apply_dstorage_configuration_once();
 		using DStorageGetFactoryFunction = HRESULT(WINAPI *)(REFIID, void **);
 		DStorageGetFactoryFunction get_factory = reinterpret_cast<DStorageGetFactoryFunction>(GetProcAddress(dstorage_module, "DStorageGetFactory"));
 		IDStorageFactory *factory = nullptr;
@@ -718,6 +722,7 @@ void DSContext::shutdown_ds_locked() {
 		tracked_requests.clear();
 		pending_request_ids.clear();
 		report_order.clear();
+		report_order_map.clear();
 	}
 	{
 		// Stream state: drop queued Refs, freeze tags as cancelled so any
@@ -860,6 +865,7 @@ bool DSContext::enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maint
 		tracked_requests[request_id] = p_request;
 		pending_request_ids.insert(request_id);
 		report_order.push_back(request_id);
+		report_order_map[request_id] = std::prev(report_order.end());
 		// Per-request finalize+evict only on the sync path; the stream flush
 		// runs both once after submit (see flush_stream_async).
 		if (!p_skip_maintenance) {

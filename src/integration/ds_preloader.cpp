@@ -1245,6 +1245,21 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 	}
 }
 
+static uint64_t estimate_payload_bytes(const DSPreloader::Payload &p_meta) {
+	uint64_t bytes = 0;
+	if (p_meta.is_v2) {
+		for (int i = 0; i < p_meta.mip_uncompressed_sizes.size(); ++i) {
+			bytes += static_cast<uint64_t>(p_meta.mip_uncompressed_sizes[i]);
+		}
+	} else {
+		bytes = p_meta.original_size;
+	}
+	if (bytes == 0) {
+		bytes = static_cast<uint64_t>(p_meta.width) * static_cast<uint64_t>(p_meta.height) * 4ULL;
+	}
+	return bytes;
+}
+
 void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_cache, int &r_stored) {
 	DSContext *ctx = DSContext::get_singleton();
 	bool is_cancelled = (ctx != nullptr && ctx->is_tag_cancelled(p_entry.tag));
@@ -1486,6 +1501,9 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 		terminal_ids.insert(terminal_ids.end(), cpu_terminal_ids.begin(), cpu_terminal_ids.end());
 	}
 
+	uint64_t slice_bytes_processed = 0;
+	constexpr uint64_t kMaxBytesPerSlice = 64ULL * 1024ULL * 1024ULL; // 64 MiB slice cap
+
 	for (size_t ti = 0; ti < terminal_ids.size(); ++ti) {
 		if (p_max_items > 0 && stored >= p_max_items) {
 			break;
@@ -1496,9 +1514,13 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				break;
 			}
 		}
+		if (stored > 0 && slice_bytes_processed >= kMaxBytesPerSlice) {
+			break;
+		}
 
 		Tracked t;
 		bool found = false;
+		bool budget_exhausted = false;
 		{
 			std::lock_guard<std::mutex> lock(state().mutex);
 			State &s = state();
@@ -1508,11 +1530,24 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				// Pending entries are immutable once enqueued, but the
 				// caller tag may differ per concurrent poll call.
 				if (p_tag == 0 || it->second.tag == p_tag) {
-					t = it->second;
-					s.pending.erase(it);
-					found = true;
+					uint64_t est_bytes = estimate_payload_bytes(it->second.meta);
+					// For CPU builds, estimate ~50us per MB for memcpy/unpad; GPU is instant (<2us)
+					uint64_t est_usec = it->second.is_gpu ? 2 : (est_bytes / (1024ULL * 1024ULL)) * 50ULL;
+					uint64_t elapsed = (p_max_usec > 0 && Time::get_singleton()) ? (Time::get_singleton()->get_ticks_usec() - start_usec) : 0;
+
+					// Pre-estimate defer: If adding this texture exceeds byte or time budget, defer it to next slice
+					if (stored > 0 && (slice_bytes_processed + est_bytes > kMaxBytesPerSlice || (p_max_usec > 0 && elapsed + est_usec > p_max_usec))) {
+						budget_exhausted = true;
+					} else {
+						t = it->second;
+						s.pending.erase(it);
+						found = true;
+					}
 				}
 			}
+		}
+		if (budget_exhausted) {
+			break;
 		}
 		if (!found) {
 			continue;
@@ -1532,12 +1567,20 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 
 		if (t.is_gpu) {
 			complete_gpu_entry(t, cache, stored);
+			slice_bytes_processed += estimate_payload_bytes(t.meta);
 		} else if (ok) {
 			Ref<Texture2D> tex = build_texture(t.meta, buffers);
 			if (tex.is_valid()) {
 				String alias = (t.meta.payload_key != t.meta.engine_path) ? t.meta.payload_key : String();
 				cache->store(t.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias);
 				stored++;
+				uint64_t entry_bytes = estimate_payload_bytes(t.meta);
+				if (entry_bytes == 0) {
+					for (size_t b = 0; b < buffers.size(); ++b) {
+						entry_bytes += (uint64_t)buffers[b].size();
+					}
+				}
+				slice_bytes_processed += entry_bytes;
 			} else {
 				UtilityFunctions::push_warning("DSPreloader: Failed to build prewarmed texture for ", t.meta.engine_path, ".");
 			}

@@ -1,5 +1,6 @@
 #include "gdeflate_decompressor.h"
 #include "../core/ds_error_handler.h"
+#include "../formats/dstex_format.h"
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 #include "GDeflate.h"
@@ -91,6 +92,10 @@ int GDeflateDecompressor::get_worker_count() const {
 
 PackedByteArray GDeflateDecompressor::decompress(const PackedByteArray &p_compressed, int p_original_size) {
 	if (p_compressed.size() == 0 || p_original_size <= 0) {
+		return PackedByteArray();
+	}
+	if (static_cast<uint64_t>(p_original_size) > DSTEX_MAX_TOTAL_BYTES) {
+		report_decompression_error("GDeflateDecompressor: Original size exceeds maximum allowed size (512 MiB).");
 		return PackedByteArray();
 	}
 	if (!validate_stream(p_compressed, p_original_size)) {

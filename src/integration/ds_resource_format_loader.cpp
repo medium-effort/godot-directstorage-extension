@@ -456,8 +456,25 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	if (result_texture.is_null()) {
 		uint32_t mip_count = p_mip_count;
 		auto wait_for_async_requests = [](DSContext *p_context, const Vector<Ref<DSRequest>> &p_requests) -> bool {
+			if (!p_context) {
+				return false;
+			}
+			// On D3D12, do a kernel-level fence wait (0% CPU, immediate wakeup)
+			if (p_context->is_d3d12_backend()) {
+				if (!p_context->wait_for_completion(5000)) {
+					return false;
+				}
+				p_context->collect_completed_results();
+				for (int i = 0; i < p_requests.size(); ++i) {
+					if (p_requests[i].is_valid() && p_requests[i]->get_status() == DSRequest::STATUS_FAILED) {
+						return false;
+					}
+				}
+				return true;
+			}
+			// Fallback backend (non-Windows / software): bounded drain loop
 			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-			while (true) {
+			while (std::chrono::steady_clock::now() < deadline) {
 				p_context->collect_completed_results();
 				bool all_complete = true;
 				for (int i = 0; i < p_requests.size(); ++i) {
@@ -469,11 +486,9 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				if (all_complete) {
 					return true;
 				}
-				if (std::chrono::steady_clock::now() >= deadline) {
-					return false;
-				}
-				std::this_thread::yield();
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			}
+			return false;
 		};
 		auto submit_memory_requests = [&](const Vector<Ref<DSRequest>> &p_requests) -> bool {
 			if (p_requests.size() == 0) {

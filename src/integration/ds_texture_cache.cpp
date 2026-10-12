@@ -281,6 +281,16 @@ DSTextureCache::~DSTextureCache() {
 	}
 }
 
+bool DSTextureCache::_is_entry_evictable_locked(const String &p_path, const Ref<Texture2D> &p_texture) const {
+	if (in_flight_takeovers.has(p_path)) {
+		return false;
+	}
+	if (ds_texture_cache_is_externally_held(p_texture)) {
+		return false;
+	}
+	return true;
+}
+
 // Evicts the oldest entry not held outside the cache, retaining its Ref in
 // r_evicted for the caller's render-thread RID release. The external-holder
 // scan MUST run on pristine counts: callers must not push candidate Refs
@@ -303,7 +313,7 @@ bool DSTextureCache::_evict_oldest(std::vector<Ref<Texture2D>> &r_evicted) {
 		const String path = e->get();
 		if (!cache_map.has(path)) {
 			lru_list.erase(e);
-		} else if (!ds_texture_cache_is_externally_held(cache_map[path].texture)) {
+		} else if (_is_entry_evictable_locked(path, cache_map[path].texture)) {
 			r_evicted.push_back(cache_map[path].texture);
 			_remove_entry(path);
 			return true;
@@ -506,6 +516,9 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 				ResourceLoader *rl = ResourceLoader::get_singleton();
 				make_resident = rl == nullptr || !rl->has_cached(p_path);
 			}
+			if (make_resident) {
+				in_flight_takeovers.insert(p_path);
+			}
 		}
 
 		std::vector<const Texture2D *> live_refs;
@@ -517,6 +530,22 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 		}
 		ds_texture_cache_drop_live_refs(evicted, live_refs);
 	}
+
+	struct TakeoverGuard {
+		std::mutex &mutex;
+		HashSet<String> &takeovers;
+		String path;
+		bool active;
+		TakeoverGuard(std::mutex &m, HashSet<String> &t, const String &p, bool act)
+				: mutex(m), takeovers(t), path(p), active(act) {}
+		~TakeoverGuard() {
+			if (active && !path.is_empty()) {
+				std::lock_guard<std::mutex> lock(mutex);
+				takeovers.erase(path);
+			}
+		}
+	} takeover_guard(cache_mutex, in_flight_takeovers, p_path, make_resident);
+
 	if (make_resident && resident.is_valid()) {
 		resident->take_over_path(p_path);
 	}
@@ -598,7 +627,7 @@ void DSTextureCache::evict(const String &p_path) {
 
 		Ref<Texture2D> victim = cache_map[canonical].texture;
 		_remove_entry(canonical);
-		if (!ds_texture_cache_is_externally_held(victim)) {
+		if (_is_entry_evictable_locked(canonical, victim)) {
 			evicted.push_back(victim);
 		}
 
@@ -620,7 +649,7 @@ void DSTextureCache::clear() {
 		std::lock_guard<std::mutex> lock(cache_mutex);
 
 		for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-			if (!ds_texture_cache_is_externally_held(kv.value.texture)) {
+			if (_is_entry_evictable_locked(kv.key, kv.value.texture)) {
 				evicted.push_back(kv.value.texture);
 			}
 		}
@@ -645,7 +674,7 @@ int DSTextureCache::clear_unused() {
 		std::vector<String> to_remove;
 		to_remove.reserve(cache_map.size());
 		for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-			if (!ds_texture_cache_is_externally_held(kv.value.texture)) {
+			if (_is_entry_evictable_locked(kv.key, kv.value.texture)) {
 				to_remove.push_back(kv.key);
 			}
 		}

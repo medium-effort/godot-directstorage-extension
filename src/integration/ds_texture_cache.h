@@ -6,6 +6,7 @@
 #include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/templates/hash_map.hpp>
+#include <godot_cpp/templates/hash_set.hpp>
 #include <godot_cpp/templates/list.hpp>
 #include <godot_cpp/templates/vector.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
@@ -37,7 +38,9 @@ private:
 	HashMap<String, CacheEntry> cache_map;
 	HashMap<String, String> alias_map;
 	List<String> lru_list;
+	HashSet<String> in_flight_takeovers;
 
+	bool _is_entry_evictable_locked(const String &p_path, const Ref<Texture2D> &p_texture) const;
 	bool _evict_oldest(std::vector<Ref<Texture2D>> &r_evicted);
 	void _remove_entry(const String &p_canonical_path);
 	void _bind_alias_locked(const String &p_canonical_path, const String &p_alias_path);

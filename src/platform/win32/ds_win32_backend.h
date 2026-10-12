@@ -78,6 +78,7 @@ private:
 		bool closing = false;
 		bool submitted = false;
 		bool completion_ready = false;
+		bool is_sync_submission = false;
 	};
 	struct QueueState {
 		IDStorageQueue1 *queue = nullptr;
@@ -174,6 +175,9 @@ private:
 public:
 	Win32Backend() = default;
 	~Win32Backend() override { shutdown(); }
+
+	static void apply_dstorage_configuration_once();
+	static bool probe_system_support();
 
 	bool is_available() const override;
 	String get_name() const override;
