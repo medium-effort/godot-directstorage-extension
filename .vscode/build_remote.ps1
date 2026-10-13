@@ -6,7 +6,9 @@ param(
     [switch]$IncludePdb,
     [switch]$IncludeTests,
     [switch]$Verbose,
-    [switch]$SkipVerify
+    [switch]$SkipVerify,
+    [switch]$Local,
+    [switch]$Remote
 )
 
 function Show-BuildFailure {
@@ -69,16 +71,76 @@ if (-not $EnvFilePath) {
     Show-BuildFailure -Step "Configuration Error" -Message "Configuration file '.env' not found! Please copy '.env.example' to '.env' and configure REMOTE_HOST and REMOTE_DIR." -Code 1
 }
 
-# Parse .env file
+# Parse .env file (strip surrounding quotes so quoted paths work)
 Get-Content $EnvFilePath | ForEach-Object {
     $line = $_.Trim()
     if ($line -and -not $line.StartsWith("#")) {
         $key, $value = $line -split '=', 2
         if ($key -and $value) {
-            [Environment]::SetEnvironmentVariable($key.Trim(), $value.Trim(), "Process")
+            [Environment]::SetEnvironmentVariable($key.Trim(), $value.Trim().Trim('"').Trim("'"), "Process")
         }
     }
 }
+
+# Local-first pipeline mode: default to local SCons unless REMOTE_BUILD=1
+# (or -Remote is passed). -Local always forces local mode.
+$IsRemote = ($Remote) -or (-not $Local -and ($env:REMOTE_BUILD -in @("1", "true", "yes")))
+
+$WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
+
+if (-not $IsRemote) {
+    # --- Local Mode (Default): compile directly with SCons ---
+    Write-Host "[Local] Building target=$Target locally with SCons..." -ForegroundColor Cyan
+    if ($IncludeTests -and -not (Test-Path -LiteralPath (Join-Path $WorkspaceRoot "extern/gdextest/SConscript"))) {
+        Write-Host "extern/gdextest submodule is missing; running 'git submodule update --init -- extern/gdextest'..." -ForegroundColor Yellow
+        try {
+            $subOut = & git submodule update --init -- extern/gdextest 2>&1
+            if ($subOut -and $Verbose) {
+                $subOut | ForEach-Object { Write-Host $_ }
+            }
+        }
+        catch {
+            $null = $_
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $WorkspaceRoot "extern/gdextest/SConscript"))) {
+            Show-BuildFailure -Step "Configuration Error" -Message "extern/gdextest is missing and auto-init failed. Run 'git submodule update --init -- extern/gdextest' manually (requires git and network access)." -Code 1
+        }
+    }
+    $LocalVerifier = Join-Path $PSScriptRoot "verify_remote.ps1"
+    if (Test-Path -LiteralPath $LocalVerifier) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $LocalVerifier -RemoteDir $WorkspaceRoot -CleanOrphans -ResetMarker 2>&1 | ForEach-Object {
+            $cText = $_.ToString()
+            if ($cText.StartsWith("KILLED_ORPHAN:")) {
+                Write-Host "    Terminated orphaned build process: $($cText.Substring(14))" -ForegroundColor Yellow
+            }
+        }
+    }
+    Push-Location $WorkspaceRoot
+    try {
+        # NOTE: each SCons variable must be a separate process argument.
+        # `dev_build=yes$TestsFlag` would fuse into one token
+        # (`dev_build=yes tests=true`) and fail boolean conversion.
+        $SconsArgs = @("platform=windows", "target=$Target", "dev_build=yes")
+        if ($IncludeTests) { $SconsArgs += "tests=true" }
+        & scons @SconsArgs
+        $LocalExit = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($LocalExit -ne 0) {
+        Show-BuildFailure -Step "Local SCons Compilation" -Message "Local SCons build failed with exit code $LocalExit." -Code $LocalExit
+    }
+    $ArtifactLocalDir = "./project/addons/directstorage_accelerator/bin"
+    $LocalManifest = Join-Path $WorkspaceRoot "project/addons/directstorage_accelerator/bin/build_manifest.json"
+    if (-not (Test-Path -LiteralPath $LocalManifest)) {
+        Write-Host "Warning: build_manifest.json not found at $LocalManifest; SCons may have skipped the manifest step." -ForegroundColor Yellow
+    }
+    Write-VerboseHost "Local artifacts in $ArtifactLocalDir." -ForegroundColor Green
+}
+else {
+    # --- Remote Mode (REMOTE_BUILD=1): SSH/SCP offload below ---
 
 $RemoteHost = $env:REMOTE_HOST
 $RemoteHostFallback = $env:REMOTE_HOST_FALLBACK
@@ -535,8 +597,10 @@ else {
 }
 
 Write-VerboseHost "Artifacts updated on Device A." -ForegroundColor Green
+} # End Remote Mode (REMOTE_BUILD=1)
 
-# 6. Post-build synchronization to external test project (e.g. TPS demo)
+# 6. Post-build synchronization to external project (e.g. TPS demo)
+# Environment-driven: syncs whenever SYNC_ADDON_DIR is defined.
 $EnableSyncVal = if ($env:ENABLE_POST_BUILD_ADDON_SYNC) { $env:ENABLE_POST_BUILD_ADDON_SYNC } `
     elseif ($env:ENABLE_ADDON_SYNC) { $env:ENABLE_ADDON_SYNC } `
     elseif ($env:DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC) { $env:DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC } `
@@ -544,25 +608,11 @@ $EnableSyncVal = if ($env:ENABLE_POST_BUILD_ADDON_SYNC) { $env:ENABLE_POST_BUILD
 
 $ShouldSync = ($EnableSyncVal.Trim().ToLower() -notin @("0", "false", "no", "off"))
 $SyncTargetDir = if ($env:SYNC_ADDON_DIR) { $env:SYNC_ADDON_DIR }
-
-$TargetGuid = if ($env:DEVICE_GUID) { $env:DEVICE_GUID } `
-    elseif ($env:TARGET_MACHINE_GUID) { $env:TARGET_MACHINE_GUID }
+$copiedCount = 0
 
 if ($ShouldSync) {
-    # Verify machine GUID on Windows
-    $CurrentGuid = $null
-    try {
-        $CurrentGuid = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Cryptography" -ErrorAction SilentlyContinue).MachineGuid
-    }
-    catch {
-        $CurrentGuid = $null
-    }
-
-    if ($TargetGuid -and $CurrentGuid -and ($TargetGuid.Trim().ToLower() -ne $CurrentGuid.Trim().ToLower())) {
-        Write-VerboseHost "Skipping post-build sync: Machine GUID ($CurrentGuid) does not match target ($TargetGuid)." -ForegroundColor DarkGray
-    }
-    elseif (-not (Test-Path "D:\")) {
-        Write-VerboseHost "Skipping post-build sync: Drive D: not found." -ForegroundColor DarkGray
+    if (-not $SyncTargetDir) {
+        Write-VerboseHost "Skipping post-build sync: SYNC_ADDON_DIR is not configured." -ForegroundColor DarkGray
     }
     else {
         Write-Host "[6/6] Syncing addon to external project ($SyncTargetDir)..." -ForegroundColor Cyan

@@ -1,10 +1,12 @@
 # Generates compile_commands.json for clangd language server.
-# By default, offloads generation to Device B where MSVC and SCons are configured,
-# downloads compile_commands.json, and normalizes paths to Device A's workspace.
-# Use -Local to generate locally on Device A if local SCons/build tools are available.
+# By default, generates locally with SCons on this machine.
+# Use -Remote (or REMOTE_BUILD=1 in .env) to offload generation to a remote
+# host where MSVC and SCons are configured, then download and normalize paths.
+# Use -Local to explicitly force local generation.
 
 param(
     [switch]$Local,
+    [switch]$Remote,
     [switch]$Verbose
 )
 
@@ -23,8 +25,37 @@ function Write-VerboseHost {
 $WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $CompileCommandsLocal = Join-Path $WorkspaceRoot "compile_commands.json"
 
-if ($Local) {
-    Write-Host "[1/2] Generating compile_commands.json locally on Device A..." -ForegroundColor Cyan
+# Load configuration from .env file (for REMOTE_BUILD / REMOTE_HOST / REMOTE_DIR)
+$EnvFileCandidates = @(
+    (Join-Path $WorkspaceRoot ".env"),
+    (Join-Path $PSScriptRoot "..\.env"),
+    (Join-Path $PSScriptRoot "build_remote.env")
+)
+
+$EnvFilePath = $null
+foreach ($cand in $EnvFileCandidates) {
+    if (Test-Path -LiteralPath $cand) {
+        $EnvFilePath = (Resolve-Path -LiteralPath $cand).Path
+        break
+    }
+}
+
+if ($EnvFilePath) {
+    Get-Content -LiteralPath $EnvFilePath | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith("#")) {
+            $key, $value = $line -split '=', 2
+            if ($key -and $value) {
+                [Environment]::SetEnvironmentVariable($key.Trim(), $value.Trim().Trim('"').Trim("'"), "Process")
+            }
+        }
+    }
+}
+
+$IsRemote = ($Remote) -or (-not $Local -and ($env:REMOTE_BUILD -in @("1", "true", "yes")))
+
+if (-not $IsRemote) {
+    Write-Host "[1/2] Generating compile_commands.json locally..." -ForegroundColor Cyan
     Push-Location $WorkspaceRoot
     try {
         & scons platform=windows compiledb
@@ -52,37 +83,12 @@ if ($Local) {
 }
 
 # -----------------------------------------------------------------------------
-# Remote Generation on Device B
+# Remote Generation (REMOTE_BUILD=1 or -Remote)
 # -----------------------------------------------------------------------------
-
-# Load configuration from .env file
-$EnvFileCandidates = @(
-    (Join-Path $WorkspaceRoot ".env"),
-    (Join-Path $PSScriptRoot "..\.env"),
-    (Join-Path $PSScriptRoot "build_remote.env")
-)
-
-$EnvFilePath = $null
-foreach ($cand in $EnvFileCandidates) {
-    if (Test-Path -LiteralPath $cand) {
-        $EnvFilePath = (Resolve-Path -LiteralPath $cand).Path
-        break
-    }
-}
 
 if (-not $EnvFilePath) {
     Write-Host "Configuration file '.env' not found! Please ensure REMOTE_HOST and REMOTE_DIR are configured." -ForegroundColor Red
     exit 1
-}
-
-Get-Content -LiteralPath $EnvFilePath | ForEach-Object {
-    $line = $_.Trim()
-    if ($line -and -not $line.StartsWith("#")) {
-        $key, $value = $line -split '=', 2
-        if ($key -and $value) {
-            [Environment]::SetEnvironmentVariable($key.Trim(), $value.Trim(), "Process")
-        }
-    }
 }
 
 $RemoteHost = $env:REMOTE_HOST
@@ -98,7 +104,7 @@ $RemoteDirWin = $RemoteDir.Replace('/', '\')
 $RemoteDirTar = $RemoteDir.Replace('\', '/')
 
 # Determine active host
-Write-Host "[1/5] Checking connectivity to Device B..." -ForegroundColor Cyan
+Write-Host "[1/5] Checking connectivity to remote host..." -ForegroundColor Cyan
 $ActiveHost = $null
 $pingPrimary = Test-Connection -ComputerName ($RemoteHost -split '@')[-1] -Count 1 -Quiet
 if ($pingPrimary) {
@@ -119,7 +125,7 @@ if (-not $ActiveHost) {
 }
 
 # Sync recent sources so SCons detects all files
-Write-Host "[2/5] Syncing source files to Device B..." -ForegroundColor Cyan
+Write-Host "[2/5] Syncing source files to remote host..." -ForegroundColor Cyan
 # Product stem for the extension binaries (see ADDON_BINARY_STEM in SConstruct).
 $AddonBinaryStem = "dsgd"
 $tarExcludes = @(
@@ -151,8 +157,8 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "Warning: Fast source sync returned code $LASTEXITCODE; continuing with remote database generation." -ForegroundColor Yellow
 }
 
-# Execute SCons compiledb on Device B
-Write-Host "[3/5] Generating compilation database on Device B..." -ForegroundColor Cyan
+# Execute SCons compiledb on remote host
+Write-Host "[3/5] Generating compilation database on remote host..." -ForegroundColor Cyan
 $RemoteMarker = "$RemoteDirWin\compiledb.ok"
 & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "del /f /q `"$RemoteMarker`" 2>nul"
 
@@ -161,12 +167,12 @@ $remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows compiledb &
 
 & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "type `"$RemoteMarker`" >nul 2>nul"
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "Error: Remote SCons compiledb failed on Device B." -ForegroundColor Red
+    Write-Host "Error: Remote SCons compiledb failed on remote host." -ForegroundColor Red
     exit 1
 }
 
 # Download compile_commands.json
-Write-Host "[4/5] Downloading compile_commands.json from Device B..." -ForegroundColor Cyan
+Write-Host "[4/5] Downloading compile_commands.json from remote host..." -ForegroundColor Cyan
 $RemoteCompiledbTar = "$RemoteDirTar/compile_commands.json"
 & scp -4 -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$RemoteCompiledbTar" "$CompileCommandsLocal"
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $CompileCommandsLocal)) {

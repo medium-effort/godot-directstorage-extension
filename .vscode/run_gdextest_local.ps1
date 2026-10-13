@@ -128,6 +128,28 @@ if (-not $GodotExe) {
     Show-StepFailure -Step "Configuration Error" -Message "No Godot binary: pass -GodotExe, set GODOT, or set GODOT_CONSOLE_PATH in .env." -Code 1
 }
 
+# Ensure the gdextest submodule is present. A plain `git clone` without
+# --recursive leaves extern/gdextest empty and every stage below fails with
+# a confusing python "can't open file" error. Init exactly the pinned commit
+# (never pull latest) and fail clearly if that is impossible.
+$GdextestCli = Join-Path $RepoRoot "extern/gdextest/tools/gdextest.py"
+if (-not (Test-Path -LiteralPath $GdextestCli)) {
+    Write-Host "gdextest submodule is missing; running 'git submodule update --init -- extern/gdextest'..." -ForegroundColor Yellow
+    try {
+        $subOut = & git submodule update --init -- extern/gdextest 2>&1
+        if ($subOut) {
+            Write-VerboseHost ($subOut -join "`n") -ForegroundColor DarkGray
+        }
+    }
+    catch {
+        $null = $_
+    }
+    if (-not (Test-Path -LiteralPath $GdextestCli)) {
+        Show-StepFailure -Step "Configuration Error" -Message "extern/gdextest is missing and auto-init failed. Run 'git submodule update --init -- extern/gdextest' manually (requires git and network access)." -Code 1
+    }
+    Write-VerboseHost "gdextest submodule initialized." -ForegroundColor Green
+}
+
 $FixtureRoot = "build/gdextest/project"
 
 # [1/5] doctor: validates config/Godot/SCons without building.

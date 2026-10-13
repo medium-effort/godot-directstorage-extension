@@ -2,7 +2,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build on Device B",
+            "label": "Build (Debug)",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -31,7 +31,7 @@
             ]
         },
         {
-            "label": "Build (Debug DLL + Tests) on Device B",
+            "label": "Build (Debug DLL + Tests)",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -58,17 +58,17 @@
             ]
         },
         {
-            "label": "Build Templates (Debug + Release) on Device B",
+            "label": "Build Templates (Debug + Release)",
             "dependsOrder": "sequence",
             "dependsOn": [
-                "Build Template (Debug) on Device B",
-                "Build Template (Release) on Device B"
+                "Build Template (Debug)",
+                "Build Template (Release)"
             ],
             "group": "build",
             "problemMatcher": []
         },
         {
-            "label": "Build Template (Debug) on Device B",
+            "label": "Build Template (Debug)",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -94,7 +94,7 @@
             ]
         },
         {
-            "label": "Build Template (Release) on Device B",
+            "label": "Build Template (Release)",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -120,11 +120,11 @@
             ]
         },
         {
-            "label": "Full Build (Templates + Tests + Run) on Device B",
+            "label": "Full Build (Templates + Tests + Run)",
             "dependsOrder": "sequence",
             "dependsOn": [
-                "Build Template (Release) on Device B",
-                "Build (Debug DLL + Tests) on Device B",
+                "Build Template (Release)",
+                "Build (Debug DLL + Tests)",
                 "Run gdextest (headless)"
             ],
             "group": "build",
@@ -199,7 +199,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Generate compile_commands.json (Device B)",
+            "label": "Generate compile_commands.json",
             "type": "shell",
             "command": "powershell",
             "args": [

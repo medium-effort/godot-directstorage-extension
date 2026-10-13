@@ -40,7 +40,7 @@ Get-Content $EnvFilePath | ForEach-Object {
     if ($line -and -not $line.StartsWith("#")) {
         $key, $value = $line -split '=', 2
         if ($key -and $value) {
-            [Environment]::SetEnvironmentVariable($key.Trim(), $value.Trim(), "Process")
+            [Environment]::SetEnvironmentVariable($key.Trim(), $value.Trim().Trim('"').Trim("'"), "Process")
         }
     }
 }
@@ -55,26 +55,14 @@ if ($Verbose) {
     Write-Host "Loaded config from $EnvFilePath" -ForegroundColor DarkGray
 }
 
-$TargetGuid = if ($env:DEVICE_GUID) { $env:DEVICE_GUID } `
-    elseif ($env:TARGET_MACHINE_GUID) { $env:TARGET_MACHINE_GUID }
-
-# Machine GUID guard (same as post-build sync): only sync on the intended Device A
-$CurrentGuid = $null
-try {
-    $CurrentGuid = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Cryptography" -ErrorAction SilentlyContinue).MachineGuid
-}
-catch {
-    $CurrentGuid = $null
-}
-
-if ($TargetGuid -and $CurrentGuid -and ($TargetGuid.Trim().ToLower() -ne $CurrentGuid.Trim().ToLower())) {
-    Write-Host "Skipping sync: Machine GUID ($CurrentGuid) does not match target ($TargetGuid)." -ForegroundColor Yellow
-    exit 0
-}
-
-if (-not (Test-Path "D:\")) {
-    Write-Host "Skipping sync: Drive D: not found." -ForegroundColor Yellow
-    exit 0
+$SyncParent = Split-Path -Parent $SyncTargetDir
+if ((-not (Test-Path $SyncTargetDir)) -and $SyncParent -and (-not (Test-Path $SyncParent))) {
+    try {
+        New-Item -ItemType Directory -Force -Path $SyncParent | Out-Null
+    } catch {
+        Write-Host "Sync target parent is not accessible: $SyncParent" -ForegroundColor Yellow
+        exit 0
+    }
 }
 
 $LocalAddonDir = (Resolve-Path (Join-Path $PSScriptRoot "..\project\addons\directstorage_accelerator")).Path
