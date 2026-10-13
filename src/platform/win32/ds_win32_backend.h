@@ -3,6 +3,7 @@
 
 #include "../platform_backend.h"
 #include <godot_cpp/templates/vector.hpp>
+#include <godot_cpp/variant/packed_string_array.hpp>
 #include <atomic>
 #include <array>
 #include <condition_variable>
@@ -178,6 +179,11 @@ public:
 
 	static void apply_dstorage_configuration_once();
 	static bool probe_system_support();
+	// Candidate directories that may hold dstorage.dll / dstoragecore.dll,
+	// in lookup order. The addon bin dir covers the editor and dev runs;
+	// the executable directory covers exported games, where Godot's
+	// GDExtension exporter places all DLLs flat next to the game binary.
+	static PackedStringArray get_runtime_search_dirs();
 
 	bool is_available() const override;
 	String get_name() const override;

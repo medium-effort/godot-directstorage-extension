@@ -28,6 +28,7 @@ src/gen/
 # Compiled GDExtension Target Outputs & Binaries
 # ==============================================================================
 project/addons/directstorage_accelerator/bin/directstorage_accelerator.*
+project/addons/directstorage_accelerator/bin/dsgd*
 project/addons/directstorage_accelerator/bin/*.lib
 project/addons/directstorage_accelerator/bin/build_manifest.json
 project/addons/directstorage_accelerator/bin/*.dll.old

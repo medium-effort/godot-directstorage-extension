@@ -5,8 +5,11 @@ extends EditorExportPlugin
 ##
 ## Author: MediumEffort
 ## Description: Bundles imported .dstex texture files into one .dspkg archive
-## during project export and automatically deploys native GDExtension binaries
-## to the required addons/directstorage_accelerator/bin subdirectory.
+## during project export. Native GDExtension binaries (dsgd_64.dll /
+## dsgd_64.debug.dll plus dstorage.dll / dstoragecore.dll) are placed flat
+## on the export root automatically by Godot's built-in GDExtension exporter
+## via the .gdextension [libraries] / [dependencies] mappings — no manual
+## DLL relocation is performed by this plugin.
 
 const OPTION_BUNDLE_DSPKG: StringName = &"directstorage/bundle_textures_dspkg"
 const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"directstorage/enforce_archive_pairing"
@@ -80,7 +83,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	var resolved_export_path := path.strip_edges().simplify_path()
 	if resolved_export_path.is_empty():
 		_target_export_dir = ""
-		push_error("[DirectStorage Exporter] Export path is empty; archive and binary deployment will be skipped.")
+		push_error("[DirectStorage Exporter] Export path is empty; archive bundling will be skipped.")
 	else:
 		if resolved_export_path.begins_with("res://") or resolved_export_path.begins_with("user://"):
 			resolved_export_path = ProjectSettings.globalize_path(resolved_export_path)
@@ -140,7 +143,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		return
 
 	if _target_export_dir.is_empty():
-		push_error("[DirectStorage Exporter] FATAL: no export directory resolved; " + _archive_name + " cannot be written. The export is incomplete and binaries will NOT be deployed.")
+		push_error("[DirectStorage Exporter] FATAL: no export directory resolved; " + _archive_name + " cannot be written. The export is incomplete.")
 		_archive_failed = true
 		return
 
@@ -239,17 +242,18 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 		print("[DirectStorage Exporter] Skipped texture payload from PCK: ", resource_path)
 
 ## Finalizes the archive, renames textures.dspkg.tmp to textures.dspkg
-## (if enabled), and deploys binaries. A DSPkg failure is fatal for this
-## plugin's outputs: partial archives are removed and binary deployment is
-## skipped so a broken build is never silently shipped. NOTE: Godot does not
+## (if enabled). A DSPkg failure is fatal for this plugin's outputs:
+## partial archives are removed so a broken build is never silently shipped.
+## NOTE: Godot does not
 ## let an EditorExportPlugin abort the core PCK/exe steps from _export_end(),
 ## so push_error() here marks the export as failed in the log but the
-## remaining core steps still run outside this plugin's control.
+## remaining core steps still run outside this plugin's control. Native DLLs
+## (dsgd_64, dstorage) are exported flat to the export root by Godot itself.
 func _export_end() -> void:
 	var dspkg_ok := true
 	if _archive_failed:
 		dspkg_ok = false
-		push_error("[DirectStorage Exporter] FATAL: export finished without a textures.dspkg archive because bundling was aborted after an earlier failure. Partial archives were removed and binaries were NOT deployed. See earlier errors for the cause (a likely candidate is out of disk space).")
+		push_error("[DirectStorage Exporter] FATAL: export finished without a textures.dspkg archive because bundling was aborted after an earlier failure. Partial archives were removed. See earlier errors for the cause (a likely candidate is out of disk space).")
 	elif _dspkg != null and _bundle_dspkg_enabled:
 		if _has_textures:
 			var err: Error = _dspkg.finalize()
@@ -260,10 +264,10 @@ func _export_end() -> void:
 				_remove_file_silent(_target_dspkg_path)
 			elif _staging_dspkg_path.is_empty() or _target_dspkg_path.is_empty():
 				dspkg_ok = false
-				push_error("[DirectStorage Exporter] FATAL: export directory was lost before finalize; " + _archive_name + " was not deployed and binaries were NOT deployed.")
+				push_error("[DirectStorage Exporter] FATAL: export directory was lost before finalize; " + _archive_name + " was not deployed.")
 			elif not FileAccess.file_exists(_staging_dspkg_path):
 				dspkg_ok = false
-				push_error("[DirectStorage Exporter] FATAL: finalized staging archive is missing at '" + _staging_dspkg_path + "'; " + _archive_name + " was not deployed and binaries were NOT deployed.")
+				push_error("[DirectStorage Exporter] FATAL: finalized staging archive is missing at '" + _staging_dspkg_path + "'; " + _archive_name + " was not deployed.")
 			else:
 				_remove_file_silent(_target_dspkg_path)
 				var rename_err := DirAccess.rename_absolute(_staging_dspkg_path, _target_dspkg_path)
@@ -282,12 +286,8 @@ func _export_end() -> void:
 	_cleanup_legacy_user_temp()
 
 	if not dspkg_ok:
-		# Do not ship DLLs next to a missing/broken textures.dspkg.
+		# Do not leave a missing/broken textures.dspkg unreported.
 		return
-
-	# Deploy native shared libraries to the exact subfolder expected by GDExtension runtime
-	if not _target_export_dir.is_empty() and _export_features.has("windows"):
-		_deploy_windows_binaries(_target_export_dir, _is_debug_export, _export_features)
 
 ## Removes the per-export staging file (textures.dspkg.tmp) in the target
 ## export directory. A rename needs no extra disk space, so normally nothing
@@ -359,7 +359,6 @@ func _is_disk_space_error(err: Error) -> bool:
 
 ## Explicit failure report that names disk space as the likely cause (with
 ## free bytes and staging size when known) instead of a generic write error.
-## Partial outputs are the caller's responsibility; binaries are NOT deployed.
 func _report_storage_failure(stage: String, err: Error, abs_path: String) -> void:
 	var free_bytes := _get_free_space_bytes(_target_export_dir)
 	var staging_bytes := -1
@@ -384,52 +383,8 @@ func _report_storage_failure(stage: String, err: Error, abs_path: String) -> voi
 		if free_bytes >= 0:
 			detail += " (free space: " + _format_bytes(free_bytes) + " at '" + _target_export_dir + "')"
 		detail += "."
-	detail += " Partial archives were removed and binaries were NOT deployed."
+	detail += " Partial archives were removed."
 	push_error(detail)
-
-## Deploys the GDExtension DLL and DirectStorage runtime dependencies to addons/directstorage_accelerator/bin.
-func _deploy_windows_binaries(target_base_dir: String, is_debug: bool, features: PackedStringArray) -> void:
-	var target_bin_dir := target_base_dir.path_join("addons/directstorage_accelerator/bin")
-	var make_dir_err := DirAccess.make_dir_recursive_absolute(target_bin_dir)
-	if make_dir_err != OK and not DirAccess.dir_exists_absolute(target_bin_dir):
-		push_error("[DirectStorage Exporter] Failed to create GDExtension target binary directory: " + target_bin_dir)
-		return
-
-	var src_bin_dir := "res://addons/directstorage_accelerator/bin/"
-	var dlls_to_copy: Array[String] = [
-		"dstorage.dll",
-		"dstoragecore.dll"
-	]
-
-	var main_dll := ""
-	if is_debug:
-		if features.has("dev") and FileAccess.file_exists(src_bin_dir.path_join("directstorage_accelerator.windows.template_debug.dev.x86_64.dll")):
-			main_dll = "directstorage_accelerator.windows.template_debug.dev.x86_64.dll"
-		else:
-			main_dll = "directstorage_accelerator.windows.template_debug.x86_64.dll"
-	else:
-		main_dll = "directstorage_accelerator.windows.template_release.x86_64.dll"
-
-	dlls_to_copy.append(main_dll)
-
-	for dll_name in dlls_to_copy:
-		var src_path := src_bin_dir.path_join(dll_name)
-		var dst_path := target_bin_dir.path_join(dll_name)
-		if FileAccess.file_exists(src_path):
-			var copy_err := DirAccess.copy_absolute(src_path, dst_path)
-			if copy_err == OK:
-				print("[DirectStorage Exporter] Deployed native binary: ", dst_path)
-			else:
-				push_warning("[DirectStorage Exporter] Could not copy " + dll_name + " to export directory: " + error_string(copy_err))
-		else:
-			push_warning("[DirectStorage Exporter] Source binary missing at: " + src_path)
-
-		# Clean up redundant duplicate DLL from root export folder left by Godot's default exporter
-		var root_dll_path := target_base_dir.path_join(dll_name)
-		if FileAccess.file_exists(root_dll_path):
-			var remove_err := DirAccess.remove_absolute(root_dll_path)
-			if remove_err == OK:
-				print("[DirectStorage Exporter] Cleaned up redundant root binary: ", dll_name)
 
 func _compute_project_guid() -> int:
 	var custom_guid = ProjectSettings.get_setting("directstorage/project_guid", 0)

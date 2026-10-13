@@ -2,7 +2,7 @@
 # every build process' output.
 
 param(
-    [string]$Target = "editor",
+    [string]$Target = "template_debug",
     [switch]$IncludePdb,
     [switch]$IncludeTests,
     [switch]$Verbose,
@@ -101,6 +101,11 @@ $ArtifactRemoteDir = "$RemoteDirTar/project/addons/directstorage_accelerator/bin
 $ArtifactLocalDir = "./project/addons/directstorage_accelerator/bin"
 $RemoteVerifyTar = "$RemoteDirTar/verify_remote.ps1"
 $RemoteVerifyWin = "$RemoteDirWin\verify_remote.ps1"
+
+# Unified DLL naming scheme: product stem for the extension binaries
+# (dsgd_64.dll / dsgd_64.debug.dll, see ADDON_BINARY_STEM in SConstruct).
+# All tar-exclude / SCP-pull / verify patterns below derive from this.
+$AddonBinaryStem = "dsgd"
 
 function Invoke-ScpArtifactWithRetry {
     param(
@@ -233,7 +238,7 @@ $tarExcludes = @(
     "--exclude=*.lib",
     "--exclude=*.ilk",
     "--exclude=*.idb",
-    "--exclude=project/addons/directstorage_accelerator/bin/directstorage_accelerator*",
+    "--exclude=project/addons/directstorage_accelerator/bin/$AddonBinaryStem*",
     "--exclude=project/addons/directstorage_accelerator/bin/~*",
     # Sync-verification manifest rides outside the tarball (uploaded via scp
     # in step [3b/6]); exclude any leftover so it can never be compiled in.
@@ -328,32 +333,42 @@ if (-not $SkipVerify) {
     Write-VerboseHost "Test sources refreshed ($TouchCount file(s))." -ForegroundColor Green
 }
 
-# 4. Trigger SCons build on Device B
-Write-Host "[4/6] Compiling target=$Target on Device B..." -ForegroundColor Cyan
+# 4. Prep + SCons build on Device B. Prep (orphan cleanup + marker reset) runs
+# FIRST in a single SSH round-trip, and [4/6] Compiling prints only after prep
+# finishes — so a slow cleanup is never mistaken for a slow compile.
 $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
+$RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
 
-# [4a/6] Clean any orphaned SCons / cl.exe build processes from previous interrupted runs for this project
-Write-VerboseHost "Cleaning any stale/orphaned build processes for $RemoteDirWin on Device B..." -ForegroundColor Cyan
-$CleanOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -CleanOrphans 2>&1
-foreach ($cLine in @($CleanOut)) {
+# [4a/6] Clean orphaned SCons / cl.exe processes from interrupted runs for this
+# project, and reset the success marker in the same remote invocation (saves
+# 2 SSH handshakes + 2 powershell cold starts vs. del/type via cmd.exe).
+Write-Host "[4/6] Cleaning stale build processes + resetting marker on Device B..." -ForegroundColor Cyan
+$prepTimer = [System.Diagnostics.Stopwatch]::StartNew()
+$PrepOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -CleanOrphans -ResetMarker 2>&1
+$prepTimer.Stop()
+$prepSecs = [int]$prepTimer.Elapsed.TotalSeconds
+$killedCount = 0
+$markerOk = $false
+foreach ($cLine in @($PrepOut)) {
     $cText = $cLine.ToString()
     if ($cText.StartsWith("KILLED_ORPHAN:")) {
-        Write-VerboseHost "Terminated orphaned build process: $($cText.Substring(14))" -ForegroundColor Yellow
+        Write-Host "    Terminated orphaned build process: $($cText.Substring(14))" -ForegroundColor Yellow
+    }
+    elseif ($cText.StartsWith("CLEANED_ORPHANS_COUNT=")) {
+        [int]::TryParse($cText.Substring(22), [ref]$killedCount) | Out-Null
+    }
+    elseif ($cText -eq "MARKER_RESET_OK") {
+        $markerOk = $true
     }
 }
-
-# Exit status cannot ride the ssh code: OpenSSH's cmd shell returns 0 even
-# when SCons fails, and %ERRORLEVEL% expands before SCons runs. A marker
-# file written only after a successful scons is the reliable signal.
-$RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
-& ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "del /f /q `"$RemoteMarkerWin`" 2>nul"
-# The deletion itself is verified: a stale marker fakes success (observed —
-# del silently failed on a locked file, scons then errored, and the
-# surviving marker passed the gate below with a SUCCESS banner).
-& ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "type `"$RemoteMarkerWin`" >nul 2>nul"
-if ($LASTEXITCODE -eq 0) {
-    Show-BuildFailure -Step "Step [4/6] Marker Reset" -Message "Stale success marker could not be deleted on Device B ($ActiveHost); refusing a build whose success cannot be verified." -Code 1
+if (-not $markerOk) {
+    $prepDetail = @($PrepOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 10) -join "`n"
+    Show-BuildFailure -Step "Step [4/6] Prep (Clean + Marker Reset)" -Message "Prep on Device B ($ActiveHost) failed after ${prepSecs}s (killed=$killedCount). Raw remote output:`n$prepDetail" -Code 1
 }
+Write-Host "    [4/6 Prep done in ${prepSecs}s, killed $killedCount orphan(s). Compiling target=$Target...]" -ForegroundColor DarkCyan
+# Exit status cannot ride the ssh code: OpenSSH's cmd shell returns 0 even
+# when SCons fails, so a marker file written only after a successful scons
+# is the reliable signal (reset above, checked below).
 # SCons output is captured and monitored. We use temporary output files with
 # Start-Process so the script can print a 1-minute heartbeat if compilation
 # is still in progress, preventing automated monitors from suspecting a hang.
@@ -442,8 +457,8 @@ if (!(Test-Path $ArtifactLocalDir)) {
 & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if exist `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`" del /q `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`"" 2>$null
 
 # Pull runtime DLLs and manifest with on-the-fly compression (-C) and bounded retries
-if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$ArtifactRemoteDir/directstorage_accelerator*.dll" -LocalDest "$ArtifactLocalDir/")) {
-    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy compiled directstorage_accelerator*.dll from Device B ($ActiveHost)." -Code 1
+if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$ArtifactRemoteDir/$AddonBinaryStem*.dll" -LocalDest "$ArtifactLocalDir/")) {
+    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy compiled $AddonBinaryStem*.dll from Device B ($ActiveHost)." -Code 1
 }
 if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$ArtifactRemoteDir/dstorage*.dll" -LocalDest "$ArtifactLocalDir/")) {
     Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy dstorage*.dll from Device B ($ActiveHost)." -Code 1
@@ -465,7 +480,7 @@ if ($IncludeTests) {
 if (-not $SkipVerify) {
     Write-VerboseHost "[5b/6] Verifying pulled artifact hashes against Device B..." -ForegroundColor Cyan
     $PullChecks = @(
-        @{ Pattern = "directstorage_accelerator*.dll"; LocalDir = $ArtifactLocalDir; Required = $true },
+        @{ Pattern = "$AddonBinaryStem*.dll"; LocalDir = $ArtifactLocalDir; Required = $true },
         @{ Pattern = "dstorage*.dll"; LocalDir = $ArtifactLocalDir; Required = $true },
         @{ Pattern = "build_manifest.json"; LocalDir = $ArtifactLocalDir; Required = $false }
     )

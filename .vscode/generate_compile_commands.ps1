@@ -120,6 +120,8 @@ if (-not $ActiveHost) {
 
 # Sync recent sources so SCons detects all files
 Write-Host "[2/5] Syncing source files to Device B..." -ForegroundColor Cyan
+# Product stem for the extension binaries (see ADDON_BINARY_STEM in SConstruct).
+$AddonBinaryStem = "dsgd"
 $tarExcludes = @(
     "--exclude=.git",
     "--exclude=.vscode",
@@ -137,7 +139,7 @@ $tarExcludes = @(
     "--exclude=*.lib",
     "--exclude=*.ilk",
     "--exclude=*.idb",
-    "--exclude=project/addons/directstorage_accelerator/bin/directstorage_accelerator*",
+    "--exclude=project/addons/directstorage_accelerator/bin/$AddonBinaryStem*",
     "--exclude=project/addons/directstorage_accelerator/bin/~*",
     "--exclude=sync_manifest.tmp",
     "--exclude=./wavexecute_tasks"

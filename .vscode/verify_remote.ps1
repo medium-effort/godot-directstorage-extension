@@ -16,7 +16,8 @@ param(
     [string]$ManifestName = "",
     [switch]$Artifacts,
     [switch]$TouchTests,
-    [switch]$CleanOrphans
+    [switch]$CleanOrphans,
+    [switch]$ResetMarker
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,21 +31,17 @@ if ([string]::IsNullOrEmpty($RemoteDir)) {
 # explicitly contains this specific $RemoteDir. This prevents file lock conflicts
 # on .sconsign, object files, or DLLs caused by previous interrupted builds, while
 # strictly avoiding killing unrelated processes or builds in other directories.
+# NOTE: server-side -Filter keeps this fast (a full Win32_Process scan with
+# CommandLine for every process costs 20-60s cold). Only cl/link/scons are
+# targeted; python/cmd are intentionally excluded (too common, risky /T kill).
 if ($CleanOrphans) {
     $killed = 0
     try {
-        $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+        $procs = Get-CimInstance Win32_Process -Filter "Name='cl.exe' OR Name='link.exe' OR Name='scons.exe'" -ErrorAction SilentlyContinue
         $normRemoteDir = $RemoteDir.TrimEnd('\', '/')
         $targetProcs = @($procs | Where-Object {
             if (-not $_.CommandLine) { return $false }
-            $cmd = $_.CommandLine
-            $hasRemoteDir = $cmd.IndexOf($normRemoteDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-            if (-not $hasRemoteDir) { return $false }
-
-            $name = $_.Name.ToLower()
-            $isBuildTool = ($name -in @("cl.exe", "link.exe", "scons.exe", "python.exe", "python3.exe", "cmd.exe")) -and
-                           ($cmd -like "*scons*" -or $name -in @("cl.exe", "link.exe"))
-            return $isBuildTool
+            return ($_.CommandLine.IndexOf($normRemoteDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
         })
 
         foreach ($p in $targetProcs) {
@@ -61,6 +58,24 @@ if ($CleanOrphans) {
         Write-Output ("CLEAN_ORPHANS_ERROR:" + $_.Exception.Message)
     }
     Write-Output ("CLEANED_ORPHANS_COUNT=" + $killed)
+}
+
+# Marker reset: delete the SCons success marker in-process so the caller needs
+# no extra SSH round-trips (del + type check). A stale marker fakes success
+# (observed: del silently failed on a locked file), so the deletion is verified
+# and reported explicitly.
+if ($ResetMarker) {
+    $markerPath = Join-Path $RemoteDir "gdextest_scons.ok"
+    try {
+        Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    } catch {
+        $null = $_
+    }
+    if (Test-Path -LiteralPath $markerPath) {
+        Write-Output "MARKER_STUCK"
+    } else {
+        Write-Output "MARKER_RESET_OK"
+    }
 }
 
 

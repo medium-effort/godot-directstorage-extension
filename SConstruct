@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os
+import re
 import sys
 
 import SCons.Script
@@ -120,7 +121,79 @@ if env["target"] in ["editor", "template_debug"]:
 
 
 output_dir = "project/addons/directstorage_accelerator/bin/"
-target_name = "directstorage_accelerator" + env["suffix"] + env["SHLIBSUFFIX"]
+# Unified flat-DLL naming scheme (single source of truth for the Windows
+# binary names; project/addons/directstorage_accelerator/
+# directstorage_accelerator.gdextension must mirror these literally).
+# Value-neutral names: the current values ("dsgd", "_64", ".debug") live
+# only on the right-hand side so a future rename touches values, not identifiers.
+#   ADDON_BINARY_STEM = product stem ("dsgd")
+#   ADDON_BINARY_ARCH_SUFFIX = target arch identifier ("_64" for x86_64)
+#   ADDON_BINARY_DEBUG_SUFFIX = debug/editor tag (".debug"; release has none)
+#   ADDON_BINARY_NAME = full binary stem: product + arch ("dsgd_64")
+# Flat root DLL deployment. Windows x86_64 uses
+# a clean 2-binary model regardless of dev_build flag:
+#   template_release -> dsgd_64.dll
+#   template_debug / editor -> dsgd_64.debug.dll
+# Non-Windows / fallback platforms retain the generic godot-cpp suffix naming.
+ADDON_BINARY_STEM = "dsgd"
+ADDON_BINARY_ARCH_SUFFIX = "_64"
+ADDON_BINARY_DEBUG_SUFFIX = ".debug"
+ADDON_BINARY_NAME = ADDON_BINARY_STEM + ADDON_BINARY_ARCH_SUFFIX
+if env["platform"] == "windows":
+    if env["target"] == "template_release":
+        target_name = ADDON_BINARY_NAME + env["SHLIBSUFFIX"]
+    elif env["target"] in ["template_debug", "editor"]:
+        target_name = ADDON_BINARY_NAME + ADDON_BINARY_DEBUG_SUFFIX + env["SHLIBSUFFIX"]
+    else:
+        target_name = "directstorage_accelerator" + env["suffix"] + env["SHLIBSUFFIX"]
+else:
+    target_name = "directstorage_accelerator" + env["suffix"] + env["SHLIBSUFFIX"]
+
+
+# Fail fast when the .gdextension manifest drifts from the ADDON_BINARY_*
+# constants above (a mismatch silently breaks editor loading and exports).
+# Uses the live constant values, so a rename only needs the manifest updated.
+# Skipped for introspection / non-build invocations (--help, dry-run, clean,
+# question, compiledb) and the sync-only aliases.
+def _assert_dll_naming_consistent():
+    skip_targets = {"sync", "sync-all", "sync-addon", "sync-test", "sync-copyable", "sync-tps", "compiledb"}
+    if (
+        SCons.Script.GetOption("no_exec")
+        or SCons.Script.GetOption("clean")
+        or SCons.Script.GetOption("help")
+        or SCons.Script.GetOption("question")
+        or any(t in skip_targets for t in SCons.Script.COMMAND_LINE_TARGETS)
+    ):
+        return
+    expected_release = ADDON_BINARY_NAME + ".dll"
+    expected_debug = ADDON_BINARY_NAME + ADDON_BINARY_DEBUG_SUFFIX + ".dll"
+    manifest_path = os.path.join("project", "addons", "directstorage_accelerator", "directstorage_accelerator.gdextension")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest_text = f.read()
+    except OSError as e:
+        print(f"[SCons] ERROR: Cannot read {manifest_path}: {e}")
+        Exit(1)
+    problems = []
+    for key, expected in (
+        ("windows.editor.x86_64", expected_debug),
+        ("windows.debug.x86_64", expected_debug),
+        ("windows.release.x86_64", expected_release),
+    ):
+        m = re.search(rf'^{re.escape(key)}\s*=\s*"([^"]+)"', manifest_text, re.MULTILINE)
+        actual = m.group(1) if m else None
+        if actual != f"bin/{expected}":
+            problems.append(f'{key}: expected "bin/{expected}", found "{actual}"')
+    if "directstorage_accelerator.windows." in manifest_text:
+        problems.append("legacy directstorage_accelerator.windows.* keys still present")
+    if problems:
+        print("[SCons] ERROR: .gdextension DLL mappings out of sync with ADDON_BINARY_* constants:")
+        for problem in problems:
+            print(f"[SCons]   - {problem}")
+        Exit(1)
+
+
+_assert_dll_naming_consistent()
 
 # Build GDExtension Shared Library (.dll)
 library = env.SharedLibrary(
@@ -457,27 +530,9 @@ def write_build_manifest():
         }
     }
 
-    # If a development build succeeded, alias/copy it to the canonical binary
-    # so official (non-dev) Godot releases/editor can load the extension out of the box.
-    if status == "SUCCESS" and env.get("target") in ["editor", "template_debug", "template_release"] and env.get("dev_build", False):
-        canonical_name = target_name.replace(".dev.", ".")
-        if canonical_name != target_name:
-            src_dll = os.path.join(output_dir, target_name)
-            dst_dll = os.path.join(output_dir, canonical_name)
-            if os.path.isfile(src_dll):
-                try:
-                    safe_copy_file(src_dll, dst_dll)
-                    print(f"[SCons] Created canonical alias: {canonical_name} <- {target_name}")
-                except Exception as e:
-                    print(f"[SCons] Warning: Failed to create canonical alias {canonical_name}: {e}")
-            # Also copy PDB if present so debuggers can resolve symbols immediately
-            src_pdb = os.path.splitext(src_dll)[0] + ".pdb"
-            dst_pdb = os.path.splitext(dst_dll)[0] + ".pdb"
-            if os.path.isfile(src_pdb):
-                try:
-                    safe_copy_file(src_pdb, dst_pdb)
-                except Exception:
-                    pass
+    # NOTE: flat dsgd_64 naming is dev_build-agnostic (dev_build=yes still
+    # outputs dsgd_64.dll / dsgd_64.debug.dll), so no canonical alias copy
+    # is needed here.
 
     if status == "SUCCESS" and ENABLE_EXTERNAL_SYNC and os.path.exists("D:\\"):
         # 1. Device B synchronization (to D:\directstorage-test and D:\directstorage-addon-copyable-windows)
@@ -551,22 +606,25 @@ def write_build_manifest():
         except Exception:
             pass
 
-    # Standard known binary targets for the current platform
+    # Standard known binary targets: flat 2-binary model on Windows,
+    # derived from the ADDON_BINARY_* naming constants above.
     known_targets = {
-        "directstorage_accelerator.windows.editor.x86_64.dll": "editor",
-        "directstorage_accelerator.windows.template_debug.x86_64.dll": "template_debug",
-        "directstorage_accelerator.windows.template_debug.dev.x86_64.dll": "template_debug.dev",
-        "directstorage_accelerator.windows.template_release.x86_64.dll": "template_release",
-        "directstorage_accelerator.windows.template_release.dev.x86_64.dll": "template_release.dev",
+        ADDON_BINARY_NAME + ".dll": "template_release",
+        ADDON_BINARY_NAME + ADDON_BINARY_DEBUG_SUFFIX + ".dll": "template_debug",
     }
     for kt_name, kt_type in known_targets.items():
         if kt_name not in targets_dict:
             targets_dict[kt_name] = {"target_type": kt_type}
 
+    # Prune legacy long-form binary entries from the pre-dsgd naming scheme.
+    for legacy_name in list(targets_dict.keys()):
+        if legacy_name.startswith("directstorage_accelerator.windows."):
+            targets_dict.pop(legacy_name, None)
+
     # Discover any additional compiled shared library binaries in output_dir
     if os.path.exists(output_dir):
         for fname in os.listdir(output_dir):
-            if (fname.startswith("directstorage_accelerator") or fname.startswith("libdirectstorage_accelerator")) and (
+            if (fname.startswith(ADDON_BINARY_STEM) or fname.startswith("libdirectstorage_accelerator")) and (
                 fname.endswith(".dll") or fname.endswith(".so") or fname.endswith(".dylib")
             ):
                 if fname not in targets_dict:
@@ -589,9 +647,9 @@ def write_build_manifest():
             entry.pop("size_bytes", None)
 
     # Update metadata specifically for the target compiled in the current SCons run
+    # NOTE: target_type intentionally omits the .dev suffix — flat dsgd_64
+    # naming is identical for dev and non-dev builds.
     curr_target_type = env.get("target", "unknown")
-    if env.get("dev_build", False):
-        curr_target_type += ".dev"
 
     curr_entry = targets_dict.setdefault(target_name, {})
     curr_entry["target_type"] = curr_target_type
@@ -614,31 +672,6 @@ def write_build_manifest():
     curr_entry["last_commit"] = commit_short
     curr_entry["last_built_at"] = build_finish_time.isoformat()
     curr_entry["last_build_duration_seconds"] = duration_seconds
-
-    # If canonical alias was generated for this dev build, record its explicit metadata
-    if env.get("target") in ["editor", "template_debug", "template_release"] and env.get("dev_build", False):
-        canonical_name = target_name.replace(".dev.", ".")
-        if canonical_name != target_name:
-            can_entry = targets_dict.setdefault(canonical_name, {})
-            can_entry["target_type"] = env.get("target")
-            can_entry["aliased_from"] = target_name
-            can_entry["is_dev_build"] = True
-            can_fpath = os.path.join(output_dir, canonical_name)
-            if os.path.isfile(can_fpath):
-                try:
-                    st_can = os.stat(can_fpath)
-                    mtime_can = datetime.datetime.fromtimestamp(st_can.st_mtime, tz=datetime.timezone.utc).astimezone()
-                    can_entry["exists"] = True
-                    can_entry["size_bytes"] = st_can.st_size
-                    can_entry["last_modified"] = mtime_can.isoformat()
-                except Exception:
-                    can_entry["exists"] = True
-            else:
-                can_entry["exists"] = False
-            can_entry["last_build_status"] = status
-            can_entry["last_commit"] = commit_short
-            can_entry["last_built_at"] = build_finish_time.isoformat()
-            can_entry["last_build_duration_seconds"] = duration_seconds
 
     manifest_data = {
         "status": status,

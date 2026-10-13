@@ -10,6 +10,8 @@
                 "Bypass",
                 "-File",
                 "${workspaceFolder}/.vscode/build_remote.ps1",
+                "-Target",
+                "template_debug",
                 "-Verbose"
             ],
             "group": {
@@ -29,7 +31,7 @@
             ]
         },
         {
-            "label": "Build (+ tests) on Device B",
+            "label": "Build (Debug DLL + Tests) on Device B",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -37,6 +39,8 @@
                 "Bypass",
                 "-File",
                 "${workspaceFolder}/.vscode/build_remote.ps1",
+                "-Target",
+                "template_debug",
                 "-IncludeTests",
                 "-Verbose"
             ],
@@ -116,12 +120,11 @@
             ]
         },
         {
-            "label": "Full Build (Editor + Templates + Tests + Run) on Device B",
+            "label": "Full Build (Templates + Tests + Run) on Device B",
             "dependsOrder": "sequence",
             "dependsOn": [
-                "Build Template (Debug) on Device B",
                 "Build Template (Release) on Device B",
-                "Build (+ tests) on Device B",
+                "Build (Debug DLL + Tests) on Device B",
                 "Run gdextest (headless)"
             ],
             "group": "build",

@@ -1738,6 +1738,25 @@ void Win32Backend::apply_dstorage_configuration_once() {
 	});
 }
 
+PackedStringArray Win32Backend::get_runtime_search_dirs() {
+	PackedStringArray dirs;
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (ps) {
+		String addon_bin = ps->globalize_path("res://addons/directstorage_accelerator/bin");
+		if (!addon_bin.is_empty()) {
+			dirs.push_back(addon_bin);
+		}
+	}
+	OS *os = OS::get_singleton();
+	if (os) {
+		String exe_dir = os->get_executable_path().get_base_dir();
+		if (!exe_dir.is_empty() && !dirs.has(exe_dir)) {
+			dirs.push_back(exe_dir);
+		}
+	}
+	return dirs;
+}
+
 bool Win32Backend::probe_system_support() {
 	Dictionary drive_info = get_drive_info_for_path("res://");
 	if (!drive_info.get("directstorage_supported", false)) {
@@ -1745,13 +1764,14 @@ bool Win32Backend::probe_system_support() {
 		return false;
 	}
 
-	ProjectSettings *ps = ProjectSettings::get_singleton();
-	if (!ps) {
-		UtilityFunctions::print("[DirectStorage] Backend unavailable: ProjectSettings is not initialized.");
-		return false;
+	DSRuntimeProbe probe;
+	PackedStringArray search_dirs = get_runtime_search_dirs();
+	for (int i = 0; i < search_dirs.size(); i++) {
+		probe = probe_runtime(search_dirs[i], 2000);
+		if (probe.available) {
+			break;
+		}
 	}
-
-	DSRuntimeProbe probe = probe_runtime(ps->globalize_path("res://addons/directstorage_accelerator/bin"), 2000);
 	if (!probe.available) {
 		UtilityFunctions::print("[DirectStorage] Backend unavailable: " + probe.reason);
 	}
@@ -1760,6 +1780,7 @@ bool Win32Backend::probe_system_support() {
 #else
 void Win32Backend::apply_dstorage_configuration_once() {}
 bool Win32Backend::probe_system_support() { return false; }
+PackedStringArray Win32Backend::get_runtime_search_dirs() { return PackedStringArray(); }
 #endif
 
 bool Win32Backend::is_available() const {
@@ -2095,35 +2116,53 @@ bool Win32Backend::initialize(const String &p_path) {
 		return false;
 	}
 	{
-		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
-		HMODULE claimed_core = nullptr;
-		HMODULE claimed_dstorage = nullptr;
-		if (claim_probed_runtime_modules(bin_dir, claimed_core, claimed_dstorage)) {
-			// Reuse the modules is_available() already loaded and verified;
-			// this is the single LoadLibrary pair for the process.
-			dstoragecore_module = claimed_core;
-			dstorage_module = claimed_dstorage;
-		} else {
-			String dstoragecore_path = bin_dir + "/dstoragecore.dll";
-			String dstorage_path = bin_dir + "/dstorage.dll";
+		// Try each candidate directory in order (addon bin for editor/dev
+		// runs, executable directory for exported games with flat DLLs).
+		// First claims modules stashed by is_available()'s probe, if the
+		// probe succeeded for that same directory.
+		PackedStringArray search_dirs = get_runtime_search_dirs();
+		bool modules_acquired = false;
+		String last_error_dir;
+		for (int i = 0; i < search_dirs.size(); i++) {
+			String bin_dir = search_dirs[i];
+			HMODULE claimed_core = nullptr;
+			HMODULE claimed_dstorage = nullptr;
+			if (claim_probed_runtime_modules(bin_dir, claimed_core, claimed_dstorage)) {
+				// Reuse the modules is_available() already loaded and verified;
+				// this is the single LoadLibrary pair for the process.
+				dstoragecore_module = claimed_core;
+				dstorage_module = claimed_dstorage;
+				modules_acquired = true;
+				break;
+			}
 
-			std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(bin_dir.utf16().get_data()));
+			String dstoragecore_path = bin_dir + String("/dstoragecore.dll");
+			String dstorage_path = bin_dir + String("/dstorage.dll");
+
 			std::wstring w_core_path(reinterpret_cast<const wchar_t *>(dstoragecore_path.utf16().get_data()));
 			std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
 
-			dstoragecore_module = LoadLibraryExW(w_core_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-			if (!dstoragecore_module) {
-				UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstoragecore.dll' could not be loaded from '" + bin_dir + "'.");
-				return false;
+			HMODULE core = LoadLibraryExW(w_core_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+			if (!core) {
+				last_error_dir = bin_dir;
+				continue;
 			}
-			dstorage_module = LoadLibraryExW(w_ds_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-			if (!dstorage_module) {
-				UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLL 'dstorage.dll' could not be loaded from '" + bin_dir + "'.");
-				unload_runtime_modules(dstoragecore_module, dstorage_module);
-				dstoragecore_module = nullptr;
-				dstorage_module = nullptr;
-				return false;
+			HMODULE dstorage = LoadLibraryExW(w_ds_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+			if (!dstorage) {
+				unload_runtime_modules(core, nullptr);
+				last_error_dir = bin_dir;
+				continue;
 			}
+			dstoragecore_module = core;
+			dstorage_module = dstorage;
+			modules_acquired = true;
+			break;
+		}
+		if (!modules_acquired) {
+			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: DirectStorage runtime DLLs ('dstoragecore.dll', 'dstorage.dll') could not be loaded from any search directory (last tried: '" + last_error_dir + "').");
+			dstoragecore_module = nullptr;
+			dstorage_module = nullptr;
+			return false;
 		}
 	}
 

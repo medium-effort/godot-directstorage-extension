@@ -241,18 +241,26 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 	bool release_dstorage_module = false;
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if ((!core_module || !dstorage_module) && ps) {
-		String bin_dir = ps->globalize_path("res://addons/directstorage_accelerator/bin");
-		String core_path = bin_dir + "/dstoragecore.dll";
-		String dstorage_path = bin_dir + "/dstorage.dll";
-		std::wstring w_core_path(reinterpret_cast<const wchar_t *>(core_path.utf16().get_data()));
-		std::wstring w_dstorage_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
-		if (!core_module) {
-			core_module = LoadLibraryW(w_core_path.c_str());
-			release_core_module = core_module != nullptr;
-		}
-		if (!dstorage_module) {
-			dstorage_module = LoadLibraryW(w_dstorage_path.c_str());
-			release_dstorage_module = dstorage_module != nullptr;
+		// Same search order as Win32Backend: addon bin first (editor/dev),
+		// then the executable directory (exported games, flat DLLs).
+		PackedStringArray search_dirs = Win32Backend::get_runtime_search_dirs();
+		for (int i = 0; i < search_dirs.size(); i++) {
+			if (core_module && dstorage_module) {
+				break;
+			}
+			String bin_dir = search_dirs[i];
+			String core_path = bin_dir + String("/dstoragecore.dll");
+			String dstorage_path = bin_dir + String("/dstorage.dll");
+			std::wstring w_core_path(reinterpret_cast<const wchar_t *>(core_path.utf16().get_data()));
+			std::wstring w_dstorage_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
+			if (!core_module) {
+				core_module = LoadLibraryW(w_core_path.c_str());
+				release_core_module = core_module != nullptr;
+			}
+			if (!dstorage_module) {
+				dstorage_module = LoadLibraryW(w_dstorage_path.c_str());
+				release_dstorage_module = dstorage_module != nullptr;
+			}
 		}
 	}
 

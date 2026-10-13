@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 13 October 2026
+Last updated: 14 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1194,4 +1194,41 @@ In addition:
 3. **Editor Memory Locking:** Commenting out or modifying an `@tool` `EditorExportPlugin` while the editor is running does not remove the active instance from memory; active editor sessions also lock DLL binaries on Windows.
 
 ### The Rule
-Never put `.dll` files or GDExtension binary directories in `include_filter` in `export_presets.cfg`. Rely on Godot's built-in GDExtension exporter to place libraries flat in the executable root folder, and avoid custom export plugins attempting to recreate subfolder hierarchies.
+Never put `.dll` files or GDExtension binary directories in `include_filter` in `export_presets.cfg`. Rely on Godot's built-in GDExtension exporter to place libraries flat in the executable root folder, and avoid custom export plugins attempting to recreate subfolder hierarchies.
+
+---
+
+## 51. GDExtension Editor Binary Redundancy & The 2-Binary Model
+
+### The Engine Reality
+Godot developers often assume that because Godot provides an `editor` compilation target (`scons target=editor`) and a `windows.editor.<arch>` key in `.gdextension`, an extension must compile and ship a dedicated editor binary.
+
+In reality:
+1. **The Godot Editor is a Debug Build:** In `core/os/os.cpp:481`, Godot defines:
+   ```cpp
+   #ifdef DEBUG_ENABLED
+   if (p_feature == "debug") {
+       return true;
+   }
+   #endif
+   ```
+   Because the Godot Editor is compiled with `DEBUG_ENABLED`, `OS::has_feature("debug")` evaluates to `true` inside the editor. When resolving `.gdextension` library tags, any entry mapped to `windows.debug.<arch>` or `windows.editor.<arch>` is fully valid.
+2. **Compiler Parity in `godot-cpp`:** In `godot-cpp/tools/godotcpp.py`, both `editor` and `template_debug` share the same optimization level (`speed_trace`), debug symbol generation, and debug assertion macros (`DEBUG_ENABLED`).
+3. **Editor ClassDB Invariant:** Classes from Godot's `editor/` module (such as `EditorPlugin`, `EditorExportPlugin`, and `EditorImportPlugin`) are compiled with `TOOLS_ENABLED` and **do not exist in `ClassDB` in runtime export templates** (`template_debug` and `template_release`). If a C++ extension defines `EditorPlugin` subclasses, it cannot be loaded in exported games without throwing `Parent class 'EditorPlugin' does not exist!`.
+
+### The Trap / Anti-Pattern
+Trying to maintain three separate binaries (`editor`, `template_debug`, and `template_release`) doubles compilation times, complicates remote build pipelines, and requires fragile DLL-aliasing steps to duplicate binaries across editor and debug targets.
+
+Conversely, attempting to rewrite editor-specific tooling (like export plugins and asset importers) into C++ breaks the clean 2-binary workflow by forcing a hard dependency on editor-only classes that are absent at runtime.
+
+### The Rule
+When an extension's editor tools (plugins, importers, exporters) are implemented in GDScript, never compile a separate `target=editor` binary; map `windows.editor` to the debug template binary (`*.debug.dll`), as Godot Editor inherently satisfies the `debug` feature tag and shares identical ABI, debug macros, and embedded doc data.
+
+In `directstorage_accelerator.gdextension`:
+```ini
+[libraries]
+windows.editor.x86_64 = "bin/dsgd_64.debug.dll"
+windows.debug.x86_64 = "bin/dsgd_64.debug.dll"
+windows.release.x86_64 = "bin/dsgd_64.dll"
+```
+
