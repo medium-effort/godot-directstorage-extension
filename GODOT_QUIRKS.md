@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 11 October 2026
+Last updated: 13 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1004,14 +1004,13 @@ func _discard_speculative_scene_async(path: String) -> void:
 
 ---
 
-## 43. Unconditional Cache `clear()` Destroys On-Screen Texture RIDs
+## 43. Unconditional Cache `clear()` and External RID Retention
 
 ### The Engine Reality
-In GDExtensions managing custom texture resources (`Texture2DRD` or native `RenderingDevice` texture allocations), the extension owns the underlying GPU texture RIDs. Calling `DSTextureCache::clear()` immediately passes every texture RID in the cache map to `RenderingDevice::free_rid()`. However, Godot's `StandardMaterial3D` and canvas pipelines hold active shader uniform sets (Set 3) binding those texture RIDs if any mesh or UI node currently in the SceneTree references them.
+In GDExtensions managing custom texture resources (`Texture2DRD` or native `RenderingDevice` texture allocations), the extension owns the underlying GPU texture RIDs. If an extension passes a texture RID to `RenderingDevice::free_rid()` while Godot's `StandardMaterial3D` or canvas pipelines hold active shader uniform sets (Set 3) binding that RID, Godot's rendering pipeline breaks immediately.
 
 ### The Trap / Symptom
-If `DSTextureCache.clear()` is called while a scene using any cached texture is active (for example, clearing level textures while the main menu robot model shares or references prewarmed textures like `res://player/...`), the underlying GPU texture resource is destroyed on the rendering device out from under the active material.
-On the next render frame, Godot attempts to build or bind the uniform set and fails continuously:
+If a texture's GPU RID is destroyed while an active scene references it, Godot attempts to build or bind the uniform set on the next frame and fails continuously:
 ```text
 [1] uniform_set_create: Texture (binding: 1, index 0) is not a valid texture. Parameter "texture" is null.
     -> <C++ Source> servers/rendering/rendering_device.cpp:4502 @ uniform_set_create()
@@ -1020,10 +1019,12 @@ On the next render frame, Godot attempts to build or bind the uniform set and fa
 ```
 The visible mesh turns completely black (drawing only untextured emission or fallback shaders), flooding the debugger with thousands of error messages per second.
 
-### The Rule
-Never call unconditional `DSTextureCache.clear()` while a scene using any cached texture is visible; call `DSTextureCache.clear_unused()` to evict only unreferenced textures (`ref_count == 1`) or restrict full `clear()` to scene transitions where no actors are rendered.
+Furthermore, calling unconditional `DSTextureCache.clear()` during active gameplay wipes all entries from `cache_map`, `alias_map`, and the LRU list. Even though external reference guards protect the GPU RIDs from being destroyed, the cache loses track of active textures, destroying deduplication and causing subsequent requests to perform redundant disk reads and memory allocations.
 
-For safe runtime cache eviction, `DSTextureCache::clear_unused()` scans canonical entries under `cache_mutex` using pristine reference counts before freeing:
+### The Rule
+Use `clear_unused()` during active gameplay to evict only unreferenced textures while preserving cache hits for live scenes; reserve `clear()` for scene transitions or teardown to avoid wiping cache entries for in-use assets.
+
+To guarantee GPU safety, both `DSTextureCache::clear()` and `DSTextureCache::clear_unused()` gate texture RID release behind `_is_entry_evictable_locked()` and `ds_texture_cache_is_externally_held()`:
 ```cpp
 static bool ds_texture_cache_is_externally_held(const Ref<Texture2D> &p_texture) {
 	if (p_texture.is_null() || !p_texture.is_valid()) {
@@ -1032,7 +1033,9 @@ static bool ds_texture_cache_is_externally_held(const Ref<Texture2D> &p_texture)
 	return p_texture->get_reference_count() > 1; // Held by active scene material or node outside cache
 }
 ```
-Any entry with `ref_count == 1` is removed from the cache map, alias map, and LRU list, its live twin references are safely filtered, and its GPU RID is queued for render-thread release via `ds_texture_cache_release_evicted()` (`src/integration/ds_texture_cache.cpp:573`).
+However, their cache retention contracts differ:
+- `DSTextureCache::clear_unused()` scans canonical entries and removes **only** unreferenced textures (`ref_count == 1`). Textures currently bound to active nodes or materials remain in `cache_map`, keeping deduplication and subsequent `get_cached()` lookups instant.
+- `DSTextureCache::clear()` preserves externally held GPU RIDs from destruction, but empties `cache_map` completely (`cache_map.clear()`).
 
 In GDScript, call `clear_unused()` whenever toggling background preloads off or releasing idle level caches during active gameplay:
 ```gdscript
@@ -1042,7 +1045,7 @@ if ClassDB.class_exists("DSTextureCache"):
 		var freed_count: int = cache.clear_unused()
 		print("[Cache] Safely evicted %d unreferenced textures" % freed_count)
 ```
-Reserve unconditional `clear()` strictly for module teardown (`~DSTextureCache()`) or blank transition screens where all old actor nodes and materials have been completely freed.
+Reserve `clear()` strictly for module teardown (`~DSTextureCache()`) or scene transitions where all previous scene nodes and materials have been completely freed.
 
 ## 44. Shareable Format Lists Must Contain the Base Format
 
@@ -1154,3 +1157,41 @@ When an addon or export plugin injects 64-bit hashes, bitmasks, or handoff flags
 
 ### The Rule
 Always call `ProjectSettings.set_as_internal(name, true)` for runtime handoff keys, export artifacts, and 64-bit integer values; Godot's Inspector represents integers with `double` floats and warns when values exceed 2^53 - 1 (`9,007,199,254,740,991`). Handled in `ds_export_plugin.gd:126-130` and `ds_plugin.gd:32-38`.
+
+## 50. Never Include GDExtension DLL Folders in export_presets.cfg include_filter (The .pck Trapping Pitfall)
+
+### The Engine Reality
+When Godot exports desktop PC builds (Windows/Linux), its platform exporter (`EditorExportPlatformPC`) is architected to strip folder hierarchies and dump all GDExtension shared libraries (`.dll`, `.so`) directly into the export root directory alongside the `<game>.exe` executable.
+
+At runtime, Godot loads dynamic libraries in `OS_Windows::open_dynamic_library` (`platform/windows/os_windows.cpp`):
+```cpp
+String path = p_path;
+if (!FileAccess::exists(path)) {
+    // This code exists so GDExtension can load .dll files from within the executable path.
+    path = get_executable_path().get_base_dir().path_join(p_path.get_file());
+}
+p_library_handle = (void *)LoadLibraryExW(...);
+```
+If `FileAccess::exists(path)` is false, Godot automatically extracts `p_path.get_file()` and resolves the binary directly in `<exe_dir>`.
+
+### The Trap / Symptom
+```
+ERROR: Can't open dynamic library: addons/my_plugin/bin/my_plugin.windows.template_debug.x86_64.dll. Error: Error 126: The specified module could not be found.
+   at: open_dynamic_library (platform/windows/os_windows.cpp:544)
+ERROR: Can't open GDExtension dynamic library: 'res://addons/my_plugin/bin/my_plugin.gdextension'.
+   at: open_library (core/extension/gdextension.cpp:811)
+ERROR: Error loading extension: 'res://addons/my_plugin/bin/my_plugin.gdextension'.
+   at: load_extensions (core/extension/gdextension_manager.cpp:333)
+```
+When developers add `addons/my_plugin/*` to `include_filter` in `export_presets.cfg`, Godot copies the native `.dll` files **into the virtual `.pck` archive**.
+At startup, `FileAccess::exists("res://addons/my_plugin/bin/my_plugin.dll")` returns **true** because the file exists inside the virtual `.pck`.
+Because it returns true, Godot **skips the root directory fallback**. It passes the unmapped relative path `addons/my_plugin/bin/my_plugin.dll` to Windows' `LoadLibraryExW`.
+Because Windows cannot read DLLs from inside a `.pck` archive and the physical subfolder does not exist on disk, Windows fails with **Error 126**.
+
+In addition:
+1. **DLL Naming is Arbitrary:** Godot does not require `windows.template_debug.x86_64` file naming. Any clean name (`dstorage_ext.dll`, `dstorage_ext.debug.dll`) works as long as mapped under `[libraries]` in the `.gdextension` file.
+2. **Secondary Dependencies:** External SDK DLLs (e.g., Microsoft's `dstorage.dll` and `dstoragecore.dll`) must reside on the export root next to `<game>.exe` or be registered in the `.gdextension` `[dependencies]` section.
+3. **Editor Memory Locking:** Commenting out or modifying an `@tool` `EditorExportPlugin` while the editor is running does not remove the active instance from memory; active editor sessions also lock DLL binaries on Windows.
+
+### The Rule
+Never put `.dll` files or GDExtension binary directories in `include_filter` in `export_presets.cfg`. Rely on Godot's built-in GDExtension exporter to place libraries flat in the executable root folder, and avoid custom export plugins attempting to recreate subfolder hierarchies.
