@@ -63,6 +63,7 @@ private:
 	// Builder state
 	String build_output_path;
 	uint64_t build_archive_fingerprint = 0;
+	uint64_t payload_alignment = 512;
 	Array staging_entries;
 	bool is_building = false;
 
@@ -80,12 +81,17 @@ protected:
 	static void _bind_methods();
 
 public:
+	static constexpr uint64_t DEFAULT_PAYLOAD_ALIGNMENT = 512;
+	static constexpr uint64_t STEAMPIPE_1MB_ALIGNMENT = 1048576;
+
 	DSPkg();
 	~DSPkg();
 
 	// Archive Builder
 	Error create(const String &p_output_path, uint64_t p_archive_fingerprint = 0);
 	void set_archive_fingerprint(uint64_t p_archive_fingerprint);
+	void set_payload_alignment(uint64_t p_alignment);
+	uint64_t get_payload_alignment() const;
 	Error add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata = Dictionary());
 	Error finalize();
 

@@ -237,6 +237,89 @@ GDEX_TEST_T(dspkg, entry_iteration_count_matches_added, TAG_INTEGRATION) {
 	remove_temp_file(dspkg_path);
 }
 
+GDEX_TEST_T(dspkg, entry_sorting_is_deterministic, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_sort.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_sort.dspkg";
+	const char *virtual_z = "res://textures/z_end.dstex";
+	const char *virtual_a = "res://textures/a_start.dstex";
+
+	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path)) == godot::OK);
+	// Staged in reverse order
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_z), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_a), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_ASSERT_TRUE(reader->open(godot::String(dspkg_path)) == godot::OK);
+
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 2);
+	godot::Array entries = reader->get_entries();
+	GDEX_EXPECT_EQ(entries.size(), 2);
+	// Must be sorted lexicographically
+	GDEX_EXPECT_TRUE(entries[0] == godot::String(virtual_a));
+	GDEX_EXPECT_TRUE(entries[1] == godot::String(virtual_z));
+
+	// On-disk payload offsets must reflect lexicographical sort order (virtual_a before virtual_z).
+	int64_t offset_a = reader->get_entry_info(godot::String(virtual_a)).get("data_offset", 0);
+	int64_t offset_z = reader->get_entry_info(godot::String(virtual_z)).get("data_offset", 0);
+	GDEX_EXPECT_TRUE(offset_a > 0);
+	GDEX_EXPECT_TRUE(offset_z > 0);
+	GDEX_EXPECT_TRUE(offset_a < offset_z);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, steampipe_1mb_payload_alignment, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_1mb.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_1mb.dspkg";
+	const char *virtual_a = "res://textures/alpha.dstex";
+	const char *virtual_b = "res://textures/beta.dstex";
+
+	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path)) == godot::OK);
+	builder->set_payload_alignment(godot::DSPkg::STEAMPIPE_1MB_ALIGNMENT);
+	GDEX_EXPECT_EQ(builder->get_payload_alignment(), godot::DSPkg::STEAMPIPE_1MB_ALIGNMENT);
+
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_a), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_b), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_ASSERT_TRUE(reader->open(godot::String(dspkg_path)) == godot::OK);
+
+	godot::Dictionary info_a = reader->get_entry_info(godot::String(virtual_a));
+	godot::Dictionary info_b = reader->get_entry_info(godot::String(virtual_b));
+	GDEX_EXPECT_FALSE(info_a.is_empty());
+	GDEX_EXPECT_FALSE(info_b.is_empty());
+
+	int64_t offset_a = info_a.get("data_offset", 1);
+	int64_t offset_b = info_b.get("data_offset", 1);
+	GDEX_EXPECT_EQ(offset_a % static_cast<int64_t>(godot::DSPkg::STEAMPIPE_1MB_ALIGNMENT), int64_t(0));
+	GDEX_EXPECT_EQ(offset_b % static_cast<int64_t>(godot::DSPkg::STEAMPIPE_1MB_ALIGNMENT), int64_t(0));
+	GDEX_EXPECT_TRUE(offset_b >= offset_a + static_cast<int64_t>(godot::DSPkg::STEAMPIPE_1MB_ALIGNMENT));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
 // --- Slow: multi-mip GPU footprint metadata + 512-byte per-mip padding --------
 
 GDEX_TEST_T(dspkg, gpu_mip_metadata_512_placement, TAG_INTEGRATION | TAG_SLOW) {

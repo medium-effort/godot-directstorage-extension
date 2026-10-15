@@ -80,3 +80,15 @@ The extension provides configurable project settings in Godot under the `directs
 | `directstorage/texture_cache_max_entries` | `int` | `128` | Maximum number of texture entries held in the LRU cache (range: `16`–`2048`). When the limit is reached, oldest unreferenced textures are evicted to reclaim VRAM. |
 | `directstorage/shutdown_drain_timeout_ms` | `int` | `10000` | Maximum time in milliseconds (clamped to a minimum of `100` ms) to wait during application exit or module shutdown for active NVMe DMA and GPU requests to drain before fail-safe cleanup, preventing device-removed crashes or driver hangs. |
 
+
+---
+
+## 5. Export Preset Options Reference
+
+When configuring a Windows Desktop export preset (`Project -> Export... -> Windows Desktop -> Options`), the following custom options are provided under the `directstorage/` category:
+
+| Export Option | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `directstorage/bundle_textures_dspkg` | `bool` | `true` | When `true`, all exported `.dstex` textures are extracted from the `.pck` via `skip()` and bundled into a standalone DirectStorage archive (`textures.dspkg`) deployed alongside the executable for unbuffered NVMe DMA loading. When `false`, texture payloads remain embedded inside the `.pck` and fall back to CPU software decompression at runtime. |
+| `directstorage/enforce_archive_pairing` | `bool` | `true` | When `true`, computes a two-tier archive fingerprint `(project_guid << 32) | manifest_hash` from sorted `(path, size)` pairs and embeds it in both the `.pck` and `textures.dspkg`. At runtime, mounting a mismatched or stale archive triggers an immediate failure to protect against corrupt reads or memory errors. |
+| `directstorage/steampipe_1mb_alignment` | `bool` | `false` | When `true`, aligns each top-level texture payload inside `textures.dspkg` to a 1 MiB (`1,048,576` bytes) boundary instead of the standard 512-byte GPU placement boundary. This follows Valve's **Game Content Structure - Best Practices** for SteamPipe: an update or size change to one texture will never shift downstream textures across 1 MB chunk boundaries, minimizing delta patch download sizes for players on Steam. |

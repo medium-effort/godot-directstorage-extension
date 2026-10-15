@@ -1,7 +1,9 @@
 #include "dspkg_format.h"
 #include "dstex_format.h"
 #include <godot_cpp/variant/utility_functions.hpp>
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace godot {
 
@@ -79,6 +81,8 @@ bool metadata_arrays_are_valid(const Dictionary &p_metadata, uint32_t p_mip_coun
 void DSPkg::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("create", "output_path", "archive_fingerprint"), &DSPkg::create, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("set_archive_fingerprint", "archive_fingerprint"), &DSPkg::set_archive_fingerprint);
+	ClassDB::bind_method(D_METHOD("set_payload_alignment", "alignment"), &DSPkg::set_payload_alignment);
+	ClassDB::bind_method(D_METHOD("get_payload_alignment"), &DSPkg::get_payload_alignment);
 	ClassDB::bind_method(D_METHOD("add_texture", "resource_path", "dstex_path", "mip_metadata"), &DSPkg::add_texture, DEFVAL(Dictionary()));
 	ClassDB::bind_method(D_METHOD("finalize"), &DSPkg::finalize);
 
@@ -101,6 +105,7 @@ DSPkg::~DSPkg() {
 Error DSPkg::create(const String &p_output_path, uint64_t p_archive_fingerprint) {
 	build_output_path = p_output_path;
 	build_archive_fingerprint = p_archive_fingerprint;
+	payload_alignment = DEFAULT_PAYLOAD_ALIGNMENT;
 	staging_entries.clear();
 	is_building = true;
 	return OK;
@@ -110,6 +115,22 @@ void DSPkg::set_archive_fingerprint(uint64_t p_archive_fingerprint) {
 	if (is_building) {
 		build_archive_fingerprint = p_archive_fingerprint;
 	}
+}
+
+void DSPkg::set_payload_alignment(uint64_t p_alignment) {
+	if (!is_building) {
+		UtilityFunctions::push_error("DSPkg: Not in building state. Call create() first.");
+		return;
+	}
+	if (p_alignment < DEFAULT_PAYLOAD_ALIGNMENT || (p_alignment & (p_alignment - 1)) != 0) {
+		UtilityFunctions::push_error("DSPkg: Payload alignment must be a power of two and >= 512 bytes.");
+		return;
+	}
+	payload_alignment = p_alignment;
+}
+
+uint64_t DSPkg::get_payload_alignment() const {
+	return payload_alignment;
 }
 
 Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata) {
@@ -167,9 +188,19 @@ Error DSPkg::finalize() {
 		return ERR_UNCONFIGURED;
 	}
 
+	// Sort staging entries lexicographically by resource_path for deterministic, reproducible packaging.
+	std::vector<Dictionary> sorted_entries;
+	sorted_entries.reserve(count);
+	for (uint32_t i = 0; i < count; ++i) {
+		sorted_entries.push_back(staging_entries[i]);
+	}
+	std::sort(sorted_entries.begin(), sorted_entries.end(), [](const Dictionary &a, const Dictionary &b) {
+		return String(a.get("resource_path", "")) < String(b.get("resource_path", ""));
+	});
+
 	bool write_gpu_metadata = false;
-	for (int i = 0; i < count; ++i) {
-		Dictionary item = staging_entries[i];
+	for (uint32_t i = 0; i < count; ++i) {
+		const Dictionary &item = sorted_entries[i];
 		if (item.get("gpu_metadata", false)) {
 			write_gpu_metadata = true;
 			break;
@@ -177,8 +208,8 @@ Error DSPkg::finalize() {
 	}
 
 	HashSet<String> seen_staging_paths;
-	for (int i = 0; i < count; ++i) {
-		Dictionary item = staging_entries[i];
+	for (uint32_t i = 0; i < count; ++i) {
+		const Dictionary &item = sorted_entries[i];
 		String res_path = item["resource_path"];
 		if (seen_staging_paths.has(res_path)) {
 			UtilityFunctions::push_error("DSPkg: Duplicate entry path encountered during finalization: " + res_path);
@@ -190,8 +221,8 @@ Error DSPkg::finalize() {
 	uint64_t header_size = sizeof(DSPkgHeader);
 	uint64_t entry_table_size = 0;
 
-	for (int i = 0; i < count; ++i) {
-		Dictionary item = staging_entries[i];
+	for (uint32_t i = 0; i < count; ++i) {
+		const Dictionary &item = sorted_entries[i];
 		String res_path = item["resource_path"];
 		CharString utf8_path = res_path.utf8();
 		if (utf8_path.length() > UINT16_MAX) {
@@ -224,7 +255,7 @@ Error DSPkg::finalize() {
 		return ERR_INVALID_PARAMETER;
 	}
 	uint64_t total_data_offset = 0;
-	if (!align_up(table_end_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, total_data_offset)) {
+	if (!align_up(table_end_offset, payload_alignment, total_data_offset)) {
 		UtilityFunctions::push_error("DSPkg: Archive data offset alignment overflow.");
 		return ERR_INVALID_PARAMETER;
 	}
@@ -246,8 +277,8 @@ Error DSPkg::finalize() {
 	file->store_buffer(reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader));
 
 	uint64_t running_data_offset = 0;
-	for (int i = 0; i < count; ++i) {
-		Dictionary item = staging_entries[i];
+	for (uint32_t i = 0; i < count; ++i) {
+		const Dictionary &item = sorted_entries[i];
 		String res_path = item["resource_path"];
 		CharString utf8_path = res_path.utf8();
 		uint16_t path_len = static_cast<uint16_t>(utf8_path.length());
@@ -261,7 +292,7 @@ Error DSPkg::finalize() {
 		uint32_t h = dstex_header.get("height", 0);
 		uint32_t fmt = dstex_header.get("pixel_format", 0);
 		uint32_t mips_count = dstex_header.get("mip_count", 0);
-		if (!align_up(running_data_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_data_offset)) {
+		if (!align_up(running_data_offset, payload_alignment, running_data_offset)) {
 			UtilityFunctions::push_error("DSPkg: Payload data offset alignment overflow.");
 			file->close();
 			return ERR_INVALID_PARAMETER;
@@ -393,11 +424,11 @@ Error DSPkg::finalize() {
 	};
 
 	uint64_t payload_offset = table_end_offset;
-	for (int i = 0; i < count; ++i) {
-		Dictionary item = staging_entries[i];
+	for (uint32_t i = 0; i < count; ++i) {
+		const Dictionary &item = sorted_entries[i];
 		PackedByteArray data = item["compressed_data"];
 		uint64_t aligned_payload_offset = 0;
-		if (!align_up(payload_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, aligned_payload_offset)) {
+		if (!align_up(payload_offset, payload_alignment, aligned_payload_offset)) {
 			UtilityFunctions::push_error("DSPkg: Payload file offset alignment overflow.");
 			file->close();
 			return ERR_INVALID_PARAMETER;
@@ -926,6 +957,7 @@ Array DSPkg::get_entries() const {
 	for (const KeyValue<String, DSPkgEntry> &E : entries_by_path) {
 		result.append(E.key);
 	}
+	result.sort();
 	return result;
 }
 

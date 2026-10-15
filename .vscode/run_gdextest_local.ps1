@@ -138,10 +138,25 @@ function Stop-OrphanFixtureProcess {
             try {
                 Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction Stop
             } catch {
-                # Stale DLL is still locked; force kill any remaining godot process as fallback
-                $godotProcs = Get-Process -Name "*godot*" -ErrorAction SilentlyContinue
-                foreach ($p in $godotProcs) {
-                    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                # Stale DLL is still locked; re-check only matching fixture processes before retrying
+                $resolved = ""
+                if (Test-Path -LiteralPath $FixturePath) {
+                    $resolved = (Resolve-Path -LiteralPath $FixturePath -ErrorAction SilentlyContinue).Path
+                }
+                $remainingProcs = Get-Process -Name "*godot*" -ErrorAction SilentlyContinue
+                foreach ($p in $remainingProcs) {
+                    try {
+                        $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue
+                        if ($cim -and $cim.CommandLine) {
+                            $cmd = $cim.CommandLine
+                            if (($resolved -and $cmd.IndexOf($resolved, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                                ($cmd -match "build[/\\]gdextest[/\\]project" -or $cmd -match "--gdextest-run")) {
+                                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                            }
+                        }
+                    } catch {
+                        $null = $_
+                    }
                 }
                 Start-Sleep -Milliseconds 300
                 Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
@@ -310,6 +325,25 @@ if (-not (Test-Path $FixtureAssets)) {
 }
 Write-VerboseHost "Fixture assets staged: $stagedCount file(s) -> $FixtureRoot/project/test_assets/" -ForegroundColor Green
 
+# [2/5] DirectStorage runtime DLLs: stage dstorage*.dll beside the fixture's
+# addon copy so Win32Backend::probe_system_support() discovers them via
+# res://addons/directstorage_accelerator/bin.
+Write-VerboseHost "Staging DirectStorage runtime DLLs into fixture..." -ForegroundColor Cyan
+$RuntimeSrcDir = Join-Path $RepoRoot "project/addons/directstorage_accelerator/bin"
+$FixtureAddonBin = Join-Path (Join-Path $RepoRoot $FixtureRoot) "addons/directstorage_accelerator/bin"
+$RuntimeDlls = @(Get-ChildItem -Path $RuntimeSrcDir -Filter "dstorage*.dll" -File -ErrorAction SilentlyContinue)
+if ($RuntimeDlls.Count -gt 0) {
+    if (-not (Test-Path -LiteralPath $FixtureAddonBin)) {
+        New-Item -ItemType Directory -Force -Path $FixtureAddonBin | Out-Null
+    }
+    foreach ($runtimeDll in $RuntimeDlls) {
+        Copy-Item -LiteralPath $runtimeDll.FullName -Destination (Join-Path $FixtureAddonBin $runtimeDll.Name) -Force
+    }
+    Write-VerboseHost "DirectStorage runtime staged: $($RuntimeDlls.Count) DLL(s) -> $FixtureRoot/addons/directstorage_accelerator/bin/" -ForegroundColor Green
+} else {
+    Write-VerboseHost "No dstorage*.dll found in $RuntimeSrcDir; D3D12 GPU suites will skip." -ForegroundColor Yellow
+}
+
 # [3/5] warmup: cold-cache deterministic pass (output discarded).
 # A single retry absorbs the observed cold-cache flake (first attempt once
 # exited 0xC0000005, immediate retry passed; spike observation). Exit 134
@@ -318,10 +352,20 @@ Write-VerboseHost "[3/5] warmup: cold-cache deterministic pass..." -ForegroundCo
 # Godot writes warnings to stderr; with $ErrorActionPreference = "Stop" that
 # becomes a terminating NativeCommandError before $LASTEXITCODE is read.
 # Relax EAP for the native call and gate purely on the exit code.
+$WarmupArgs = @("--headless", "--editor")
+if ($RenderingDriver) {
+    $WarmupArgs += "--rendering-driver"
+    $WarmupArgs += $RenderingDriver
+}
+$WarmupArgs += "--path"
+$WarmupArgs += $FixtureRoot
+$WarmupArgs += "--quit-after"
+$WarmupArgs += "2"
+
 $WarmupCode = 1
 for ($attempt = 1; $attempt -le 2; $attempt++) {
     $ErrorActionPreference = "Continue"
-    & $GodotExe --headless --editor --path $FixtureRoot --quit-after 2 *> $null
+    & $GodotExe @WarmupArgs *> $null
     $WarmupCode = $LASTEXITCODE
     $ErrorActionPreference = "Stop"
     if ($null -eq $WarmupCode) { $WarmupCode = 1 }

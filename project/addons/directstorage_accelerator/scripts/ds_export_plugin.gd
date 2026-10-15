@@ -13,6 +13,7 @@ extends EditorExportPlugin
 
 const OPTION_BUNDLE_DSPKG: StringName = &"directstorage/bundle_textures_dspkg"
 const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"directstorage/enforce_archive_pairing"
+const OPTION_STEAMPIPE_1MB_ALIGNMENT: StringName = &"directstorage/steampipe_1mb_alignment"
 
 var _dspkg: RefCounted = null
 ## Staging/final archive paths. Both live in the target export directory so no
@@ -31,6 +32,7 @@ var _export_features: PackedStringArray = []
 var _is_debug_export: bool = false
 var _bundle_dspkg_enabled: bool = false
 var _enforce_pairing_enabled: bool = true
+var _steampipe_1mb_alignment_enabled: bool = false
 var _current_fingerprint: int = 0
 var _archive_name: String = "textures.dspkg"
 ## Manifest accumulator: dstex/archive entry path -> uncompressed size.
@@ -74,6 +76,16 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 				"usage": PROPERTY_USAGE_DEFAULT
 			},
 			"default_value": true,
+		},
+		{
+			"option": {
+				"name": OPTION_STEAMPIPE_1MB_ALIGNMENT,
+				"type": TYPE_BOOL,
+				"hint": PROPERTY_HINT_NONE,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT
+			},
+			"default_value": false,
 		}
 	]
 
@@ -103,6 +115,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_is_debug_export = is_debug
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
+	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
 	_has_textures = false
 	_archive_failed = false
 	_dspkg = null
@@ -160,6 +173,12 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 			_dspkg = null
 			_archive_failed = true
 		else:
+			if _steampipe_1mb_alignment_enabled:
+				if _dspkg.has_method("set_payload_alignment"):
+					_dspkg.set_payload_alignment(1048576)
+					print("[DirectStorage Exporter] SteamPipe 1MB payload alignment padding is ENABLED.")
+				else:
+					push_warning("[DirectStorage Exporter] Active DSPkg binary does not support 'set_payload_alignment'; archive will use default 512-byte alignment.")
 			print("[DirectStorage Exporter] Initialized DSPkg staging archive at: ", _staging_dspkg_path)
 
 ## Reads v2 per-mip footprint data so DSPkg can preserve GPU upload layouts.
