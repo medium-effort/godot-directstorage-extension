@@ -25,6 +25,7 @@
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/string_name.hpp>
@@ -470,5 +471,69 @@ GDEX_TEST_T(context_lifecycle, concurrent_reader_queries_during_shutdown_stress,
     }
 
     GDEX_EXPECT_TRUE(static_cast<bool>(ds->call(godot::StringName("is_initialized"))));
+}
+
+GDEX_TEST_T(context_lifecycle, auto_tune_setting_toggle_and_defaults, TAG_INTEGRATION) {
+    godot::Object *ds = require_singleton(ctx, "DSContext");
+    // Verify default auto-tune setting is true (reduction-only UMA clamp active)
+    const bool default_auto_tune = static_cast<bool>(
+        ds->call(godot::StringName("get_auto_tune_for_integrated_gpu")));
+    GDEX_EXPECT_TRUE(default_auto_tune);
+
+    // Ensure state cleans up on teardown
+    ctx.add_teardown([ds, default_auto_tune]() {
+        ds->call(godot::StringName("set_auto_tune_for_integrated_gpu"), default_auto_tune);
+    });
+
+    // Toggle off
+    ds->call(godot::StringName("set_auto_tune_for_integrated_gpu"), false);
+    GDEX_EXPECT_FALSE(static_cast<bool>(
+        ds->call(godot::StringName("get_auto_tune_for_integrated_gpu"))));
+
+    // Toggle back on
+    ds->call(godot::StringName("set_auto_tune_for_integrated_gpu"), true);
+    GDEX_EXPECT_TRUE(static_cast<bool>(
+        ds->call(godot::StringName("get_auto_tune_for_integrated_gpu"))));
+}
+
+GDEX_TEST_T(context_lifecycle, gpu_adapter_info_schema_and_uma_invariants, TAG_INTEGRATION) {
+    godot::Object *ds = require_singleton(ctx, "DSContext");
+
+    // Call get_gpu_adapter_info and verify Dictionary schema
+    godot::Variant adapter_var = ds->call(godot::StringName("get_gpu_adapter_info"));
+    GDEX_ASSERT_EQ(adapter_var.get_type(), godot::Variant::DICTIONARY);
+    godot::Dictionary adapter = static_cast<godot::Dictionary>(adapter_var);
+
+    // Required schema keys
+    GDEX_EXPECT_TRUE(adapter.has("available"));
+    GDEX_EXPECT_TRUE(adapter.has("adapter_name"));
+    GDEX_EXPECT_TRUE(adapter.has("adapter_vendor"));
+    GDEX_EXPECT_TRUE(adapter.has("vendor_id"));
+    GDEX_EXPECT_TRUE(adapter.has("device_id"));
+    GDEX_EXPECT_TRUE(adapter.has("dedicated_vram_mb"));
+    GDEX_EXPECT_TRUE(adapter.has("shared_system_mb"));
+    GDEX_EXPECT_TRUE(adapter.has("software_adapter"));
+    GDEX_EXPECT_TRUE(adapter.has("is_uma"));
+    GDEX_EXPECT_TRUE(adapter.has("is_cache_coherent_uma"));
+    GDEX_EXPECT_TRUE(adapter.has("integrated_gpu_guess"));
+
+    // Check capability report schema
+    godot::Variant cap_var = ds->call(godot::StringName("get_capability_report"));
+    GDEX_ASSERT_EQ(cap_var.get_type(), godot::Variant::DICTIONARY);
+    godot::Dictionary cap = static_cast<godot::Dictionary>(cap_var);
+    GDEX_EXPECT_TRUE(cap.has("is_uma"));
+    GDEX_EXPECT_TRUE(cap.has("is_cache_coherent_uma"));
+
+    // Direct methods vs Dictionary consistency
+    const bool is_uma_method = static_cast<bool>(ds->call(godot::StringName("is_uma")));
+    const bool is_uma_dict = static_cast<bool>(adapter.get("is_uma", false));
+    GDEX_EXPECT_EQ(is_uma_method, is_uma_dict);
+
+    const bool is_igpu_method = static_cast<bool>(ds->call(godot::StringName("is_integrated_gpu")));
+
+    // Logical invariant: if hardware reports UMA == true, it MUST be recognized as integrated GPU
+    if (is_uma_method) {
+        GDEX_EXPECT_TRUE(is_igpu_method);
+    }
 }
 

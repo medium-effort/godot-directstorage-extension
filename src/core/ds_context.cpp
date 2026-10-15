@@ -468,6 +468,16 @@ int DSContext::get_gpu_decompression_support_tier() const {
 Dictionary DSContext::get_gpu_adapter_info() const {
 	Dictionary info;
 	info["available"] = false;
+	info["adapter_name"] = String("unknown");
+	info["adapter_vendor"] = String("Unknown");
+	info["vendor_id"] = static_cast<int64_t>(0);
+	info["device_id"] = static_cast<int64_t>(0);
+	info["dedicated_vram_mb"] = static_cast<int64_t>(0);
+	info["shared_system_mb"] = static_cast<int64_t>(0);
+	info["software_adapter"] = false;
+	info["is_uma"] = false;
+	info["is_cache_coherent_uma"] = false;
+	info["integrated_gpu_guess"] = false;
 #ifdef _WIN32
 	const DSD3D12AdapterProbe &probe = query_d3d12_adapter();
 	if (!probe.available) {

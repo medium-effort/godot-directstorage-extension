@@ -50,24 +50,104 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Write-ReportText {
+    param(
+        [string]$Message = "",
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray,
+        $BackgroundColor = $null,
+        [switch]$IsError
+    )
+    if ([Console]::IsOutputRedirected -or [Console]::IsErrorRedirected) {
+        if ($IsError) {
+            [Console]::Error.WriteLine($Message)
+        } else {
+            [Console]::Out.WriteLine($Message)
+        }
+    } else {
+        if ($null -ne $BackgroundColor) {
+            Write-Host $Message -ForegroundColor $ForegroundColor -BackgroundColor $BackgroundColor
+        } else {
+            Write-Host $Message -ForegroundColor $ForegroundColor
+        }
+    }
+}
+
 function Show-StepFailure {
     param(
         [string]$Step,
         [string]$Message,
         [int]$Code = 1
     )
-    Write-Host ""
-    Write-Host "================================================================================" -ForegroundColor Red
-    Write-Host " [RUN FAILED] $Step " -ForegroundColor White -BackgroundColor DarkRed
-    Write-Host "================================================================================" -ForegroundColor Red
-    Write-Host " Reason: $Message" -ForegroundColor Red
+    Write-ReportText "" -IsError
+    Write-ReportText "================================================================================" -ForegroundColor Red -IsError
+    Write-ReportText " [RUN FAILED] $Step " -ForegroundColor White -BackgroundColor DarkRed -IsError
+    Write-ReportText "================================================================================" -ForegroundColor Red -IsError
+    Write-ReportText " Reason: $Message" -ForegroundColor Red -IsError
     if ($Code -ne 0) {
-        Write-Host " Exit Code: $Code" -ForegroundColor Yellow
+        Write-ReportText " Exit Code: $Code" -ForegroundColor Yellow -IsError
     }
-    Write-Host " Check the terminal output above for details." -ForegroundColor DarkGray
-    Write-Host "================================================================================" -ForegroundColor Red
-    Write-Host ""
+    Write-ReportText " Check the terminal output above for details." -ForegroundColor DarkGray -IsError
+    Write-ReportText "================================================================================" -ForegroundColor Red -IsError
+    Write-ReportText "" -IsError
     exit $Code
+}
+
+function Stop-OrphanFixtureProcess {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [string]$FixturePath
+    )
+    try {
+        $godotProcs = Get-Process -Name "*godot*" -ErrorAction SilentlyContinue
+        if ($godotProcs) {
+            $resolved = ""
+            if (Test-Path -LiteralPath $FixturePath) {
+                $resolved = (Resolve-Path -LiteralPath $FixturePath -ErrorAction SilentlyContinue).Path
+            }
+            foreach ($p in $godotProcs) {
+                $match = $false
+                try {
+                    $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue
+                    if ($cim -and $cim.CommandLine) {
+                        $cmd = $cim.CommandLine
+                        if ($resolved -and $cmd.IndexOf($resolved, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                            $match = $true
+                        } elseif ($cmd -match "build[/\\]gdextest[/\\]project" -or $cmd -match "--gdextest-run") {
+                            $match = $true
+                        }
+                    }
+                } catch {
+                    $null = $_
+                }
+                if ($match) {
+                    Write-ReportText "Terminating orphan Godot fixture process (PID $($p.Id))..." -ForegroundColor Yellow
+                    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Milliseconds 250
+                }
+            }
+        }
+    } catch {
+        $null = $_
+    }
+
+    # Clean up stale locked shadow DLLs if still remaining in fixture addons bin
+    $binDir = Join-Path $FixturePath "addons/gdextest/bin"
+    if (Test-Path -LiteralPath $binDir) {
+        $staleDlls = Get-ChildItem -Path $binDir -Filter "~*.dll" -ErrorAction SilentlyContinue
+        foreach ($stale in $staleDlls) {
+            try {
+                Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction Stop
+            } catch {
+                # Stale DLL is still locked; force kill any remaining godot process as fallback
+                $godotProcs = Get-Process -Name "*godot*" -ErrorAction SilentlyContinue
+                foreach ($p in $godotProcs) {
+                    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                }
+                Start-Sleep -Milliseconds 300
+                Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 function Get-GodotConsolePath {
@@ -100,11 +180,11 @@ function Show-RunSuccess {
     param(
         [string]$Message = "All test stages completed successfully!"
     )
-    Write-Host ""
-    Write-Host "================================================================================" -ForegroundColor Green
-    Write-Host " [RUN SUCCESS] $Message " -ForegroundColor White -BackgroundColor DarkGreen
-    Write-Host "================================================================================" -ForegroundColor Green
-    Write-Host ""
+    Write-ReportText ""
+    Write-ReportText "================================================================================" -ForegroundColor Green
+    Write-ReportText " [RUN SUCCESS] $Message " -ForegroundColor White -BackgroundColor DarkGreen
+    Write-ReportText "================================================================================" -ForegroundColor Green
+    Write-ReportText ""
 }
 
 function Write-VerboseHost {
@@ -113,7 +193,7 @@ function Write-VerboseHost {
         [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray
     )
     if ($Verbose) {
-        Write-Host $Message -ForegroundColor $ForegroundColor
+        Write-ReportText $Message -ForegroundColor $ForegroundColor
     }
 }
 
@@ -134,7 +214,7 @@ if (-not $GodotExe) {
 # (never pull latest) and fail clearly if that is impossible.
 $GdextestCli = Join-Path $RepoRoot "extern/gdextest/tools/gdextest.py"
 if (-not (Test-Path -LiteralPath $GdextestCli)) {
-    Write-Host "gdextest submodule is missing; running 'git submodule update --init -- extern/gdextest'..." -ForegroundColor Yellow
+    Write-ReportText "gdextest submodule is missing; running 'git submodule update --init -- extern/gdextest'..." -ForegroundColor Yellow
     try {
         $subOut = & git submodule update --init -- extern/gdextest 2>&1
         if ($subOut) {
@@ -167,13 +247,16 @@ if ($Verbose) {
 $DoctorCode = $LASTEXITCODE
 if ((-not $?) -or ($null -eq $DoctorCode) -or ($DoctorCode -ne 0)) {
     if (-not $Verbose -and $doctorOut) {
-        Write-Host ($doctorOut -join "`n") -ForegroundColor Red
+        foreach ($line in $doctorOut) {
+            Write-ReportText $line -ForegroundColor Red -IsError
+        }
     }
     if ($null -eq $DoctorCode -or $DoctorCode -eq 0) { $DoctorCode = 1 }
     Show-StepFailure -Step "Step [1/5] Doctor" -Message "gdextest doctor checks failed." -Code $DoctorCode
 }
 
 # [2/5] fixture: generate the disposable Godot project for the test library.
+Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
 Write-VerboseHost "[2/5] fixture: generating Godot fixture project..." -ForegroundColor Cyan
 $TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.editor*.dll" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
@@ -194,7 +277,9 @@ if ($Verbose) {
 }
 if ($LASTEXITCODE -ne 0) {
     if (-not $Verbose -and $fixtureOut) {
-        Write-Host ($fixtureOut -join "`n") -ForegroundColor Red
+        foreach ($line in $fixtureOut) {
+            Write-ReportText $line -ForegroundColor Red -IsError
+        }
     }
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "generate_fixture.py failed." -Code $LASTEXITCODE
 }
@@ -248,6 +333,7 @@ if ($WarmupCode -eq 134) {
 } elseif ($WarmupCode -ne 0) {
     Show-StepFailure -Step "Step [3/5] Warmup" -Message "Warmup pass failed twice." -Code $WarmupCode
 }
+Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
 
 # [4/5] run: renderer flag BEFORE `--`, runner flags AFTER `--`,
 # and never anything else after `--`. Test failures (exit 1) still proceed
@@ -292,18 +378,19 @@ if ($null -eq $RunCode) { $RunCode = 1 }
 # code (e.g. 0xC0000005-class abort) means the host crashed before writing.
 if ($RunCode -lt 0) {
     if (-not $Verbose -and $godotOut) {
-        Write-Host "--- Godot Engine Output (tail) ---" -ForegroundColor Red
-        $godotOut | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+        Write-ReportText "--- Godot Engine Output (tail) ---" -ForegroundColor Red -IsError
+        $godotOut | Select-Object -Last 30 | ForEach-Object { Write-ReportText $_ -ForegroundColor Red -IsError }
     }
     Show-StepFailure -Step "Step [4/5] Run" -Message "Godot host crashed before writing results (exit $RunCode). See the engine output above." -Code 1
 }
 if (-not (Test-Path $ReportJson)) {
     if (-not $Verbose -and $godotOut) {
-        Write-Host "--- Godot Engine Output (tail) ---" -ForegroundColor Red
-        $godotOut | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+        Write-ReportText "--- Godot Engine Output (tail) ---" -ForegroundColor Red -IsError
+        $godotOut | Select-Object -Last 30 | ForEach-Object { Write-ReportText $_ -ForegroundColor Red -IsError }
     }
     Show-StepFailure -Step "Step [4/5] Run" -Message "Test run produced no results file at $ReportJson (exit $RunCode); the suite likely aborted during startup." -Code $(if ($RunCode -ne 0) { $RunCode } else { 1 })
 }
+Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
 if ($RunCode -ne 0) {
     Write-VerboseHost "Test run exited $RunCode; proceeding to report (report exit code gates the pipeline)." -ForegroundColor Yellow
 }
@@ -328,43 +415,44 @@ try {
     if ($t) {
         $crashedNote = if ($t.crashed) { ", crashed: $($t.crashed)" } else { "" }
         $color = if ($ReportCode -eq 0) { "Green" } else { "Red" }
-        Write-Host "Tests: passed $($t.pass), failed $($t.fail), skipped $($t.skip)$crashedNote" -ForegroundColor $color
+        Write-ReportText "Tests: passed $($t.pass), failed $($t.fail), skipped $($t.skip)$crashedNote" -ForegroundColor $color
     }
 } catch {
-    Write-Host "Tests: could not parse totals from $ReportJson" -ForegroundColor Yellow
+    Write-ReportText "Tests: could not parse totals from $ReportJson" -ForegroundColor Yellow
 }
 if ($ReportCode -ne 0) {
     if (-not $Verbose -and $reportOut) {
-        Write-Host "--- Full Test Report ---" -ForegroundColor DarkGray
-        $reportOut | ForEach-Object { Write-Host $_ }
+        Write-ReportText "--- Full Test Report ---" -ForegroundColor DarkGray -IsError
+        $reportOut | ForEach-Object { Write-ReportText $_ -ForegroundColor DarkGray -IsError }
     }
     if ($doc -and $doc.results) {
         $failedResults = @($doc.results | Where-Object { $_.status -in @("fail", "crashed") })
         if ($failedResults.Count -gt 0) {
-            Write-Host ""
-            Write-Host "================================================================================" -ForegroundColor Red
-            Write-Host " Failed Test Details ($($failedResults.Count))" -ForegroundColor White -BackgroundColor DarkRed
-            Write-Host "================================================================================" -ForegroundColor Red
+            Write-ReportText "" -IsError
+            Write-ReportText "================================================================================" -ForegroundColor Red -IsError
+            Write-ReportText " Failed Test Details ($($failedResults.Count))" -ForegroundColor White -BackgroundColor DarkRed -IsError
+            Write-ReportText "================================================================================" -ForegroundColor Red -IsError
             foreach ($res in $failedResults) {
-                Write-Host " [FAIL] $($res.suite).$($res.name)" -ForegroundColor Red
+                Write-ReportText " [FAIL] $($res.suite).$($res.name)" -ForegroundColor Red -IsError
                 if ($res.failures -and $res.failures.Count -gt 0) {
                     foreach ($f in $res.failures) {
                         $loc = if ($f.file) { "$($f.file):$($f.line): " } else { "" }
                         $lines = if ($f.message) { @($f.message -split "`r?`n") } else { @("failed without a recorded message") }
-                        Write-Host "     $loc$($lines[0])" -ForegroundColor Red
+                        Write-ReportText "     $loc$($lines[0])" -ForegroundColor Red -IsError
                         for ($i = 1; $i -lt $lines.Count; $i++) {
-                            Write-Host "       $($lines[$i])" -ForegroundColor Yellow
+                            Write-ReportText "       $($lines[$i])" -ForegroundColor Yellow -IsError
                         }
                     }
                 } else {
-                    Write-Host "     failed or crashed without a recorded assertion failure" -ForegroundColor Red
+                    Write-ReportText "     failed or crashed without a recorded assertion failure" -ForegroundColor Red -IsError
                 }
             }
-            Write-Host "================================================================================" -ForegroundColor Red
+            Write-ReportText "================================================================================" -ForegroundColor Red -IsError
         }
     }
     Show-StepFailure -Step "Step [5/5] Report" -Message "Tests failed or report could not be generated (see console report above)." -Code $ReportCode
 }
 
+Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
 Show-RunSuccess -Message "All test stages completed successfully!"
 exit 0
