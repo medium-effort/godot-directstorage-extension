@@ -46,7 +46,15 @@ private:
 
 	uint32_t staging_buffer_size_mb = 128;
 	bool disable_gpu_decompression = false;
-	uint16_t queue_capacity = 2000;
+	// Reduction-only UMA auto-tune (see initialize_ds_locked): when true and
+	// the active adapter is an integrated/UMA GPU, effective staging/queue
+	// are clamped down to the UMA caps. Explicit low values pass through
+	// untouched; set false to use configured values verbatim.
+	bool auto_tune_for_integrated_gpu = true;
+	// Must match the ProjectSetting default registered in register_types.cpp
+	// ("directstorage/queue_capacity" = 512); the setting wins at init,
+	// this is only the no-setting fallback.
+	uint16_t queue_capacity = 512;
 
 	PlatformBackend *active_backend = nullptr;
 	mutable std::mutex init_mutex;
@@ -123,9 +131,18 @@ public:
 	static constexpr uint32_t DEFAULT_STAGING_BUFFER_SIZE_MB = 128;
 	static constexpr uint32_t MIN_STAGING_BUFFER_SIZE_MB = 1;
 	static constexpr uint32_t MAX_STAGING_BUFFER_SIZE_MB = 2048;
-	static constexpr uint16_t DEFAULT_QUEUE_CAPACITY = 2000;
+	// Staging buffer and queue capacity defaults: these stay fixed, user-overridable
+	// baseline settings. When auto_tune_for_integrated_gpu is enabled (default true)
+	// and the active GPU is an integrated/UMA adapter, effective runtime values are
+	// clamped down to UMA_MAX_STAGING_BUFFER_SIZE_MB and UMA_MAX_QUEUE_CAPACITY at
+	// initialization, leaving discrete-GPU defaults and lower user settings untouched.
+	static constexpr uint16_t DEFAULT_QUEUE_CAPACITY = 512;
 	static constexpr uint16_t MIN_QUEUE_CAPACITY = 128;
 	static constexpr uint16_t MAX_QUEUE_CAPACITY = 8192;
+	// UMA auto-tune caps (reduction-only, applied at init when
+	// auto_tune_for_integrated_gpu is true on an integrated GPU).
+	static constexpr uint32_t UMA_MAX_STAGING_BUFFER_SIZE_MB = 64;
+	static constexpr uint16_t UMA_MAX_QUEUE_CAPACITY = 256;
 
 	static uint32_t clamp_staging_buffer_size_mb(uint32_t p_size_mb) {
 		return std::clamp<uint32_t>(p_size_mb, MIN_STAGING_BUFFER_SIZE_MB, MAX_STAGING_BUFFER_SIZE_MB);
@@ -147,6 +164,18 @@ public:
 	bool is_gpu_decompression_available() const;
 	bool is_gpu_decompression_enabled() const;
 	int get_gpu_decompression_support_tier() const;
+	// DXGI identity of the exact D3D12 adapter Godot runs on (matched by
+	// adapter LUID, so multi-GPU reports the right device). Keys:
+	// available, adapter_name, adapter_vendor, vendor_id, device_id,
+	// dedicated_vram_mb, shared_system_mb, software_adapter,
+	// is_uma, is_cache_coherent_uma, integrated_gpu_guess.
+	Dictionary get_gpu_adapter_info() const;
+	// Hardware/heuristic verdict: true when D3D12 reports UMA (unified memory
+	// architecture) or the adapter reports <1 GiB dedicated VRAM.
+	bool is_integrated_gpu() const;
+	// Direct D3D12 hardware query: true when D3D12_FEATURE_ARCHITECTURE1
+	// reports UMA == TRUE (shared system memory architecture).
+	bool is_uma() const;
 	Dictionary get_capability_report() const;
 	Dictionary get_request_execution_report(Ref<DSRequest> p_request) const;
 	DSRequest::DSDestinationType get_actual_destination_type(Ref<DSRequest> p_request) const;
@@ -194,6 +223,9 @@ public:
 
 	void set_disable_gpu_decompression(bool p_disable);
 	bool get_disable_gpu_decompression() const;
+
+	void set_auto_tune_for_integrated_gpu(bool p_enable);
+	bool get_auto_tune_for_integrated_gpu() const;
 
 	void set_queue_capacity(uint16_t p_capacity);
 	uint16_t get_queue_capacity() const;

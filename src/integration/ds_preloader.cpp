@@ -906,7 +906,12 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 
 	// Evaluated once up front: render-side alloc re-validates per chunk, and
 	// anything ineligible (or late-unavailable GPU) stays on the memory path.
-	const bool gpu_ok = p_prefer_gpu && is_gpu_prewarm_available();
+	bool prefer_gpu = p_prefer_gpu;
+	if (prefer_gpu && ctx->get_auto_tune_for_integrated_gpu() && ctx->is_integrated_gpu()) {
+		prefer_gpu = false;
+		UtilityFunctions::print("[DirectStorage] Integrated/UMA GPU detected: prewarm_gpu_async auto-routed to System RAM prewarm to eliminate loading screen hitches (directstorage/auto_tune_for_integrated_gpu=true).");
+	}
+	const bool gpu_ok = prefer_gpu && is_gpu_prewarm_available();
 	const int chunk_size = p_chunk_size > 0 ? p_chunk_size : 16;
 
 	// Tag first with an empty list (total 0); each stream enqueue bumps the

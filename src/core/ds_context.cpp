@@ -13,10 +13,13 @@
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
+#include <string>
+
 namespace godot {
 
 #ifdef _WIN32
 #include <wrl/client.h>
+#include <dxgi.h>
 Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device();
 uint64_t ds_win32_get_completion_fence(PlatformBackend *p_backend);
 bool ds_win32_wait_for_completion(PlatformBackend *p_backend, uint64_t p_fence_value, uint32_t p_timeout_msec);
@@ -305,6 +308,134 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 	s_support_cached = true;
 	return support;
 }
+
+struct DSD3D12AdapterProbe {
+	// NOTE: no Godot types here. This struct lives in static storage and
+	// is constructed at DLL load, before the GDExtension interface
+	// exists — a godot::String member would crash in DllMain (Error
+	// 1114). UTF-8 bytes only; converted to String at call time.
+	bool available = false;
+	std::string adapter_name;
+	uint32_t vendor_id = 0;
+	uint32_t device_id = 0;
+	uint64_t dedicated_bytes = 0;
+	uint64_t shared_bytes = 0;
+	bool software_adapter = false;
+	bool is_uma = false;
+	bool is_cache_coherent_uma = false;
+	bool integrated_guess = false;
+};
+
+static DSD3D12AdapterProbe s_adapter_probe;
+static std::mutex s_adapter_probe_mutex;
+static bool s_adapter_probe_finalized = false;
+
+static String ds_adapter_vendor_name(uint32_t p_vendor_id) {
+	switch (p_vendor_id) {
+		case 0x10DE:
+			return "NVIDIA";
+		case 0x1002:
+			return "AMD";
+		case 0x8086:
+			return "Intel";
+		case 0x1414:
+			return "Microsoft (WARP/software)";
+		case 0x5143:
+			return "Qualcomm";
+		default:
+			return "Unknown";
+	}
+}
+
+static void probe_d3d12_adapter_locked() {
+	if (s_adapter_probe.available || s_adapter_probe_finalized) {
+		return;
+	}
+
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (rs && rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+		// Permanently finalized: active driver is Vulkan/OpenGL, D3D12 device will never exist.
+		s_adapter_probe = DSD3D12AdapterProbe();
+		s_adapter_probe_finalized = true;
+		return;
+	}
+
+	Microsoft::WRL::ComPtr<ID3D12Device> device = ds_win32_get_d3d12_device();
+	if (!device) {
+		// D3D12 device not created or acquired yet. Do not cache available=false so
+		// subsequent calls (e.g. at initialize_ds_locked) re-probe when the device is up.
+		return;
+	}
+
+	DSD3D12AdapterProbe info;
+	// Direct D3D12 hardware architecture query: arch.UMA == TRUE is the
+	// authoritative hardware indicator of unified memory architecture (APU /
+	// integrated GPU sharing physical RAM with CPU), immune to BIOS-carved
+	// dedicated video memory reservations (e.g. AMD APUs reporting 2GB VRAM).
+	D3D12_FEATURE_DATA_ARCHITECTURE1 arch1 = {};
+	if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch1, sizeof(arch1)))) {
+		info.is_uma = (arch1.UMA == TRUE);
+		info.is_cache_coherent_uma = (arch1.CacheCoherentUMA == TRUE);
+	} else {
+		D3D12_FEATURE_DATA_ARCHITECTURE arch0 = {};
+		if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch0, sizeof(arch0)))) {
+			info.is_uma = (arch0.UMA == TRUE);
+			info.is_cache_coherent_uma = (arch0.CacheCoherentUMA == TRUE);
+		}
+	}
+	// Match Godot's exact device by LUID so multi-GPU systems report the
+	// adapter actually in use, not default adapter #0.
+	LUID luid = device->GetAdapterLuid();
+	IDXGIFactory *factory = nullptr;
+	if (FAILED(CreateDXGIFactory(__uuidof(IDXGIFactory), reinterpret_cast<void **>(&factory))) || !factory) {
+		info.available = true;
+		info.integrated_guess = info.is_uma;
+		s_adapter_probe = info;
+		return;
+	}
+	for (UINT i = 0;; i++) {
+		IDXGIAdapter *candidate = nullptr;
+		if (FAILED(factory->EnumAdapters(i, &candidate)) || !candidate) {
+			break;
+		}
+		DXGI_ADAPTER_DESC desc = {};
+		bool is_match = SUCCEEDED(candidate->GetDesc(&desc)) &&
+				desc.AdapterLuid.HighPart == luid.HighPart &&
+				desc.AdapterLuid.LowPart == luid.LowPart;
+		candidate->Release();
+		if (!is_match) {
+			continue;
+		}
+		char utf8[128] = {};
+		WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, utf8, sizeof(utf8), nullptr, nullptr);
+		info.available = true;
+		info.adapter_name = utf8;
+		info.vendor_id = desc.VendorId;
+		info.device_id = desc.DeviceId;
+		info.dedicated_bytes = desc.DedicatedVideoMemory;
+		info.shared_bytes = desc.SharedSystemMemory;
+		info.software_adapter = (desc.VendorId == 0x1414);
+		// An adapter is integrated if D3D12 reports UMA == TRUE, or fallback
+		// heuristic: <1 GiB dedicated VRAM on non-software adapters.
+		info.integrated_guess = !info.software_adapter &&
+				(info.is_uma || desc.DedicatedVideoMemory < (1024ULL * 1024ULL * 1024ULL));
+		break;
+	}
+	factory->Release();
+	if (!info.available) {
+		info.available = true;
+		info.integrated_guess = info.is_uma;
+	}
+	s_adapter_probe = info;
+}
+
+static const DSD3D12AdapterProbe &query_d3d12_adapter() {
+	std::lock_guard<std::mutex> lock(s_adapter_probe_mutex);
+	if (!s_adapter_probe.available && !s_adapter_probe_finalized) {
+		probe_d3d12_adapter_locked();
+	}
+	return s_adapter_probe;
+}
 #endif
 
 } // namespace
@@ -334,6 +465,47 @@ int DSContext::get_gpu_decompression_support_tier() const {
 	return 0;
 }
 
+Dictionary DSContext::get_gpu_adapter_info() const {
+	Dictionary info;
+	info["available"] = false;
+#ifdef _WIN32
+	const DSD3D12AdapterProbe &probe = query_d3d12_adapter();
+	if (!probe.available) {
+		return info;
+	}
+	const uint64_t mib = 1024ULL * 1024ULL;
+	info["available"] = true;
+	info["adapter_name"] = probe.adapter_name.empty() ? String("unknown") : String(probe.adapter_name.c_str());
+	info["adapter_vendor"] = ds_adapter_vendor_name(probe.vendor_id);
+	info["vendor_id"] = static_cast<int64_t>(probe.vendor_id);
+	info["device_id"] = static_cast<int64_t>(probe.device_id);
+	info["dedicated_vram_mb"] = static_cast<int64_t>(probe.dedicated_bytes / mib);
+	info["shared_system_mb"] = static_cast<int64_t>(probe.shared_bytes / mib);
+	info["software_adapter"] = probe.software_adapter;
+	info["is_uma"] = probe.is_uma;
+	info["is_cache_coherent_uma"] = probe.is_cache_coherent_uma;
+	info["integrated_gpu_guess"] = probe.integrated_guess;
+#endif
+	return info;
+}
+
+bool DSContext::is_integrated_gpu() const {
+#ifdef _WIN32
+	const DSD3D12AdapterProbe &probe = query_d3d12_adapter();
+	return probe.is_uma || probe.integrated_guess;
+#else
+	return false;
+#endif
+}
+
+bool DSContext::is_uma() const {
+#ifdef _WIN32
+	return query_d3d12_adapter().is_uma;
+#else
+	return false;
+#endif
+}
+
 Dictionary DSContext::get_capability_report() const {
 	Dictionary report;
 	int gpu_tier = get_gpu_decompression_support_tier();
@@ -353,6 +525,15 @@ Dictionary DSContext::get_capability_report() const {
 	report["gpu_decompression_available"] = gpu_tier > 0;
 	report["gpu_decompression_enabled"] = gpu_tier > 0 && !disable_gpu_decompression;
 	report["gpu_decompression_tier"] = gpu_tier;
+	Dictionary adapter = get_gpu_adapter_info();
+	report["adapter_name"] = adapter.get("adapter_name", "unknown");
+	report["adapter_vendor"] = adapter.get("adapter_vendor", "unknown");
+	report["dedicated_vram_mb"] = adapter.get("dedicated_vram_mb", 0);
+	report["shared_system_mb"] = adapter.get("shared_system_mb", 0);
+	report["software_adapter"] = adapter.get("software_adapter", false);
+	report["is_uma"] = adapter.get("is_uma", false);
+	report["is_cache_coherent_uma"] = adapter.get("is_cache_coherent_uma", false);
+	report["integrated_gpu_guess"] = adapter.get("integrated_gpu_guess", false);
 	report["active_backend"] = get_active_backend_name();
 	report["supported_destination_types"] = supported_destinations;
 	return report;
@@ -631,7 +812,33 @@ bool DSContext::initialize_ds_locked() {
 			uint32_t configured_cap = static_cast<uint32_t>(v);
 			queue_capacity = clamp_queue_capacity(configured_cap > 0 ? configured_cap : DEFAULT_QUEUE_CAPACITY);
 		}
+		if (ps->has_setting("directstorage/auto_tune_for_integrated_gpu")) {
+			auto_tune_for_integrated_gpu = ps->get_setting("directstorage/auto_tune_for_integrated_gpu");
+		}
 	}
+
+#ifdef _WIN32
+	// UMA auto-tune: reduction-only clamp of the *effective* values. Runs
+	// before backend creation so every consumer (queue setup, staging
+	// checks, stream flush budget) observes the clamped values. Members
+	// are reloaded from ProjectSettings on every init, so an explicit
+	// user configuration is never lost — only the in-effect copy shrinks.
+	if (auto_tune_for_integrated_gpu && is_integrated_gpu()) {
+		uint32_t requested_staging = staging_buffer_size_mb;
+		uint16_t requested_queue = queue_capacity;
+		staging_buffer_size_mb = std::min(staging_buffer_size_mb, UMA_MAX_STAGING_BUFFER_SIZE_MB);
+		queue_capacity = std::min(queue_capacity, UMA_MAX_QUEUE_CAPACITY);
+		if (staging_buffer_size_mb != requested_staging || queue_capacity != requested_queue) {
+			Dictionary adapter = get_gpu_adapter_info();
+			UtilityFunctions::print("[DirectStorage] Integrated/UMA GPU detected ('" +
+					String(adapter.get("adapter_name", "unknown")) +
+					"'): auto-tune clamped staging " + String::num_uint64(requested_staging) +
+					"->" + String::num_uint64(staging_buffer_size_mb) + " MiB, queue " +
+					String::num_uint64(requested_queue) + "->" + String::num_uint64(queue_capacity) +
+					" (directstorage/auto_tune_for_integrated_gpu=true; set false to use configured values).");
+		}
+	}
+#endif
 
 #ifdef _WIN32
 	Win32Backend *backend = memnew(Win32Backend);
@@ -1416,6 +1623,14 @@ bool DSContext::get_disable_gpu_decompression() const {
 	return disable_gpu_decompression;
 }
 
+void DSContext::set_auto_tune_for_integrated_gpu(bool p_enable) {
+	auto_tune_for_integrated_gpu = p_enable;
+}
+
+bool DSContext::get_auto_tune_for_integrated_gpu() const {
+	return auto_tune_for_integrated_gpu;
+}
+
 void DSContext::set_queue_capacity(uint16_t p_capacity) {
 	queue_capacity = clamp_queue_capacity(p_capacity > 0 ? p_capacity : DEFAULT_QUEUE_CAPACITY);
 }
@@ -1433,6 +1648,9 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_gpu_decompression_available"), &DSContext::is_gpu_decompression_available);
 	ClassDB::bind_method(D_METHOD("is_gpu_decompression_enabled"), &DSContext::is_gpu_decompression_enabled);
 	ClassDB::bind_method(D_METHOD("get_gpu_decompression_support_tier"), &DSContext::get_gpu_decompression_support_tier);
+	ClassDB::bind_method(D_METHOD("get_gpu_adapter_info"), &DSContext::get_gpu_adapter_info);
+	ClassDB::bind_method(D_METHOD("is_integrated_gpu"), &DSContext::is_integrated_gpu);
+	ClassDB::bind_method(D_METHOD("is_uma"), &DSContext::is_uma);
 	ClassDB::bind_method(D_METHOD("get_capability_report"), &DSContext::get_capability_report);
 	ClassDB::bind_method(D_METHOD("is_current_drive_supported"), &DSContext::is_current_drive_supported);
 	ClassDB::bind_method(D_METHOD("is_path_supported", "path"), &DSContext::is_path_supported);
@@ -1475,11 +1693,15 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_disable_gpu_decompression", "disable"), &DSContext::set_disable_gpu_decompression);
 	ClassDB::bind_method(D_METHOD("get_disable_gpu_decompression"), &DSContext::get_disable_gpu_decompression);
 
+	ClassDB::bind_method(D_METHOD("set_auto_tune_for_integrated_gpu", "enable"), &DSContext::set_auto_tune_for_integrated_gpu);
+	ClassDB::bind_method(D_METHOD("get_auto_tune_for_integrated_gpu"), &DSContext::get_auto_tune_for_integrated_gpu);
+
 	ClassDB::bind_method(D_METHOD("set_queue_capacity", "capacity"), &DSContext::set_queue_capacity);
 	ClassDB::bind_method(D_METHOD("get_queue_capacity"), &DSContext::get_queue_capacity);
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "staging_buffer_size_mb"), "set_staging_buffer_size_mb", "get_staging_buffer_size_mb");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disable_gpu_decompression"), "set_disable_gpu_decompression", "get_disable_gpu_decompression");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_tune_for_integrated_gpu"), "set_auto_tune_for_integrated_gpu", "get_auto_tune_for_integrated_gpu");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "queue_capacity"), "set_queue_capacity", "get_queue_capacity");
 
 	BIND_ENUM_CONSTANT(INIT_STATUS_UNINITIALIZED);

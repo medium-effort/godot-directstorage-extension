@@ -2302,9 +2302,37 @@ bool Win32Backend::initialize(const String &p_path) {
 		}
 		RenderingServer *rs = RenderingServer::get_singleton();
 		String driver_name = rs ? rs->get_current_rendering_driver_name().to_lower() : "unknown";
+		int gpu_tier = ctx ? ctx->get_gpu_decompression_support_tier() : 0;
+		// Human-readable GPU path: tier 2 = GPU-optimized GDeflate shaders,
+		// tier 1 = compute-shader fallback (works, slower, contends with
+		// rendering on weak iGPUs), tier 0 = no GPU support (CPU decode).
+		String gpu_mode = "unavailable (no GPU support)";
+		if (disable_gpu) {
+			gpu_mode = "disabled (project setting)";
+		} else if (gpu_tier >= 2) {
+			gpu_mode = "enabled (GPU-optimized)";
+		} else if (gpu_tier == 1) {
+			gpu_mode = "enabled (GPU-fallback)";
+		}
+		String adapter_suffix;
+		if (ctx) {
+			Dictionary adapter = ctx->get_gpu_adapter_info();
+			if (bool(adapter.get("available", false))) {
+				String uma_desc;
+				if (bool(adapter.get("is_uma", false))) {
+					uma_desc = ", UMA" + String(bool(adapter.get("is_cache_coherent_uma", false)) ? " coherent" : " non-coherent");
+				} else if (bool(adapter.get("integrated_gpu_guess", false))) {
+					uma_desc = ", UMA guess";
+				}
+				adapter_suffix = ", adapter='" + String(adapter.get("adapter_name", "unknown")) + "' (" +
+						String(adapter.get("dedicated_vram_mb", 0)) + " MiB dedicated" +
+						uma_desc +
+						(bool(adapter.get("software_adapter", false)) ? ", software" : "") + ")";
+			}
+		}
 		UtilityFunctions::print("[DirectStorage] Win32DirectStorage ready: driver=" + driver_name +
 				", staging_buffer=" + String::num_uint64(staging_mb) + " MiB, queue_capacity=" +
-				String::num_uint64(capacity) + ", gpu_decompression=" + (disable_gpu ? "disabled" : "enabled"));
+				String::num_uint64(capacity) + ", gpu_decompression=" + gpu_mode + adapter_suffix);
 		return true;
 	} else {
 		uint32_t u_hr = static_cast<uint32_t>(hr);

@@ -91,9 +91,17 @@
 			<return type="int" />
 			<description>Returns the total number of asynchronous batches submitted via [method flush_batch_async] / [method flush_stream_async] since initialization. Because many textures share one batch, this number is normally far below the texture count. Returns [code]0[/code] before initialization.</description>
 		</method>
+		<method name="get_auto_tune_for_integrated_gpu" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether integrated-GPU auto-tune is enabled (see [member auto_tune_for_integrated_gpu]).</description>
+		</method>
 		<method name="get_capability_report" qualifiers="const">
 			<return type="Dictionary" />
-			<description>Returns a comprehensive [Dictionary] detailing the active backend, Direct3D 12 device status, GPU decompression support tier, GPU decompression enabled status, queue capacity, and staging buffer configuration.</description>
+			<description>Returns a comprehensive [Dictionary] detailing the active backend, Direct3D 12 device status, GPU decompression support tier, GPU decompression enabled status, queue capacity, staging buffer configuration, and DXGI adapter identity ([code]adapter_name[/code], [code]adapter_vendor[/code], [code]dedicated_vram_mb[/code], [code]shared_system_mb[/code], [code]software_adapter[/code], [code]integrated_gpu_guess[/code]).</description>
+		</method>
+		<method name="get_gpu_adapter_info" qualifiers="const">
+			<return type="Dictionary" />
+			<description>Returns identity details for the exact graphics device in use (matched by adapter LUID, so multi-GPU PCs report the right one): [code]available[/code], [code]adapter_name[/code] (e.g. "AMD Radeon(TM) Graphics"), [code]adapter_vendor[/code], [code]vendor_id[/code], [code]device_id[/code], [code]dedicated_vram_mb[/code] (the GPU's own private memory; tiny or zero on integrated graphics), [code]shared_system_mb[/code] (ordinary RAM the GPU may borrow), [code]software_adapter[/code] (true for Microsoft WARP emulation, i.e. no real GPU), and [code]integrated_gpu_guess[/code] (true when dedicated memory is under 1 GiB — the sign of graphics that share system RAM). [code]available[/code] is [code]false[/code] off Windows or without an active D3D12 device.</description>
 		</method>
 		<method name="get_completion_fence" qualifiers="const">
 			<return type="int" />
@@ -110,7 +118,7 @@
 		</method>
 		<method name="get_gpu_decompression_support_tier" qualifiers="const">
 			<return type="int" />
-			<description>Returns the GPU decompression support tier reported by DirectStorage ([code]0[/code] for unsupported or software-only, [code]1[/code] or higher for hardware GPU decompression support).</description>
+			<description>Returns the GPU decompression path reported by DirectStorage: [code]0[/code] unsupported (CPU decode only), [code]1[/code] GPU fallback via compute shaders (works, slower), [code]2[/code] GPU-optimized GDeflate path.</description>
 		</method>
 		<method name="get_in_flight_async_batch_count" qualifiers="const">
 			<return type="int" />
@@ -191,6 +199,14 @@
 			<return type="bool" />
 			<description>Returns [code]true[/code] if GPU decompression is currently enabled and available (i.e. supported and not disabled via [member disable_gpu_decompression]).</description>
 		</method>
+		<method name="is_integrated_gpu" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] when the PC's graphics look like an integrated GPU — one that shares system RAM (typical for laptops, handhelds, and mini-PCs) instead of having its own dedicated VRAM. Detected via Windows Direct3D 12 Unified Memory Architecture (UMA) hardware query, with fallback heuristic checking for under 1 GiB of dedicated video memory. Returns [code]false[/code] when unknown, off Windows, or without an active D3D12 device. See [member auto_tune_for_integrated_gpu].</description>
+		</method>
+		<method name="is_uma" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if the active Direct3D 12 adapter reports Unified Memory Architecture (UMA == TRUE via [code]D3D12_FEATURE_ARCHITECTURE1[/code]), indicating CPU and GPU share the same physical system RAM bus.</description>
+		</method>
 		<method name="is_initialized" qualifiers="const">
 			<return type="bool" />
 			<description>
@@ -228,6 +244,11 @@
 			<description>
 				Issues a fresh stream tag and registers its expected request total for progress queries. Accepts engine texture paths ([code].png/.jpg/.webp[/code]); file remapping is resolved internally. Non-blocking: call [code]track_prewarm(tag)[/code] on the [code]DSBatchManager[/code] autoload for per-tag progress signals, then bind with [code]CACHE_MODE_REUSE[/code] once [method is_prewarm_complete] holds.
 			</description>
+		</method>
+		<method name="set_auto_tune_for_integrated_gpu">
+			<return type="void" />
+			<param index="0" name="enable" type="bool" />
+			<description>Enables or disables integrated-GPU auto-tune (see [member auto_tune_for_integrated_gpu]). When enabled and the PC's graphics share system RAM instead of having dedicated VRAM, the effective staging buffer and queue capacity are lowered to 64 MiB / 256 at initialization. Never raises values; set [code]false[/code] to use your configured values exactly.</description>
 		</method>
 		<method name="set_disable_gpu_decompression">
 			<return type="void" />
@@ -270,6 +291,9 @@
 		</method>
 	</methods>
 	<members>
+		<member name="auto_tune_for_integrated_gpu" type="bool" setter="set_auto_tune_for_integrated_gpu" getter="get_auto_tune_for_integrated_gpu" default="true">
+			Automatically shrinks DirectStorage memory usage on integrated GPUs (laptop/handheld graphics that share system RAM instead of having their own VRAM). When [code]true[/code] and such a GPU is detected, the effective staging buffer and queue capacity are lowered to 64 MiB / 256 at startup, and the log states the before/after values. Only ever lowers, never raises: values you set below the caps pass through untouched, your saved settings are never rewritten, and discrete-GPU PCs are unaffected. Set [code]false[/code] for full manual control.
+		</member>
 		<member name="disable_gpu_decompression" type="bool" setter="set_disable_gpu_decompression" getter="get_disable_gpu_decompression" default="false">
 			If [code]true[/code], forces DirectStorage runtime to perform CPU decompression instead of GPU decompression shaders.
 		</member>

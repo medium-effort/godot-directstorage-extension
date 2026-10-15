@@ -216,11 +216,13 @@ if env["platform"] == "windows":
 # Build with: scons tests=true
 # Run with:   ./extern/gdextest/gdextest test
 # Gated on tests flag so normal builds never require extern/gdextest.
-# The flag is declared explicitly so `tests=true` is a known SCons variable
-# (otherwise SCons warns "Unknown SCons variables were passed and will be
-# ignored"). BoolVariable also normalizes values, so `tests=false` is False
-# (raw ARGUMENTS strings are truthy for ANY non-empty value, including
-# "false" and "0").
+# NOTE: `scons tests=true` still prints godot-cpp's "Unknown SCons variables"
+# warning. That check (godot-cpp/SConstruct: UnknownVariables) only knows
+# godot-cpp's own variables and runs before this declaration, so the warning
+# is expected noise: the flag IS honored below (verified: the test library
+# links in the same run that prints it). BoolVariable also normalizes values,
+# so `tests=false` is False (raw ARGUMENTS strings are truthy for ANY
+# non-empty value, including "false" and "0").
 _tests_options = SCons.Script.Variables()
 _tests_options.Add(SCons.Script.BoolVariable("tests", "Build the gdextest unit-test library alongside the extension", False))
 _tests_options.Update(env)

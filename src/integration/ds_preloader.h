@@ -131,10 +131,11 @@ public:
 	// decompression active) are allocated as RenderingDevice textures on
 	// the render thread (one call_on_render_thread per chunk of
 	// p_chunk_size) and filled by DirectStorage DMA straight into VRAM.
-	// Ineligible payloads take the memory path under the SAME tag, and
-	// when the GPU path is unavailable everything degrades to the memory
-	// path, so the call is safe anywhere prewarm_async is (including
-	// headless CI, where it behaves identically to prewarm_async).
+	// Ineligible payloads take the memory path under the SAME tag. When the
+	// GPU path is unavailable (or on integrated/UMA GPUs when
+	// auto_tune_for_integrated_gpu is enabled), everything automatically
+	// degrades to the memory path, eliminating loading-screen hitches and
+	// making the call safe anywhere prewarm_async is (including headless CI).
 	// Completion wraps Texture2DRD on the main/render thread only; worker
 	// poll_completed() calls skip GPU entries and leave them pending.
 	// Returns the DSContext stream tag, or 0 when DSContext is unavailable.

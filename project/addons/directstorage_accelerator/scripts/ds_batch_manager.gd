@@ -47,8 +47,15 @@ var _has_pump_gpu: bool = false
 ## Adaptive slice backpressure (Rev1 plan: Q13/Q41).
 ## EMA of main-thread frame time; slice budgets passed by value to the
 ## worker via bind() so no cross-thread mutable read occurs.
+## `_baseline_ema_ms` tracks the device's natural menu-idle frame cost
+## (updated only while nothing streams); slice thresholds derive from it
+## so a 30 FPS iGPU doesn't pin to "heavy" while fast dGPUs keep the
+## original absolute thresholds. Baseline intentionally survives
+## `reset_slice_stats()` so Play inherits the menu calibration.
 var _slice_ema_ms: float = 0.0
 var _slice_ema_init: bool = false
+var _baseline_ema_ms: float = 0.0
+var _baseline_init: bool = false
 var _smooth_streak: int = 2
 ## Backpressure path tracking: transition-only log + per-batch slice counts
 ## (no per-frame spam). Silent by default; Settings enables `_slice_debug`
@@ -91,6 +98,7 @@ func set_slice_debug(enabled: bool) -> void:
 
 
 ## Clears per-batch slice counters (called at benchmark start).
+## Baseline + EMA intentionally survive so Play inherits menu calibration.
 func reset_slice_stats() -> void:
 	_warm_slices = 0
 	_mild_slices = 0
@@ -231,15 +239,33 @@ func _process(delta: float) -> void:
 				_slice_ema_init = true
 			else:
 				_slice_ema_ms = 0.5 * frame_ms + 0.5 * _slice_ema_ms
+			# Calibrate while idle (no tracked tags, nothing queued): slow
+			# alpha so load hitches never leak into the baseline.
+			if _tracked_tags.is_empty() and not ctx.has_stream_pending():
+				if not _baseline_init:
+					_baseline_ema_ms = frame_ms
+					_baseline_init = true
+				else:
+					_baseline_ema_ms = 0.05 * frame_ms + 0.95 * _baseline_ema_ms
+			# Device-relative thresholds: fast devices reproduce the original
+			# absolute bands (45/20/10 ms); slow devices scale with their own
+			# menu-idle baseline instead of thrashing mild<->heavy.
+			var heavy_at: float = 45.0
+			var mild_at: float = 20.0
+			var warm_at: float = 10.0
+			if _baseline_init:
+				heavy_at = maxf(45.0, _baseline_ema_ms * 2.5)
+				mild_at = maxf(20.0, _baseline_ema_ms * 1.5)
+				warm_at = maxf(10.0, _baseline_ema_ms * 1.1)
 			var slice_items: int = 3
 			var slice_usec: int = 4000
 			var slice_label: String = "mild"
-			if _slice_ema_ms > 45.0:
+			if _slice_ema_ms > heavy_at:
 				slice_items = 1
 				slice_usec = 4000
 				slice_label = "heavy"
 				_smooth_streak = 0
-			elif _slice_ema_ms > 20.0:
+			elif _slice_ema_ms > mild_at:
 				slice_items = 3
 				slice_usec = 4000
 				slice_label = "mild"
@@ -247,7 +273,7 @@ func _process(delta: float) -> void:
 			else:
 				_smooth_streak += 1
 				if _smooth_streak >= 2:
-					if _slice_ema_ms < 10.0:
+					if _slice_ema_ms < warm_at:
 						slice_items = 12
 						slice_usec = 8000
 					else:
