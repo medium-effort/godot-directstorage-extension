@@ -68,6 +68,31 @@ bool write_temp_dstex(const char *p_path, int p_width, int p_height, int p_mip_c
 	return err == godot::OK;
 }
 
+godot::PackedByteArray make_incompressible_payload(int64_t p_size, uint32_t p_seed = 0x12345678) {
+	godot::PackedByteArray payload;
+	payload.resize(p_size);
+	uint32_t state = p_seed;
+	for (int64_t i = 0; i < p_size; ++i) {
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		payload[i] = static_cast<uint8_t>(state & 0xFF);
+	}
+	return payload;
+}
+
+bool write_temp_dstex_incompressible(const char *p_path, int p_width, int p_height, int p_mip_count, int64_t p_payload_size, uint32_t p_seed = 0x12345678, bool p_is_srgb = false, bool p_as_image_texture = false) {
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	if (dstex.is_null()) {
+		return false;
+	}
+	godot::Error err = dstex->write_to_file(
+			godot::String(p_path), make_incompressible_payload(p_payload_size, p_seed),
+			p_width, p_height, godot::Image::FORMAT_RGBA8, p_mip_count, 1, p_is_srgb, p_as_image_texture);
+	return err == godot::OK;
+}
+
 void remove_temp_file(const char *p_path) {
 	godot::Ref<godot::DirAccess> dir = godot::DirAccess::open("user://");
 	if (dir.is_valid()) {
@@ -317,6 +342,89 @@ GDEX_TEST_T(dspkg, steampipe_1mb_payload_alignment, TAG_INTEGRATION) {
 	GDEX_EXPECT_TRUE(offset_b >= offset_a + static_cast<int64_t>(godot::DSPkg::STEAMPIPE_1MB_ALIGNMENT));
 
 	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, steampipe_1mb_bin_packing, TAG_INTEGRATION) {
+	const char *dstex_a = "user://gdextest_binpack_a.dstex";
+	const char *dstex_b = "user://gdextest_binpack_b.dstex";
+	const char *dstex_c = "user://gdextest_binpack_c.dstex";
+	const char *dspkg_path = "user://gdextest_binpack.dspkg";
+	const char *res_a = "res://textures/binpack_a.dstex";
+	const char *res_b = "res://textures/binpack_b.dstex";
+	const char *res_c = "res://textures/binpack_c.dstex";
+
+	const int64_t TEX_SIZE = 400 * 1024; // 400 KB
+	if (!write_temp_dstex_incompressible(dstex_a, 512, 200, 1, TEX_SIZE, 0x11111111) ||
+			!write_temp_dstex_incompressible(dstex_b, 512, 200, 1, TEX_SIZE, 0x22222222) ||
+			!write_temp_dstex_incompressible(dstex_c, 512, 200, 1, TEX_SIZE, 0x33333333)) {
+		GDEX_ABORT_TEST("fixture DSTex writes failed");
+	}
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path)) == godot::OK);
+	builder->set_payload_alignment(godot::DSPkg::STEAMPIPE_1MB_ALIGNMENT);
+	builder->set_bin_packing_enabled(true);
+	GDEX_EXPECT_TRUE(builder->is_bin_packing_enabled());
+
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_a), godot::String(dstex_a)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_b), godot::String(dstex_b)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_c), godot::String(dstex_c)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_ASSERT_TRUE(reader->open(godot::String(dspkg_path)) == godot::OK);
+
+	godot::Dictionary info_a = reader->get_entry_info(godot::String(res_a));
+	godot::Dictionary info_b = reader->get_entry_info(godot::String(res_b));
+	godot::Dictionary info_c = reader->get_entry_info(godot::String(res_c));
+
+	int64_t offset_a = info_a.get("data_offset", -1);
+	int64_t offset_b = info_b.get("data_offset", -1);
+	int64_t offset_c = info_c.get("data_offset", -1);
+
+	const int64_t base_offset = static_cast<int64_t>(godot::DSPkg::STEAMPIPE_1MB_ALIGNMENT);
+	const int64_t chunk_size = static_cast<int64_t>(godot::DSPkg::STEAMPIPE_1MB_ALIGNMENT);
+
+	// A and B both start in Chunk 0 (< base_offset + 1 MiB) and are 512-byte aligned
+	GDEX_EXPECT_EQ(offset_a, base_offset);
+	GDEX_EXPECT_EQ((offset_b - base_offset) % 512, int64_t(0));
+	GDEX_EXPECT_GT(offset_b, offset_a);
+	GDEX_EXPECT_LT(offset_b, base_offset + chunk_size);
+
+	// C crossed the 1 MiB boundary, so it jumped to Chunk 1 (base_offset + 1 MiB)
+	GDEX_EXPECT_EQ(offset_c, base_offset + chunk_size);
+
+	// Read textures and verify byte payloads match
+	godot::Dictionary tex_a = reader->read_texture(godot::String(res_a));
+	godot::Dictionary tex_b = reader->read_texture(godot::String(res_b));
+	godot::Dictionary tex_c = reader->read_texture(godot::String(res_c));
+
+	godot::PackedByteArray read_a = tex_a.get("compressed_data", godot::PackedByteArray());
+	godot::PackedByteArray read_b = tex_b.get("compressed_data", godot::PackedByteArray());
+	godot::PackedByteArray read_c = tex_c.get("compressed_data", godot::PackedByteArray());
+
+	godot::Ref<godot::DSTex> dstex_reader;
+	dstex_reader.instantiate();
+	godot::PackedByteArray expected_a = dstex_reader->read_from_file(godot::String(dstex_a)).get("compressed_data", godot::PackedByteArray());
+	godot::PackedByteArray expected_b = dstex_reader->read_from_file(godot::String(dstex_b)).get("compressed_data", godot::PackedByteArray());
+	godot::PackedByteArray expected_c = dstex_reader->read_from_file(godot::String(dstex_c)).get("compressed_data", godot::PackedByteArray());
+
+	GDEX_ASSERT_EQ(read_a.size(), expected_a.size());
+	GDEX_ASSERT_EQ(read_b.size(), expected_b.size());
+	GDEX_ASSERT_EQ(read_c.size(), expected_c.size());
+
+	GDEX_EXPECT_EQ(memcmp(read_a.ptr(), expected_a.ptr(), expected_a.size()), 0);
+	GDEX_EXPECT_EQ(memcmp(read_b.ptr(), expected_b.ptr(), expected_b.size()), 0);
+	GDEX_EXPECT_EQ(memcmp(read_c.ptr(), expected_c.ptr(), expected_c.size()), 0);
+
+	remove_temp_file(dstex_a);
+	remove_temp_file(dstex_b);
+	remove_temp_file(dstex_c);
 	remove_temp_file(dspkg_path);
 }
 

@@ -273,14 +273,9 @@ if ((-not $?) -or ($null -eq $DoctorCode) -or ($DoctorCode -ne 0)) {
 # [2/5] fixture: generate the disposable Godot project for the test library.
 Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
 Write-VerboseHost "[2/5] fixture: generating Godot fixture project..." -ForegroundColor Cyan
-$TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.editor*.dll" -ErrorAction SilentlyContinue |
+$TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.dll" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
-if (-not $TestDll) {
-    $TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.dll" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-}
 if (-not $TestDll) {
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "No test library found at bin/libdirectstorage_tests*.dll. Build with .vscode/build_remote.ps1 -IncludeTests first." -Code 1
 }

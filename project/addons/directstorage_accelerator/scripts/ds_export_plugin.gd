@@ -176,7 +176,11 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 			if _steampipe_1mb_alignment_enabled:
 				if _dspkg.has_method("set_payload_alignment"):
 					_dspkg.set_payload_alignment(1048576)
-					print("[DirectStorage Exporter] SteamPipe 1MB payload alignment padding is ENABLED.")
+					if _dspkg.has_method("set_bin_packing_enabled"):
+						_dspkg.set_bin_packing_enabled(true)
+						print("[DirectStorage Exporter] SteamPipe 1MB payload bin-packing is ENABLED.")
+					else:
+						push_warning("[DirectStorage Exporter] Active DSPkg binary does not support 'set_bin_packing_enabled'; archive will fall back to strict 1MB alignment.")
 				else:
 					push_warning("[DirectStorage Exporter] Active DSPkg binary does not support 'set_payload_alignment'; archive will use default 512-byte alignment.")
 			print("[DirectStorage Exporter] Initialized DSPkg staging archive at: ", _staging_dspkg_path)

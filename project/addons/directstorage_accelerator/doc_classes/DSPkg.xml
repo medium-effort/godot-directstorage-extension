@@ -48,10 +48,18 @@
 			<param index="0" name="offset" type="int" />
 			<description>Returns an array of [Dictionary] records representing the GPU mip entries located at absolute payload [param offset]. Each dictionary contains [code]offset[/code] ([int]), [code]compressed_size[/code] ([int]), [code]uncompressed_size[/code] ([int]), and [code]row_pitch[/code] ([int]). Returns an empty array if no mip entries match the offset or if no archive is open.</description>
 		</method>
+		<method name="get_payload_alignment" qualifiers="const">
+			<return type="int" />
+			<description>Returns the payload byte alignment configured for the archive builder (default is [code]512[/code]).</description>
+		</method>
 		<method name="has_texture" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="resource_path" type="String" />
 			<description>Returns whether the opened archive contains [param resource_path].</description>
+		</method>
+		<method name="is_bin_packing_enabled" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether 1 MiB chunk bin-packing is enabled for payload alignment.</description>
 		</method>
 		<method name="open">
 			<return type="Error" />
@@ -68,6 +76,16 @@
 			<return type="void" />
 			<param index="0" name="archive_fingerprint" type="int" />
 			<description>Sets or overrides the 64-bit validation fingerprint written into the archive header during [method finalize]. Must be called while building an archive.</description>
+		</method>
+		<method name="set_bin_packing_enabled">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>Enables or disables 1 MiB chunk bin-packing when [method set_payload_alignment] is set to 1 MiB. When enabled, multiple small textures are packed into the same 1 MiB chunk with 512-byte GPU alignment, only inserting 1 MiB padding when a texture would cross a chunk boundary.</description>
+		</method>
+		<method name="set_payload_alignment">
+			<return type="void" />
+			<param index="0" name="alignment" type="int" />
+			<description>Sets the payload byte alignment for archive entries. Must be a power of two and &gt;= [code]512[/code]. For SteamPipe delta patching, pass [code]1048576[/code] (1 MiB).</description>
 		</method>
 	</methods>
 </class>

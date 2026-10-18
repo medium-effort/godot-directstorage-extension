@@ -64,6 +64,7 @@ private:
 	String build_output_path;
 	uint64_t build_archive_fingerprint = 0;
 	uint64_t payload_alignment = 512;
+	bool bin_packing_enabled = false;
 	Array staging_entries;
 	bool is_building = false;
 
@@ -92,6 +93,8 @@ public:
 	void set_archive_fingerprint(uint64_t p_archive_fingerprint);
 	void set_payload_alignment(uint64_t p_alignment);
 	uint64_t get_payload_alignment() const;
+	void set_bin_packing_enabled(bool p_enabled);
+	bool is_bin_packing_enabled() const;
 	Error add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata = Dictionary());
 	Error finalize();
 

@@ -76,6 +76,31 @@ bool metadata_arrays_are_valid(const Dictionary &p_metadata, uint32_t p_mip_coun
 			mip_row_pitches.size() == static_cast<int64_t>(p_mip_count);
 }
 
+bool calculate_packed_payload_offset(uint64_t p_current_offset, uint64_t p_item_size, uint64_t p_chunk_alignment, uint64_t &r_result) {
+	if (p_chunk_alignment == 0 || (p_chunk_alignment % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) != 0) {
+		return false;
+	}
+	uint64_t aligned_512 = 0;
+	if (!align_up(p_current_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, aligned_512)) {
+		return false;
+	}
+	uint64_t chunk_idx = aligned_512 / p_chunk_alignment;
+	uint64_t current_chunk_end = 0;
+	if (!checked_multiply(chunk_idx + 1, p_chunk_alignment, current_chunk_end)) {
+		return false;
+	}
+	uint64_t item_end = 0;
+	if (!checked_add(aligned_512, p_item_size, item_end)) {
+		return false;
+	}
+	if (item_end > current_chunk_end && (aligned_512 % p_chunk_alignment) != 0) {
+		r_result = current_chunk_end;
+	} else {
+		r_result = aligned_512;
+	}
+	return true;
+}
+
 } // namespace
 
 void DSPkg::_bind_methods() {
@@ -83,6 +108,8 @@ void DSPkg::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_archive_fingerprint", "archive_fingerprint"), &DSPkg::set_archive_fingerprint);
 	ClassDB::bind_method(D_METHOD("set_payload_alignment", "alignment"), &DSPkg::set_payload_alignment);
 	ClassDB::bind_method(D_METHOD("get_payload_alignment"), &DSPkg::get_payload_alignment);
+	ClassDB::bind_method(D_METHOD("set_bin_packing_enabled", "enabled"), &DSPkg::set_bin_packing_enabled);
+	ClassDB::bind_method(D_METHOD("is_bin_packing_enabled"), &DSPkg::is_bin_packing_enabled);
 	ClassDB::bind_method(D_METHOD("add_texture", "resource_path", "dstex_path", "mip_metadata"), &DSPkg::add_texture, DEFVAL(Dictionary()));
 	ClassDB::bind_method(D_METHOD("finalize"), &DSPkg::finalize);
 
@@ -106,6 +133,7 @@ Error DSPkg::create(const String &p_output_path, uint64_t p_archive_fingerprint)
 	build_output_path = p_output_path;
 	build_archive_fingerprint = p_archive_fingerprint;
 	payload_alignment = DEFAULT_PAYLOAD_ALIGNMENT;
+	bin_packing_enabled = false;
 	staging_entries.clear();
 	is_building = true;
 	return OK;
@@ -131,6 +159,18 @@ void DSPkg::set_payload_alignment(uint64_t p_alignment) {
 
 uint64_t DSPkg::get_payload_alignment() const {
 	return payload_alignment;
+}
+
+void DSPkg::set_bin_packing_enabled(bool p_enabled) {
+	if (!is_building) {
+		UtilityFunctions::push_error("DSPkg: Not in building state. Call create() first.");
+		return;
+	}
+	bin_packing_enabled = p_enabled;
+}
+
+bool DSPkg::is_bin_packing_enabled() const {
+	return bin_packing_enabled;
 }
 
 Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata) {
@@ -260,6 +300,7 @@ Error DSPkg::finalize() {
 		return ERR_INVALID_PARAMETER;
 	}
 
+
 	Ref<FileAccess> file = FileAccess::open(build_output_path, FileAccess::WRITE);
 	if (file.is_null() || !file->is_open()) {
 		UtilityFunctions::push_error("DSPkg: Could not open file for writing: ", build_output_path);
@@ -277,6 +318,8 @@ Error DSPkg::finalize() {
 	file->store_buffer(reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader));
 
 	uint64_t running_data_offset = 0;
+	std::vector<uint64_t> entry_payload_offsets;
+	entry_payload_offsets.resize(count);
 	for (uint32_t i = 0; i < count; ++i) {
 		const Dictionary &item = sorted_entries[i];
 		String res_path = item["resource_path"];
@@ -292,11 +335,6 @@ Error DSPkg::finalize() {
 		uint32_t h = dstex_header.get("height", 0);
 		uint32_t fmt = dstex_header.get("pixel_format", 0);
 		uint32_t mips_count = dstex_header.get("mip_count", 0);
-		if (!align_up(running_data_offset, payload_alignment, running_data_offset)) {
-			UtilityFunctions::push_error("DSPkg: Payload data offset alignment overflow.");
-			file->close();
-			return ERR_INVALID_PARAMETER;
-		}
 		PackedInt32Array mip_sizes_entry = item.get("mip_sizes", PackedInt32Array());
 		PackedInt32Array mip_uncompressed_sizes = item.get("mip_uncompressed_sizes", PackedInt32Array());
 		PackedInt32Array mip_row_pitches = item.get("mip_row_pitches", PackedInt32Array());
@@ -334,6 +372,21 @@ Error DSPkg::finalize() {
 		} else {
 			comp_size = static_cast<uint64_t>(data.size());
 		}
+
+		if (bin_packing_enabled) {
+			if (!calculate_packed_payload_offset(running_data_offset, comp_size, payload_alignment, running_data_offset)) {
+				UtilityFunctions::push_error("DSPkg: Payload data offset bin-pack alignment overflow.");
+				file->close();
+				return ERR_INVALID_PARAMETER;
+			}
+		} else {
+			if (!align_up(running_data_offset, payload_alignment, running_data_offset)) {
+				UtilityFunctions::push_error("DSPkg: Payload data offset alignment overflow.");
+				file->close();
+				return ERR_INVALID_PARAMETER;
+			}
+		}
+		entry_payload_offsets[i] = running_data_offset;
 
 		file->store_64(hash);
 		file->store_16(path_len);
@@ -423,18 +476,24 @@ Error DSPkg::finalize() {
 		}
 	};
 
-	uint64_t payload_offset = table_end_offset;
+	write_zero_padding(table_end_offset, total_data_offset);
+	uint64_t payload_offset = total_data_offset;
 	for (uint32_t i = 0; i < count; ++i) {
 		const Dictionary &item = sorted_entries[i];
 		PackedByteArray data = item["compressed_data"];
-		uint64_t aligned_payload_offset = 0;
-		if (!align_up(payload_offset, payload_alignment, aligned_payload_offset)) {
-			UtilityFunctions::push_error("DSPkg: Payload file offset alignment overflow.");
+		uint64_t target_payload_offset = 0;
+		if (!checked_add(total_data_offset, entry_payload_offsets[i], target_payload_offset)) {
+			UtilityFunctions::push_error("DSPkg: Payload target offset overflow.");
 			file->close();
 			return ERR_INVALID_PARAMETER;
 		}
-		write_zero_padding(payload_offset, aligned_payload_offset);
-		payload_offset = aligned_payload_offset;
+		if (target_payload_offset < payload_offset) {
+			UtilityFunctions::push_error("DSPkg: Payload offset sequence non-monotonic.");
+			file->close();
+			return ERR_INVALID_DATA;
+		}
+		write_zero_padding(payload_offset, target_payload_offset);
+		payload_offset = target_payload_offset;
 
 		Dictionary dstex_header = item["header"];
 		uint32_t mips = dstex_header.get("mip_count", 0);
