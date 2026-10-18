@@ -292,7 +292,7 @@ static std::unordered_map<DSRequest *, DSRequest *> s_chunk_parents;
 static std::unordered_map<DSRequest *, ID3D12Resource *> s_resource_guards;
 static std::unordered_set<std::string> s_staging_buffer_warnings;
 
-static String retrieve_queue_error(IDStorageQueue1 *p_queue, String *r_failed_request_name = nullptr) {
+static String retrieve_queue_error(IDStorageQueue *p_queue, String *r_failed_request_name = nullptr) {
 	if (!p_queue) {
 		return String();
 	}
@@ -1521,7 +1521,7 @@ static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_ca
 	queue_desc.Priority = DSTORAGE_PRIORITY_NORMAL;
 	queue_desc.Name = "DirectStorageCapabilityProbe";
 	queue_desc.Device = nullptr;
-	IDStorageQueue1 *probe_queue = nullptr;
+	IDStorageQueue3 *probe_queue = nullptr;
 	hr = probe_factory->CreateQueue(&queue_desc, IID_PPV_ARGS(&probe_queue));
 	if (FAILED(hr) || !probe_queue) {
 		result.reason = "DirectStorage queue creation failed (HRESULT: 0x" + String::num_uint64(static_cast<uint32_t>(hr), 16) + ").";
@@ -3289,8 +3289,13 @@ void Win32Backend::submit_async() {
 			if (i < slot.request_names.size()) {
 				slot.dstorage_requests[i].Name = slot.request_names[i].c_str();
 			}
-			queue.queue->EnqueueRequest(&slot.dstorage_requests[i]);
 		}
+		queue.queue->EnqueueRequests(
+				slot.dstorage_requests.data(),
+				static_cast<UINT>(slot.dstorage_requests.size()),
+				nullptr,
+				0,
+				DSTORAGE_ENQUEUE_REQUEST_FLAG_NONE);
 		slot.dstorage_requests.clear();
 	}
 
@@ -3557,8 +3562,13 @@ void Win32Backend::submit_batch() {
 			if (i < slot.request_names.size()) {
 				slot.dstorage_requests[i].Name = slot.request_names[i].c_str();
 			}
-			queue.queue->EnqueueRequest(&slot.dstorage_requests[i]);
 		}
+		queue.queue->EnqueueRequests(
+				slot.dstorage_requests.data(),
+				static_cast<UINT>(slot.dstorage_requests.size()),
+				nullptr,
+				0,
+				DSTORAGE_ENQUEUE_REQUEST_FLAG_NONE);
 		slot.dstorage_requests.clear();
 	}
 

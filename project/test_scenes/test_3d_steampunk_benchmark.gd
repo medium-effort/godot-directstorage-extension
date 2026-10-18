@@ -64,7 +64,15 @@ func update_backend_status() -> void:
 		if not ctx.is_initialized():
 			ctx.initialize_ds()
 		var backend_name: String = ctx.get_active_backend_name()
-		backend_label.text = "Active Backend: " + backend_name + " | Asset: Raw GLB"
+		var decompression_info: String = ""
+		if backend_name == "Win32DirectStorage" and ctx.has_method("get_gpu_decompression_queue_type"):
+			var qtype: String = ctx.get_gpu_decompression_queue_type()
+			var opt: bool = ctx.is_gpu_decompression_optimized()
+			var mode: String = "GPU Optimized" if opt else "Shader Fallback"
+			if qtype != "none":
+				mode += " - " + qtype.capitalize() + " Queue"
+			decompression_info = " (" + mode + ")"
+		backend_label.text = "Active Backend: " + backend_name + decompression_info + " | Asset: Raw GLB"
 		status_label.text = "Status: Ready for 3D Model Load Benchmark"
 	else:
 		status_label.text = "Status: DSContext Singleton Null"

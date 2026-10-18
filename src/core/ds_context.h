@@ -164,6 +164,8 @@ public:
 	bool is_gpu_decompression_available() const;
 	bool is_gpu_decompression_enabled() const;
 	int get_gpu_decompression_support_tier() const;
+	String get_gpu_decompression_queue_type() const;
+	bool is_gpu_decompression_optimized() const;
 	// DXGI identity of the exact D3D12 adapter Godot runs on (matched by
 	// adapter LUID, so multi-GPU reports the right device). Keys:
 	// available, adapter_name, adapter_vendor, vendor_id, device_id,

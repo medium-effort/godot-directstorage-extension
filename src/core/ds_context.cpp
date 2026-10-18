@@ -465,6 +465,34 @@ int DSContext::get_gpu_decompression_support_tier() const {
 	return 0;
 }
 
+String DSContext::get_gpu_decompression_queue_type() const {
+#ifdef _WIN32
+	if (!is_d3d12_backend()) {
+		return "none";
+	}
+	DSTORAGE_COMPRESSION_SUPPORT support = query_gpu_decompression_support(queue_capacity);
+	if ((support & DSTORAGE_COMPRESSION_SUPPORT_USES_COMPUTE_QUEUE) != 0) {
+		return "compute";
+	}
+	if ((support & DSTORAGE_COMPRESSION_SUPPORT_USES_COPY_QUEUE) != 0) {
+		return "copy";
+	}
+#endif
+	return "none";
+}
+
+bool DSContext::is_gpu_decompression_optimized() const {
+#ifdef _WIN32
+	if (!is_d3d12_backend()) {
+		return false;
+	}
+	DSTORAGE_COMPRESSION_SUPPORT support = query_gpu_decompression_support(queue_capacity);
+	return (support & DSTORAGE_COMPRESSION_SUPPORT_GPU_OPTIMIZED) != 0;
+#else
+	return false;
+#endif
+}
+
 Dictionary DSContext::get_gpu_adapter_info() const {
 	Dictionary info;
 	info["available"] = false;
@@ -528,13 +556,27 @@ Dictionary DSContext::get_capability_report() const {
 
 #ifdef _WIN32
 	String directstorage_version = String::num_int64(DSTORAGE_SDK_VERSION / 100) + "." + String::num_int64(DSTORAGE_SDK_VERSION % 100);
+	DSTORAGE_COMPRESSION_SUPPORT compression_support = is_d3d12_backend() ? query_gpu_decompression_support(queue_capacity) : DSTORAGE_COMPRESSION_SUPPORT_NONE;
+	bool gpu_optimized = (compression_support & DSTORAGE_COMPRESSION_SUPPORT_GPU_OPTIMIZED) != 0;
+	bool gpu_shader_fallback = (compression_support & DSTORAGE_COMPRESSION_SUPPORT_GPU_FALLBACK) != 0;
+	bool cpu_fallback = (compression_support & DSTORAGE_COMPRESSION_SUPPORT_CPU_FALLBACK) != 0;
+	String queue_type = (compression_support & DSTORAGE_COMPRESSION_SUPPORT_USES_COMPUTE_QUEUE) != 0 ? "compute" :
+			((compression_support & DSTORAGE_COMPRESSION_SUPPORT_USES_COPY_QUEUE) != 0 ? "copy" : "none");
 #else
 	String directstorage_version = "Unavailable";
+	bool gpu_optimized = false;
+	bool gpu_shader_fallback = false;
+	bool cpu_fallback = false;
+	String queue_type = "none";
 #endif
 	report["directstorage_version"] = directstorage_version;
 	report["gpu_decompression_available"] = gpu_tier > 0;
 	report["gpu_decompression_enabled"] = gpu_tier > 0 && !disable_gpu_decompression;
 	report["gpu_decompression_tier"] = gpu_tier;
+	report["gpu_decompression_queue_type"] = queue_type;
+	report["gpu_decompression_optimized"] = gpu_optimized;
+	report["gpu_decompression_shader_fallback"] = gpu_shader_fallback;
+	report["cpu_decompression_fallback_available"] = cpu_fallback;
 	Dictionary adapter = get_gpu_adapter_info();
 	report["adapter_name"] = adapter.get("adapter_name", "unknown");
 	report["adapter_vendor"] = adapter.get("adapter_vendor", "unknown");
@@ -754,7 +796,8 @@ Error DSContext::initialize_ds_for_path(const String &p_path) {
 		if (initialized.load(std::memory_order_acquire)) {
 			shutdown_ds_locked();
 		}
-		return initialize_ds_locked() ? OK : ERR_CANT_CREATE;
+		bool fallback_ok = initialize_ds_locked();
+		return fallback_ok ? ERR_FILE_NOT_FOUND : ERR_CANT_CREATE;
 	}
 
 	Dictionary drive_info = Win32Backend::get_drive_info_for_path(p_path);
@@ -1658,6 +1701,8 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_gpu_decompression_available"), &DSContext::is_gpu_decompression_available);
 	ClassDB::bind_method(D_METHOD("is_gpu_decompression_enabled"), &DSContext::is_gpu_decompression_enabled);
 	ClassDB::bind_method(D_METHOD("get_gpu_decompression_support_tier"), &DSContext::get_gpu_decompression_support_tier);
+	ClassDB::bind_method(D_METHOD("get_gpu_decompression_queue_type"), &DSContext::get_gpu_decompression_queue_type);
+	ClassDB::bind_method(D_METHOD("is_gpu_decompression_optimized"), &DSContext::is_gpu_decompression_optimized);
 	ClassDB::bind_method(D_METHOD("get_gpu_adapter_info"), &DSContext::get_gpu_adapter_info);
 	ClassDB::bind_method(D_METHOD("is_integrated_gpu"), &DSContext::is_integrated_gpu);
 	ClassDB::bind_method(D_METHOD("is_uma"), &DSContext::is_uma);

@@ -82,7 +82,7 @@ private:
 		bool is_sync_submission = false;
 	};
 	struct QueueState {
-		IDStorageQueue1 *queue = nullptr;
+		IDStorageQueue3 *queue = nullptr;
 		HANDLE completion_event = nullptr;
 		ID3D12Fence *completion_fence = nullptr;
 		uint64_t completion_fence_value = 0;

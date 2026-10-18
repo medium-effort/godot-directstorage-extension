@@ -120,6 +120,14 @@
 			<return type="int" />
 			<description>Returns the GPU decompression path reported by DirectStorage: [code]0[/code] unsupported (CPU decode only), [code]1[/code] GPU fallback via compute shaders (works, slower), [code]2[/code] GPU-optimized GDeflate path.</description>
 		</method>
+		<method name="get_gpu_decompression_queue_type" qualifiers="const">
+			<return type="String" />
+			<description>Returns the Direct3D 12 queue type used by DirectStorage for GPU decompression: [code]"compute"[/code] if decompression executes on a compute queue, [code]"copy"[/code] if executed on a copy queue, or [code]"none"[/code] if unsupported or on fallback.</description>
+		</method>
+		<method name="is_gpu_decompression_optimized" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if GPU decompression uses an optimized graphics driver path rather than a shader fallback or CPU decode.</description>
+		</method>
 		<method name="get_in_flight_async_batch_count" qualifiers="const">
 			<return type="int" />
 			<description>Returns the number of asynchronous batches currently in flight (submitted but not yet collected via [method collect_completed_results]). Returns [code]0[/code] when no batch is running.</description>
@@ -175,7 +183,7 @@
 		<method name="initialize_ds_for_path">
 			<return type="int" enum="@GlobalScope.Error" />
 			<param index="0" name="path" type="String" />
-			<description>Initializes DirectStorage targeting the specific volume where [param path] is located. Validates volume bypass eligibility and DirectStorage support before initializing. Accepts file paths, directory paths, and Godot virtual paths ([code]res://[/code], [code]user://[/code]). If the specified path is on an unsupported drive, falls back to default [code]res://[/code] initialization or software fallback. Returns [constant @GlobalScope.OK] on success.</description>
+			<description>Initializes DirectStorage targeting the specific volume where [param path] is located. Validates volume bypass eligibility and DirectStorage support before initializing. Accepts file paths, directory paths, and Godot virtual paths ([code]res://[/code], [code]user://[/code]). If the specified path is on an unsupported drive, falls back to default [code]res://[/code] initialization or software fallback. Returns [constant @GlobalScope.OK] on success, or [constant @GlobalScope.ERR_FILE_NOT_FOUND] if the specified path does not exist.</description>
 		</method>
 		<method name="is_batch_complete" qualifiers="const">
 			<return type="bool" />
