@@ -105,9 +105,9 @@ void remove_temp_file(const char *p_path) {
 
 // --- Pure-C++: struct layout + alignment math (no engine) --------------------
 
-GDEX_TEST(dspkg, header_packed_size_is_28) {
-	// 4 (magic) + 2 (version) + 2 (flags) + 4 (entry_count) + 8 (data_offset) + 8 (reserved).
-	GDEX_EXPECT_EQ(sizeof(godot::DSPkgHeader), 28u);
+GDEX_TEST(dspkg, header_v4_layout) {
+	GDEX_ASSERT_EQ(godot::DSPKG_HEADER_SIZE_LEGACY, 28u);
+	GDEX_ASSERT_EQ(sizeof(godot::DSPkgHeader), 64u);
 }
 
 GDEX_TEST(dspkg, mip_entry_packed_size_is_24) {
@@ -727,9 +727,9 @@ GDEX_TEST_T(dspkg, med09_corrupt_entry_caps_rejected, TAG_INTEGRATION) {
 	// Read file and mutate the entry's mip_count to 32 (> DSTEX_MAX_MIP_COUNT = 16)
 	godot::Ref<godot::FileAccess> fa = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ_WRITE);
 	GDEX_ASSERT_TRUE(fa.is_valid());
-	// Header is 28 bytes. Path length is 4 bytes + "test.png" (8 bytes).
-	// Fixed fields: original_size(8), compressed_size(8), offset(8), format(4), width(4), height(4), pixel_format(4), mip_count(4)
-	fa->seek(28 + 4 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4);
+	// Header is 64 bytes (v4). Path length is 2 bytes (store_16) + "test.png" (8 bytes).
+	// Fixed fields: running_data_offset(8), comp_size(8), orig_size(8), w(4), h(4), fmt(4), mip_count(4)
+	fa->seek(64 + 8 + 2 + 8 + 8 + 8 + 8 + 4 + 4 + 4);
 	fa->store_32(32);
 	fa->close();
 

@@ -42,6 +42,8 @@ project/addons/directstorage_accelerator/bin/~*
 /project/exports
 project/test_assets/*.glb
 project/test_assets/*.png
+*.dspkg
+*.dstex
 
 # ==============================================================================
 # Godot Local Addons

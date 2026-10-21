@@ -250,9 +250,22 @@ static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vec
 		if (s_dspkg_cache->package.is_null() || s_dspkg_cache->path != resolved_path) {
 			Ref<DSPkg> fresh;
 			fresh.instantiate();
-			if (fresh.is_null() || fresh->open(resolved_path) != OK) {
+			uint64_t expected_fingerprint = 0;
+			ProjectSettings *ps = ProjectSettings::get_singleton();
+			if (ps && ps->has_setting("directstorage/expected_archive_fingerprint")) {
+				expected_fingerprint = static_cast<uint64_t>(ps->get_setting("directstorage/expected_archive_fingerprint"));
+			}
+			Error open_err = (fresh.is_valid()) ? fresh->open(resolved_path, expected_fingerprint) : ERR_CANT_CREATE;
+			if (open_err != OK) {
 				s_dspkg_cache->package.unref();
 				s_dspkg_cache->path = String();
+				if (open_err == ERR_UNAUTHORIZED) {
+					static String s_last_backend_unauth_path;
+					if (s_last_backend_unauth_path != resolved_path) {
+						s_last_backend_unauth_path = resolved_path;
+						UtilityFunctions::push_error(vformat("DirectStorage Win32 Backend: Decryption unauthorized or key mismatch for archive '%s'. Set encryption key via DSPkg::set_global_encryption_key() or verify expected fingerprint.", resolved_path));
+					}
+				}
 				return false;
 			}
 			s_dspkg_cache->package = fresh;

@@ -170,7 +170,17 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 			if (ps && ps->has_setting("directstorage/expected_archive_fingerprint")) {
 				expected_fingerprint = static_cast<uint64_t>(ps->get_setting("directstorage/expected_archive_fingerprint"));
 			}
-			if (fresh->open(archive_path, expected_fingerprint) != OK) {
+			Error open_err = fresh->open(archive_path, expected_fingerprint);
+			if (open_err != OK) {
+				if (open_err == ERR_UNAUTHORIZED) {
+					static String s_last_reported_preloader_unauth;
+					if (s_last_reported_preloader_unauth != archive_path) {
+						s_last_reported_preloader_unauth = archive_path;
+						UtilityFunctions::push_error("DirectStorage Preloader: Decryption failed for package '" + archive_path + "'. Ensure valid encryption key is configured via DSPkg::set_global_encryption_key().");
+					}
+				} else {
+					UtilityFunctions::push_error("DirectStorage Preloader: Failed to open DirectStorage package '" + archive_path + "': " + UtilityFunctions::error_string(open_err));
+				}
 				return false;
 			}
 			s.archive_path = archive_path;

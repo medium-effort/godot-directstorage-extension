@@ -1,15 +1,27 @@
 @tool
 extends SceneTree
 
-func _write_dspkg_header(file: FileAccess, version: int, flags: int, entry_count: int, data_offset: int, reserved: int = 0) -> void:
+func _write_dspkg_header(file: FileAccess, version: int, flags: int, entry_count: int, data_offset: int, min_reader_version: int = 4, compression_codec: int = 0, archive_salt: PackedByteArray = PackedByteArray(), key_id: int = 0, reserved: PackedByteArray = PackedByteArray(), archive_fingerprint: int = 0, legacy_reserved: int = 0) -> void:
 	file.store_32(0x474B5044)
 	file.store_16(version)
 	file.store_16(flags)
 	file.store_32(entry_count)
 	file.store_64(data_offset)
-	file.store_64(reserved)
+	if version < 4:
+		file.store_64(legacy_reserved)
+	else:
+		file.store_64(archive_fingerprint)
+		file.store_32(compression_codec)
+		var salt = archive_salt.duplicate()
+		salt.resize(16)
+		file.store_buffer(salt)
+		file.store_32(min_reader_version)
+		file.store_64(key_id)
+		var res = reserved.duplicate()
+		res.resize(4)
+		file.store_buffer(res)
 
-func _write_dspkg_entry(file: FileAccess, path: String, data_offset: int, compressed_size: int, original_size: int, width: int = 256, height: int = 256, mip_count: int = 1) -> void:
+func _write_dspkg_entry(file: FileAccess, path: String, data_offset: int, compressed_size: int, original_size: int, width: int = 256, height: int = 256, mip_count: int = 1, flags: int = 0, version: int = 1) -> void:
 	var path_bytes = path.to_utf8_buffer()
 	file.store_64(path.hash())
 	file.store_16(path_bytes.size())
@@ -21,6 +33,8 @@ func _write_dspkg_entry(file: FileAccess, path: String, data_offset: int, compre
 	file.store_32(height)
 	file.store_32(Image.FORMAT_RGBA8)
 	file.store_32(mip_count)
+	if version >= 3:
+		file.store_32(flags)
 
 func _init() -> void:
 	print("--- Running DirectStorage Phase 2 Step 2 Formats Test ---")
@@ -328,6 +342,24 @@ func _init() -> void:
 		quit(1)
 		return
 	print("SUCCESS: Oversized original size correctly rejected.")
+
+	var valid_v4_path = "user://test_valid_v4.dspkg"
+	var valid_v4_file = FileAccess.open(valid_v4_path, FileAccess.WRITE)
+	var v4_path_bytes = dummy_path.to_utf8_buffer() if false else "test.png".to_utf8_buffer()
+	var v4_payload_size = 4096
+	var v4_data_offset = 64 + 54 + v4_path_bytes.size()
+	_write_dspkg_header(valid_v4_file, 4, 0, 1, v4_data_offset)
+	_write_dspkg_entry(valid_v4_file, "test.png", 0, v4_payload_size, v4_payload_size, 256, 256, 1, 0, 4)
+	for b in range(v4_payload_size):
+		valid_v4_file.store_8(0)
+	valid_v4_file.close()
+	var v4_reader = DSPkg.new()
+	if v4_reader.open(valid_v4_path) != OK:
+		print("FAIL: Valid unencrypted v4 archive failed to open cleanly.")
+		quit(1)
+		return
+	DirAccess.remove_absolute(valid_v4_path)
+	print("SUCCESS: Valid unencrypted v4 archive opened cleanly.")
 
 	# A failed reopen must not leave the previous archive exposed.
 	var state_reader = DSPkg.new()

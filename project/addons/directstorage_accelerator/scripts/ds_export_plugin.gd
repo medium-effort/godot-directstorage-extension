@@ -14,6 +14,8 @@ extends EditorExportPlugin
 const OPTION_BUNDLE_DSPKG: StringName = &"directstorage/bundle_textures_dspkg"
 const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"directstorage/enforce_archive_pairing"
 const OPTION_STEAMPIPE_1MB_ALIGNMENT: StringName = &"directstorage/steampipe_1mb_alignment"
+const OPTION_ENCRYPTION_ENABLED: StringName = &"directstorage/encryption_enabled"
+const OPTION_ENCRYPTION_KEY: StringName = &"directstorage/encryption_key"
 
 var _dspkg: RefCounted = null
 ## Staging/final archive paths. Both live in the target export directory so no
@@ -33,6 +35,7 @@ var _is_debug_export: bool = false
 var _bundle_dspkg_enabled: bool = false
 var _enforce_pairing_enabled: bool = true
 var _steampipe_1mb_alignment_enabled: bool = false
+var _encryption_enabled: bool = false
 var _current_fingerprint: int = 0
 var _archive_name: String = "textures.dspkg"
 ## Manifest accumulator: dstex/archive entry path -> uncompressed size.
@@ -86,6 +89,26 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 				"usage": PROPERTY_USAGE_DEFAULT
 			},
 			"default_value": false,
+		},
+		{
+			"option": {
+				"name": OPTION_ENCRYPTION_ENABLED,
+				"type": TYPE_BOOL,
+				"hint": PROPERTY_HINT_NONE,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT
+			},
+			"default_value": false,
+		},
+		{
+			"option": {
+				"name": OPTION_ENCRYPTION_KEY,
+				"type": TYPE_STRING,
+				"hint": PROPERTY_HINT_PASSWORD,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_SECRET
+			},
+			"default_value": "",
 		}
 	]
 
@@ -116,6 +139,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
+	_encryption_enabled = bool(get_option(OPTION_ENCRYPTION_ENABLED))
 	_has_textures = false
 	_archive_failed = false
 	_dspkg = null
@@ -145,6 +169,8 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	ProjectSettings.set_setting("directstorage/archive_name", _archive_name)
 	ProjectSettings.set_as_internal("directstorage/archive_name", true)
 
+	if not _bundle_dspkg_enabled and _encryption_enabled:
+		push_warning("[DirectStorage Exporter] Encryption is enabled but DirectStorage package bundling is disabled. Package will not be generated.")
 	if not _bundle_dspkg_enabled:
 		print("[DirectStorage Exporter] Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK and loaded via CPU decompression at runtime.")
 		return
@@ -184,6 +210,46 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 				else:
 					push_warning("[DirectStorage Exporter] Active DSPkg binary does not support 'set_payload_alignment'; archive will use default 512-byte alignment.")
 			print("[DirectStorage Exporter] Initialized DSPkg staging archive at: ", _staging_dspkg_path)
+
+			if _encryption_enabled:
+				if not _dspkg.has_method("set_encryption_key") or not ClassDB.class_has_method("DSPkg", "compute_key_id") or not ClassDB.class_has_method("DSPkg", "get_global_encryption_key_id"):
+					push_error("[DirectStorage Exporter] Loaded DirectStorage extension binary does not support DSPkg TOC encryption. Recompile extension.")
+					_dspkg = null
+					_archive_failed = true
+					_cleanup_staging()
+					return
+
+				var key_hex: String = String(get_option(OPTION_ENCRYPTION_KEY)).strip_edges()
+				if key_hex.is_empty():
+					key_hex = OS.get_environment("DSPKG_EXPORT_ENCRYPTION_KEY").strip_edges()
+				if key_hex.is_empty():
+					key_hex = OS.get_environment("DSPKG_ENCRYPTION_KEY").strip_edges()
+
+				if key_hex.length() != 64 or not key_hex.is_valid_hex_number(false):
+					push_error("[DirectStorage Exporter] Encryption key must be a valid 64-character hexadecimal string.")
+					_dspkg = null
+					_archive_failed = true
+					_cleanup_staging()
+					return
+
+				var entered_id: String = DSPkg.compute_key_id(key_hex)
+				var active_id: String = DSPkg.get_global_encryption_key_id()
+				if not active_id.is_empty() and entered_id != active_id:
+					push_error("[DirectStorage Exporter] Encryption key mismatch! Entered export key ID (" + entered_id + ") differs from active runtime key ID (" + active_id + ") in editor build.")
+					_dspkg = null
+					_archive_failed = true
+					_cleanup_staging()
+					return
+				elif active_id.is_empty():
+					print("[DirectStorage Exporter] Notice: No active runtime key detected in editor build. Ensure runtime sets key via set_global_encryption_key() or baked template.")
+
+				err = _dspkg.set_encryption_key(key_hex)
+				if err != OK:
+					push_error("[DirectStorage Exporter] Failed to configure encryption key: " + error_string(err))
+					_dspkg = null
+					_archive_failed = true
+					_cleanup_staging()
+					return
 
 ## Reads v2 per-mip footprint data so DSPkg can preserve GPU upload layouts.
 func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:

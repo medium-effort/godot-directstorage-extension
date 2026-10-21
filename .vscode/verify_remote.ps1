@@ -87,8 +87,12 @@ if ($TouchTests) {
     $testsDir = Join-Path $RemoteDir "tests"
     $touched = 0
     foreach ($testFile in (Get-ChildItem -LiteralPath $testsDir -Filter *.cpp -Recurse -File -ErrorAction SilentlyContinue)) {
-        $testFile.LastWriteTime = Get-Date
-        $touched++
+        try {
+            $testFile.LastWriteTime = Get-Date
+            $touched++
+        } catch {
+            Write-Output ("VERIFY_WARNING:Could not touch " + $testFile.FullName + " (" + $_.Exception.Message + ")")
+        }
     }
     Write-Output ("TOUCHED_TESTS=" + $touched)
     if ($touched -eq 0) {

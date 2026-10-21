@@ -54,6 +54,7 @@ env = SConscript("godot-cpp/SConstruct")
 # must not be visible to non-Windows toolchains.
 include_paths = [
     "src",
+    "thirdparty/monocypher",
     "thirdparty/gdeflate",
     "thirdparty/libdeflate",
     "thirdparty/libdeflate/lib",
@@ -80,6 +81,8 @@ if env["platform"] == "windows":
             env.Append(LINKFLAGS=["/guard:cf"])
         if "/Qspectre" not in env["CXXFLAGS"]:
             env.Append(CXXFLAGS=["/Qspectre"])
+        if "/FS" not in env["CXXFLAGS"]:
+            env.Append(CXXFLAGS=["/FS"])
 
 # Source files (GDExtension C++ code + GDeflate & libdeflate sources).
 # Keep the Windows backend out of non-Windows builds; its implementation uses
@@ -97,6 +100,8 @@ thirdparty_sources = (
     Glob("thirdparty/libdeflate/lib/*.c") +
     Glob("thirdparty/libdeflate/lib/x86/*.c")
 )
+
+thirdparty_objects = thirdparty_sources + Glob("thirdparty/monocypher/monocypher.c")
 if env["platform"] == "windows":
     project_sources += Glob("src/platform/win32/*.cpp")
 
@@ -105,8 +110,11 @@ if env["platform"] == "windows":
 thirdparty_objects = thirdparty_sources
 if env["platform"] == "windows" and "msvc" in env["TOOLS"]:
     thirdparty_env = env.Clone()
-    thirdparty_env.Append(CCFLAGS=["/wd4244", "/wd4127", "/wd4267", "/wd4100", "/wd4245", "/wd4456", "/wd4018", "/wd4146", "/wd4310"])
-    thirdparty_objects = thirdparty_env.SharedObject(thirdparty_sources)
+    thirdparty_env.Append(CCFLAGS=["/wd4244", "/wd4127", "/wd4267", "/wd4100", "/wd4245", "/wd4456", "/wd4018", "/wd4146", "/wd4310", "/FS"])
+    monocypher_env = thirdparty_env.Clone()
+    monocypher_env.Append(CFLAGS=["/std:c11"])
+    monocypher_objects = monocypher_env.SharedObject(Glob("thirdparty/monocypher/monocypher.c"))
+    thirdparty_objects = thirdparty_env.SharedObject(thirdparty_sources) + monocypher_objects
 
 sources = project_sources + thirdparty_objects
 
@@ -195,6 +203,18 @@ def _assert_dll_naming_consistent():
 
 _assert_dll_naming_consistent()
 
+# DSPKG encryption key (baked at compile time)
+_enc_options = SCons.Script.Variables()
+_enc_options.Add("DSPKG_ENCRYPTION_KEY", "64-character hexadecimal encryption key baked into build", "")
+_enc_options.Update(env)
+SCons.Script.Help(_enc_options.GenerateHelpText(env))
+encryption_key = str(env.get("DSPKG_ENCRYPTION_KEY", "")).strip()
+if encryption_key:
+    if len(encryption_key) != 64 or not all(c in "0123456789abcdefABCDEF" for c in encryption_key):
+        print("[SCons] ERROR: DSPKG_ENCRYPTION_KEY must be a 64-character hexadecimal string.")
+        Exit(1)
+    env.Append(CPPDEFINES=[("DSPKG_ENCRYPTION_KEY_BAKED", f'\\"{encryption_key}\\"')])
+
 # Build GDExtension Shared Library (.dll)
 library = env.SharedLibrary(
     target=output_dir + target_name,
@@ -239,6 +259,7 @@ if env["tests"]:
         _gdex_env = env.Clone()
         if "msvc" in _gdex_env.get("TOOLS", []):
             _gdex_env.Append(LINKFLAGS=["/ignore:4199"])
+            _gdex_env.Append(CFLAGS=["/std:c11"])
         _gdex_exports = {"env": _gdex_env, "gdextest": {}}
         if _gdex_env.get("platform", "") != "windows":
             # gdextest has no per-platform sources: .gdextest.toml lists both

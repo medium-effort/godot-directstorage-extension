@@ -31,7 +31,8 @@ const DSTEX_ENTRY_OFF_OFFSET := 0
 const DSTEX_ENTRY_OFF_CSIZE := 8
 const DSTEX_ENTRY_OFF_PITCH := 16
 
-const DSPKG_HEADER_SIZE := 28
+const DSPKG_HEADER_SIZE := 64
+const DSPKG_LEGACY_HEADER_SIZE := 28
 const DSPKG_OFF_VERSION := 4
 const DSPKG_OFF_ENTRY_COUNT := 8
 const DSPKG_OFF_DATA_OFFSET := 12
@@ -278,8 +279,8 @@ func _test_header_fuzz() -> void:
 		var p := _next_case_path("dspkg_" + str(entry[0]), "dspkg")
 		if _write_bytes(p, _patched(_valid_dspkg_bytes, 0, entry[1])):
 			_probe_dspkg(p, "DSPkg " + str(entry[0]), true)
-	# DSPkg version: only 1 (legacy) and 2 (GPU metadata) are valid.
-	for v in [0, 3, 99, 0xFFFF]:
+	# DSPkg version: only 1, 2, 3, 4 are valid.
+	for v in [0, 5, 99, 0xFFFF]:
 		var p := _next_case_path("dspkg_ver_%d" % v, "dspkg")
 		if _write_bytes(p, _patched(_valid_dspkg_bytes, DSPKG_OFF_VERSION, _le16(v))):
 			_probe_dspkg(p, "DSPkg version=%d" % v, true)

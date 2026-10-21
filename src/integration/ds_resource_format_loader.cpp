@@ -257,7 +257,15 @@ Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_
 
 	Ref<DSPkg> archive;
 	archive.instantiate();
-	if (archive->open(p_archive_path, expected_fingerprint) != OK) {
+	Error open_err = archive->open(p_archive_path, expected_fingerprint);
+	if (open_err != OK) {
+		if (open_err == ERR_UNAUTHORIZED) {
+			static String s_last_reported_unauth_path;
+			if (s_last_reported_unauth_path != p_archive_path) {
+				s_last_reported_unauth_path = p_archive_path;
+				UtilityFunctions::push_error("DirectStorage: Decryption failed for package '" + p_archive_path + "'. Ensure valid encryption key is configured via DSPkg::set_global_encryption_key().");
+			}
+		}
 		return Ref<DSPkg>();
 	}
 

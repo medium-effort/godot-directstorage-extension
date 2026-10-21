@@ -3,7 +3,7 @@ version = "1"
 minimum_required_godot_version = "4.5"
 
 [gdextest.tests]
-sources = ["tests/**/*.cpp", "src/register_types.cpp", "src/formats/*.cpp", "src/compression/*.cpp", "src/core/*.cpp", "src/integration/*.cpp", "src/platform/win32/*.cpp", "src/platform/fallback/*.cpp", "thirdparty/gdeflate/*.cpp", "thirdparty/libdeflate/lib/*.c", "thirdparty/libdeflate/lib/x86/*.c"]
+sources = ["tests/**/*.cpp", "src/register_types.cpp", "src/formats/*.cpp", "src/compression/*.cpp", "src/core/*.cpp", "src/integration/*.cpp", "src/platform/win32/*.cpp", "src/platform/fallback/*.cpp", "thirdparty/gdeflate/*.cpp", "thirdparty/libdeflate/lib/*.c", "thirdparty/libdeflate/lib/x86/*.c", "thirdparty/monocypher/*.c"]
 exclude = ["tests/helpers/**"]
 # NOTE: code under test must compile INTO the test library.
 # Closure (verified by include-scan): formats -> compression -> ds_error_handler;

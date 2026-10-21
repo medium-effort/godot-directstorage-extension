@@ -8,7 +8,11 @@ param(
     [switch]$Verbose,
     [switch]$SkipVerify,
     [switch]$Local,
-    [switch]$Remote
+    [switch]$Remote,
+    [string]$EncryptionKey = "",
+    [switch]$AuditOnly,
+    [string[]]$AuditPath = @(),
+    [switch]$Json
 )
 
 function Show-BuildFailure {
@@ -31,6 +35,12 @@ function Show-BuildFailure {
     exit $Code
 }
 
+if ($EncryptionKey) {
+    if ($EncryptionKey -notmatch '^[0-9a-fA-F]{64}$') {
+        Show-BuildFailure -Step "Validation" -Message "EncryptionKey must be a 64-character hexadecimal string." -Code 1
+    }
+}
+
 function Show-BuildSuccess {
     param(
         [string]$Message = "All steps completed successfully!"
@@ -49,6 +59,249 @@ function Write-VerboseHost {
     )
     if ($Verbose) {
         Write-Host $Message -ForegroundColor $ForegroundColor
+    }
+}
+
+# --- Deployed-binary audit (read-only, advisory) -----------------------------
+# Compares the files actually present in a deployed addon directory against the
+# paths declared by that directory's .gdextension (the only files Godot loads).
+# It never deletes, moves, or repairs anything: binaries left behind by an older
+# naming scheme, hand copies, or stray experiments are reported so a human or an
+# agent can decide what to remove.
+function Get-DeployBinAudit {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AddonDir
+    )
+
+    if (-not (Test-Path -LiteralPath $AddonDir -PathType Container)) {
+        return [pscustomobject]@{ addon_dir = $AddonDir; status = 'skipped'; reason = 'addon directory not found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0 }
+    }
+
+    $manifestFiles = @(Get-ChildItem -LiteralPath $AddonDir -Filter '*.gdextension' -File -ErrorAction SilentlyContinue)
+    if ($manifestFiles.Count -eq 0) {
+        return [pscustomobject]@{ addon_dir = $AddonDir; status = 'skipped'; reason = 'no .gdextension manifest found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0 }
+    }
+
+    # Only [libraries] and [dependencies] declare files that must exist on disk.
+    # Everything else in the file (comments, entry_symbol, ...) is ignored.
+    # Each declaration key starts with a platform tag (windows./linux./macos.),
+    # which lets us ignore foreign-platform entries that cannot exist here.
+    $expectedEntries = @()
+    foreach ($manifest in $manifestFiles) {
+        $section = ''
+        foreach ($rawLine in @(Get-Content -LiteralPath $manifest.FullName -ErrorAction SilentlyContinue)) {
+            $line = $rawLine.Trim()
+            if ($line -match '^\[(?<name>.+)\]$') {
+                $section = $matches['name'].ToLowerInvariant()
+                continue
+            }
+            if ($line.StartsWith(';') -or $line.StartsWith('#')) { continue }
+            if ($section -ne 'libraries' -and $section -ne 'dependencies') { continue }
+
+            $declared = $line
+            $platform = ''
+            if ($line -match '^(?<key>[A-Za-z0-9_.]+)\s*=\s*(?<rest>.*)$') {
+                $platform = ($matches['key'] -split '\.')[0].ToLowerInvariant()
+                $declared = $matches['rest']
+            }
+
+            $pattern = '"(?<path>[^"]*\.(?:dll|so|dylib))"'
+            foreach ($match in [regex]::Matches($declared, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+                $rel = $match.Groups['path'].Value.Trim()
+                $rel = $rel.Replace('/', '\')
+                if ($rel.StartsWith('.\')) { $rel = $rel.Substring(2) }
+                if (-not $rel) { continue }
+                if (@($expectedEntries | Where-Object { $_.rel -eq $rel }).Count -gt 0) { continue }
+                $expectedEntries += [pscustomobject]@{ rel = $rel; platform = $platform }
+            }
+        }
+    }
+
+    if ($expectedEntries.Count -eq 0) {
+        return [pscustomobject]@{ addon_dir = $AddonDir; status = 'skipped'; reason = 'manifest declares no shared libraries'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0 }
+    }
+
+    $expectedRel = @($expectedEntries | ForEach-Object { $_.rel })
+
+    # Foreign-platform libraries are declared but intentionally absent on this OS.
+    $currentPlatform = 'windows'
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        if ($IsLinux) { $currentPlatform = 'linux' }
+        elseif ($IsMacOS) { $currentPlatform = 'macos' }
+    }
+
+    $expectedFull = @()
+    foreach ($rel in $expectedRel) {
+        $expectedFull += [System.IO.Path]::GetFullPath((Join-Path $AddonDir $rel))
+    }
+
+    # Audit only the directories that actually hold declared files, so unrelated
+    # subfolders (icons/, doc_classes/, scripts/, ...) are never reported.
+    $auditDirs = @()
+    foreach ($full in $expectedFull) {
+        $parent = [System.IO.Path]::GetDirectoryName($full)
+        if ($parent -and ($auditDirs -notcontains $parent) -and (Test-Path -LiteralPath $parent -PathType Container)) {
+            $auditDirs += $parent
+        }
+    }
+    if ($auditDirs.Count -eq 0) {
+        $fallbackDir = Join-Path $AddonDir 'bin'
+        if (Test-Path -LiteralPath $fallbackDir -PathType Container) {
+            $auditDirs += [System.IO.Path]::GetFullPath($fallbackDir)
+        }
+    }
+
+    # Files that legitimately live beside the binaries without being declared.
+    $allowNames = @('build_manifest.json', '.gitkeep', '.gdignore', 'desktop.ini', 'Thumbs.db')
+
+    $missing = @()
+    $ignoredForeign = 0
+    foreach ($entry in $expectedEntries) {
+        if ($entry.platform -and $entry.platform -ne $currentPlatform) {
+            $ignoredForeign += 1
+            continue
+        }
+        $full = [System.IO.Path]::GetFullPath((Join-Path $AddonDir $entry.rel))
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            $name = [System.IO.Path]::GetFileName($full)
+            if ($missing -notcontains $name) { $missing += $name }
+        }
+    }
+
+    $expectedSet = @{}
+    foreach ($full in $expectedFull) { $expectedSet[$full.ToLowerInvariant()] = $true }
+
+    $undeclared = @()
+    foreach ($dir in $auditDirs) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) {
+            if ($expectedSet.ContainsKey($file.FullName.ToLowerInvariant())) { continue }
+            if ($allowNames -contains $file.Name) { continue }
+            # Symbol files accompany a DLL; .old files are transient swap artifacts.
+            if ($file.Name.EndsWith('.pdb', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($file.Name.EndsWith('.old', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $undeclared += [pscustomobject]@{
+                name          = $file.Name
+                path          = $file.FullName
+                size_bytes    = $file.Length
+                last_modified = $file.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+            }
+        }
+    }
+
+    $status = 'clean'
+    if ($missing.Count -gt 0) {
+        $status = 'error'
+    }
+    elseif ($undeclared.Count -gt 0) {
+        $status = 'findings'
+    }
+
+    return [pscustomobject]@{
+        addon_dir       = $AddonDir
+        status          = $status
+        reason          = ''
+        expected        = $expectedRel
+        missing         = $missing
+        undeclared      = $undeclared
+        ignored_foreign = $ignoredForeign
+    }
+}
+
+function Write-DeployBinAudit {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Audit
+    )
+
+    if ($Audit.status -eq 'skipped') {
+        # Visible by default: a target that resolves to nothing (wrong subpath,
+        # missing directory) must not look like a clean result.
+        Write-Host ("[audit] Skipped {0} ({1})" -f $Audit.addon_dir, $Audit.reason) -ForegroundColor DarkGray
+        return
+    }
+
+    if ($Audit.status -eq 'clean') {
+        Write-Host ("[audit] {0}: OK - {1} declared file(s), nothing unexpected" -f $Audit.addon_dir, $Audit.expected.Count) -ForegroundColor Green
+        if ($Audit.ignored_foreign -gt 0) {
+            Write-Host ("  ({0} foreign-platform library entry/entries ignored)" -f $Audit.ignored_foreign) -ForegroundColor DarkGray
+        }
+        return
+    }
+
+    Write-Host ("[audit] {0}" -f $Audit.addon_dir) -ForegroundColor Cyan
+    if ($Audit.missing.Count -gt 0) {
+        Write-Host ("  MISSING ({0}) - declared in .gdextension but absent:" -f $Audit.missing.Count) -ForegroundColor Red
+        foreach ($name in $Audit.missing) {
+            Write-Host ("    {0}" -f $name) -ForegroundColor Red
+        }
+    }
+    if ($Audit.undeclared.Count -gt 0) {
+        Write-Host ("  UNDECLARED ({0}) - on disk but not referenced by .gdextension:" -f $Audit.undeclared.Count) -ForegroundColor Yellow
+        foreach ($item in $Audit.undeclared) {
+            Write-Host ("    {0}  {1} bytes  {2}" -f $item.name, $item.size_bytes, $item.last_modified) -ForegroundColor Yellow
+        }
+        Write-Host "  Advisory only - nothing was deleted or moved." -ForegroundColor DarkGray
+    }
+    if ($Audit.ignored_foreign -gt 0) {
+        Write-Host ("  ({0} foreign-platform library entry/entries ignored)" -f $Audit.ignored_foreign) -ForegroundColor DarkGray
+    }
+}
+
+# Deployment destinations are entirely environment-driven (see .env.example and
+# SConstruct). Each variable names a different root shape, so the addon
+# subdirectory differs per target:
+#   SYNC_ADDON_DIR          -> the addon directory itself
+#   SYNC_ADDON_COPYABLE_DIR -> <base>\directstorage_accelerator  (+ <base>\src)
+#   SYNC_TEST_DIR           -> mirror of project/ -> <base>\addons\directstorage_accelerator
+# Nothing here is hardcoded to a specific checkout.
+function Get-ConfiguredAddonDir {
+    [CmdletBinding()]
+    param()
+
+    $dirs = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:SYNC_ADDON_DIR)) {
+        $dirs += $env:SYNC_ADDON_DIR
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:SYNC_ADDON_COPYABLE_DIR)) {
+        $dirs += (Join-Path $env:SYNC_ADDON_COPYABLE_DIR 'directstorage_accelerator')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:SYNC_TEST_DIR)) {
+        $dirs += (Join-Path $env:SYNC_TEST_DIR 'addons\directstorage_accelerator')
+    }
+    return $dirs
+}
+
+function Invoke-DeployAudit {
+    [CmdletBinding()]
+    param(
+        [string[]]$AddonDirs = @(),
+        [switch]$Json
+    )
+
+    $results = @()
+    $seen = @()
+    foreach ($dir in $AddonDirs) {
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        $resolved = $dir
+        if (Test-Path -LiteralPath $dir) {
+            $resolved = (Resolve-Path -LiteralPath $dir).Path
+        }
+        $dedupeKey = $resolved.ToLowerInvariant()
+        if ($seen -contains $dedupeKey) { continue }
+        $seen += $dedupeKey
+        $results += Get-DeployBinAudit -AddonDir $resolved
+    }
+
+    if ($Json) {
+        ConvertTo-Json -InputObject @($results) -Depth 5
+        return
+    }
+
+    foreach ($audit in $results) {
+        Write-DeployBinAudit -Audit $audit
     }
 }
 
@@ -88,6 +341,20 @@ $IsRemote = ($Remote) -or (-not $Local -and ($env:REMOTE_BUILD -in @("1", "true"
 
 $WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
+$DefaultAddonDir = Join-Path $WorkspaceRoot "project\addons\directstorage_accelerator"
+
+# Audit-only mode: report deployment contents without compiling or syncing.
+if ($AuditOnly) {
+    $AuditTargets = @()
+    if ($AuditPath.Count -gt 0) {
+        $AuditTargets = @($AuditPath)
+    }
+    else {
+        $AuditTargets = @($DefaultAddonDir) + @(Get-ConfiguredAddonDir)
+    }
+    Invoke-DeployAudit -AddonDirs $AuditTargets -Json:$Json
+    exit 0
+}
 
 if (-not $IsRemote) {
     # --- Local Mode (Default): compile directly with SCons ---
@@ -123,6 +390,7 @@ if (-not $IsRemote) {
         # (`dev_build=yes tests=true`) and fail boolean conversion.
         $SconsArgs = @("platform=windows", "target=$Target", "dev_build=yes")
         if ($IncludeTests) { $SconsArgs += "tests=true" }
+        if ($EncryptionKey) { $SconsArgs += "DSPKG_ENCRYPTION_KEY=$EncryptionKey" }
         & scons @SconsArgs
         $LocalExit = $LASTEXITCODE
     }
@@ -281,6 +549,19 @@ if ($RemoteDriveLetter.Length -eq 1) {
     }
 }
 
+# Clean orphaned SCons / cl.exe / link.exe processes on Device B BEFORE syncing sources.
+# If an earlier build timed out or was interrupted, cl.exe or scons.exe may
+# still be running and holding read locks on headers (e.g. ds_profiler.h),
+# which causes tar in step [3/6] to fail with "Can't unlink ... Permission denied".
+Write-VerboseHost "Cleaning stale build processes on Device B before sync..." -ForegroundColor Cyan
+$preSyncOut = & ssh -4 -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -CleanOrphans 2>&1
+foreach ($cLine in @($preSyncOut)) {
+    $cText = $cLine.ToString()
+    if ($cText.StartsWith("KILLED_ORPHAN:")) {
+        Write-Host "    Terminated orphaned build process before sync: $($cText.Substring(14))" -ForegroundColor Yellow
+    }
+}
+
 # 3. Stream source files via native tar over SSH (using cmd.exe for raw binary piping)
 Write-Host "[3/6] Syncing source files to Device B..." -ForegroundColor Cyan
 $tarExcludes = @(
@@ -338,7 +619,7 @@ if (-not $syncSuccess) {
 # cache will happily compile stale sources into a "successful" build.
 if (-not $SkipVerify) {
     Write-VerboseHost "[3b/6] Verifying source sync integrity on Device B..." -ForegroundColor Cyan
-    $SyncVerifyRoots = @("src", "tests", "thirdparty/gdeflate", "thirdparty/libdeflate", "extern/gdextest/src", "extern/gdextest/tools")
+    $SyncVerifyRoots = @("src", "tests", "thirdparty/gdeflate", "thirdparty/libdeflate", "thirdparty/monocypher", "extern/gdextest/src", "extern/gdextest/tools")
     $SyncVerifyFiles = @("SConstruct", ".gdextest.toml", "extern/gdextest/SConscript")
     $CwdPath = (Resolve-Path ".").Path
     $ManifestEntries = New-Object System.Collections.Generic.List[string]
@@ -354,6 +635,9 @@ if (-not $SkipVerify) {
         if (Test-Path -LiteralPath $singleFile) {
             $ManifestEntries.Add($singleFile.Replace("\", "/") + "|" + (Get-FileHash -LiteralPath $singleFile -Algorithm SHA256).Hash)
         }
+    }
+    if (-not (Test-Path -LiteralPath "thirdparty/monocypher")) {
+        Show-BuildFailure -Step "SyncVerify" -Message "Required vendored dependency thirdparty/monocypher is missing on Device A." -Code 1
     }
     # Relative name (no drive colon) so scp treats it as a local path.
     $ManifestTmp = "sync_manifest.tmp"
@@ -436,7 +720,8 @@ Write-Host "    [4/6 Prep done in ${prepSecs}s, killed $killedCount orphan(s). C
 # is still in progress, preventing automated monitors from suspecting a hang.
 $sconsOutFile = Join-Path $env:TEMP ("scons_remote_out_" + [System.Guid]::NewGuid().ToString() + ".log")
 $sconsErrFile = Join-Path $env:TEMP ("scons_remote_err_" + [System.Guid]::NewGuid().ToString() + ".log")
-$remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag && echo ok> `"$RemoteMarkerWin`""
+$encArg = if ($EncryptionKey) { " DSPKG_ENCRYPTION_KEY=$EncryptionKey" } else { "" }
+$remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag$encArg && echo ok> `"$RemoteMarkerWin`""
 
 $sconsArgs = @(
     "-n",
@@ -744,6 +1029,13 @@ if ($ShouldSync) {
 else {
     Write-VerboseHost "Post-build addon sync is disabled (ENABLE_POST_BUILD_ADDON_SYNC=0)." -ForegroundColor DarkGray
 }
+
+# Advisory deployment audit: reports files present in a deployed addon folder
+# that its .gdextension does not declare (stale binaries from an older naming
+# scheme, hand copies, ...). Read-only - nothing is deleted or moved here.
+Write-Host "[audit] Scanning deployed addon directories..." -ForegroundColor Cyan
+$DeployAuditTargets = @($DefaultAddonDir) + @(Get-ConfiguredAddonDir)
+Invoke-DeployAudit -AddonDirs $DeployAuditTargets -Json:$Json
 
 $syncMsg = if ($ShouldSync -and $copiedCount -gt 0) { " (Synced $copiedCount file(s))" } else { "" }
 Show-BuildSuccess -Message "All build and sync steps completed successfully!$syncMsg"

@@ -11,20 +11,54 @@
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
-
 namespace godot {
+
+constexpr uint16_t DSPKG_VERSION_LEGACY = 1;
+constexpr uint16_t DSPKG_VERSION_GPU_METADATA = 2;
+constexpr uint16_t DSPKG_VERSION_ENTRY_FLAGS = 3;
+constexpr uint16_t DSPKG_VERSION_V4 = 4;
+
+constexpr uint16_t DSPKG_FLAG_GPU_MIP_METADATA = (1 << 0);
+constexpr uint16_t DSPKG_FLAG_ENCRYPTED_TOC = (1 << 1);
+
+constexpr uint64_t DSPKG_ENTRY_PREFIX_SIZE = 10;
+constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE_LEGACY = 40;
+constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE_V3 = 44;
+constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE_LEGACY = 50;
+constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE_V3 = 54;
+
+constexpr uint64_t DSPKG_MAX_TOC_SIZE = 16ULL * 1024ULL * 1024ULL;
+constexpr uint64_t DSPKG_HEADER_SIZE_LEGACY = 28;
+constexpr uint64_t DSPKG_HEADER_SIZE_V4 = 64;
+constexpr uint64_t DSPKG_ENCRYPTION_MAC_SIZE = 16;
+constexpr uint64_t DSPKG_ENCRYPTION_SALT_SIZE = 16;
+constexpr uint64_t DSPKG_ENCRYPTION_NONCE_SIZE = 24;
 
 #pragma pack(push, 1)
 struct DSPkgHeader {
-	uint32_t magic;               // 0x474B5044 ("DPKG" little-endian)
-	uint16_t version;             // 1 for legacy archives, 2 for GPU mip metadata, 3 for entry flags
-	uint16_t flags;               // DSPKG_FLAG_GPU_MIP_METADATA for version 2/3
-	uint32_t entry_count;         // Number of entries
-	uint64_t data_offset;         // Byte offset to start of data blob
-	uint64_t archive_fingerprint; // Two-tier fingerprint: (project_guid << 32) | manifest_hash, or 0 if unpaired
+	uint32_t magic;
+	uint16_t version;
+	uint16_t flags;
+	uint32_t entry_count;
+	uint64_t data_offset;
+	uint64_t archive_fingerprint;
+	uint32_t compression_codec;
+	uint8_t archive_salt[16];
+	uint32_t min_reader_version;
+	uint64_t key_id;
+	uint8_t reserved[4];
 };
 #pragma pack(pop)
+
+static_assert(sizeof(DSPkgHeader) == 64, "DSPkgHeader v4 must be exactly 64 bytes");
+static_assert(offsetof(DSPkgHeader, compression_codec) == 28, "compression_codec offset mismatch");
+static_assert(offsetof(DSPkgHeader, archive_salt) == 32, "archive_salt offset mismatch");
+static_assert(offsetof(DSPkgHeader, min_reader_version) == 48, "min_reader_version offset mismatch");
+static_assert(offsetof(DSPkgHeader, key_id) == 52, "key_id offset mismatch");
+static_assert(offsetof(DSPkgHeader, reserved) == 60, "reserved offset mismatch");
 
 #pragma pack(push, 1)
 struct DSPkgMipEntry {
@@ -67,6 +101,11 @@ private:
 	bool bin_packing_enabled = false;
 	Array staging_entries;
 	bool is_building = false;
+	bool m_encryption_enabled = false;
+	std::array<uint8_t, 32> m_encryption_key = {};
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	PackedByteArray m_test_salt_override;
+#endif
 
 	// Reader state
 	String opened_path;
@@ -90,13 +129,25 @@ public:
 
 	// Archive Builder
 	Error create(const String &p_output_path, uint64_t p_archive_fingerprint = 0);
+	void close_write();
 	void set_archive_fingerprint(uint64_t p_archive_fingerprint);
 	void set_payload_alignment(uint64_t p_alignment);
 	uint64_t get_payload_alignment() const;
 	void set_bin_packing_enabled(bool p_enabled);
 	bool is_bin_packing_enabled() const;
 	Error add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata = Dictionary());
+	Error set_encryption_key(const String &p_key_hex);
 	Error finalize();
+
+	// Runtime static key API
+	static Error set_global_encryption_key(const String &p_key_hex);
+	static String get_global_encryption_key_id();
+	static String compute_key_id(const String &p_key_hex);
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+public:
+	void _set_archive_salt_for_testing(const PackedByteArray &p_salt);
+#endif
 
 	// Archive Reader
 	Error open(const String &p_path, uint64_t p_expected_fingerprint = 0);
