@@ -5,6 +5,8 @@ param(
     [switch]$Verbose
 )
 
+$ScriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
 function Write-VerboseHost {
     param(
         [string]$Message,
@@ -173,9 +175,10 @@ if (Test-Path $destBin) {
     }
 }
 
+$elapsedSecs = $ScriptStopwatch.Elapsed.TotalSeconds.ToString("F1")
 if ($copiedCount -gt 0) {
-    Write-Host "Sync complete: Updated $copiedCount file(s), $skippedCount already up to date -> $SyncTargetDir" -ForegroundColor Green
+    Write-Host "Sync complete: Updated $copiedCount file(s), $skippedCount already up to date (${elapsedSecs}s) -> $SyncTargetDir" -ForegroundColor Green
 }
 else {
-    Write-Host "Sync: Target $SyncTargetDir is already up to date ($skippedCount file(s) checked)." -ForegroundColor DarkGray
+    Write-Host "Sync: Target $SyncTargetDir is already up to date ($skippedCount file(s) checked, ${elapsedSecs}s)." -ForegroundColor DarkGray
 }

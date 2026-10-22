@@ -59,13 +59,29 @@
         },
         {
             "label": "Build Templates (Debug + Release)",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Build Template (Debug)",
-                "Build Template (Release)"
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/.vscode/build_remote.ps1",
+                "-Target",
+                "template_debug_and_release",
+                "-Verbose"
             ],
             "group": "build",
-            "problemMatcher": []
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": false
+            },
+            "problemMatcher": [
+                "$msCompile"
+            ]
         },
         {
             "label": "Build Template (Debug)",
@@ -120,15 +136,55 @@
             ]
         },
         {
-            "label": "Full Build (Templates + Tests + Run)",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Build Template (Release)",
-                "Build (Debug DLL + Tests)",
-                "Run gdextest (headless)"
+            "label": "Build Templates (Debug + Release + Tests)",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/.vscode/build_remote.ps1",
+                "-Target",
+                "template_debug_and_release",
+                "-IncludeTests",
+                "-Verbose"
             ],
             "group": "build",
-            "problemMatcher": []
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": false
+            },
+            "problemMatcher": [
+                "$msCompile"
+            ]
+        },
+        {
+            "label": "Full Build (Templates + Tests + Run)",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/.vscode/full_build.ps1",
+                "-Verbose"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": false
+            },
+            "problemMatcher": [
+                "$msCompile"
+            ]
         },
         {
             "label": "Sync Addon to Test Project (no build)",
@@ -210,6 +266,51 @@
                 "-Verbose"
             ],
             "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": false
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Generate Encryption Key (.keys/dspkg_encryption.key)",
+            "type": "shell",
+            "command": "cmd.exe",
+            "args": [
+                "/c",
+                "start",
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/.vscode/generate_encryption_key.ps1"
+            ],
+            "problemMatcher": [],
+            "presentation": {
+                "echo": false,
+                "reveal": "never",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": false
+            }
+        },
+        {
+            "label": "Check GDScript Syntax",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/.vscode/check_scripts.ps1"
+            ],
+            "group": "test",
             "presentation": {
                 "echo": true,
                 "reveal": "always",

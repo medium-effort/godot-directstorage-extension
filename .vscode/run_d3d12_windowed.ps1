@@ -45,6 +45,8 @@ param(
     [switch]$Verbose
 )
 
+$ScriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
 function Get-GodotConsolePath {
     param(
         [string]$RepoRoot
@@ -238,16 +240,19 @@ if (-not $testPassed -and -not $Verbose) {
     }
 }
 
+$elapsedSecs = $ScriptStopwatch.Elapsed.TotalSeconds.ToString("F1")
 if ($testPassed) {
     Write-Host ""
     Write-Host "================================================================================" -ForegroundColor Green
     Write-Host " [RUN SUCCESS] D3D12 windowed tests completed successfully! " -ForegroundColor White -BackgroundColor DarkGreen
+    Write-Host " Duration: ${elapsedSecs}s" -ForegroundColor Green
     Write-Host "================================================================================" -ForegroundColor Green
     exit 0
 } else {
     Write-Host ""
     Write-Host "================================================================================" -ForegroundColor Red
     Write-Host " [RUN FAILED] D3D12 windowed tests failed " -ForegroundColor White -BackgroundColor DarkRed
+    Write-Host " Duration: ${elapsedSecs}s" -ForegroundColor DarkGray
     Write-Host "================================================================================" -ForegroundColor Red
     exit $(if ($exitCode -ne 0) { $exitCode } else { 1 })
 }

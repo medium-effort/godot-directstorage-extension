@@ -50,6 +50,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$ScriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Get-FormattedElapsed {
+    param([System.Diagnostics.Stopwatch]$Stopwatch)
+    if (-not $Stopwatch) { return "" }
+    $elapsed = $Stopwatch.Elapsed
+    if ($elapsed.TotalMinutes -ge 1) {
+        $mins = [int][Math]::Floor($elapsed.TotalMinutes)
+        return ("{0}m {1:D2}s ({2:F1}s total)" -f $mins, $elapsed.Seconds, $elapsed.TotalSeconds)
+    }
+    return ("{0:F1}s" -f $elapsed.TotalSeconds)
+}
+
 function Write-ReportText {
     param(
         [string]$Message = "",
@@ -78,6 +91,7 @@ function Show-StepFailure {
         [string]$Message,
         [int]$Code = 1
     )
+    $elapsedStr = Get-FormattedElapsed $ScriptStopwatch
     Write-ReportText "" -IsError
     Write-ReportText "================================================================================" -ForegroundColor Red -IsError
     Write-ReportText " [RUN FAILED] $Step " -ForegroundColor White -BackgroundColor DarkRed -IsError
@@ -85,6 +99,9 @@ function Show-StepFailure {
     Write-ReportText " Reason: $Message" -ForegroundColor Red -IsError
     if ($Code -ne 0) {
         Write-ReportText " Exit Code: $Code" -ForegroundColor Yellow -IsError
+    }
+    if ($elapsedStr) {
+        Write-ReportText " Elapsed Time: $elapsedStr" -ForegroundColor DarkGray -IsError
     }
     Write-ReportText " Check the terminal output above for details." -ForegroundColor DarkGray -IsError
     Write-ReportText "================================================================================" -ForegroundColor Red -IsError
@@ -195,9 +212,13 @@ function Show-RunSuccess {
     param(
         [string]$Message = "All test stages completed successfully!"
     )
+    $elapsedStr = Get-FormattedElapsed $ScriptStopwatch
     Write-ReportText ""
     Write-ReportText "================================================================================" -ForegroundColor Green
     Write-ReportText " [RUN SUCCESS] $Message " -ForegroundColor White -BackgroundColor DarkGreen
+    if ($elapsedStr) {
+        Write-ReportText " Duration: $elapsedStr" -ForegroundColor Green
+    }
     Write-ReportText "================================================================================" -ForegroundColor Green
     Write-ReportText ""
 }

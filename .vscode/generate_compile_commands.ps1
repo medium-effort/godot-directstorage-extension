@@ -11,6 +11,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ScriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 function Write-VerboseHost {
     param(
@@ -76,7 +77,8 @@ if (-not $IsRemote) {
     }
 
     if (Test-Path -LiteralPath $CompileCommandsLocal) {
-        Write-Host "[2/2] compile_commands.json generated locally successfully!" -ForegroundColor Green
+        $elapsedSecs = $ScriptStopwatch.Elapsed.TotalSeconds.ToString("F1")
+        Write-Host "[2/2] compile_commands.json generated locally successfully (${elapsedSecs}s)!" -ForegroundColor Green
         exit 0
     }
     else {
@@ -235,7 +237,8 @@ try {
 
     [System.IO.File]::WriteAllText($CompileCommandsLocal, $content, [System.Text.Encoding]::UTF8)
 
-    Write-Host "compile_commands.json successfully created and configured at $CompileCommandsLocal!" -ForegroundColor Green
+    $elapsedSecs = $ScriptStopwatch.Elapsed.TotalSeconds.ToString("F1")
+    Write-Host "compile_commands.json successfully created and configured at $CompileCommandsLocal (${elapsedSecs}s)!" -ForegroundColor Green
     exit 0
 }
 finally {

@@ -20,6 +20,19 @@ param(
     [switch]$Json
 )
 
+$ScriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Get-FormattedElapsed {
+    param([System.Diagnostics.Stopwatch]$Stopwatch)
+    if (-not $Stopwatch) { return "" }
+    $elapsed = $Stopwatch.Elapsed
+    if ($elapsed.TotalMinutes -ge 1) {
+        $mins = [int][Math]::Floor($elapsed.TotalMinutes)
+        return ("{0}m {1:D2}s ({2:F1}s total)" -f $mins, $elapsed.Seconds, $elapsed.TotalSeconds)
+    }
+    return ("{0:F1}s" -f $elapsed.TotalSeconds)
+}
+
 # Snapshot the genuine process environment BEFORE .env is merged into it (R9-02).
 # The Godot export plugin reads the OS environment only, so a key declared in .env is not the
 # R7-14 hazard and must not abort compiling builds.
@@ -50,6 +63,7 @@ function Show-BuildFailure {
         [string]$Message,
         [int]$Code = 1
     )
+    $elapsedStr = Get-FormattedElapsed $ScriptStopwatch
     Write-Status ""
     Write-Status "================================================================================" -ForegroundColor Red
     Write-Status " [BUILD FAILED] $Step " -ForegroundColor White -BackgroundColor DarkRed
@@ -57,6 +71,9 @@ function Show-BuildFailure {
     Write-Status " Reason: $Message" -ForegroundColor Red
     if ($Code -ne 0) {
         Write-Status " Exit Code: $Code" -ForegroundColor Yellow
+    }
+    if ($elapsedStr) {
+        Write-Status " Elapsed Time: $elapsedStr" -ForegroundColor DarkGray
     }
     Write-Status " Check the compiler/terminal output above for details." -ForegroundColor DarkGray
     Write-Status "================================================================================" -ForegroundColor Red
@@ -68,9 +85,13 @@ function Show-BuildSuccess {
     param(
         [string]$Message = "All steps completed successfully!"
     )
+    $elapsedStr = Get-FormattedElapsed $ScriptStopwatch
     Write-Status ""
     Write-Status "================================================================================" -ForegroundColor Green
     Write-Status " [BUILD SUCCESS] $Message " -ForegroundColor White -BackgroundColor DarkGreen
+    if ($elapsedStr) {
+        Write-Status " Duration: $elapsedStr" -ForegroundColor Green
+    }
     Write-Status "================================================================================" -ForegroundColor Green
     Write-Status ""
 }
@@ -482,6 +503,7 @@ Get-Content $EnvFilePath | ForEach-Object {
 $IsRemote = ($Remote) -or (-not $Local -and ($env:REMOTE_BUILD -in @("1", "true", "yes")))
 
 $WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$IsMultiTarget = ($Target -in @("template_debug_and_release", "all"))
 $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
 $DefaultAddonDir = Join-Path $WorkspaceRoot "project\addons\directstorage_accelerator"
 
@@ -718,17 +740,34 @@ if (-not $IsRemote) {
             New-DspkgKeyHeader -Reset
         }
 
-        # NOTE: each SCons variable must be a separate process argument.
-        # `dev_build=yes$TestsFlag` would fuse into one token
-        # (`dev_build=yes tests=true`) and fail boolean conversion.
-        $SconsArgs = @("platform=windows", "target=$Target", "dev_build=yes")
-        if ($IncludeTests) { $SconsArgs += "tests=true" }
-        if ($EffectiveKey) { $SconsArgs += "KEEP_KEY_HEADER=1" }
-        if ($ResetKeyHeader) { $SconsArgs += "DSPKG_KEY_HEADER_RESET=1" }
-        $env:DSPKG_KEY_HEADER_ACTIVE = if ($EffectiveKey) { "1" } else { "0" }
+        $targetsToBuild = if ($IsMultiTarget) {
+            @(
+                @{ Name = "template_release"; DevBuild = "no"; Tests = $false },
+                @{ Name = "template_debug"; DevBuild = "yes"; Tests = [bool]$IncludeTests }
+            )
+        } else {
+            $devBuildVal = if ($Target -eq "template_release") { "no" } else { "yes" }
+            @(
+                @{ Name = $Target; DevBuild = $devBuildVal; Tests = [bool]$IncludeTests }
+            )
+        }
 
-        & scons @SconsArgs 2>&1 | ForEach-Object { Write-Status ([string]$_) }
-        $LocalExit = $LASTEXITCODE
+        $LocalExit = 0
+        foreach ($tDef in $targetsToBuild) {
+            Write-Status "[Local] Compiling target=$($tDef.Name) dev_build=$($tDef.DevBuild)$(if ($tDef.Tests) { ' tests=true' })..." -ForegroundColor Cyan
+            # NOTE: each SCons variable must be a separate process argument.
+            $SconsArgs = @("platform=windows", "target=$($tDef.Name)", "dev_build=$($tDef.DevBuild)")
+            if ($tDef.Tests) { $SconsArgs += "tests=true" }
+            if ($EffectiveKey) { $SconsArgs += "KEEP_KEY_HEADER=1" }
+            if ($ResetKeyHeader) { $SconsArgs += "DSPKG_KEY_HEADER_RESET=1" }
+            $env:DSPKG_KEY_HEADER_ACTIVE = if ($EffectiveKey) { "1" } else { "0" }
+
+            & scons @SconsArgs 2>&1 | ForEach-Object { Write-Status ([string]$_) }
+            $LocalExit = $LASTEXITCODE
+            if ($LocalExit -ne 0) {
+                break
+            }
+        }
     }
     finally {
         Pop-Location
@@ -820,7 +859,7 @@ if ($LocalDriveLetter) {
 # 1. Probe connectivity (Local Wi-Fi first, fallback to Tailscale)
 Write-Status "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
 $ActiveHost = $null
-& ssh -4 -o BatchMode=yes -o ConnectTimeout=2 $RemoteHost "exit 0" 2>$null
+& ssh -4 -n -o BatchMode=yes -o ConnectTimeout=2 $RemoteHost "exit 0" 2>$null
 
 if ($LASTEXITCODE -eq 0) {
     $ActiveHost = $RemoteHost
@@ -828,7 +867,7 @@ if ($LASTEXITCODE -eq 0) {
 }
 elseif ($RemoteHostFallback) {
     Write-VerboseHost "Local host unreachable. Attempting Tailscale fallback ($RemoteHostFallback)..." -ForegroundColor Yellow
-    & ssh -o BatchMode=yes -o ConnectTimeout=4 $RemoteHostFallback "exit 0" 2>$null
+    & ssh -n -o BatchMode=yes -o ConnectTimeout=4 $RemoteHostFallback "exit 0" 2>$null
     if ($LASTEXITCODE -eq 0) {
         $ActiveHost = $RemoteHostFallback
         Write-VerboseHost "Connected via Tailscale ($ActiveHost)." -ForegroundColor Green
@@ -843,7 +882,7 @@ else {
 
 # 2. Ensure target directory exists on Device B
 Write-Status "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
-& ssh -4 -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
+& ssh -4 -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to ensure remote build directory exists on $ActiveHost." -Code $LASTEXITCODE
 }
@@ -881,7 +920,7 @@ if (-not $uploadSuccess) {
 $RemoteDriveLetter = ($RemoteDirWin -split ':')[0].Trim()
 if ($RemoteDriveLetter.Length -eq 1) {
     Write-VerboseHost "Checking remote disk space on drive ${RemoteDriveLetter}: on Device B..." -ForegroundColor Cyan
-    $remoteFreeOutput = ssh $ActiveHost "powershell -NoProfile -Command `"[int64]((Get-PSDrive $RemoteDriveLetter).Free / 1MB)`"" 2>$null
+    $remoteFreeOutput = ssh -4 -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "powershell -NoProfile -Command `"[int64]((Get-PSDrive $RemoteDriveLetter).Free / 1MB)`"" 2>$null
     if ($remoteFreeOutput) {
         $remoteFreeMb = 0
         $parsed = [int64]::TryParse($remoteFreeOutput.Trim(), [ref]$remoteFreeMb)
@@ -905,7 +944,7 @@ if ($RemoteDriveLetter.Length -eq 1) {
 # still be running and holding read locks on headers (e.g. ds_profiler.h),
 # which causes tar in step [3/6] to fail with "Can't unlink ... Permission denied".
 Write-VerboseHost "Cleaning stale build processes on Device B before sync..." -ForegroundColor Cyan
-$preSyncOut = & ssh -4 -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -CleanOrphans 2>&1
+$preSyncOut = & ssh -4 -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -CleanOrphans 2>&1
 foreach ($cLine in @($preSyncOut)) {
     $cText = $cLine.ToString()
     if ($cText.StartsWith("KILLED_ORPHAN:")) {
@@ -1012,7 +1051,7 @@ if (-not $SkipVerify) {
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Sync manifest is empty; nothing was hashed on Device A. Refusing vacuous pass." -Code 1
     }
     # The verifier runs with spaceless arguments only
-    $VerifyOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -ManifestName sync_manifest.txt 2>&1
+    $VerifyOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -ManifestName sync_manifest.txt 2>&1
     if ($VerifyOut -notcontains "SYNC_MANIFEST_OK") {
         $detailLines = @($VerifyOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 20) -join "`n"
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Device B verification failed ($ActiveHost) with no clean OK. Raw remote output:`n$detailLines" -Code 1
@@ -1029,7 +1068,7 @@ if (-not $SkipVerify) {
     # tests), so test TUs are touched to guarantee the next compile sees
     # them. Quoteless invocation, same as [3b/6].
     Write-VerboseHost "[3c/6] Touching test sources on Device B..." -ForegroundColor Cyan
-    $TouchOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -TouchTests 2>&1
+    $TouchOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -TouchTests 2>&1
     $TouchCount = 0
     foreach ($touchLine in @($TouchOut)) {
         $touchText = $touchLine.ToString()
@@ -1055,7 +1094,7 @@ $RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
 # 2 SSH handshakes + 2 powershell cold starts vs. del/type via cmd.exe).
 Write-Status "[4/6] Cleaning stale build processes + resetting marker on Device B..." -ForegroundColor Cyan
 $prepTimer = [System.Diagnostics.Stopwatch]::StartNew()
-$PrepOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -CleanOrphans -ResetMarker 2>&1
+$PrepOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -CleanOrphans -ResetMarker 2>&1
 $prepTimer.Stop()
 $prepSecs = [int]$prepTimer.Elapsed.TotalSeconds
 $killedCount = 0
@@ -1086,7 +1125,16 @@ Write-Status "    [4/6 Prep done in ${prepSecs}s, killed $killedCount orphan(s).
 $sconsOutFile = Join-Path $env:TEMP ("scons_remote_out_" + [System.Guid]::NewGuid().ToString() + ".log")
 $sconsErrFile = Join-Path $env:TEMP ("scons_remote_err_" + [System.Guid]::NewGuid().ToString() + ".log")
 $keepArg = if ($EffectiveKey) { " KEEP_KEY_HEADER=1" } elseif ($ResetKeyHeader) { " DSPKG_KEY_HEADER_RESET=1" } else { "" }
-$remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag$keepArg && echo ok> `"$RemoteMarkerWin`""
+if ($IsMultiTarget) {
+    $testsArgDebug = if ($IncludeTests) { " tests=true" } else { "" }
+    $sconsRelCmd = "call scons platform=windows target=template_release dev_build=no$keepArg"
+    $sconsDbgCmd = "call scons platform=windows target=template_debug dev_build=yes$testsArgDebug$keepArg"
+    $remoteCmd = "cd /d `"$RemoteDirWin`" && $sconsRelCmd && $sconsDbgCmd && echo ok> `"$RemoteMarkerWin`""
+}
+else {
+    $devBuildVal = if ($Target -eq "template_release") { "no" } else { "yes" }
+    $remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=$devBuildVal$TestsFlag$keepArg && echo ok> `"$RemoteMarkerWin`""
+}
 
 $sconsArgs = @(
     "-n",
@@ -1126,7 +1174,7 @@ if ($Verbose -and $sconsLines) {
 # Distinguish network/SSH drop (exit code 255 or host unreachable) from actual compilation error
 $sshDropped = ($sconsProc.ExitCode -eq 255)
 if (-not $sshDropped) {
-    & ssh -o BatchMode=yes -o ConnectTimeout=3 $ActiveHost "exit 0" 2>$null
+    & ssh -n -o BatchMode=yes -o ConnectTimeout=3 $ActiveHost "exit 0" 2>$null
     if ($LASTEXITCODE -ne 0) {
         $sshDropped = $true
     }
@@ -1166,7 +1214,7 @@ if (!(Test-Path $ArtifactLocalDir)) {
 }
 
 # Clean any remote hot-reload temporary DLLs before pulling
-& ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if exist `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`" del /q `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`"" 2>$null
+& ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if exist `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`" del /q `"$RemoteDirWin\project\addons\directstorage_accelerator\bin\~*`"" 2>$null
 
 # Pull runtime DLLs and manifest with on-the-fly compression (-C) and bounded retries
 if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$ArtifactRemoteDir/$AddonBinaryStem*.dll" -LocalDest "$ArtifactLocalDir/")) {
@@ -1179,7 +1227,8 @@ if ($IncludeTests) {
     if (!(Test-Path "./bin")) {
         New-Item -ItemType Directory -Force -Path "./bin" | Out-Null
     }
-    $targetTestPattern = "libdirectstorage_tests*.$Target*.dll"
+    $targetForTestPattern = if ($IsMultiTarget) { "template_debug" } else { $Target }
+    $targetTestPattern = "libdirectstorage_tests*.$targetForTestPattern*.dll"
     Get-ChildItem -Path "./bin" -Filter $targetTestPattern -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$RemoteDirTar/bin/$targetTestPattern" -LocalDest "./bin/")) {
         Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll ($targetTestPattern) from Device B ($ActiveHost). The remote test build likely failed." -Code 1
@@ -1197,12 +1246,13 @@ if (-not $SkipVerify) {
         @{ Pattern = "build_manifest.json"; LocalDir = $ArtifactLocalDir; Required = [bool]($EffectiveKey -or $RequireManifest) }
     )
     if ($IncludeTests) {
-        $targetTestPattern = "libdirectstorage_tests*.$Target*.dll"
+        $targetForTestPattern = if ($IsMultiTarget) { "template_debug" } else { $Target }
+        $targetTestPattern = "libdirectstorage_tests*.$targetForTestPattern*.dll"
         $PullChecks += @{ Pattern = $targetTestPattern; LocalDir = "./bin"; Required = $true }
     }
     # Remote hashes come from the verifier script (quoteless invocation, same
     # as step [3b/6]) so no nested quoting is needed here either.
-    $ArtOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -Artifacts 2>&1
+    $ArtOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -Artifacts 2>&1
     $RemoteArtifacts = @{}
     foreach ($artLine in @($ArtOut)) {
         $artText = $artLine.ToString()
@@ -1264,6 +1314,18 @@ finally {
     }
 }
 } # End Remote Mode (REMOTE_BUILD=1)
+
+# 5b. GDScript Syntax Verification
+if (-not $SkipVerify) {
+    Write-Status "[verify] Validating addon GDScript syntax..." -ForegroundColor Cyan
+    $checkScript = Join-Path $PSScriptRoot "check_scripts.ps1"
+    if (Test-Path -LiteralPath $checkScript) {
+        & powershell -ExecutionPolicy Bypass -File $checkScript
+        if ($LASTEXITCODE -ne 0) {
+            Show-BuildFailure -Step "GDScript Verification" -Message "One or more addon GDScript files failed syntax validation. Aborting before sync." -Code 1
+        }
+    }
+}
 
 # 6. Post-build synchronization to external project (e.g. TPS demo)
 # Environment-driven: syncs whenever SYNC_ADDON_DIR is defined.

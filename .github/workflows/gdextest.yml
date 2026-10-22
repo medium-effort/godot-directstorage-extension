@@ -144,7 +144,25 @@ jobs:
         if: failure() && steps.build.outcome == 'failure'
         shell: bash
         run: python .github/scripts/extract_build_errors.py scons-build.log
-          
+
+      - name: Validate addon GDScripts
+        shell: bash
+        run: |
+          echo "Validating addon GDScript files with Godot..."
+          FAILED=0
+          for script in project/addons/directstorage_accelerator/scripts/*.gd; do
+            rel_script="${script#project/}"
+            echo "Checking $rel_script..."
+            "$GODOT" --path project --headless --check-only --script "$rel_script" || FAILED=1
+          done
+          if [ $FAILED -ne 0 ]; then
+            echo "ERROR: One or more addon GDScript files failed syntax validation!"
+            exit 1
+          fi
+          echo "All addon GDScript files passed syntax validation."
+        env:
+          GODOT: ${{ env.GODOT }}
+
       - name: Run gdextest
         shell: bash
         run: |
