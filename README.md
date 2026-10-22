@@ -92,3 +92,15 @@ When configuring a Windows Desktop export preset (`Project -> Export... -> Windo
 | `directstorage/bundle_textures_dspkg` | `bool` | `true` | When `true`, all exported `.dstex` textures are extracted from the `.pck` via `skip()` and bundled into a standalone DirectStorage archive (`textures.dspkg`) deployed alongside the executable for unbuffered NVMe DMA loading. When `false`, texture payloads remain embedded inside the `.pck` and fall back to CPU software decompression at runtime. |
 | `directstorage/enforce_archive_pairing` | `bool` | `true` | When `true`, computes a two-tier archive fingerprint `(project_guid << 32) | manifest_hash` from sorted `(path, size)` pairs and embeds it in both the `.pck` and `textures.dspkg`. At runtime, mounting a mismatched or stale archive triggers an immediate failure to protect against corrupt reads or memory errors. |
 | `directstorage/steampipe_1mb_alignment` | `bool` | `false` | When `true`, packs texture payloads inside `textures.dspkg` into 1 MiB (`1,048,576` bytes) chunks with 512-byte GPU sub-alignment, padding to 1 MiB boundaries only when a texture would cross a chunk boundary. This follows Valve's best practice for SteamPipe, keeping delta patch downloads isolated to modified 1 MiB chunks while eliminating wasted file-size of zero-padding compared to strict per-texture alignment. Note: strict 1 MiB per-texture alignment is available via `DSPkg::set_bin_packing_enabled(false)` for backwards compatibility or specialized workloads where total chunk isolation is required. |
+| `directstorage/encryption_enabled` | `bool` | `false` | When `true`, packages textures into Version 4 `.dspkg` format with table-of-contents (TOC) structure encryption and Poly1305 authentication. Protects asset file layout and texture catalogue metadata from offline inspection. |
+| `directstorage/encryption_key` | `String` | `""` | 64-character hexadecimal symmetric encryption key (32 bytes) used to encrypt and authenticate the `.dspkg` TOC. In production, prefer baking keys at compile time via key files or CI environment variables rather than committing plaintext keys in export presets. |
+
+---
+
+## 6. Version 4 Archives & Encryption
+
+The `.dspkg` pipeline supports Version 4 archives featuring table-of-contents structure encryption and authentication:
+- **TOC Encryption & Authentication**: Encrypts and authenticates the archive entry table using authenticated AEAD encryption (BLAKE2b key-ID derivation, XChaCha20 encryption, and Poly1305 MAC via Monocypher).
+- **Zero-Copy DMA Payloads**: Payload blocks remain unencrypted on disk to enable direct zero-copy NVMe-to-GPU DirectStorage DMA transfers.
+- **Runtime Key Provisioning Contract**: Games shipping with encrypted archives can provide their symmetric key at startup using `DSPkg.set_global_encryption_key("64_hex_chars...")` during initialization, or compile the key into the binary via `DSPKG_ENCRYPTION_KEY_FILE`.
+- **Security Notice**: Avoid saving plaintext encryption keys in export preset configuration files if the preset is committed to public source control.

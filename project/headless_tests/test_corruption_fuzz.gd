@@ -11,7 +11,7 @@ extends SceneTree
 #     mip_count u32@20, original_size u64@24, compressed_size u64@32,
 #     reserved u64@40. V2 mip entry (24 B) at 48 + 24*i: offset u64@+0,
 #     compressed_size u32@+8, uncompressed_size u32@+12, row_pitch u32@+16.
-#   DSPkg header (28 B): magic u32@0 (0x474B5044 "DPKG"), version u16@4,
+#   DSPkg header (64 B v4, 28 B legacy v1-v3): magic u32@0 (0x474B5044 "DPKG"), version u16@4,
 #     flags u16@6, entry_count u32@8, data_offset u64@12, reserved u64@20.
 
 const TEX_W := 64
@@ -233,7 +233,7 @@ func _test_truncation() -> void:
 		var p := _next_case_path("trunc_dstex_%db" % n, "dstex")
 		if _write_bytes(p, _truncated(_valid_dstex_bytes, n)):
 			_probe_dstex(p, "DSTex truncated to %d B" % n, true)
-	var dspkg_sizes := [0, 4, DSPKG_HEADER_SIZE - 1, _valid_dspkg_bytes.size() / 2]
+	var dspkg_sizes := [0, 4, DSPKG_LEGACY_HEADER_SIZE - 1, DSPKG_HEADER_SIZE - 1, _valid_dspkg_bytes.size() / 2]
 	for n in dspkg_sizes:
 		var p := _next_case_path("trunc_dspkg_%db" % n, "dspkg")
 		if _write_bytes(p, _truncated(_valid_dspkg_bytes, n)):
@@ -284,6 +284,17 @@ func _test_header_fuzz() -> void:
 		var p := _next_case_path("dspkg_ver_%d" % v, "dspkg")
 		if _write_bytes(p, _patched(_valid_dspkg_bytes, DSPKG_OFF_VERSION, _le16(v))):
 			_probe_dspkg(p, "DSPkg version=%d" % v, true)
+	# DSPkg version downgrade mutation probe with encrypted flags (v4 -> v2, v3).
+	for v in [2, 3]:
+		var downgraded := _valid_dspkg_bytes.duplicate()
+		downgraded[DSPKG_OFF_VERSION] = v & 0xFF
+		downgraded[DSPKG_OFF_VERSION + 1] = (v >> 8) & 0xFF
+		downgraded[6] = 3
+		downgraded[7] = 0
+		downgraded[52] = 0x01
+		var p := _next_case_path("dspkg_downgrade_v%d" % v, "dspkg")
+		if _write_bytes(p, downgraded):
+			_probe_dspkg(p, "DSPkg version downgrade to v%d with encrypted flags" % v, true)
 
 # -------------------------------------------------------------- category 3 ---
 

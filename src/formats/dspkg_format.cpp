@@ -1,5 +1,6 @@
 #include "dspkg_format.h"
 #include "dstex_format.h"
+#include "gen/dspkg_encryption_key.h"
 #include "monocypher.h"
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/os.hpp>
@@ -11,6 +12,8 @@
 
 namespace godot {
 
+extern const char *const dspkg_baked_key_id_tag = DSPKG_KEY_ID_TAG;
+
 namespace {
 
 constexpr uint64_t DSPKG_MAX_PAYLOAD_SIZE = static_cast<uint64_t>(INT32_MAX);
@@ -21,13 +24,6 @@ constexpr uint32_t D3D12_TEXTURE_DATA_PITCH_ALIGNMENT = 256;
 constexpr uint32_t D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT = 512;
 
 static const uint8_t DOMAIN_SEPARATOR[8] = {'D', 'S', 'P', 'K', 'G', 'v', '4', 0x01};
-
-#ifdef DSPKG_ENCRYPTION_KEY_BAKED
-static_assert(sizeof(DSPKG_ENCRYPTION_KEY_BAKED) - 1 == 64, "Baked DSPKG encryption key must be exactly 64 hex characters");
-static const char *const s_baked_encryption_key_hex = DSPKG_ENCRYPTION_KEY_BAKED;
-#else
-static const char *const s_baked_encryption_key_hex = "";
-#endif
 
 enum KeyResolutionState {
 	KEY_STATE_DEFAULT,
@@ -71,22 +67,15 @@ static bool parse_hex_key_32(const String &p_hex, std::array<uint8_t, 32> &r_byt
 	return true;
 }
 
-static bool parse_hex_key_cstr_32(const char *p_hex, std::array<uint8_t, 32> &r_bytes) {
-	if (!p_hex || strlen(p_hex) != 64) return false;
+#if DSPKG_ENCRYPTION_ENABLED
+static void unmask_baked_key(std::array<uint8_t, 32> &r_key_bytes) {
+	volatile const unsigned char *p_mask = dspkg_key::MASK;
+	volatile const unsigned char *p_masked = dspkg_key::MASKED_KEY;
 	for (size_t i = 0; i < 32; ++i) {
-		auto hex_nibble = [](char c) -> int {
-			if (c >= '0' && c <= '9') return c - '0';
-			if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-			if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-			return -1;
-		};
-		int hi = hex_nibble(p_hex[i * 2]);
-		int lo = hex_nibble(p_hex[i * 2 + 1]);
-		if (hi < 0 || lo < 0) return false;
-		r_bytes[i] = static_cast<uint8_t>((hi << 4) | lo);
+		r_key_bytes[i] = p_mask[i] ^ p_masked[i];
 	}
-	return true;
 }
+#endif
 
 static bool resolve_encryption_key(std::array<uint8_t, 32> &r_key_bytes, uint64_t &r_key_id) {
 	std::lock_guard<std::mutex> lock(s_key_mutex);
@@ -101,18 +90,16 @@ static bool resolve_encryption_key(std::array<uint8_t, 32> &r_key_bytes, uint64_
 		memcpy(&r_key_id, id_buf, 8);
 		return true;
 	}
-	if (s_baked_encryption_key_hex[0] != '\0') {
-		if (parse_hex_key_cstr_32(s_baked_encryption_key_hex, r_key_bytes)) {
-			uint8_t id_buf[8] = {0};
-			crypto_blake2b(id_buf, 8, r_key_bytes.data(), 32);
-			memcpy(&r_key_id, id_buf, 8);
-			return true;
-		} else {
-			UtilityFunctions::push_error("DSPkg: Baked encryption key failed hex validation.");
-		}
-	}
+#if DSPKG_ENCRYPTION_ENABLED
+	unmask_baked_key(r_key_bytes);
+	uint8_t id_buf[8] = {0};
+	crypto_blake2b(id_buf, 8, r_key_bytes.data(), 32);
+	memcpy(&r_key_id, id_buf, 8);
+	return true;
+#else
 	crypto_wipe(r_key_bytes.data(), 32);
 	return false;
+#endif
 }
 
 class TOCBufferReader {
@@ -314,24 +301,28 @@ Error DSPkg::set_global_encryption_key(const String &p_key_hex) {
 
 String DSPkg::get_global_encryption_key_id() {
 	std::lock_guard<std::mutex> lock(s_key_mutex);
+	// Volatile pointer qualification and dereference guarantees an observable load under MSVC /O2,
+	// preventing /OPT:REF from dead-stripping the anchor tag in release builds for both keyed
+	// and keyless ("dspkg-key-id=none") binaries (R7-04, R8-11, R8-15).
+	const char *volatile p_tag = dspkg_baked_key_id_tag;
+	(void)*p_tag;
+
 	if (s_key_resolution_state == KEY_STATE_DISABLED) return "";
 	if (s_key_resolution_state == KEY_STATE_OVERRIDE) {
 		uint8_t id_buf[8] = {0};
 		crypto_blake2b(id_buf, 8, s_global_encryption_key_bytes.data(), 32);
 		return key_id_to_hex(id_buf);
 	}
-	if (s_baked_encryption_key_hex[0] != '\0') {
-		std::array<uint8_t, 32> baked_bytes = {};
-		if (parse_hex_key_cstr_32(s_baked_encryption_key_hex, baked_bytes)) {
-			uint8_t id_buf[8] = {0};
-			crypto_blake2b(id_buf, 8, baked_bytes.data(), 32);
-			crypto_wipe(baked_bytes.data(), 32);
-			return key_id_to_hex(id_buf);
-		} else {
-			UtilityFunctions::push_error("DSPkg: Baked encryption key failed hex validation.");
-		}
-	}
+#if DSPKG_ENCRYPTION_ENABLED
+	std::array<uint8_t, 32> baked_bytes = {};
+	unmask_baked_key(baked_bytes);
+	uint8_t id_buf[8] = {0};
+	crypto_blake2b(id_buf, 8, baked_bytes.data(), 32);
+	crypto_wipe(baked_bytes.data(), 32);
+	return key_id_to_hex(id_buf);
+#else
 	return "";
+#endif
 }
 
 String DSPkg::compute_key_id(const String &p_key_hex) {
@@ -969,7 +960,7 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 			return fail(ERR_FILE_CORRUPT, "TOC envelope exceeds maximum size limit (16 MiB).");
 		}
 	} else {
-		constexpr uint64_t MAX_SERIALIZED_ENTRY_SIZE = DSPKG_ENTRY_PREFIX_SIZE + UINT16_MAX + DSPKG_ENTRY_FIELDS_SIZE_V3 + 24ULL * 16; // DSTEX_MAX_MIP_COUNT assumed 16
+		constexpr uint64_t MAX_SERIALIZED_ENTRY_SIZE = DSPKG_ENTRY_PREFIX_SIZE + UINT16_MAX + DSPKG_ENTRY_FIELDS_SIZE_V3 + 24ULL * DSTEX_MAX_MIP_COUNT;
 		uint64_t max_legacy_toc_table = 0;
 		if (!checked_multiply(loaded_header.entry_count, MAX_SERIALIZED_ENTRY_SIZE, max_legacy_toc_table)) {
 			return fail(ERR_FILE_CORRUPT, "Entry table size overflow.");
@@ -1064,9 +1055,13 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 		entry.flags = is_v3_or_higher ? reader.get_32() : 0;
 
 		if (entry.width == 0 || entry.height == 0 || entry.mip_count == 0 ||
-			entry.mip_count > 16 ||
-			!payload_sizes_are_supported(entry)) {
+			entry.mip_count > DSTEX_MAX_MIP_COUNT ||
+			!dstex_sizes_are_sane(entry.width, entry.height, entry.original_size, entry.compressed_size)) {
 			return fail(ERR_FILE_CORRUPT, "Invalid entry dimensions or mip count.");
+		}
+
+		if (!payload_sizes_are_supported(entry)) {
+			return fail(ERR_FILE_CORRUPT, "Entry payload size is zero or exceeds the supported limit.");
 		}
 
 		uint64_t abs_payload_offset = 0;
@@ -1104,32 +1099,51 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 				uint64_t mip_end = 0;
 				if (mip_compressed == 0 || mip_reserved != 0 ||
 					!checked_add(mip_offset, mip_compressed, mip_end) ||
-					mip_offset < previous_mip_end || mip_end > abs_payload_end) {
+					mip_offset < previous_mip_end || mip_end > abs_payload_end ||
+					!checked_add(compressed_mip_size, mip_compressed, compressed_mip_size) ||
+					(mip_uncompressed > 0 &&
+						(mip_row_pitch == 0 || mip_row_pitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT != 0)) ||
+					(mip_uncompressed > 0 &&
+						!checked_add(footprint_size, mip_uncompressed, footprint_size))) {
 					return fail(ERR_FILE_CORRUPT, "Invalid entry mip metadata.");
 				}
 				if (mip == 0 && mip_offset != abs_payload_offset) {
 					return fail(ERR_FILE_CORRUPT, "First mip offset must match entry payload start.");
 				}
-				if (mip_uncompressed > 0 && mip_row_pitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT != 0) {
-					return fail(ERR_FILE_CORRUPT, "Invalid mip row pitch.");
+				if (mip_uncompressed > 0 && mip_offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT != 0) {
+					return fail(ERR_FILE_CORRUPT, "Mip offset must be aligned to 512 bytes for GPU footprint.");
 				}
 				previous_mip_end = mip_end;
 			}
-			entry.has_gpu_metadata = true;
-			Vector<DSPkgMipEntry> mip_vector;
-			mip_vector.resize(entry.mip_count);
-			for (uint32_t mip = 0; mip < entry.mip_count; ++mip) {
-				DSPkgMipEntry &m_e = mip_vector.write[mip];
-				m_e.offset = static_cast<uint64_t>(entry.mip_offsets[mip]);
-				m_e.compressed_size = static_cast<uint32_t>(entry.mip_sizes[mip]);
-				m_e.uncompressed_size = static_cast<uint32_t>(entry.mip_uncompressed_sizes[mip]);
-				m_e.row_pitch = static_cast<uint32_t>(entry.mip_row_pitches[mip]);
-				m_e.reserved = 0;
+			if (compressed_mip_size > entry.compressed_size) {
+				return fail(ERR_FILE_CORRUPT, "Entry mip sizes exceed compressed size.");
 			}
-			if (entries_by_offset.has(abs_payload_offset)) {
-				return fail(ERR_FILE_CORRUPT, "Duplicate entry payload offset in archive.");
+			if (entry.mip_count == 1 && compressed_mip_size != entry.compressed_size) {
+				return fail(ERR_FILE_CORRUPT, "Entry mip size does not match compressed size.");
 			}
-			entries_by_offset[abs_payload_offset] = mip_vector;
+			if (entry.mip_count > 1 && previous_mip_end != abs_payload_end) {
+				return fail(ERR_FILE_CORRUPT, "Last mip does not end at entry compressed payload boundary.");
+			}
+			entry.has_gpu_metadata = footprint_size > 0;
+			if (entry.has_gpu_metadata && footprint_size != entry.original_size) {
+				return fail(ERR_FILE_CORRUPT, "Entry footprint metadata does not match original size.");
+			}
+			if (entry.has_gpu_metadata) {
+				Vector<DSPkgMipEntry> mip_vector;
+				mip_vector.resize(entry.mip_count);
+				for (uint32_t mip = 0; mip < entry.mip_count; ++mip) {
+					DSPkgMipEntry &m_e = mip_vector.write[mip];
+					m_e.offset = static_cast<uint64_t>(entry.mip_offsets[mip]);
+					m_e.compressed_size = static_cast<uint32_t>(entry.mip_sizes[mip]);
+					m_e.uncompressed_size = static_cast<uint32_t>(entry.mip_uncompressed_sizes[mip]);
+					m_e.row_pitch = static_cast<uint32_t>(entry.mip_row_pitches[mip]);
+					m_e.reserved = 0;
+				}
+				if (entries_by_offset.has(abs_payload_offset)) {
+					return fail(ERR_FILE_CORRUPT, "Duplicate entry payload offset in archive.");
+				}
+				entries_by_offset[abs_payload_offset] = mip_vector;
+			}
 		}
 
 		if (entries_by_path.has(entry.path)) {
@@ -1137,9 +1151,6 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 		}
 		entries_by_path[entry.path] = entry;
 		entries_by_hash[entry.path_hash].push_back(entry);
-		if (has_gpu_metadata) {
-			// store mip entries by offset handled above; skip for brevity
-		}
 	}
 
 	if (is_encrypted && plaintext_toc.size() > 0) {

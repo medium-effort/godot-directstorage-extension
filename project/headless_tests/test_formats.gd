@@ -142,7 +142,7 @@ func _init() -> void:
 
 	var test_bad_path = "user://test_malformed.dspkg"
 
-	# 1. Truncated Header (< 28 bytes)
+	# 1. Truncated Header (< 28 bytes legacy, < 64 bytes v4)
 	var truncated_bytes = PackedByteArray([0x44, 0x50, 0x4B, 0x47, 0x01, 0x00])
 	var f_trunc = FileAccess.open(test_bad_path, FileAccess.WRITE)
 	f_trunc.store_buffer(truncated_bytes)
@@ -154,10 +154,10 @@ func _init() -> void:
 		return
 	print("SUCCESS: Truncated header correctly rejected.")
 
-	# 2. Bad Version (version = 2)
+	# 2. Bad Version (version = 5)
 	var bad_ver_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
 	bad_ver_file.store_32(0x474B5044)
-	bad_ver_file.store_16(2)
+	bad_ver_file.store_16(5)
 	bad_ver_file.store_16(0)
 	bad_ver_file.store_32(0)
 	bad_ver_file.store_64(28)
@@ -345,11 +345,11 @@ func _init() -> void:
 
 	var valid_v4_path = "user://test_valid_v4.dspkg"
 	var valid_v4_file = FileAccess.open(valid_v4_path, FileAccess.WRITE)
-	var v4_path_bytes = dummy_path.to_utf8_buffer() if false else "test.png".to_utf8_buffer()
+	var v4_path_bytes = dummy_path.to_utf8_buffer()
 	var v4_payload_size = 4096
 	var v4_data_offset = 64 + 54 + v4_path_bytes.size()
 	_write_dspkg_header(valid_v4_file, 4, 0, 1, v4_data_offset)
-	_write_dspkg_entry(valid_v4_file, "test.png", 0, v4_payload_size, v4_payload_size, 256, 256, 1, 0, 4)
+	_write_dspkg_entry(valid_v4_file, dummy_path, 0, v4_payload_size, v4_payload_size, 256, 256, 1, 0, 4)
 	for b in range(v4_payload_size):
 		valid_v4_file.store_8(0)
 	valid_v4_file.close()
@@ -360,6 +360,78 @@ func _init() -> void:
 		return
 	DirAccess.remove_absolute(valid_v4_path)
 	print("SUCCESS: Valid unencrypted v4 archive opened cleanly.")
+
+	# Truncated 40-byte v4 header (< 64 bytes)
+	var trunc_v4_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(trunc_v4_file, 4, 0, 1, 100)
+	trunc_v4_file.close()
+	var raw_bytes = FileAccess.get_file_as_bytes(test_bad_path).slice(0, 40)
+	var trunc_write = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	trunc_write.store_buffer(raw_bytes)
+	trunc_write.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Truncated 40-byte v4 header accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Truncated 40-byte v4 header correctly rejected.")
+
+	# Malformed v4 with min_reader_version = 5
+	var bad_min_ver_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(bad_min_ver_file, 4, 0, 1, 64 + 54 + path_len, 5)
+	bad_min_ver_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Malformed v4 with min_reader_version=5 accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Malformed v4 with min_reader_version=5 correctly rejected.")
+
+	# Malformed v4 with compression_codec = 1
+	var bad_codec_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(bad_codec_file, 4, 0, 1, 64 + 54 + path_len, 4, 1)
+	bad_codec_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Malformed v4 with compression_codec=1 accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Malformed v4 with compression_codec=1 correctly rejected.")
+
+	# Malformed v4 with reserved[0] != 0
+	var bad_reserved_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(bad_reserved_file, 4, 0, 1, 64 + 54 + path_len, 4, 0, PackedByteArray(), 0, PackedByteArray([1, 0, 0, 0]))
+	bad_reserved_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Malformed v4 with non-zero reserved bytes accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Malformed v4 with non-zero reserved bytes correctly rejected.")
+
+	# Malformed v3 with flags = DSPKG_FLAG_ENCRYPTED_TOC (2)
+	var bad_v3_enc_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(bad_v3_enc_file, 3, 2, 1, 28 + 54 + path_len)
+	bad_v3_enc_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Malformed v3 with encrypted flag accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Malformed v3 with encrypted flag correctly rejected.")
+
+	# Malformed encrypted v4 with empty TOC envelope (data_offset == toc_start == 80)
+	var empty_env_file = FileAccess.open(test_bad_path, FileAccess.WRITE)
+	_write_dspkg_header(empty_env_file, 4, 2, 0, 80, 4, 0, PackedByteArray(), 0x123456789ABCDEF0)
+	for b in range(16):
+		empty_env_file.store_8(0)
+	empty_env_file.close()
+	reader = DSPkg.new()
+	if reader.open(test_bad_path) == OK:
+		print("FAIL: Empty encrypted TOC envelope accepted by DSPkg.open()")
+		quit(1)
+		return
+	print("SUCCESS: Empty encrypted TOC envelope correctly rejected.")
 
 	# A failed reopen must not leave the previous archive exposed.
 	var state_reader = DSPkg.new()

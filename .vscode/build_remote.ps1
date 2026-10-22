@@ -10,10 +10,39 @@ param(
     [switch]$Local,
     [switch]$Remote,
     [string]$EncryptionKey = "",
+    [string]$EncryptionKeyFile = "",
+    [switch]$ResetKeyHeader,
+    [switch]$KeepRemoteKeyHeader,
+    [switch]$KeepLocalKeyHeader,
+    [switch]$RequireManifest,
     [switch]$AuditOnly,
     [string[]]$AuditPath = @(),
     [switch]$Json
 )
+
+# Snapshot the genuine process environment BEFORE .env is merged into it (R9-02).
+# The Godot export plugin reads the OS environment only, so a key declared in .env is not the
+# R7-14 hazard and must not abort compiling builds.
+$AmbientKeySnapshot = $env:DSPKG_ENCRYPTION_KEY
+
+function Write-Status {
+    param(
+        [string]$Message = "",
+        [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray,
+        [ConsoleColor]$BackgroundColor
+    )
+    if ($Json) {
+        [Console]::Error.WriteLine($Message)
+    }
+    else {
+        if ($PSBoundParameters.ContainsKey('BackgroundColor')) {
+            Write-Host $Message -ForegroundColor $ForegroundColor -BackgroundColor $BackgroundColor
+        }
+        else {
+            Write-Host $Message -ForegroundColor $ForegroundColor
+        }
+    }
+}
 
 function Show-BuildFailure {
     param(
@@ -21,35 +50,29 @@ function Show-BuildFailure {
         [string]$Message,
         [int]$Code = 1
     )
-    Write-Host ""
-    Write-Host "================================================================================" -ForegroundColor Red
-    Write-Host " [BUILD FAILED] $Step " -ForegroundColor White -BackgroundColor DarkRed
-    Write-Host "================================================================================" -ForegroundColor Red
-    Write-Host " Reason: $Message" -ForegroundColor Red
+    Write-Status ""
+    Write-Status "================================================================================" -ForegroundColor Red
+    Write-Status " [BUILD FAILED] $Step " -ForegroundColor White -BackgroundColor DarkRed
+    Write-Status "================================================================================" -ForegroundColor Red
+    Write-Status " Reason: $Message" -ForegroundColor Red
     if ($Code -ne 0) {
-        Write-Host " Exit Code: $Code" -ForegroundColor Yellow
+        Write-Status " Exit Code: $Code" -ForegroundColor Yellow
     }
-    Write-Host " Check the compiler/terminal output above for details." -ForegroundColor DarkGray
-    Write-Host "================================================================================" -ForegroundColor Red
-    Write-Host ""
+    Write-Status " Check the compiler/terminal output above for details." -ForegroundColor DarkGray
+    Write-Status "================================================================================" -ForegroundColor Red
+    Write-Status ""
     exit $Code
-}
-
-if ($EncryptionKey) {
-    if ($EncryptionKey -notmatch '^[0-9a-fA-F]{64}$') {
-        Show-BuildFailure -Step "Validation" -Message "EncryptionKey must be a 64-character hexadecimal string." -Code 1
-    }
 }
 
 function Show-BuildSuccess {
     param(
         [string]$Message = "All steps completed successfully!"
     )
-    Write-Host ""
-    Write-Host "================================================================================" -ForegroundColor Green
-    Write-Host " [BUILD SUCCESS] $Message " -ForegroundColor White -BackgroundColor DarkGreen
-    Write-Host "================================================================================" -ForegroundColor Green
-    Write-Host ""
+    Write-Status ""
+    Write-Status "================================================================================" -ForegroundColor Green
+    Write-Status " [BUILD SUCCESS] $Message " -ForegroundColor White -BackgroundColor DarkGreen
+    Write-Status "================================================================================" -ForegroundColor Green
+    Write-Status ""
 }
 
 function Write-VerboseHost {
@@ -58,7 +81,7 @@ function Write-VerboseHost {
         [ConsoleColor]$ForegroundColor = [ConsoleColor]::Gray
     )
     if ($Verbose) {
-        Write-Host $Message -ForegroundColor $ForegroundColor
+        Write-Status $Message -ForegroundColor $ForegroundColor
     }
 }
 
@@ -72,16 +95,19 @@ function Get-DeployBinAudit {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$AddonDir
+        [string]$AddonDir,
+        [switch]$RequireManifest
     )
 
     if (-not (Test-Path -LiteralPath $AddonDir -PathType Container)) {
-        return [pscustomobject]@{ addon_dir = $AddonDir; status = 'skipped'; reason = 'addon directory not found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0 }
+        $skipStatus = if ($RequireManifest) { 'error' } else { 'skipped' }
+        return [pscustomobject]@{ addon_dir = $AddonDir; status = $skipStatus; reason = 'addon directory not found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0; binaries = @() }
     }
 
     $manifestFiles = @(Get-ChildItem -LiteralPath $AddonDir -Filter '*.gdextension' -File -ErrorAction SilentlyContinue)
     if ($manifestFiles.Count -eq 0) {
-        return [pscustomobject]@{ addon_dir = $AddonDir; status = 'skipped'; reason = 'no .gdextension manifest found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0 }
+        $skipStatus = if ($RequireManifest) { 'error' } else { 'skipped' }
+        return [pscustomobject]@{ addon_dir = $AddonDir; status = $skipStatus; reason = 'no .gdextension manifest found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0; binaries = @() }
     }
 
     # Only [libraries] and [dependencies] declare files that must exist on disk.
@@ -114,13 +140,14 @@ function Get-DeployBinAudit {
                 if ($rel.StartsWith('.\')) { $rel = $rel.Substring(2) }
                 if (-not $rel) { continue }
                 if (@($expectedEntries | Where-Object { $_.rel -eq $rel }).Count -gt 0) { continue }
-                $expectedEntries += [pscustomobject]@{ rel = $rel; platform = $platform }
+                $expectedEntries += [pscustomobject]@{ rel = $rel; platform = $platform; section = $section }
             }
         }
     }
 
     if ($expectedEntries.Count -eq 0) {
-        return [pscustomobject]@{ addon_dir = $AddonDir; status = 'skipped'; reason = 'manifest declares no shared libraries'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0 }
+        $skipStatus = if ($RequireManifest) { 'error' } else { 'skipped' }
+        return [pscustomobject]@{ addon_dir = $AddonDir; status = $skipStatus; reason = 'manifest declares no shared libraries'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0; binaries = @() }
     }
 
     $expectedRel = @($expectedEntries | ForEach-Object { $_.rel })
@@ -190,23 +217,102 @@ function Get-DeployBinAudit {
         }
     }
 
-    $status = 'clean'
-    if ($missing.Count -gt 0) {
-        $status = 'error'
-    }
-    elseif ($undeclared.Count -gt 0) {
-        $status = 'findings'
+    $buildManifestJson = $null
+    $manifestPath = Join-Path $AddonDir "bin\build_manifest.json"
+    if (Test-Path -LiteralPath $manifestPath) {
+        try {
+            $buildManifestJson = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        } catch {}
     }
 
-    return [pscustomobject]@{
+    $binAudits = @()
+    foreach ($entry in $expectedEntries) {
+        if ($entry.platform -and $entry.platform -ne $currentPlatform) { continue }
+        $full = [System.IO.Path]::GetFullPath((Join-Path $AddonDir $entry.rel))
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+
+        $targetFileName = [System.IO.Path]::GetFileName($entry.rel)
+        if ($entry.section -eq 'libraries') {
+            $binaryTag = "<missing>"
+            try {
+                $rawAscii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($full))
+                if ($rawAscii -match 'dspkg-key-id=(?<id>[0-9a-fA-F]{16}|none)') {
+                    $binaryTag = $matches['id'].ToLowerInvariant()
+                }
+            } catch {}
+
+            $targetProp = if ($buildManifestJson -and $buildManifestJson.targets) { $buildManifestJson.targets.PSObject.Properties[$targetFileName] } else { $null }
+            $manifestEnc = if ($targetProp) { $targetProp.Value.encryption } else { $null }
+            $manifestKeyId = if ($manifestEnc -and $manifestEnc.enabled -and $manifestEnc.key_id) {
+                $manifestEnc.key_id.ToLowerInvariant()
+            } else {
+                "none"
+            }
+            $isMatch = ($binaryTag -eq $manifestKeyId)
+
+            $binAudits += [pscustomobject]@{
+                target          = $targetFileName
+                path            = $full
+                section         = 'libraries'
+                tag             = $binaryTag
+                manifest_key_id = $manifestKeyId
+                isMatch         = $isMatch
+                verified        = $true
+            }
+        }
+        else {
+            $binAudits += [pscustomobject]@{
+                target          = $targetFileName
+                path            = $full
+                section         = 'dependencies'
+                tag             = "not_applicable"
+                manifest_key_id = "not_applicable"
+                isMatch         = $true
+                verified        = $true
+            }
+        }
+    }
+
+    $audit = [pscustomobject]@{
         addon_dir       = $AddonDir
-        status          = $status
+        status          = 'clean'
         reason          = ''
         expected        = $expectedRel
         missing         = $missing
         undeclared      = $undeclared
         ignored_foreign = $ignoredForeign
+        binaries        = $binAudits
     }
+
+    if (-not $RequireManifest -and @($binAudits | Where-Object { $_.tag -match '^[0-9a-fA-F]{16}$' }).Count -gt 0) {
+        # A keyed binary implies a manifest is expected (R8-13)
+        $RequireManifest = $true
+    }
+
+    $manifestMissing = ($null -eq $buildManifestJson)
+    $mismatchCount = @($binAudits | Where-Object { $_.isMatch -eq $false }).Count
+    if ($manifestMissing -and $RequireManifest) {
+        $audit.status = 'error'
+        $audit.reason = 'build_manifest.json missing from addon bin directory (required for keyed/release build)'
+    }
+    elseif ($manifestMissing) {
+        $audit.status = 'skipped'
+        $audit.reason = 'build_manifest.json not present in addon bin directory'
+    }
+    elseif ($missing.Count -gt 0) {
+        $audit.status = 'error'
+    }
+    elseif ($mismatchCount -gt 0) {
+        $audit.status = 'mismatch'
+    }
+    elseif ($undeclared.Count -gt 0) {
+        $audit.status = 'findings'
+    }
+    else {
+        $audit.status = 'clean'
+    }
+
+    return $audit
 }
 
 function Write-DeployBinAudit {
@@ -223,8 +329,38 @@ function Write-DeployBinAudit {
         return
     }
 
+    if ($Audit.status -eq 'error') {
+        Write-Host ("[audit] {0}: ERROR" -f $Audit.addon_dir) -ForegroundColor Red
+        if ($Audit.reason) {
+            Write-Host ("  {0}" -f $Audit.reason) -ForegroundColor Red
+        }
+        if ($Audit.missing.Count -gt 0) {
+            Write-Host ("  MISSING ({0}) - declared in .gdextension but absent:" -f $Audit.missing.Count) -ForegroundColor Red
+            foreach ($name in $Audit.missing) {
+                Write-Host ("    {0}" -f $name) -ForegroundColor Red
+            }
+        }
+        return
+    }
+
+    if ($Audit.status -eq 'mismatch') {
+        Write-Host ("[audit] {0}: MISMATCH - encryption key-id tag does not match build manifest" -f $Audit.addon_dir) -ForegroundColor Red
+        foreach ($bin in @($Audit.binaries | Where-Object { $_.isMatch -eq $false })) {
+            Write-Host ("  {0}: binary tag '{1}' != manifest key '{2}'" -f $bin.target, $bin.tag, $bin.manifest_key_id) -ForegroundColor Red
+        }
+        return
+    }
+
+    $binSummaries = @($Audit.binaries | Where-Object { $_.tag -ne "not_applicable" } | ForEach-Object {
+        $statusText = if ($_.tag -eq "none") { "keyless" } elseif ($_.tag -eq "<missing>") { "unversioned" } else { "keyed ($($_.tag))" }
+        "{0}: {1}" -f $_.target, $statusText
+    }) -join ", "
+
     if ($Audit.status -eq 'clean') {
         Write-Host ("[audit] {0}: OK - {1} declared file(s), nothing unexpected" -f $Audit.addon_dir, $Audit.expected.Count) -ForegroundColor Green
+        if ($binSummaries) {
+            Write-Host ("  [{0}]" -f $binSummaries) -ForegroundColor DarkGray
+        }
         if ($Audit.ignored_foreign -gt 0) {
             Write-Host ("  ({0} foreign-platform library entry/entries ignored)" -f $Audit.ignored_foreign) -ForegroundColor DarkGray
         }
@@ -232,18 +368,15 @@ function Write-DeployBinAudit {
     }
 
     Write-Host ("[audit] {0}" -f $Audit.addon_dir) -ForegroundColor Cyan
-    if ($Audit.missing.Count -gt 0) {
-        Write-Host ("  MISSING ({0}) - declared in .gdextension but absent:" -f $Audit.missing.Count) -ForegroundColor Red
-        foreach ($name in $Audit.missing) {
-            Write-Host ("    {0}" -f $name) -ForegroundColor Red
-        }
-    }
     if ($Audit.undeclared.Count -gt 0) {
         Write-Host ("  UNDECLARED ({0}) - on disk but not referenced by .gdextension:" -f $Audit.undeclared.Count) -ForegroundColor Yellow
         foreach ($item in $Audit.undeclared) {
             Write-Host ("    {0}  {1} bytes  {2}" -f $item.name, $item.size_bytes, $item.last_modified) -ForegroundColor Yellow
         }
         Write-Host "  Advisory only - nothing was deleted or moved." -ForegroundColor DarkGray
+    }
+    if ($binSummaries) {
+        Write-Host ("  [{0}]" -f $binSummaries) -ForegroundColor DarkGray
     }
     if ($Audit.ignored_foreign -gt 0) {
         Write-Host ("  ({0} foreign-platform library entry/entries ignored)" -f $Audit.ignored_foreign) -ForegroundColor DarkGray
@@ -277,8 +410,10 @@ function Get-ConfiguredAddonDir {
 function Invoke-DeployAudit {
     [CmdletBinding()]
     param(
-        [string[]]$AddonDirs = @(),
-        [switch]$Json
+        [Parameter(Mandatory = $true)]
+        [string[]]$AddonDirs,
+        [switch]$Json,
+        [switch]$RequireManifest
     )
 
     $results = @()
@@ -292,17 +427,21 @@ function Invoke-DeployAudit {
         $dedupeKey = $resolved.ToLowerInvariant()
         if ($seen -contains $dedupeKey) { continue }
         $seen += $dedupeKey
-        $results += Get-DeployBinAudit -AddonDir $resolved
+        $results += Get-DeployBinAudit -AddonDir $resolved -RequireManifest:$RequireManifest
     }
+
+    $hasError = @($results | Where-Object { $_.status -in @('mismatch', 'error') }).Count -gt 0
 
     if ($Json) {
-        ConvertTo-Json -InputObject @($results) -Depth 5
-        return
+        [Console]::Out.WriteLine((ConvertTo-Json -InputObject @($results) -Depth 5))
+    }
+    else {
+        foreach ($audit in $results) {
+            Write-DeployBinAudit -Audit $audit
+        }
     }
 
-    foreach ($audit in $results) {
-        Write-DeployBinAudit -Audit $audit
-    }
+    return $hasError
 }
 
 # Load configuration from .env file
@@ -324,13 +463,16 @@ if (-not $EnvFilePath) {
     Show-BuildFailure -Step "Configuration Error" -Message "Configuration file '.env' not found! Please copy '.env.example' to '.env' and configure REMOTE_HOST and REMOTE_DIR." -Code 1
 }
 
-# Parse .env file (strip surrounding quotes so quoted paths work)
+# Parse .env file (preserve pre-existing process environment variables to enforce ambient > .env precedence, R8-06)
 Get-Content $EnvFilePath | ForEach-Object {
     $line = $_.Trim()
     if ($line -and -not $line.StartsWith("#")) {
         $key, $value = $line -split '=', 2
         if ($key -and $value) {
-            [Environment]::SetEnvironmentVariable($key.Trim(), $value.Trim().Trim('"').Trim("'"), "Process")
+            $k = $key.Trim()
+            if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($k, "Process"))) {
+                [Environment]::SetEnvironmentVariable($k, $value.Trim().Trim('"').Trim("'"), "Process")
+            }
         }
     }
 }
@@ -343,8 +485,111 @@ $WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
 $DefaultAddonDir = Join-Path $WorkspaceRoot "project\addons\directstorage_accelerator"
 
+function New-DspkgKeyHeader {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [string]$KeyHex = "",
+        [switch]$Reset
+    )
+    $outPath = [System.IO.Path]::GetFullPath((Join-Path $WorkspaceRoot "src\gen\dspkg_encryption_key.h"))
+    $parentDir = Split-Path -Path $outPath -Parent
+    if (-not (Test-Path -LiteralPath $parentDir -PathType Container)) {
+        [System.IO.Directory]::CreateDirectory($parentDir) | Out-Null
+    }
+
+    if ($Reset -or -not $KeyHex) {
+        $content = "// Auto-generated bootstrap fallback. Overwritten when key is provided.`n#pragma once`n`n#define DSPKG_ENCRYPTION_ENABLED 0`n#define DSPKG_KEY_ID_TAG `"dspkg-key-id=none`"`n"
+    }
+    else {
+        $raw = [byte[]]::new(32)
+        for ($i = 0; $i -lt 32; $i++) {
+            $raw[$i] = [Convert]::ToByte($KeyHex.Substring($i * 2, 2), 16)
+        }
+        $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($raw)
+        $mask = $sha[0..31]
+        $masked = for ($i = 0; $i -lt 32; $i++) { [byte]($raw[$i] -bxor $mask[$i]) }
+
+        # Pass secret exclusively via stdin anonymous pipe; command-line string is static
+        # Filter hex characters to tolerate PowerShell pipeline encoding and UTF-8 BOM (\ufeff)
+        $pyCode = "import sys,hashlib; txt = ''.join([c for c in sys.stdin.read() if c in '0123456789abcdefABCDEF']); assert len(txt) == 64; print(hashlib.blake2b(bytes.fromhex(txt), digest_size=8).hexdigest().lower())"
+
+        # Discover Python interpreter without cmd.exe or WindowsApps stub
+        $pyExe = $null
+        $pyArgs = @()
+        $pyCandidate = Get-Command python -ErrorAction SilentlyContinue
+        if ($pyCandidate -and $pyCandidate.Source -notmatch 'WindowsApps') {
+            $pyExe = $pyCandidate.Source
+            $pyArgs = @("-c", $pyCode)
+        }
+        else {
+            $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+            if ($pyLauncher) {
+                $pyExe = $pyLauncher.Source
+                $pyArgs = @("-3", "-c", $pyCode)
+            }
+        }
+        if (-not $pyExe) {
+            Show-BuildFailure -Step "Validation" -Message "Python 3 interpreter not found on PATH. Required for BLAKE2b key ID derivation." -Code 1
+        }
+
+        $keyId = ($KeyHex | & $pyExe @pyArgs 2>$null).Trim()
+        if ($LASTEXITCODE -ne 0 -or $keyId -notmatch '^[0-9a-f]{16}$') {
+            Show-BuildFailure -Step "KeyHeader" -Message "Failed to derive 16-hex key ID via Python stdin pipe." -Code 1
+        }
+
+        $maskStr = ($mask | ForEach-Object { "0x{0:x2}" -f $_ }) -join ", "
+        $maskedStr = ($masked | ForEach-Object { "0x{0:x2}" -f $_ }) -join ", "
+
+        $content = "// Auto-generated by build pipeline. DO NOT COMMIT OR EDIT MANUALLY.`n#pragma once`n`n#define DSPKG_ENCRYPTION_ENABLED 1`n#define DSPKG_KEY_ID_TAG `"dspkg-key-id=$keyId`"`n`nnamespace dspkg_key {`n    constexpr unsigned char MASK[32] = {`n        $maskStr`n    };`n`n    constexpr unsigned char MASKED_KEY[32] = {`n        $maskedStr`n    };`n`n    static_assert(sizeof(MASK) == 32 && sizeof(MASKED_KEY) == 32, `"Mask and key arrays must be exactly 32 bytes`");`n} // namespace dspkg_key`n"
+    }
+
+    # Churn Guard with normalized LF and case-sensitive ordinal match
+    if (Test-Path -LiteralPath $outPath -PathType Leaf) {
+        $existingContent = [System.IO.File]::ReadAllText($outPath).Replace("`r`n", "`n")
+        if ($existingContent -ceq $content) {
+            return
+        }
+    }
+
+    if ($PSCmdlet.ShouldProcess($outPath, "Write DSPKG encryption key header")) {
+        $tmpPath = "$outPath.tmp"
+        try {
+            [System.IO.File]::WriteAllText($tmpPath, $content, [System.Text.UTF8Encoding]::new($false))
+            if (Test-Path -LiteralPath $outPath) {
+                [System.IO.File]::Replace($tmpPath, $outPath, [NullString]::Value)
+            }
+            else {
+                [System.IO.File]::Move($tmpPath, $outPath)
+            }
+        }
+        finally {
+            if (Test-Path -LiteralPath $tmpPath) {
+                Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+if ($EncryptionKeyFile -and $EncryptionKey) {
+    Show-BuildFailure -Step "Validation" -Message "Pass either -EncryptionKeyFile or -EncryptionKey, not both." -Code 1
+}
+if ($ResetKeyHeader -and ($EncryptionKeyFile -or $EncryptionKey)) {
+    Show-BuildFailure -Step "Validation" -Message "-ResetKeyHeader cannot be combined with key input arguments." -Code 1
+}
+
 # Audit-only mode: report deployment contents without compiling or syncing.
 if ($AuditOnly) {
+    # Ensure fresh checkout has Branch B header even if SCons has not run, or reset header if -ResetKeyHeader (R7-03, R8-10)
+    $genHeaderPath = Join-Path $WorkspaceRoot "src\gen\dspkg_encryption_key.h"
+    if ($ResetKeyHeader -or -not (Test-Path -LiteralPath $genHeaderPath)) {
+        New-DspkgKeyHeader -Reset
+    }
+
+    # Audit must not depend on key material: key resolution runs only after this block (R10-09), so the
+    # manifest requirement comes from the explicit switch plus per-directory keyed-tag inference (R8-13).
+    if ($EncryptionKeyFile -or $EncryptionKey) {
+        Write-Status "[AuditOnly] Key arguments are ignored in audit mode; pass -RequireManifest to require build_manifest.json." -ForegroundColor Yellow
+    }
     $AuditTargets = @()
     if ($AuditPath.Count -gt 0) {
         $AuditTargets = @($AuditPath)
@@ -352,19 +597,97 @@ if ($AuditOnly) {
     else {
         $AuditTargets = @($DefaultAddonDir) + @(Get-ConfiguredAddonDir)
     }
-    Invoke-DeployAudit -AddonDirs $AuditTargets -Json:$Json
-    exit 0
+    $auditExpectsManifest = [bool]$RequireManifest
+    $hasError = Invoke-DeployAudit -AddonDirs $AuditTargets -Json:$Json -RequireManifest:$auditExpectsManifest
+    if ($hasError) { exit 1 } else { exit 0 }
+}
+
+$ResolvedKeyFile = ""
+$KeyFileRelWin = ""
+$EffectiveKey = ""
+if ($ResetKeyHeader) {
+    # Strip ambient key variables from child build environments so child processes cannot re-key (R7-13)
+    Remove-Item Env:DSPKG_ENCRYPTION_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:DSPKG_ENCRYPTION_KEY_FILE -ErrorAction SilentlyContinue
+}
+else {
+    $CandidateKeyFile = $EncryptionKeyFile
+    $isCliKeyFile = [bool]$CandidateKeyFile
+    if (-not $CandidateKeyFile -and $env:DSPKG_ENCRYPTION_KEY_FILE) {
+        $CandidateKeyFile = $env:DSPKG_ENCRYPTION_KEY_FILE
+        $isCliKeyFile = $false
+    }
+    if ($CandidateKeyFile) {
+        $ResolvedKeyFile = if ([System.IO.Path]::IsPathRooted($CandidateKeyFile)) {
+            $CandidateKeyFile
+        } elseif ($isCliKeyFile) {
+            # CLI argument resolves against caller's current working directory (R7-11)
+            [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $CandidateKeyFile))
+        } else {
+            # Ambient .env fallback resolves against repository root (R7-11)
+            [System.IO.Path]::GetFullPath((Join-Path $WorkspaceRoot $CandidateKeyFile))
+        }
+        if (-not (Test-Path -LiteralPath $ResolvedKeyFile -PathType Leaf)) {
+            Show-BuildFailure -Step "Validation" -Message "EncryptionKeyFile not found or is not a file: $ResolvedKeyFile" -Code 1
+        }
+        $fileItem = Get-Item -LiteralPath $ResolvedKeyFile
+        if ($fileItem.Length -eq 0) {
+            Show-BuildFailure -Step "Validation" -Message "EncryptionKeyFile is empty." -Code 1
+        }
+        # Strip whitespace and any leading/trailing UTF-8/UTF-16 BOM (R6-09)
+        $rawFileContent = [System.IO.File]::ReadAllText($ResolvedKeyFile).Trim().Trim([char]0xFEFF)
+        if ($rawFileContent -notmatch '^[0-9a-fA-F]{64}$') {
+            Show-BuildFailure -Step "Validation" -Message "EncryptionKeyFile content must be a 64-character hexadecimal string." -Code 1
+        }
+        $EffectiveKey = $rawFileContent
+
+        # Strip ambient key file variable when CLI key is provided to ensure SCons cannot invert precedence (R7-01)
+        if ($isCliKeyFile) {
+            Remove-Item Env:DSPKG_ENCRYPTION_KEY_FILE -ErrorAction SilentlyContinue
+        }
+
+        # For tar exclusion and remote cleanup
+        $rootWithSep = $WorkspaceRoot.TrimEnd('\', '/') + '\'
+        if ($ResolvedKeyFile.StartsWith($rootWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $KeyFileRelWin = $ResolvedKeyFile.Substring($rootWithSep.Length)
+        }
+    }
+    elseif ($EncryptionKey) {
+        Write-Status "[Security Warning] Passing -EncryptionKey exposes the raw key in process argument vectors, Event 4688, and shell history. Prefer using -EncryptionKeyFile." -ForegroundColor Yellow
+        $trimmedKey = $EncryptionKey.Trim().Trim([char]0xFEFF)
+        if ($trimmedKey -notmatch '^[0-9a-fA-F]{64}$') {
+            Show-BuildFailure -Step "Validation" -Message "EncryptionKey must be a 64-character hexadecimal string." -Code 1
+        }
+        $EffectiveKey = $trimmedKey
+        Remove-Item Env:DSPKG_ENCRYPTION_KEY_FILE -ErrorAction SilentlyContinue
+    }
+}
+
+# Guard against a genuinely exported DSPKG_ENCRYPTION_KEY leaking into the export plugin without key arguments
+# (R7-14, R8-01, R8-02). Evaluated strictly AFTER $CandidateKeyFile / $EffectiveKey resolution (R8-01), strictly for
+# compiling builds (R8-02), and strictly on the pre-.env snapshot (R9-02) so a key declared only in .env - which the
+# Godot editor never reads - does not abort the build.
+if (-not $AuditOnly -and $AmbientKeySnapshot -and -not $EffectiveKey -and -not $ResetKeyHeader) {
+    Show-BuildFailure -Step "Validation" -Message "DSPKG_ENCRYPTION_KEY is exported in the process environment, but builds require -EncryptionKeyFile, -EncryptionKey, or DSPKG_ENCRYPTION_KEY_FILE. Building a keyless DLL while the export plugin uses this exported key would cause runtime decryption failure. Unset DSPKG_ENCRYPTION_KEY (or move it to .env, where only build scripts read it), supply -EncryptionKeyFile, or pass -ResetKeyHeader." -Code 1
+}
+
+# A DSPKG_ENCRYPTION_KEY that came from .env (i.e. is not in the pre-.env snapshot) is invisible to the
+# Godot editor and useless for the build, but would still be inherited by SCons and trip its own gate.
+# Drop it from the child environment with a warning so both entry points agree (R9-02).
+if ($env:DSPKG_ENCRYPTION_KEY -and -not $AmbientKeySnapshot) {
+    Write-Status "[Config] Ignoring DSPKG_ENCRYPTION_KEY declared in .env: the Godot editor cannot read .env. Export it in your shell if the export plugin needs it." -ForegroundColor Yellow
+    Remove-Item Env:DSPKG_ENCRYPTION_KEY -ErrorAction SilentlyContinue
 }
 
 if (-not $IsRemote) {
     # --- Local Mode (Default): compile directly with SCons ---
-    Write-Host "[Local] Building target=$Target locally with SCons..." -ForegroundColor Cyan
+    Write-Status "[Local] Building target=$Target locally with SCons..." -ForegroundColor Cyan
     if ($IncludeTests -and -not (Test-Path -LiteralPath (Join-Path $WorkspaceRoot "extern/gdextest/SConscript"))) {
-        Write-Host "extern/gdextest submodule is missing; running 'git submodule update --init -- extern/gdextest'..." -ForegroundColor Yellow
+        Write-Status "extern/gdextest submodule is missing; running 'git submodule update --init -- extern/gdextest'..." -ForegroundColor Yellow
         try {
             $subOut = & git submodule update --init -- extern/gdextest 2>&1
             if ($subOut -and $Verbose) {
-                $subOut | ForEach-Object { Write-Host $_ }
+                $subOut | ForEach-Object { Write-Status $_ }
             }
         }
         catch {
@@ -379,23 +702,40 @@ if (-not $IsRemote) {
         & powershell -NoProfile -ExecutionPolicy Bypass -File $LocalVerifier -RemoteDir $WorkspaceRoot -CleanOrphans -ResetMarker 2>&1 | ForEach-Object {
             $cText = $_.ToString()
             if ($cText.StartsWith("KILLED_ORPHAN:")) {
-                Write-Host "    Terminated orphaned build process: $($cText.Substring(14))" -ForegroundColor Yellow
+                Write-Status "    Terminated orphaned build process: $($cText.Substring(14))" -ForegroundColor Yellow
             }
         }
     }
     Push-Location $WorkspaceRoot
     try {
+        # Header write is inside the protected region so every exit path (including Show-BuildFailure)
+        # runs the finally reset below; see the remote-mode rule in R9-05 (R10-06).
+        $genHeaderPath = Join-Path $WorkspaceRoot "src\gen\dspkg_encryption_key.h"
+        if ($EffectiveKey) {
+            New-DspkgKeyHeader -KeyHex $EffectiveKey
+        }
+        elseif ($ResetKeyHeader -or -not (Test-Path -LiteralPath $genHeaderPath)) {
+            New-DspkgKeyHeader -Reset
+        }
+
         # NOTE: each SCons variable must be a separate process argument.
         # `dev_build=yes$TestsFlag` would fuse into one token
         # (`dev_build=yes tests=true`) and fail boolean conversion.
         $SconsArgs = @("platform=windows", "target=$Target", "dev_build=yes")
         if ($IncludeTests) { $SconsArgs += "tests=true" }
-        if ($EncryptionKey) { $SconsArgs += "DSPKG_ENCRYPTION_KEY=$EncryptionKey" }
-        & scons @SconsArgs
+        if ($EffectiveKey) { $SconsArgs += "KEEP_KEY_HEADER=1" }
+        if ($ResetKeyHeader) { $SconsArgs += "DSPKG_KEY_HEADER_RESET=1" }
+        $env:DSPKG_KEY_HEADER_ACTIVE = if ($EffectiveKey) { "1" } else { "0" }
+
+        & scons @SconsArgs 2>&1 | ForEach-Object { Write-Status ([string]$_) }
         $LocalExit = $LASTEXITCODE
     }
     finally {
         Pop-Location
+        $env:DSPKG_KEY_HEADER_ACTIVE = "0"
+        if ($EffectiveKey -and -not $KeepLocalKeyHeader) {
+            New-DspkgKeyHeader -Reset
+        }
     }
     if ($LocalExit -ne 0) {
         Show-BuildFailure -Step "Local SCons Compilation" -Message "Local SCons build failed with exit code $LocalExit." -Code $LocalExit
@@ -403,7 +743,7 @@ if (-not $IsRemote) {
     $ArtifactLocalDir = "./project/addons/directstorage_accelerator/bin"
     $LocalManifest = Join-Path $WorkspaceRoot "project/addons/directstorage_accelerator/bin/build_manifest.json"
     if (-not (Test-Path -LiteralPath $LocalManifest)) {
-        Write-Host "Warning: build_manifest.json not found at $LocalManifest; SCons may have skipped the manifest step." -ForegroundColor Yellow
+        Write-Status "Warning: build_manifest.json not found at $LocalManifest; SCons may have skipped the manifest step." -ForegroundColor Yellow
     }
     Write-VerboseHost "Local artifacts in $ArtifactLocalDir." -ForegroundColor Green
 }
@@ -417,6 +757,17 @@ $RemoteDir = $env:REMOTE_DIR
 if (-not $RemoteHost -or -not $RemoteDir) {
     Show-BuildFailure -Step "Configuration Error" -Message "REMOTE_HOST or REMOTE_DIR is missing in $EnvFilePath" -Code 1
 }
+
+try {
+    # Header write is inside the protected region so every exit path (including Show-BuildFailure)
+    # runs the finally reset below (R8-10, R9-05).
+    $genHeaderPath = Join-Path $WorkspaceRoot "src\gen\dspkg_encryption_key.h"
+    if ($EffectiveKey) {
+        New-DspkgKeyHeader -KeyHex $EffectiveKey
+    }
+    elseif ($ResetKeyHeader -or -not (Test-Path -LiteralPath $genHeaderPath)) {
+        New-DspkgKeyHeader -Reset
+    }
 
 # Path separator variants: remote cmd.exe treats / as a switch prefix
 # (so D:/ssh-tunnel/... parses /ssh-tunnel as a flag), while tar/scp
@@ -467,7 +818,7 @@ if ($LocalDriveLetter) {
 }
 
 # 1. Probe connectivity (Local Wi-Fi first, fallback to Tailscale)
-Write-Host "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
+Write-Status "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
 $ActiveHost = $null
 & ssh -4 -o BatchMode=yes -o ConnectTimeout=2 $RemoteHost "exit 0" 2>$null
 
@@ -491,7 +842,7 @@ else {
 }
 
 # 2. Ensure target directory exists on Device B
-Write-Host "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
+Write-Status "[2/6] Ensuring build directory exists on Device B..." -ForegroundColor Cyan
 & ssh -4 -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "if not exist `"$RemoteDirWin`" mkdir `"$RemoteDirWin`""
 if ($LASTEXITCODE -ne 0) {
     Show-BuildFailure -Step "Step [2/6] Directory Setup" -Message "Failed to ensure remote build directory exists on $ActiveHost." -Code $LASTEXITCODE
@@ -540,7 +891,7 @@ if ($RemoteDriveLetter.Length -eq 1) {
                 Show-BuildFailure -Step "Step [2/6] Remote Disk Space Check" -Message "Drive ${RemoteDriveLetter}: on Device B ($ActiveHost) has only ${remoteFreeGb} GB free space. SCons compilation requires at least 1.5 GB free space." -Code 1
             }
             elseif ($remoteFreeMb -lt 3072) {
-                Write-Host "Warning: Drive ${RemoteDriveLetter}: on Device B ($ActiveHost) has only ${remoteFreeGb} GB free space. Consider cleaning up old build artifacts." -ForegroundColor Yellow
+                Write-Status "Warning: Drive ${RemoteDriveLetter}: on Device B ($ActiveHost) has only ${remoteFreeGb} GB free space. Consider cleaning up old build artifacts." -ForegroundColor Yellow
             }
             else {
                 Write-VerboseHost "Remote drive ${RemoteDriveLetter}: has ${remoteFreeGb} GB free space." -ForegroundColor Green
@@ -558,13 +909,13 @@ $preSyncOut = & ssh -4 -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershe
 foreach ($cLine in @($preSyncOut)) {
     $cText = $cLine.ToString()
     if ($cText.StartsWith("KILLED_ORPHAN:")) {
-        Write-Host "    Terminated orphaned build process before sync: $($cText.Substring(14))" -ForegroundColor Yellow
+        Write-Status "    Terminated orphaned build process before sync: $($cText.Substring(14))" -ForegroundColor Yellow
     }
 }
 
 # 3. Stream source files via native tar over SSH (using cmd.exe for raw binary piping)
-Write-Host "[3/6] Syncing source files to Device B..." -ForegroundColor Cyan
-$tarExcludes = @(
+Write-Status "[3/6] Syncing source files to Device B..." -ForegroundColor Cyan
+$tarExcludesList = @(
     "--exclude=.git",
     "--exclude=.vscode",
     "--exclude=.codegraph",
@@ -583,6 +934,9 @@ $tarExcludes = @(
     "--exclude=*.idb",
     "--exclude=project/addons/directstorage_accelerator/bin/$AddonBinaryStem*",
     "--exclude=project/addons/directstorage_accelerator/bin/~*",
+    "--exclude=.keys",
+    "--exclude=*.key",
+    "--exclude=*.key.txt",
     # Sync-verification manifest rides outside the tarball (uploaded via scp
     # in step [3b/6]); exclude any leftover so it can never be compiled in.
     "--exclude=sync_manifest.tmp",
@@ -593,7 +947,12 @@ $tarExcludes = @(
     # repo-root review clone this was meant for does not exist; if one is
     # ever created, syncing it to B is harmless bulk, never a break.
     "--exclude=./wavexecute_tasks"
-) -join " "
+)
+if ($KeyFileRelWin) {
+    $tarExcludesList += ("--exclude=" + $KeyFileRelWin.Replace('\', '/'))
+    Write-Status "[Sync] Withholding repo-resident key file '$KeyFileRelWin' from Device B transport." -ForegroundColor DarkGray
+}
+$tarExcludes = $tarExcludesList -join " "
 
 $tarCmd = "tar -czf - $tarExcludes . | ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost ""tar -xzf - -C $RemoteDirTar"""
 $syncSuccess = $false
@@ -659,6 +1018,12 @@ if (-not $SkipVerify) {
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Device B verification failed ($ActiveHost) with no clean OK. Raw remote output:`n$detailLines" -Code 1
     }
     Write-VerboseHost "Source sync verified ($($ManifestEntries.Count) files)." -ForegroundColor Green
+
+    # [3b/6] verified: the keyed header is already on Device B, so scrub Device A now (fast path) (R16-01).
+    if ($EffectiveKey -and -not $KeepLocalKeyHeader) {
+        New-DspkgKeyHeader -Reset
+    }
+
     # [3c/6] Force test-source freshness on Device B: SCons has silently
     # skipped recompiling changed/new tests/*.cpp (stale DLL, suite runs 0
     # tests), so test TUs are touched to guarantee the next compile sees
@@ -688,7 +1053,7 @@ $RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
 # [4a/6] Clean orphaned SCons / cl.exe processes from interrupted runs for this
 # project, and reset the success marker in the same remote invocation (saves
 # 2 SSH handshakes + 2 powershell cold starts vs. del/type via cmd.exe).
-Write-Host "[4/6] Cleaning stale build processes + resetting marker on Device B..." -ForegroundColor Cyan
+Write-Status "[4/6] Cleaning stale build processes + resetting marker on Device B..." -ForegroundColor Cyan
 $prepTimer = [System.Diagnostics.Stopwatch]::StartNew()
 $PrepOut = & ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -CleanOrphans -ResetMarker 2>&1
 $prepTimer.Stop()
@@ -698,7 +1063,7 @@ $markerOk = $false
 foreach ($cLine in @($PrepOut)) {
     $cText = $cLine.ToString()
     if ($cText.StartsWith("KILLED_ORPHAN:")) {
-        Write-Host "    Terminated orphaned build process: $($cText.Substring(14))" -ForegroundColor Yellow
+        Write-Status "    Terminated orphaned build process: $($cText.Substring(14))" -ForegroundColor Yellow
     }
     elseif ($cText.StartsWith("CLEANED_ORPHANS_COUNT=")) {
         [int]::TryParse($cText.Substring(22), [ref]$killedCount) | Out-Null
@@ -711,7 +1076,7 @@ if (-not $markerOk) {
     $prepDetail = @($PrepOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 10) -join "`n"
     Show-BuildFailure -Step "Step [4/6] Prep (Clean + Marker Reset)" -Message "Prep on Device B ($ActiveHost) failed after ${prepSecs}s (killed=$killedCount). Raw remote output:`n$prepDetail" -Code 1
 }
-Write-Host "    [4/6 Prep done in ${prepSecs}s, killed $killedCount orphan(s). Compiling target=$Target...]" -ForegroundColor DarkCyan
+Write-Status "    [4/6 Prep done in ${prepSecs}s, killed $killedCount orphan(s). Compiling target=$Target...]" -ForegroundColor DarkCyan
 # Exit status cannot ride the ssh code: OpenSSH's cmd shell returns 0 even
 # when SCons fails, so a marker file written only after a successful scons
 # is the reliable signal (reset above, checked below).
@@ -720,8 +1085,8 @@ Write-Host "    [4/6 Prep done in ${prepSecs}s, killed $killedCount orphan(s). C
 # is still in progress, preventing automated monitors from suspecting a hang.
 $sconsOutFile = Join-Path $env:TEMP ("scons_remote_out_" + [System.Guid]::NewGuid().ToString() + ".log")
 $sconsErrFile = Join-Path $env:TEMP ("scons_remote_err_" + [System.Guid]::NewGuid().ToString() + ".log")
-$encArg = if ($EncryptionKey) { " DSPKG_ENCRYPTION_KEY=$EncryptionKey" } else { "" }
-$remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag$encArg && echo ok> `"$RemoteMarkerWin`""
+$keepArg = if ($EffectiveKey) { " KEEP_KEY_HEADER=1" } elseif ($ResetKeyHeader) { " DSPKG_KEY_HEADER_RESET=1" } else { "" }
+$remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows target=$Target dev_build=yes$TestsFlag$keepArg && echo ok> `"$RemoteMarkerWin`""
 
 $sconsArgs = @(
     "-n",
@@ -740,7 +1105,7 @@ while (-not $sconsProc.WaitForExit(10000)) {
     $elapsedMin = [int][Math]::Floor($stopwatch.Elapsed.TotalMinutes)
     if ($elapsedMin -gt $lastHeartbeatMin) {
         $lastHeartbeatMin = $elapsedMin
-        Write-Host "    [4/6 Still compiling on Device B... ($lastHeartbeatMin min elapsed)]" -ForegroundColor DarkCyan
+        Write-Status "    [4/6 Still compiling on Device B... ($lastHeartbeatMin min elapsed)]" -ForegroundColor DarkCyan
     }
 }
 $stopwatch.Stop()
@@ -755,7 +1120,7 @@ if (Test-Path -LiteralPath $sconsErrFile) {
     Remove-Item -LiteralPath $sconsErrFile -Force -ErrorAction SilentlyContinue
 }
 if ($Verbose -and $sconsLines) {
-    $sconsLines | ForEach-Object { Write-Host $_ }
+    $sconsLines | ForEach-Object { Write-Status $_ }
 }
 
 # Distinguish network/SSH drop (exit code 255 or host unreachable) from actual compilation error
@@ -769,8 +1134,8 @@ if (-not $sshDropped) {
 
 if ($sshDropped) {
     if ($sconsLines) {
-        Write-Host "--- SCons Output (before connection was lost) ---" -ForegroundColor Yellow
-        $sconsLines | Select-Object -Last 15 | ForEach-Object { Write-Host $_ }
+        Write-Status "--- SCons Output (before connection was lost) ---" -ForegroundColor Yellow
+        $sconsLines | Select-Object -Last 15 | ForEach-Object { Write-Status $_ }
     }
     Show-BuildFailure -Step "Step [4/6] SSH Disconnected" -Message "SSH connection to Device B ($ActiveHost) dropped or timed out during compilation (SSH Exit Code: $($sconsProc.ExitCode))." -Code 255
 }
@@ -782,12 +1147,12 @@ if ($markerMissing -or $sconsFailed) {
     if ($sconsLines) {
         $errorLines = $sconsLines | Where-Object { $_ -match "error[:\s]|fatal|failed|exception" }
         if ($errorLines) {
-            Write-Host "--- SCons Compilation Errors ---" -ForegroundColor Red
-            $errorLines | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+            Write-Status "--- SCons Compilation Errors ---" -ForegroundColor Red
+            $errorLines | Select-Object -Last 30 | ForEach-Object { Write-Status $_ }
         }
         else {
-            Write-Host "--- SCons Output (tail) ---" -ForegroundColor Red
-            $sconsLines | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+            Write-Status "--- SCons Output (tail) ---" -ForegroundColor Red
+            $sconsLines | Select-Object -Last 30 | ForEach-Object { Write-Status $_ }
         }
     }
     $why = if ($sconsFailed) { "SCons reported compilation errors" } else { "missing success marker (SCons did not complete successfully)" }
@@ -795,7 +1160,7 @@ if ($markerMissing -or $sconsFailed) {
 }
 
 # 5. Pull back compiled binary and debug symbols to Device A
-Write-Host "[5/6] Pulling artifacts back to Device A (compressed)..." -ForegroundColor Cyan
+Write-Status "[5/6] Pulling artifacts back to Device A (compressed)..." -ForegroundColor Cyan
 if (!(Test-Path $ArtifactLocalDir)) {
     New-Item -ItemType Directory -Force -Path $ArtifactLocalDir | Out-Null
 }
@@ -829,7 +1194,7 @@ if (-not $SkipVerify) {
     $PullChecks = @(
         @{ Pattern = "$AddonBinaryStem*.dll"; LocalDir = $ArtifactLocalDir; Required = $true },
         @{ Pattern = "dstorage*.dll"; LocalDir = $ArtifactLocalDir; Required = $true },
-        @{ Pattern = "build_manifest.json"; LocalDir = $ArtifactLocalDir; Required = $false }
+        @{ Pattern = "build_manifest.json"; LocalDir = $ArtifactLocalDir; Required = [bool]($EffectiveKey -or $RequireManifest) }
     )
     if ($IncludeTests) {
         $targetTestPattern = "libdirectstorage_tests*.$Target*.dll"
@@ -882,6 +1247,22 @@ else {
 }
 
 Write-VerboseHost "Artifacts updated on Device A." -ForegroundColor Green
+}
+finally {
+    # Device A: abort-safe reset, covering every termination path that precedes the
+    # post-[3b/6] reset (SSH drop, SCons failure, missing marker) (R14-02).
+    # -KeepLocalKeyHeader deliberately retains the header at rest.
+    $env:DSPKG_KEY_HEADER_ACTIVE = "0"
+    if ($EffectiveKey -and -not $KeepLocalKeyHeader) {
+        New-DspkgKeyHeader -Reset
+    }
+    if ($ActiveHost -and -not $KeepRemoteKeyHeader) {
+        $headerWin = "$RemoteDirWin\src\gen\dspkg_encryption_key.h"
+        $remotePurgeTargets = "`"$headerWin*`" `"$headerWin.tmp*`""
+        if ($KeyFileRelWin) { $remotePurgeTargets += " `"$RemoteDirWin\$KeyFileRelWin`"" }
+        & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "del /f /q $remotePurgeTargets 2>nul" 2>&1 | Out-Null
+    }
+}
 } # End Remote Mode (REMOTE_BUILD=1)
 
 # 6. Post-build synchronization to external project (e.g. TPS demo)
@@ -900,7 +1281,7 @@ if ($ShouldSync) {
         Write-VerboseHost "Skipping post-build sync: SYNC_ADDON_DIR is not configured." -ForegroundColor DarkGray
     }
     else {
-        Write-Host "[6/6] Syncing addon to external project ($SyncTargetDir)..." -ForegroundColor Cyan
+        Write-Status "[6/6] Syncing addon to external project ($SyncTargetDir)..." -ForegroundColor Cyan
         $LocalAddonDir = (Resolve-Path (Join-Path $PSScriptRoot "..\project\addons\directstorage_accelerator")).Path
 
         if (Test-Path $LocalAddonDir) {
@@ -986,7 +1367,7 @@ if ($ShouldSync) {
                             $copiedCount++
                         }
                         catch {
-                            Write-Host "Warning: Failed to copy $($item.Name): $_" -ForegroundColor Yellow
+                            Write-Status "Warning: Failed to copy $($item.Name): $_" -ForegroundColor Yellow
                         }
                     }
                 }
@@ -1033,9 +1414,12 @@ else {
 # Advisory deployment audit: reports files present in a deployed addon folder
 # that its .gdextension does not declare (stale binaries from an older naming
 # scheme, hand copies, ...). Read-only - nothing is deleted or moved here.
-Write-Host "[audit] Scanning deployed addon directories..." -ForegroundColor Cyan
+Write-Status "[audit] Scanning deployed addon directories..." -ForegroundColor Cyan
 $DeployAuditTargets = @($DefaultAddonDir) + @(Get-ConfiguredAddonDir)
-Invoke-DeployAudit -AddonDirs $DeployAuditTargets -Json:$Json
+$postBuildAuditError = Invoke-DeployAudit -AddonDirs $DeployAuditTargets -Json:$Json -RequireManifest:([bool]($EffectiveKey -or $RequireManifest))
+if ($postBuildAuditError -and ($EffectiveKey -or $RequireManifest)) {
+    Show-BuildFailure -Step "Audit" -Message "Keyed/release build deployment audit failed due to binary/manifest key-id mismatch or error." -Code 1
+}
 
 $syncMsg = if ($ShouldSync -and $copiedCount -gt 0) { " (Synced $copiedCount file(s))" } else { "" }
 Show-BuildSuccess -Message "All build and sync steps completed successfully!$syncMsg"

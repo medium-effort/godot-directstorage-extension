@@ -4,7 +4,7 @@
 		Builds and reads archives of DirectStorage texture payloads.
 	</brief_description>
 	<description>
-		[DSPkg] packages existing [code].dstex[/code] files into a [code].dspkg[/code] archive without recompressing their payloads. Supports version 1, version 2, and version 3 archives. Version 2 archives store per-entry GPU mip metadata ([code]DSPkgMipEntry[/code]), enabling direct GPU streaming and hardware decompression from package files into VRAM. Version 3 archives additionally store 32-bit per-entry flags ([code]flags[/code]), preserving [code]is_srgb[/code] and [code]as_image_texture[/code] attributes across archive roundtrips. Use [method create], [method add_texture], and [method finalize] to build an archive. Use [method open] and the reader methods to inspect or extract entry data. The resource loader also uses [code]res://textures.dspkg[/code] for bundled texture lookups.
+		[DSPkg] packages existing [code].dstex[/code] files into a [code].dspkg[/code] archive without recompressing their payloads. Supports version 1, version 2, version 3, and version 4 archives. Version 2 archives store per-entry GPU mip metadata ([code]DSPkgMipEntry[/code]), enabling direct GPU streaming and hardware decompression from package files into VRAM. Version 3 archives store 32-bit per-entry flags ([code]flags[/code]), preserving [code]is_srgb[/code] and [code]as_image_texture[/code] attributes across archive roundtrips. Version 4 archives support table-of-contents (TOC) structure encryption and Poly1305 authentication. Shipped games using encrypted archives must supply their key at startup via [method set_global_encryption_key]. Note: Avoid storing plaintext keys in committed export presets. Use [method create], [method add_texture], and [method finalize] to build an archive. Use [method open] and the reader methods to inspect or extract entry data. The resource loader also uses [code]res://textures.dspkg[/code] for bundled texture lookups.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -29,7 +29,7 @@
 		</method>
 		<method name="finalize">
 			<return type="Error" />
-			<description>Writes the archive header, entry table, and staged payloads as a version 3 archive. If entries have GPU mip metadata, writes [code]DSPkgMipEntry[/code] tables. Each entry also serializes 32-bit entry flags (such as sRGB and ImageTexture compatibility). Returns [constant OK] on success, [constant ERR_UNCONFIGURED] if not building, [constant ERR_INVALID_DATA] if no entries were staged, or [constant ERR_INVALID_PARAMETER] on file write failure.</description>
+			<description>Writes the archive header, entry table, and staged payloads as a version 3 or version 4 archive (version 4 when encryption is configured). If entries have GPU mip metadata, writes [code]DSPkgMipEntry[/code] tables. Each entry also serializes 32-bit entry flags (such as sRGB and ImageTexture compatibility). Returns [constant OK] on success, [constant ERR_UNCONFIGURED] if not building, [constant ERR_INVALID_DATA] if no entries were staged, or [constant ERR_INVALID_PARAMETER] on file write failure or bin-packing TOC overflow.</description>
 		</method>
 		<method name="get_archive_fingerprint" qualifiers="const">
 			<return type="int" />
@@ -74,7 +74,7 @@
 			<return type="Error" />
 			<param index="0" name="path" type="String" />
 			<param index="1" name="expected_fingerprint" type="int" default="0" />
-			<description>Opens and validates a [code].dspkg[/code] archive (version 1, version 2, or version 3) for reading. If [param expected_fingerprint] is non-zero, opening fails if the archive's embedded fingerprint does not match. A failed open clears any previously loaded archive state.</description>
+			<description>Opens and validates a [code].dspkg[/code] archive (version 1, version 2, version 3, or version 4) for reading. For encrypted archives (v4), requires the matching decryption key to be configured via [method set_global_encryption_key], returning [constant ERR_UNAUTHORIZED] on key mismatch or authentication failure. If [param expected_fingerprint] is non-zero, opening fails with [constant ERR_FILE_UNRECOGNIZED] if the archive's embedded fingerprint does not match. A failed open clears any previously loaded archive state.</description>
 		</method>
 		<method name="read_texture" qualifiers="const">
 			<return type="Dictionary" />
@@ -94,12 +94,12 @@
 		<method name="set_encryption_key">
 			<return type="Error" />
 			<param index="0" name="key_hex" type="String" />
-			<description>Configures the encryption key for the archive currently being built (builder-only; returns ERR_UNCONFIGURED otherwise). Passing an empty string or "disabled"/"none" disables encryption. Returns OK on success or ERR_INVALID_PARAMETER on invalid input (previous key state is preserved).</description>
+			<description>Configures the 64-hex-character symmetric encryption key for the archive currently being built (builder-only; returns [constant ERR_UNCONFIGURED] otherwise). Passing an empty string or "disabled"/"none" disables encryption. Returns [constant OK] on success or [constant ERR_INVALID_PARAMETER] on invalid input (previous key state is preserved). Warning: Storing plaintext keys in export preset configuration files risks exposing secrets if committed to source control.</description>
 		</method>
 		<method name="set_global_encryption_key" qualifiers="static">
 			<return type="Error" />
 			<param index="0" name="key_hex" type="String" />
-			<description>Sets the global runtime encryption key used to open encrypted archives. Passing an empty string resets to the baked key (if compiled); "disabled"/"none" explicitly disables. Returns OK or ERR_INVALID_PARAMETER.</description>
+			<description>Sets the global runtime encryption key used to open encrypted archives (shipped runtime key provisioning contract). Shipped games using encrypted archives must call this method during startup initialization. Passing an empty string resets to the compile-time baked key (if compiled); "disabled"/"none" explicitly disables runtime decryption. Returns [constant OK] or [constant ERR_INVALID_PARAMETER].</description>
 		</method>
 		<method name="set_payload_alignment">
 			<return type="void" />

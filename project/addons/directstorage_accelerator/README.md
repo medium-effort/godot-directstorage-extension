@@ -8,7 +8,7 @@ Enable the `DirectStorage Accelerator` plugin. It registers the `DSBatchManager`
 
 The importer converts `.png`, `.jpg`, `.jpeg`, and `.webp` sources into `.dstex` (version 2) resources with D3D12-aligned footprints (256-byte row pitch alignment and 512-byte mip placement alignment) for direct hardware decompression. Its Import dock options control source compression mode (S3TC vs uncompressed), source color space, and GDeflate compression level.
 
-During export, imported `.dstex` files are bundled into `res://textures.dspkg` (version 3) along with per-entry GPU mip metadata and entry flags. The runtime resource loader resolves texture paths directly from that archive without requiring individual `.dstex` files in the exported PCK.
+During export, imported `.dstex` files are bundled into `res://textures.dspkg` (version 3 or version 4 with encrypted TOC) along with per-entry GPU mip metadata and entry flags. The runtime resource loader resolves texture paths directly from that archive without requiring individual `.dstex` files in the exported PCK.
 
 ## Direct GPU Decompression & Fallback
 
@@ -21,7 +21,7 @@ The native classes are documented in Godot's Editor Help and support Ctrl-click 
 - `DSContext`: initialize DirectStorage hardware queues and staging buffers, enqueue `DSRequest` objects, execute synchronous (`flush_batch`) or asynchronous (`flush_batch_async`) batches, handle completion signals (`batch_completed`, `batch_failed`), and query drive/GPU capabilities.
 - `DSRequest`: configure source file paths, byte ranges, compression format (`COMPRESSION_NONE`, `COMPRESSION_GDEFLATE`), destination target (`DESTINATION_MEMORY`, `DESTINATION_GPU_BUFFER`, `DESTINATION_GPU_TEXTURE`), subresource ranges, request priorities (`PRIORITY_LOW`, `PRIORITY_NORMAL`, `PRIORITY_HIGH`), and query execution status.
 - `DSTex`: create or inspect `.dstex` (v1 and v2) files and retrieve per-mip footprint metadata (`mip_offsets`, `mip_sizes`, `mip_uncompressed_sizes`, `mip_row_pitches`).
-- `DSPkg`: build or read bundled `.dspkg` archives (v1, v2, and v3) with per-entry GPU mip tables and flags.
+- `DSPkg`: build or read bundled `.dspkg` archives (v1, v2, v3, and v4) with per-entry GPU mip tables, flags, and optional TOC encryption.
 - `GDeflateCompressor` and `GDeflateDecompressor`: encode and decode GDeflate tile-compressed payloads with configurable thread pools.
 - `DSTextureCache`: inspect or manage the runtime texture LRU cache.
 - `DSErrorHandler` and `DSProfiler`: monitor asynchronous DirectStorage kernel errors, measure physical storage throughput, and inspect logical decompression metrics.
@@ -59,5 +59,22 @@ Why that matters for DirectStorage settings:
 - **Prewarm auto-routing**: `prewarm_gpu_async()` calls automatically route to System RAM prewarm (`prewarm_async()`) on integrated GPUs when auto-tune is enabled. This prevents 3D/Copy-queue render contention and hard freezes during animated loading screens while preserving direct-to-VRAM DMA on discrete graphics cards.
 
 `directstorage/auto_tune_for_integrated_gpu` (default `true`) handles this automatically: when the extension detects an integrated/UMA adapter (queried directly via Direct3D 12 hardware UMA architecture, or under 1 GiB of dedicated VRAM reported by Windows), it quietly lowers the *effective* staging buffer to 64 MiB and the queue to 256 at startup, routes GPU prewarms to System RAM, and says so once in the log (`auto-tune clamped staging 128->64 MiB, queue 512->256`). It only ever lowers, never raises — if you already set smaller values, they pass through untouched, and your saved settings are never rewritten. Discrete-GPU PCs are completely unaffected. Turn it off (`false`) if you want full manual control, e.g. when benchmarking exact configured values.
+
+## Export Preset Options & TOC Encryption
+
+When configuring a Windows Desktop export preset (`Project -> Export... -> Windows Desktop -> Options`), the exporter supports bundling and encrypting texture archives:
+
+| Export Option | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `directstorage/bundle_textures_dspkg` | `bool` | `true` | Bundles exported textures into `textures.dspkg` for unbuffered DirectStorage DMA loading. |
+| `directstorage/enforce_archive_pairing` | `bool` | `true` | Embeds matching fingerprint in PCK and archive to prevent stale/corrupt reads. |
+| `directstorage/steampipe_1mb_alignment` | `bool` | `false` | Aligns texture payloads to 1 MiB chunks for SteamPipe differential patching efficiency. |
+| `directstorage/encryption_enabled` | `bool` | `false` | Generates Version 4 archives with encrypted and authenticated table of contents (TOC). |
+| `directstorage/encryption_key` | `String` | `""` | 64-hex symmetric key for TOC encryption. Avoid storing secrets in committed presets. |
+
+### Encryption Architecture & Key Provisioning
+- **TOC Structure Obfuscation & Authentication**: Protects the entry table (names, dimensions, offsets) using authenticated AEAD encryption (BLAKE2b key-ID derivation, XChaCha20 encryption, and Poly1305 MAC via Monocypher).
+- **Zero-Copy DMA Payloads**: Payload blocks remain unencrypted on disk to enable direct zero-copy NVMe-to-GPU DirectStorage DMA transfers.
+- **Runtime Key Contract**: Games shipping with encrypted archives can provide their symmetric key at startup using `DSPkg.set_global_encryption_key("64_hex_chars...")` during initialization, or compile the key into the binary via `DSPKG_ENCRYPTION_KEY_FILE`.
 
 

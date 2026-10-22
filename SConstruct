@@ -29,26 +29,221 @@ def _prevent_build_flag_set():
     return False
 
 
-if _prevent_build_flag_set():
-    _sync_only = {"sync", "sync-all", "sync-addon", "sync-test", "sync-copyable", "sync-tps", "compiledb"}
-    _cmd_targets = set(SCons.Script.COMMAND_LINE_TARGETS)
-    _non_build = (
-        SCons.Script.GetOption("no_exec")
-        or SCons.Script.GetOption("clean")
-        or SCons.Script.GetOption("help")
-        or SCons.Script.GetOption("question")
-        or bool(_cmd_targets and _cmd_targets <= _sync_only)
-    )
-    if not _non_build:
-        print("[SCons] ERROR: Local builds are disabled on this device (PREVENT_BUILD_ON_THIS_DEVICE=1).")
-        print("[SCons] Use the remote build script instead: .vscode/build_remote.ps1")
+_sync_only = {"sync", "sync-all", "sync-addon", "sync-test", "sync-copyable", "sync-tps", "compiledb"}
+_cmd_targets = set(SCons.Script.COMMAND_LINE_TARGETS)
+_non_build = bool(
+    SCons.Script.GetOption("no_exec")
+    or SCons.Script.GetOption("clean")
+    or SCons.Script.GetOption("help")
+    or SCons.Script.GetOption("question")
+    or (_cmd_targets and _cmd_targets <= _sync_only)
+)
+
+if _prevent_build_flag_set() and not _non_build:
+    print("[SCons] ERROR: Local builds are disabled on this device (PREVENT_BUILD_ON_THIS_DEVICE=1).")
+    print("[SCons] Use the remote build script instead: .vscode/build_remote.ps1")
+    Exit(1)
+
+if "DSPKG_ENCRYPTION_KEY" in SCons.Script.ARGUMENTS:
+    print("[SCons] ERROR: Passing DSPKG_ENCRYPTION_KEY on the command line is deprecated for security (avoids process argument logging).")
+    print("[SCons] Use DSPKG_ENCRYPTION_KEY_FILE=<path> or build_remote.ps1 -EncryptionKeyFile instead.")
+    Exit(1)
+
+# Pop variables before godot-cpp parses options to avoid UnknownVariables warnings
+scons_key_file = SCons.Script.ARGUMENTS.pop("DSPKG_ENCRYPTION_KEY_FILE", None)
+keep_key_header = SCons.Script.ARGUMENTS.pop("KEEP_KEY_HEADER", None) in ("1", "true", "yes", True)
+reset_header = SCons.Script.ARGUMENTS.pop("DSPKG_KEY_HEADER_RESET", None) in ("1", "true", "yes", True)
+
+# Disallow the mutually exclusive command-line combination (R8-03, R9-10). The environment/
+# .env form of DSPKG_ENCRYPTION_KEY_FILE is intentionally ignored in this mode: the on-disk header wins.
+if keep_key_header and scons_key_file:
+    print("[SCons] ERROR: KEEP_KEY_HEADER=1 and DSPKG_ENCRYPTION_KEY_FILE=<path> cannot be combined on the command line.")
+    print("[SCons] Pass KEEP_KEY_HEADER=1 to retain/trust an existing header, or DSPKG_ENCRYPTION_KEY_FILE to generate a new one.")
+    Exit(1)
+
+# Precedence: ARGUMENTS > os.environ > .env
+# When keep_key_header or reset_header is active, DO NOT scan ambient environment or .env (R7-01, R7-13).
+# The caller's header or explicit reset is authoritative.
+if not keep_key_header and not reset_header:
+    if not scons_key_file:
+        scons_key_file = os.environ.get("DSPKG_ENCRYPTION_KEY_FILE")
+    if not scons_key_file and os.path.isfile(".env"):
+        try:
+            # Read .env with utf-8-sig to tolerate Windows UTF-8/UTF-16 BOM (R7-07)
+            with open(".env", "r", encoding="utf-8-sig") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("DSPKG_ENCRYPTION_KEY_FILE="):
+                        candidate_file = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if candidate_file:
+                            scons_key_file = candidate_file
+                        break
+        except Exception: pass
+
+# Guard against a genuinely exported DSPKG_ENCRYPTION_KEY leaking into export plugin without key file
+# (R7-14, R8-01, R8-02, R9-02). Evaluated strictly AFTER scons_key_file resolution (R8-01), strictly for
+# compiling invocations (R8-02), and pre-.env by construction: load_env_file() does not run until line 320,
+# so a key declared only in .env (which the Godot editor never reads) can never trip this gate (R9-02).
+if not _non_build and "DSPKG_ENCRYPTION_KEY" in os.environ and not scons_key_file and not keep_key_header and not reset_header:
+    print("[SCons] ERROR: Ambient DSPKG_ENCRYPTION_KEY is set in environment, but SCons requires DSPKG_ENCRYPTION_KEY_FILE=<path>.")
+    print("[SCons] DirectStorage export plugin reads DSPKG_ENCRYPTION_KEY; building a keyless DLL now would cause runtime decryption failure.")
+    print("[SCons] Unset DSPKG_ENCRYPTION_KEY or specify DSPKG_ENCRYPTION_KEY_FILE=<path>.")
+    Exit(1)
+
+import hashlib
+import atexit
+
+def generate_dspkg_key_header_from_file(key_file_path, output_header_path):
+    try:
+        with open(key_file_path, "r", encoding="utf-8-sig") as f:
+            key_hex = f.read().strip()
+    except Exception as e:
+        print(f"[SCons] ERROR: Failed to read encryption key file ({key_file_path}): {e}")
         Exit(1)
+
+    if len(key_hex) != 64 or not all(c in "0123456789abcdefABCDEF" for c in key_hex):
+        print(f"[SCons] ERROR: Encryption key file ({key_file_path}) must contain exactly 64 hexadecimal characters.")
+        Exit(1)
+
+    raw = bytes.fromhex(key_hex)
+    mask = hashlib.sha256(raw).digest()
+    masked = bytes(r ^ m for r, m in zip(raw, mask))
+    key_id = hashlib.blake2b(raw, digest_size=8).hexdigest().lower()
+
+    mask_str = ", ".join(f"0x{b:02x}" for b in mask)
+    masked_str = ", ".join(f"0x{b:02x}" for b in masked)
+
+    content = (
+        "// Auto-generated by build pipeline. DO NOT COMMIT OR EDIT MANUALLY.\n"
+        "#pragma once\n\n"
+        "#define DSPKG_ENCRYPTION_ENABLED 1\n"
+        f'#define DSPKG_KEY_ID_TAG "dspkg-key-id={key_id}"\n\n'
+        "namespace dspkg_key {\n"
+        f"    constexpr unsigned char MASK[32] = {{\n        {mask_str}\n    }};\n\n"
+        f"    constexpr unsigned char MASKED_KEY[32] = {{\n        {masked_str}\n    }};\n\n"
+        '    static_assert(sizeof(MASK) == 32 && sizeof(MASKED_KEY) == 32, "Mask and key arrays must be exactly 32 bytes");\n'
+        "} // namespace dspkg_key\n"
+    )
+
+    os.makedirs(os.path.dirname(output_header_path), exist_ok=True)
+    if os.path.exists(output_header_path):
+        try:
+            with open(output_header_path, "r", encoding="utf-8") as existing_f:
+                if existing_f.read().replace("\r\n", "\n") == content:
+                    return
+        except Exception: pass
+
+    tmp_path = output_header_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+        os.replace(tmp_path, output_header_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except Exception: pass
+
+def restore_branch_b_header(output_header_path):
+    os.makedirs(os.path.dirname(output_header_path), exist_ok=True)
+    branch_b_content = (
+        "// Auto-generated bootstrap fallback. Overwritten when key is provided.\n"
+        "#pragma once\n\n"
+        "#define DSPKG_ENCRYPTION_ENABLED 0\n"
+        '#define DSPKG_KEY_ID_TAG "dspkg-key-id=none"\n'
+    )
+    tmp_path = output_header_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(branch_b_content)
+        os.replace(tmp_path, output_header_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except Exception: pass
+
+if scons_key_file and not keep_key_header and not reset_header:
+    if not _non_build:
+        generate_dspkg_key_header_from_file(scons_key_file, "src/gen/dspkg_encryption_key.h")
+        atexit.register(restore_branch_b_header, os.path.abspath("src/gen/dspkg_encryption_key.h"))
+
 
 EnsureSConsVersion(4, 0)
 EnsurePythonVersion(3, 8)
 
 # Delegate environment initialization to godot-cpp/SConstruct
 env = SConscript("godot-cpp/SConstruct")
+
+gen_header_dir = os.path.join("src", "gen")
+gen_header_file = os.path.join(gen_header_dir, "dspkg_encryption_key.h")
+is_keyed_build = bool(scons_key_file or keep_key_header or os.environ.get("DSPKG_KEY_HEADER_ACTIVE") == "1")
+
+# Stage A: Create-if-missing only (runs unconditionally, including for _non_build like --help, compiledb, -n) (R7-03, R8-04)
+# This guarantees fresh clones immediately possess Branch B for IDE/clangd without mutating existing state,
+# even when .env configures a key file for subsequent compiling builds (R8-04).
+if not os.path.exists(gen_header_file) and (_non_build or not is_keyed_build):
+    os.makedirs(gen_header_dir, exist_ok=True)
+    restore_branch_b_header(gen_header_file)
+
+# Stage B: Full validation, corruption check, and stale reset (runs strictly when compiling)
+if not _non_build:
+    # Fail-closed guard: keyed build requested but header missing (R7-02)
+    if is_keyed_build and not reset_header and not os.path.exists(gen_header_file):
+        print("[SCons] ERROR: Keyed build requested (via KEEP_KEY_HEADER / DSPKG_KEY_HEADER_ACTIVE), but src/gen/dspkg_encryption_key.h is missing.")
+        print("[SCons] Check that the header was generated on Device A and properly transported.")
+        Exit(1)
+
+    needs_bootstrap = True
+    if os.path.exists(gen_header_file):
+        try:
+            with open(gen_header_file, "r", encoding="utf-8") as f:
+                hdr_text = f.read()
+            import re
+            key_id_match = re.search(r'DSPKG_KEY_ID_TAG\s+"dspkg-key-id=([0-9a-fA-F]{16})"', hdr_text)
+            # Single source of truth for "keyed header": Stage B and write_build_manifest. The binary audit
+            # scanner reuses the same 16-hex id shape but must additionally accept `none` (R9-06).
+            if "DSPKG_ENCRYPTION_ENABLED 1" in hdr_text:
+                if "MASK[32]" in hdr_text and "MASKED_KEY[32]" in hdr_text and key_id_match is not None:
+                    # Only honor Branch A if key is actively configured for this process
+                    if is_keyed_build:
+                        needs_bootstrap = False
+                    else:
+                        # Stale Branch A from killed process without key argument: reset to Branch B
+                        needs_bootstrap = True
+                else:
+                    print("[SCons] ERROR: Existing src/gen/dspkg_encryption_key.h is corrupted (missing MASK[32]/MASKED_KEY[32] or a valid 16-hex DSPKG_KEY_ID_TAG).")
+                    print("[SCons] Rerun with DSPKG_ENCRYPTION_KEY_FILE=<path> or delete the file to build keyless.")
+                    Exit(1)
+            elif "DSPKG_ENCRYPTION_ENABLED 0" in hdr_text and re.search(r'DSPKG_KEY_ID_TAG\s+"dspkg-key-id=none"', hdr_text):
+                # Branch B must carry the exact keyless tag, not just the macro name: a truncated
+                # header ending at `#define DSPKG_KEY_ID_TAG` must fall through to the "no
+                # recognizable markers" error instead of passing as a valid keyless header (R10-08).
+                if is_keyed_build and not reset_header:
+                    # Fail-closed guard: keyed build requested, but header is Branch B (R8-03).
+                    # Refuse to silently compile keyless when keyed build was intended.
+                    print("[SCons] ERROR: Keyed build requested, but src/gen/dspkg_encryption_key.h contains DSPKG_ENCRYPTION_ENABLED 0 (Branch B).")
+                    print("[SCons] Transport or generate the keyed header on Device A, or run without KEEP_KEY_HEADER.")
+                    Exit(1)
+                needs_bootstrap = False
+            else:
+                # No recognizable marker (0-byte file, truncated write, foreign content).
+                # Keyed builds must fail closed rather than silently downgrade to keyless (R8-03).
+                if is_keyed_build and not reset_header:
+                    print("[SCons] ERROR: Existing src/gen/dspkg_encryption_key.h has no consistent key-header markers (expected DSPKG_ENCRYPTION_ENABLED 1 with a 16-hex DSPKG_KEY_ID_TAG, or DSPKG_ENCRYPTION_ENABLED 0 with DSPKG_KEY_ID_TAG \"dspkg-key-id=none\").")
+                    print("[SCons] Delete the file to build keyless, or regenerate it from the key file / with build_remote.ps1.")
+                    Exit(1)
+                needs_bootstrap = True
+        except Exception as e:
+            # Keyed builds fail closed on an unreadable header (R8-03); keyless builds may repair it.
+            if is_keyed_build and not reset_header:
+                print(f"[SCons] ERROR: Failed to read src/gen/dspkg_encryption_key.h during validation: {e}")
+                Exit(1)
+            needs_bootstrap = True
+
+    if needs_bootstrap:
+        os.makedirs(gen_header_dir, exist_ok=True)
+        restore_branch_b_header(gen_header_file)
+
+env.Depends("src/formats/dspkg_format.cpp", gen_header_file)
 
 # Add cross-platform include paths. The DirectStorage SDK is Windows-only and
 # must not be visible to non-Windows toolchains.
@@ -203,23 +398,14 @@ def _assert_dll_naming_consistent():
 
 _assert_dll_naming_consistent()
 
-# DSPKG encryption key (baked at compile time)
-_enc_options = SCons.Script.Variables()
-_enc_options.Add("DSPKG_ENCRYPTION_KEY", "64-character hexadecimal encryption key baked into build", "")
-_enc_options.Update(env)
-SCons.Script.Help(_enc_options.GenerateHelpText(env))
-encryption_key = str(env.get("DSPKG_ENCRYPTION_KEY", "")).strip()
-if encryption_key:
-    if len(encryption_key) != 64 or not all(c in "0123456789abcdefABCDEF" for c in encryption_key):
-        print("[SCons] ERROR: DSPKG_ENCRYPTION_KEY must be a 64-character hexadecimal string.")
-        Exit(1)
-    env.Append(CPPDEFINES=[("DSPKG_ENCRYPTION_KEY_BAKED", f'\\"{encryption_key}\\"')])
+
 
 # Build GDExtension Shared Library (.dll)
 library = env.SharedLibrary(
     target=output_dir + target_name,
     source=sources,
 )
+env.Depends(library, gen_header_file)
 
 targets = [library]
 
@@ -257,6 +443,7 @@ if env["tests"]:
         # /ignore:4199 keeps the no-op delay-load warning non-fatal if a
         # future source set stops importing dstorage.dll (spike defect #3).
         _gdex_env = env.Clone()
+        _gdex_env.Depends("src/formats/dspkg_format.cpp", gen_header_file)
         if "msvc" in _gdex_env.get("TOOLS", []):
             _gdex_env.Append(LINKFLAGS=["/ignore:4199"])
             _gdex_env.Append(CFLAGS=["/std:c11"])
@@ -289,7 +476,7 @@ if env["tests"]:
             exports=_gdex_exports,
         )
         if gdextest_lib:
-            Default(gdextest_lib)
+            Default(targets, gdextest_lib)
     else:
         print("[SCons] Warning: tests=true requested but extern/gdextest/SConscript is missing; skipping test target.")
 
@@ -305,7 +492,7 @@ import SCons.Script
 def load_env_file(env_path=".env"):
     if os.path.isfile(env_path):
         try:
-            with open(env_path, "r", encoding="utf-8") as f:
+            with open(env_path, "r", encoding="utf-8-sig") as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith("#") and "=" in line:
@@ -318,6 +505,9 @@ def load_env_file(env_path=".env"):
             pass
 
 load_env_file()
+
+if "DSPKG_ENCRYPTION_KEY" in os.environ and not _non_build:
+    print("[SCons] Notice: DSPKG_ENCRYPTION_KEY declared in environment or .env is ignored by SCons. DirectStorage export plugin reads this variable, but SCons builds require DSPKG_ENCRYPTION_KEY_FILE=<path>.")
 
 BUILD_START_TIME = datetime.datetime.now().astimezone()
 
@@ -432,6 +622,8 @@ def src_filter(rel_path, filename):
         return False
     if fname_lower.endswith((".obj", ".o", ".os")):
         return False
+    if fname_lower == "dspkg_encryption_key.h":
+        return False
     return True
 
 def clean_excluded_files(dst_dir, file_filter):
@@ -476,15 +668,7 @@ def clean_excluded_files(dst_dir, file_filter):
 #                 pass
 
 def write_build_manifest():
-    # Skip manifest generation and post-build sync on dry-run, clean, help, question, or sync-only invocations
-    sync_only_targets = {"sync", "sync-all", "sync-addon", "sync-test"}
-    if (
-        SCons.Script.GetOption("no_exec")
-        or SCons.Script.GetOption("clean")
-        or SCons.Script.GetOption("help")
-        or SCons.Script.GetOption("question")
-        or any(t in sync_only_targets for t in SCons.Script.COMMAND_LINE_TARGETS)
-    ):
+    if _non_build:
         return
 
     build_finish_time = datetime.datetime.now().astimezone()
@@ -680,6 +864,51 @@ def write_build_manifest():
     curr_entry["last_commit"] = commit_short
     curr_entry["last_built_at"] = build_finish_time.isoformat()
     curr_entry["last_build_duration_seconds"] = duration_seconds
+
+    # Per-target "built in this run" test instead of the run-global `status` (R9-07): a
+    # multi-target run in which another target fails must still record the key_id of the
+    # target that DID compile, otherwise its freshly written DLL is audited against a
+    # stale key and the run fails on a false mismatch.
+    _built_this_run = (
+        os.path.isfile(curr_fpath)
+        and os.path.getmtime(curr_fpath) >= (BUILD_START_TIME.timestamp() - 2.0)
+    )
+    if _built_this_run:
+        is_enc = False
+        key_id_hex = None
+        if os.path.isfile(gen_header_file):
+            try:
+                with open(gen_header_file, "r", encoding="utf-8") as f:
+                    txt = f.read()
+                    if "DSPKG_ENCRYPTION_ENABLED 1" in txt:
+                        import re
+                        m = re.search(r'DSPKG_KEY_ID_TAG\s+"dspkg-key-id=([0-9a-fA-F]{16})"', txt)
+                        if m:
+                            is_enc = True
+                            key_id_hex = m.group(1).lower()
+            except Exception: pass
+        curr_entry["encryption"] = {
+            "enabled": is_enc,
+            "key_id": key_id_hex
+        }
+    elif os.path.isfile(curr_fpath):
+        # Target was up-to-date (not rebuilt this run): reconcile encryption metadata
+        # directly from the binary's embedded tag so stale manifest entries cannot persist.
+        try:
+            with open(curr_fpath, "rb") as f:
+                bin_data = f.read()
+            import re
+            m = re.search(b'dspkg-key-id=([0-9a-fA-F]{16}|none)', bin_data)
+            if m:
+                tag = m.group(1).decode("ascii").lower()
+                curr_entry["encryption"] = {
+                    "enabled": tag != "none",
+                    "key_id": tag if tag != "none" else None,
+                }
+        except Exception:
+            pass
+    else:
+        curr_entry.pop("encryption", None)
 
     manifest_data = {
         "status": status,

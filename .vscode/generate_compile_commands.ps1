@@ -46,7 +46,10 @@ if ($EnvFilePath) {
         if ($line -and -not $line.StartsWith("#")) {
             $key, $value = $line -split '=', 2
             if ($key -and $value) {
-                [Environment]::SetEnvironmentVariable($key.Trim(), $value.Trim().Trim('"').Trim("'"), "Process")
+                $k = $key.Trim()
+                if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($k, "Process"))) {
+                    [Environment]::SetEnvironmentVariable($k, $value.Trim().Trim('"').Trim("'"), "Process")
+                }
             }
         }
     }
@@ -128,7 +131,7 @@ if (-not $ActiveHost) {
 Write-Host "[2/5] Syncing source files to remote host..." -ForegroundColor Cyan
 # Product stem for the extension binaries (see ADDON_BINARY_STEM in SConstruct).
 $AddonBinaryStem = "dsgd"
-$tarExcludes = @(
+$tarExcludesList = @(
     "--exclude=.git",
     "--exclude=.vscode",
     "--exclude=.codegraph",
@@ -145,70 +148,101 @@ $tarExcludes = @(
     "--exclude=*.lib",
     "--exclude=*.ilk",
     "--exclude=*.idb",
+    "--exclude=src/gen/dspkg_encryption_key.h*",
+    "--exclude=.keys",
+    "--exclude=*.key",
+    "--exclude=*.key.txt",
     "--exclude=project/addons/directstorage_accelerator/bin/$AddonBinaryStem*",
     "--exclude=project/addons/directstorage_accelerator/bin/~*",
     "--exclude=sync_manifest.tmp",
     "--exclude=./wavexecute_tasks"
-) -join " "
+)
 
-$tarCmd = "tar -czf - $tarExcludes . | ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost ""tar -xzf - -C $RemoteDirTar"""
-cmd.exe /c $tarCmd
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Warning: Fast source sync returned code $LASTEXITCODE; continuing with remote database generation." -ForegroundColor Yellow
+$KeyFileRelWin = ""
+if ($env:DSPKG_ENCRYPTION_KEY_FILE) {
+    $candKeyFile = if ([System.IO.Path]::IsPathRooted($env:DSPKG_ENCRYPTION_KEY_FILE)) {
+        $env:DSPKG_ENCRYPTION_KEY_FILE
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $WorkspaceRoot $env:DSPKG_ENCRYPTION_KEY_FILE))
+    }
+    $rootWithSep = $WorkspaceRoot.TrimEnd('\', '/') + '\'
+    if ($candKeyFile.StartsWith($rootWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $rel = $candKeyFile.Substring($rootWithSep.Length)
+        $KeyFileRelWin = $rel.Replace('/', '\')
+        $tarExcludesList += ("--exclude=" + $rel.Replace('\', '/'))
+    }
 }
 
-# Execute SCons compiledb on remote host
-Write-Host "[3/5] Generating compilation database on remote host..." -ForegroundColor Cyan
-$RemoteMarker = "$RemoteDirWin\compiledb.ok"
-& ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "del /f /q `"$RemoteMarker`" 2>nul"
+$tarExcludes = $tarExcludesList -join " "
 
-$remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows compiledb && echo ok> `"$RemoteMarker`""
-& ssh -o BatchMode=yes -o ConnectTimeout=10 $ActiveHost $remoteCmd
+try {
+    $tarCmd = "tar -czf - $tarExcludes . | ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost ""tar -xzf - -C $RemoteDirTar"""
+    cmd.exe /c $tarCmd
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Warning: Fast source sync returned code $LASTEXITCODE; continuing with remote database generation." -ForegroundColor Yellow
+    }
 
-& ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "type `"$RemoteMarker`" >nul 2>nul"
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Error: Remote SCons compiledb failed on remote host." -ForegroundColor Red
-    exit 1
+    # Execute SCons compiledb on remote host
+    Write-Host "[3/5] Generating compilation database on remote host..." -ForegroundColor Cyan
+    $RemoteMarker = "$RemoteDirWin\compiledb.ok"
+    & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "del /f /q `"$RemoteMarker`" 2>nul"
+
+    $remoteCmd = "cd /d `"$RemoteDirWin`" && call scons platform=windows compiledb && echo ok> `"$RemoteMarker`""
+    & ssh -o BatchMode=yes -o ConnectTimeout=10 $ActiveHost $remoteCmd
+
+    & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "type `"$RemoteMarker`" >nul 2>nul"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Error: Remote SCons compiledb failed on remote host." -ForegroundColor Red
+        exit 1
+    }
+
+    # Download compile_commands.json
+    Write-Host "[4/5] Downloading compile_commands.json from remote host..." -ForegroundColor Cyan
+    $RemoteCompiledbTar = "$RemoteDirTar/compile_commands.json"
+    & scp -4 -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$RemoteCompiledbTar" "$CompileCommandsLocal"
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $CompileCommandsLocal)) {
+        Write-Host "Error: Failed to transfer compile_commands.json via SCP." -ForegroundColor Red
+        exit 1
+    }
+
+    # Normalize paths for local clangd
+    Write-Host "[5/5] Normalizing paths in compile_commands.json for local workspace..." -ForegroundColor Cyan
+
+    $RemoteWinUpper = $RemoteDirWin
+    $RemoteTarUpper = $RemoteDirTar
+    $LocalWin = $WorkspaceRoot
+    $LocalTar = $WorkspaceRoot.Replace('\', '/')
+
+    $content = [System.IO.File]::ReadAllText($CompileCommandsLocal, [System.Text.Encoding]::UTF8)
+
+    # Replace remote base directory variations with local base directory using literal string replaces
+    # 1. Escaped JSON backslashes: D:\\ssh-tunnel\\builds\\godot-directstorage -> D:\\Users\\...
+    $remoteJsonEscaped = $RemoteWinUpper.Replace('\', '\\')
+    $localJsonEscaped = $LocalWin.Replace('\', '\\')
+    $content = $content.Replace($remoteJsonEscaped, $localJsonEscaped)
+
+    # 2. Forward slashes: D:/ssh-tunnel/builds/godot-directstorage -> D:/Users/...
+    $content = $content.Replace($RemoteTarUpper, $LocalTar)
+
+    # 3. Single backslashes (if unescaped): D:\ssh-tunnel\builds\godot-directstorage -> D:\Users\...
+    $content = $content.Replace($RemoteWinUpper, $LocalWin)
+
+    # 4. Clean up any quadruple backslashes if present
+    $quadBackslashes = $LocalWin.Replace('\', '\\\\')
+    if ($content.Contains($quadBackslashes)) {
+        $content = $content.Replace($quadBackslashes, $localJsonEscaped)
+    }
+
+    [System.IO.File]::WriteAllText($CompileCommandsLocal, $content, [System.Text.Encoding]::UTF8)
+
+    Write-Host "compile_commands.json successfully created and configured at $CompileCommandsLocal!" -ForegroundColor Green
+    exit 0
 }
-
-# Download compile_commands.json
-Write-Host "[4/5] Downloading compile_commands.json from remote host..." -ForegroundColor Cyan
-$RemoteCompiledbTar = "$RemoteDirTar/compile_commands.json"
-& scp -4 -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$RemoteCompiledbTar" "$CompileCommandsLocal"
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $CompileCommandsLocal)) {
-    Write-Host "Error: Failed to transfer compile_commands.json via SCP." -ForegroundColor Red
-    exit 1
+finally {
+    if ($ActiveHost) {
+        $headerWin = "$RemoteDirWin\src\gen\dspkg_encryption_key.h"
+        $remotePurgeTargets = "`"$headerWin*`" `"$headerWin.tmp*`""
+        if ($KeyFileRelWin) { $remotePurgeTargets += " `"$RemoteDirWin\$KeyFileRelWin`"" }
+        & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost "del /f /q $remotePurgeTargets 2>nul" 2>&1 | Out-Null
+    }
 }
-
-# Normalize paths for local clangd
-Write-Host "[5/5] Normalizing paths in compile_commands.json for local workspace..." -ForegroundColor Cyan
-
-$RemoteWinUpper = $RemoteDirWin
-$RemoteTarUpper = $RemoteDirTar
-$LocalWin = $WorkspaceRoot
-$LocalTar = $WorkspaceRoot.Replace('\', '/')
-
-$content = [System.IO.File]::ReadAllText($CompileCommandsLocal, [System.Text.Encoding]::UTF8)
-
-# Replace remote base directory variations with local base directory using literal string replaces
-# 1. Escaped JSON backslashes: D:\\ssh-tunnel\\builds\\godot-directstorage -> D:\\Users\\...
-$remoteJsonEscaped = $RemoteWinUpper.Replace('\', '\\')
-$localJsonEscaped = $LocalWin.Replace('\', '\\')
-$content = $content.Replace($remoteJsonEscaped, $localJsonEscaped)
-
-# 2. Forward slashes: D:/ssh-tunnel/builds/godot-directstorage -> D:/Users/...
-$content = $content.Replace($RemoteTarUpper, $LocalTar)
-
-# 3. Single backslashes (if unescaped): D:\ssh-tunnel\builds\godot-directstorage -> D:\Users\...
-$content = $content.Replace($RemoteWinUpper, $LocalWin)
-
-# 4. Clean up any quadruple backslashes if present
-$quadBackslashes = $LocalWin.Replace('\', '\\\\')
-if ($content.Contains($quadBackslashes)) {
-    $content = $content.Replace($quadBackslashes, $localJsonEscaped)
-}
-
-[System.IO.File]::WriteAllText($CompileCommandsLocal, $content, [System.Text.Encoding]::UTF8)
-
-Write-Host "compile_commands.json successfully created and configured at $CompileCommandsLocal!" -ForegroundColor Green
-exit 0

@@ -3,6 +3,7 @@
 
 #include "formats/dspkg_format.h"
 #include "formats/dstex_format.h"
+#include "monocypher.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/image.hpp>
@@ -11,6 +12,7 @@
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 
+#include <cstddef>
 #include <cstdint>
 
 // Suite covering the same area as project/headless_tests/test_dspkg_alignment.gd
@@ -22,7 +24,7 @@
 //   DSPkg::create/add_texture/finalize/open/has_texture/read_texture,
 //   get_entry_info/get_entry_count/get_entries,
 //   get_mip_entries_for_offset (Vector overload + Array overload).
-// DSPkgHeader is 28 B packed; DSPkgMipEntry is 24 B packed (static_assert in header).
+// DSPkgHeader is 64 B packed in v4 (DSPKG_HEADER_SIZE_V4); legacy v1-v3 headers are 28 B (DSPKG_HEADER_SIZE_LEGACY); DSPkgMipEntry is 24 B packed (static_assert in header).
 //
 // Pure-C++ cases (untagged GDEX_TEST) touch structs/math only: no engine
 // singletons, no files. Everything that instantiates DSPkg or touches
@@ -32,6 +34,14 @@
 // is deferred to D3D12 backend tests.
 
 namespace {
+
+struct GlobalKeyResetGuard {
+	godot::String restore_key;
+	GlobalKeyResetGuard(const godot::String &p_restore = "") : restore_key(p_restore) {}
+	~GlobalKeyResetGuard() {
+		godot::DSPkg::set_global_encryption_key(restore_key);
+	}
+};
 
 constexpr uint32_t D3D12_PLACEMENT_ALIGNMENT = 512;
 constexpr uint32_t D3D12_PITCH_ALIGNMENT = 256;
@@ -108,6 +118,11 @@ void remove_temp_file(const char *p_path) {
 GDEX_TEST(dspkg, header_v4_layout) {
 	GDEX_ASSERT_EQ(godot::DSPKG_HEADER_SIZE_LEGACY, 28u);
 	GDEX_ASSERT_EQ(sizeof(godot::DSPkgHeader), 64u);
+	GDEX_ASSERT_EQ(offsetof(godot::DSPkgHeader, compression_codec), 28u);
+	GDEX_ASSERT_EQ(offsetof(godot::DSPkgHeader, archive_salt), 32u);
+	GDEX_ASSERT_EQ(offsetof(godot::DSPkgHeader, min_reader_version), 48u);
+	GDEX_ASSERT_EQ(offsetof(godot::DSPkgHeader, key_id), 52u);
+	GDEX_ASSERT_EQ(offsetof(godot::DSPkgHeader, reserved), 60u);
 }
 
 GDEX_TEST(dspkg, mip_entry_packed_size_is_24) {
@@ -742,5 +757,346 @@ GDEX_TEST_T(dspkg, med09_corrupt_entry_caps_rejected, TAG_INTEGRATION) {
 	remove_temp_file(dstex_path);
 	remove_temp_file(dspkg_path);
 }
+
+GDEX_TEST_T(dspkg, encryption_tamper_and_auth, TAG_INTEGRATION) {
+	const char *dstex_path = "user://temp_enc_test.dstex";
+	const char *dspkg_path = "user://temp_enc_test.dspkg";
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
+
+	const godot::String key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+	const godot::String wrong_key_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), 0x1234567890ABCDEFULL) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->set_encryption_key(key_hex) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture("test.png", godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	// 1. Valid open with matching global key
+	{
+		GlobalKeyResetGuard key_guard("");
+		godot::DSPkg::set_global_encryption_key(key_hex);
+		godot::Ref<godot::DSPkg> reader;
+		reader.instantiate();
+		GDEX_ASSERT_TRUE(reader.is_valid());
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), 0ULL), godot::OK);
+		GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+		GDEX_EXPECT_TRUE(godot::DSPkg::get_global_encryption_key_id() == godot::DSPkg::compute_key_id(key_hex));
+	}
+
+	// 2. Open with wrong key -> ERR_UNAUTHORIZED
+	{
+		GlobalKeyResetGuard key_guard("");
+		godot::DSPkg::set_global_encryption_key(wrong_key_hex);
+		godot::Ref<godot::DSPkg> reader;
+		reader.instantiate();
+		GDEX_ASSERT_TRUE(reader.is_valid());
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), 0ULL), godot::ERR_UNAUTHORIZED);
+	}
+
+	// 3. MAC Tamper: alter 1 byte at offset 64
+	{
+		GlobalKeyResetGuard key_guard("");
+		godot::DSPkg::set_global_encryption_key(key_hex);
+		godot::Ref<godot::FileAccess> fa = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ_WRITE);
+		GDEX_ASSERT_TRUE(fa.is_valid());
+		fa->seek(64);
+		uint8_t byte = fa->get_8() ^ 0xFF;
+		fa->seek(64);
+		fa->store_8(byte);
+		fa->close();
+
+		godot::Ref<godot::DSPkg> reader;
+		reader.instantiate();
+		GDEX_ASSERT_TRUE(reader.is_valid());
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), 0ULL), godot::ERR_UNAUTHORIZED);
+
+		// Restore MAC byte
+		fa = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ_WRITE);
+		fa->seek(64);
+		fa->store_8(byte ^ 0xFF);
+		fa->close();
+	}
+
+	// 4. Key ID mismatch: alter key_id at offset 52
+	{
+		GlobalKeyResetGuard key_guard("");
+		godot::DSPkg::set_global_encryption_key(key_hex);
+		godot::Ref<godot::FileAccess> fa = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ_WRITE);
+		GDEX_ASSERT_TRUE(fa.is_valid());
+		fa->seek(52);
+		uint64_t kid = fa->get_64() ^ 0x01ULL;
+		fa->seek(52);
+		fa->store_64(kid);
+		fa->close();
+
+		godot::Ref<godot::DSPkg> reader;
+		reader.instantiate();
+		GDEX_ASSERT_TRUE(reader.is_valid());
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), 0ULL), godot::ERR_UNAUTHORIZED);
+
+		// Restore key_id
+		fa = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ_WRITE);
+		fa->seek(52);
+		fa->store_64(kid ^ 0x01ULL);
+		fa->close();
+	}
+
+	// 5. Header AD Tamper: alter archive_fingerprint at offset 20
+	{
+		GlobalKeyResetGuard key_guard("");
+		godot::DSPkg::set_global_encryption_key(key_hex);
+		godot::Ref<godot::FileAccess> fa = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ_WRITE);
+		GDEX_ASSERT_TRUE(fa.is_valid());
+		fa->seek(20);
+		uint64_t fp = fa->get_64() ^ 0x01ULL;
+		fa->seek(20);
+		fa->store_64(fp);
+		fa->close();
+
+		godot::Ref<godot::DSPkg> reader;
+		reader.instantiate();
+		GDEX_ASSERT_TRUE(reader.is_valid());
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), 0ULL), godot::ERR_UNAUTHORIZED);
+
+		// Restore fingerprint
+		fa = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ_WRITE);
+		fa->seek(20);
+		fa->store_64(fp ^ 0x01ULL);
+		fa->close();
+	}
+
+	// 6. Ciphertext Tamper: alter TOC ciphertext at offset 80
+	{
+		GlobalKeyResetGuard key_guard("");
+		godot::DSPkg::set_global_encryption_key(key_hex);
+		godot::Ref<godot::FileAccess> fa = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ_WRITE);
+		GDEX_ASSERT_TRUE(fa.is_valid());
+		fa->seek(80);
+		uint8_t byte = fa->get_8() ^ 0xFF;
+		fa->seek(80);
+		fa->store_8(byte);
+		fa->close();
+
+		godot::Ref<godot::DSPkg> reader;
+		reader.instantiate();
+		GDEX_ASSERT_TRUE(reader.is_valid());
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), 0ULL), godot::ERR_UNAUTHORIZED);
+	}
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, encrypted_archive_fingerprint_matching, TAG_INTEGRATION) {
+	const char *dstex_path = "user://temp_enc_fp.dstex";
+	const char *dspkg_path = "user://temp_enc_fp.dspkg";
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
+
+	const godot::String key_hex = "1111111122222222333333334444444455555555666666667777777788888888";
+	const uint64_t expected_fp = 0xAABBCCDDEEFF0011ULL;
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), expected_fp) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->set_encryption_key(key_hex) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture("test.png", godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	GlobalKeyResetGuard key_guard("");
+	godot::DSPkg::set_global_encryption_key(key_hex);
+
+	// Open with matching fingerprint -> OK
+	{
+		godot::Ref<godot::DSPkg> reader;
+		reader.instantiate();
+		GDEX_ASSERT_TRUE(reader.is_valid());
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), expected_fp), godot::OK);
+	}
+
+	// Open with mismatching fingerprint -> ERR_FILE_UNRECOGNIZED
+	{
+		godot::Ref<godot::DSPkg> reader;
+		reader.instantiate();
+		GDEX_ASSERT_TRUE(reader.is_valid());
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), expected_fp ^ 0x01ULL), godot::ERR_FILE_UNRECOGNIZED);
+	}
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, bin_packing_overflow_and_alignment_cap, TAG_INTEGRATION) {
+	const char *dstex_path = "user://temp_overflow.dstex";
+	const char *dspkg_path = "user://temp_overflow.dspkg";
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
+
+	// 16 MiB alignment cap: setting above 16 MiB should be rejected/ignored
+	{
+		godot::Ref<godot::DSPkg> builder;
+		builder.instantiate();
+		GDEX_ASSERT_TRUE(builder.is_valid());
+		GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), 0ULL) == godot::OK);
+		builder->set_payload_alignment(32 * 1024 * 1024);
+		GDEX_EXPECT_EQ(builder->get_payload_alignment(), 512ULL);
+		remove_temp_file(dspkg_path);
+	}
+
+	// Bin-packing Chunk #0 overflow: >= 7 entries (TOC envelope > 512 B)
+	{
+		godot::Ref<godot::DSPkg> builder;
+		builder.instantiate();
+		GDEX_ASSERT_TRUE(builder.is_valid());
+		GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), 0ULL) == godot::OK);
+		builder->set_bin_packing_enabled(true);
+		builder->set_payload_alignment(512);
+
+		for (int i = 0; i < 7; ++i) {
+			godot::String name = "texture_" + godot::String::num_int64(i) + ".png";
+			GDEX_ASSERT_TRUE(builder->add_texture(name, godot::String(dstex_path)) == godot::OK);
+		}
+		// Finalize must fail ERR_INVALID_PARAMETER because TOC envelope exceeds payload_alignment
+		GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_INVALID_PARAMETER);
+		// Output file must not exist
+		godot::Ref<godot::DirAccess> da = godot::DirAccess::open("user://");
+		if (da.is_valid()) {
+			GDEX_EXPECT_FALSE(da->file_exists(godot::String(dspkg_path).get_file()));
+		}
+	}
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+GDEX_TEST_T(dspkg, steampipe_1mib_chunk_isolation, TAG_INTEGRATION) {
+	const char *dstex_path1 = "user://temp_chunk_1.dstex";
+	const char *dstex_path2 = "user://temp_chunk_2.dstex";
+	const char *dstex_path3_a = "user://temp_chunk_3a.dstex";
+	const char *dstex_path3_b = "user://temp_chunk_3b.dstex";
+	const char *dstex_path4 = "user://temp_chunk_4.dstex";
+	const char *dstex_path5 = "user://temp_chunk_5.dstex";
+	const char *dspkg_v1 = "user://temp_chunk_v1.dspkg";
+	const char *dspkg_v2 = "user://temp_chunk_v2.dspkg";
+
+	remove_temp_file(dstex_path1);
+	remove_temp_file(dstex_path2);
+	remove_temp_file(dstex_path3_a);
+	remove_temp_file(dstex_path3_b);
+	remove_temp_file(dstex_path4);
+	remove_temp_file(dstex_path5);
+	remove_temp_file(dspkg_v1);
+	remove_temp_file(dspkg_v2);
+
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path1, 64, 64, 1, 64 * 64 * 4));
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path2, 64, 64, 1, 64 * 64 * 4));
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path3_a, 64, 64, 1, 64 * 64 * 4));
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path3_b, 64, 64, 1, 64 * 64 * 4));
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path4, 64, 64, 1, 64 * 64 * 4));
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path5, 64, 64, 1, 64 * 64 * 4));
+
+	const godot::String key_hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+	godot::PackedByteArray fixed_salt;
+	fixed_salt.resize(16);
+	for (int i = 0; i < 16; ++i) {
+		fixed_salt[i] = static_cast<uint8_t>(i + 1);
+	}
+
+	// Build V1
+	{
+		godot::Ref<godot::DSPkg> b1;
+		b1.instantiate();
+		GDEX_ASSERT_TRUE(b1.is_valid());
+		GDEX_ASSERT_TRUE(b1->create(godot::String(dspkg_v1), 0ULL) == godot::OK);
+		b1->set_bin_packing_enabled(false);
+		b1->set_payload_alignment(1048576);
+		GDEX_ASSERT_TRUE(b1->set_encryption_key(key_hex) == godot::OK);
+		b1->_set_archive_salt_for_testing(fixed_salt);
+		GDEX_ASSERT_TRUE(b1->add_texture("tex1.png", godot::String(dstex_path1)) == godot::OK);
+		GDEX_ASSERT_TRUE(b1->add_texture("tex2.png", godot::String(dstex_path2)) == godot::OK);
+		GDEX_ASSERT_TRUE(b1->add_texture("tex3.png", godot::String(dstex_path3_a)) == godot::OK);
+		GDEX_ASSERT_TRUE(b1->add_texture("tex4.png", godot::String(dstex_path4)) == godot::OK);
+		GDEX_ASSERT_TRUE(b1->add_texture("tex5.png", godot::String(dstex_path5)) == godot::OK);
+		GDEX_ASSERT_TRUE(b1->finalize() == godot::OK);
+	}
+
+	// Build V2 (tex3 modified)
+	{
+		godot::Ref<godot::DSPkg> b2;
+		b2.instantiate();
+		GDEX_ASSERT_TRUE(b2.is_valid());
+		GDEX_ASSERT_TRUE(b2->create(godot::String(dspkg_v2), 0ULL) == godot::OK);
+		b2->set_bin_packing_enabled(false);
+		b2->set_payload_alignment(1048576);
+		GDEX_ASSERT_TRUE(b2->set_encryption_key(key_hex) == godot::OK);
+		b2->_set_archive_salt_for_testing(fixed_salt);
+		GDEX_ASSERT_TRUE(b2->add_texture("tex1.png", godot::String(dstex_path1)) == godot::OK);
+		GDEX_ASSERT_TRUE(b2->add_texture("tex2.png", godot::String(dstex_path2)) == godot::OK);
+		GDEX_ASSERT_TRUE(b2->add_texture("tex3.png", godot::String(dstex_path3_b)) == godot::OK);
+		GDEX_ASSERT_TRUE(b2->add_texture("tex4.png", godot::String(dstex_path4)) == godot::OK);
+		GDEX_ASSERT_TRUE(b2->add_texture("tex5.png", godot::String(dstex_path5)) == godot::OK);
+		GDEX_ASSERT_TRUE(b2->finalize() == godot::OK);
+	}
+
+	godot::PackedByteArray v1_bytes = godot::FileAccess::get_file_as_bytes(godot::String(dspkg_v1));
+	godot::PackedByteArray v2_bytes = godot::FileAccess::get_file_as_bytes(godot::String(dspkg_v2));
+	GDEX_ASSERT_TRUE(v1_bytes.size() >= 5 * 1048576);
+	GDEX_ASSERT_TRUE(v2_bytes.size() >= 5 * 1048576);
+
+	// Check that unmodified chunk slices match exactly
+	for (int64_t offset : {1048576LL, 2097152LL, 4194304LL}) {
+		if (offset + 1024 <= v1_bytes.size() && offset + 1024 <= v2_bytes.size()) {
+			GDEX_EXPECT_TRUE(v1_bytes.slice(offset, offset + 1024) == v2_bytes.slice(offset, offset + 1024));
+		}
+	}
+
+	// Suite 4 steps 4-6: Runtime test under GlobalKeyResetGuard + wrong-key negative control
+	{
+		GlobalKeyResetGuard key_guard("");
+		godot::DSPkg::set_global_encryption_key(key_hex);
+
+		godot::Ref<godot::DSPkg> r1;
+		r1.instantiate();
+		GDEX_ASSERT_TRUE(r1.is_valid());
+		GDEX_EXPECT_EQ(r1->open(godot::String(dspkg_v1), 0ULL), godot::OK);
+		GDEX_EXPECT_EQ(r1->get_entry_count(), 5);
+
+		godot::Ref<godot::DSPkg> r2;
+		r2.instantiate();
+		GDEX_ASSERT_TRUE(r2.is_valid());
+		GDEX_EXPECT_EQ(r2->open(godot::String(dspkg_v2), 0ULL), godot::OK);
+		GDEX_EXPECT_EQ(r2->get_entry_count(), 5);
+
+		// Negative control: wrong key fails with ERR_UNAUTHORIZED
+		const godot::String wrong_key_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+		godot::DSPkg::set_global_encryption_key(wrong_key_hex);
+		godot::Ref<godot::DSPkg> r_bad;
+		r_bad.instantiate();
+		GDEX_ASSERT_TRUE(r_bad.is_valid());
+		GDEX_EXPECT_EQ(r_bad->open(godot::String(dspkg_v1), 0ULL), godot::ERR_UNAUTHORIZED);
+	}
+
+	remove_temp_file(dstex_path1);
+	remove_temp_file(dstex_path2);
+	remove_temp_file(dstex_path3_a);
+	remove_temp_file(dstex_path3_b);
+	remove_temp_file(dstex_path4);
+	remove_temp_file(dstex_path5);
+	remove_temp_file(dspkg_v1);
+	remove_temp_file(dspkg_v2);
+}
+#endif
 
 
