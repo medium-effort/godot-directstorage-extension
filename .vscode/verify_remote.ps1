@@ -10,6 +10,8 @@
     Manifest mode re-hashes a Device A manifest (lines "relpath|SHA256") and
     prints MANIFEST_LINES=N plus SYNC_MANIFEST_OK or MISSING:/HASH: lines.
     Artifact mode prints ARTIFACT:name|SHA256 lines for shippable binaries.
+    Every run also ends with VERIFY_TIMING:TOTAL_MS=..;TOUCH_MS=..;HASH_MS=..
+    so build_remote.ps1 can show where the Device B time actually goes.
 #>
 param(
     [string]$RemoteDir = "",
@@ -21,6 +23,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Wall-clock split for build_remote.ps1 [3b/6]. Started right after script load,
+# so TOTAL_MS - TOUCH_MS - HASH_MS is process startup + manifest read/parse.
+$verifyTimer = [System.Diagnostics.Stopwatch]::StartNew()
+$touchMs = 0
+$hashMs = 0
 
 if ([string]::IsNullOrEmpty($RemoteDir)) {
     Write-Output "VERIFY_ERROR:Missing -RemoteDir"
@@ -84,6 +92,7 @@ if ($ResetMarker) {
 # silently skipped until touched). Test TUs only (fast); extension sources
 # have never shown the same staleness.
 if ($TouchTests) {
+    $touchTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $testsDir = Join-Path $RemoteDir "tests"
     $touched = 0
     foreach ($testFile in (Get-ChildItem -LiteralPath $testsDir -Filter *.cpp -Recurse -File -ErrorAction SilentlyContinue)) {
@@ -94,6 +103,8 @@ if ($TouchTests) {
             Write-Output ("VERIFY_WARNING:Could not touch " + $testFile.FullName + " (" + $_.Exception.Message + ")")
         }
     }
+    $touchTimer.Stop()
+    $touchMs = [int][math]::Round($touchTimer.Elapsed.TotalMilliseconds)
     Write-Output ("TOUCHED_TESTS=" + $touched)
     if ($touched -eq 0) {
         Write-Output "VERIFY_ERROR:No test sources found under tests/"
@@ -102,22 +113,47 @@ if ($TouchTests) {
 }
 
 if ($ManifestName -ne "") {
+    $hashTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $manifestPath = Join-Path $RemoteDir $ManifestName
     $lines = @(Get-Content -LiteralPath $manifestPath)
     Write-Output ("MANIFEST_LINES=" + $lines.Count)
     $bad = @()
-    foreach ($entry in $lines) {
-        $sep = $entry.IndexOf("|")
-        if ($sep -lt 0) { continue }
-        $rel = $entry.Substring(0, $sep)
-        $expected = $entry.Substring($sep + 1)
-        $full = Join-Path $RemoteDir ($rel.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
-        if (-not (Test-Path -LiteralPath $full)) {
-            $bad += ("MISSING:" + $rel)
-        } elseif ((Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash -ne $expected) {
-            $bad += ("HASH:" + $rel)
+    # One SHA256 instance for the whole manifest. Get-FileHash costs ~1.3 ms per
+    # call in Windows PowerShell (cmdlet + provider + FileInfo rebuild); hashing
+    # the raw stream is ~0.08 ms. File.Exists replaces Test-Path for the same
+    # reason -- at ~600 entries those two calls alone are most of the wall time.
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($entry in $lines) {
+            $sep = $entry.IndexOf("|")
+            if ($sep -lt 0) { continue }
+            $rel = $entry.Substring(0, $sep)
+            $expected = $entry.Substring($sep + 1)
+            $full = Join-Path $RemoteDir ($rel.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
+            if (-not [System.IO.File]::Exists($full)) {
+                $bad += ("MISSING:" + $rel)
+                continue
+            }
+            try {
+                $stream = [System.IO.File]::Open($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+                try {
+                    $actual = [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace("-", "")
+                } finally {
+                    $stream.Dispose()
+                }
+            } catch {
+                $bad += ("HASH:" + $rel)
+                continue
+            }
+            if ($actual -ne $expected) {
+                $bad += ("HASH:" + $rel)
+            }
         }
+    } finally {
+        $sha256.Dispose()
     }
+    $hashTimer.Stop()
+    $hashMs = [int][math]::Round($hashTimer.Elapsed.TotalMilliseconds)
     if ($bad.Count -eq 0) {
         Write-Output "SYNC_MANIFEST_OK"
     } else {
@@ -138,3 +174,6 @@ if ($Artifacts) {
         }
     }
 }
+
+$verifyTimer.Stop()
+Write-Output ("VERIFY_TIMING:TOTAL_MS=" + [int][math]::Round($verifyTimer.Elapsed.TotalMilliseconds) + ";TOUCH_MS=" + $touchMs + ";HASH_MS=" + $hashMs)

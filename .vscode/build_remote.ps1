@@ -976,16 +976,41 @@ $tarExcludesList = @(
     "--exclude=.keys",
     "--exclude=*.key",
     "--exclude=*.key.txt",
-    # Sync-verification manifest rides outside the tarball (uploaded via scp
-    # in step [3b/6]); exclude any leftover so it can never be compiled in.
-    "--exclude=sync_manifest.tmp",
+    # NOTE: sync_manifest.tmp is deliberately NOT excluded. It is written at
+    # repo root just before this tar runs and travels inside the archive, so
+    # step [3b/6] verifies the extracted copy instead of paying a second SSH
+    # connection (scp) to upload 15 KB. It is deleted locally right after the
+    # sync, and nothing on either side compiles or imports it.
     # NOTE: do NOT exclude anything matching gdextest here. Windows bsdtar
     # matches --exclude patterns against every path component, so even an
     # anchored-looking "--exclude=./gdextest" strips extern/gdextest/ from the
     # Device B sync and breaks `scons tests=true` (spike defect #1). The
     # repo-root review clone this was meant for does not exist; if one is
     # ever created, syncing it to B is harmless bulk, never a break.
-    "--exclude=./wavexecute_tasks"
+    "--exclude=./wavexecute_tasks",
+    # --- Local build output: Device B produces its own copy. Shipping these
+    # was 168 of the old 178 MB payload (measured), for zero benefit.
+    # SCons names object files *.os, so the *.obj pattern above never matched
+    # them; *.os alone was ~35 MB per sync.
+    "--exclude=*.os",
+    # .gitignore flags these as generated/untracked; tar does not read it.
+    # *.glb is the 47 MB interactive-benchmark model (only
+    # test_scenes/test_3d_steampunk_benchmark.gd references it, no suite does).
+    "--exclude=*.glb",
+    "--exclude=*.pyc",
+    "--exclude=__pycache__",
+    # WARNING: bsdtar here matches slash patterns loosely -- BOTH
+    # "--exclude=./bin" and "--exclude=./bin/*" stripped
+    # thirdparty/directstorage/bin/ and project/addons/.../bin/, silently
+    # removing dstorage.dll and build_manifest.json from the sync (verified).
+    # Root bin/ therefore needs a filename-anchored pattern instead.
+    "--exclude=./build/*",
+    "--exclude=./bin/libdirectstorage_tests*",
+    "--exclude=./.cache/*",
+    "--exclude=./.projectmem/*",
+    "--exclude=./logs/*",
+    "--exclude=./compile_commands.json",
+    "--exclude=./test-results.xml"
 )
 if ($KeyFileRelWin) {
     $tarExcludesList += ("--exclude=" + $KeyFileRelWin.Replace('\', '/'))
@@ -993,7 +1018,82 @@ if ($KeyFileRelWin) {
 }
 $tarExcludes = $tarExcludesList -join " "
 
+# [3b/6 prep] Build the sync-verification manifest BEFORE the tar runs so the
+# hashes ride inside the same archive. This replaces a separate `scp` upload of
+# ~15 KB, and that connection cost a full SSH handshake (~1 s) -- which was
+# most of what remained in this step. Hashing first does not weaken the check:
+# these are the same local bytes the tar is about to package, and a file
+# mutated between the two is reported as a HASH mismatch on Device B exactly
+# as it was with the old tar-then-hash order.
+if (-not $SkipVerify) {
+    $manifestTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    $SyncVerifyRoots = @("src", "tests", "thirdparty/gdeflate", "thirdparty/libdeflate", "thirdparty/monocypher", "extern/gdextest/src", "extern/gdextest/tools")
+    $SyncVerifyFiles = @("SConstruct", ".gdextest.toml", "extern/gdextest/SConscript")
+    # NOTE: "project" was verified here once (it caught a truncated GDScript/asset
+    # sync) but it is ~400 of the ~620 entries and costs one file open each on
+    # Device B, which is the expensive part of this step. The C++ build inputs are
+    # what SCons can silently reuse stale; re-add "project" to $SyncVerifyRoots if
+    # that extra coverage is ever worth the round-trip.
+    # Anything the tarball deliberately withholds must stay out of the manifest,
+    # or verification would report it MISSING on Device B. Keep this in sync with
+    # $tarExcludesList. Binaries under the addon bin/ are verified separately in
+    # step [5b/6] (and Device B rewrites build_manifest.json during the build).
+    $SyncVerifySkip = '^(build|bin|\.cache|\.projectmem|logs)/|^project/addons/directstorage_accelerator/bin/|^project/\.godot/|\.os$|\.glb$|\.pyc$|__pycache__|^compile_commands\.json$|^test-results\.xml$'
+    $CwdPath = (Resolve-Path ".").Path
+    $ManifestEntries = New-Object System.Collections.Generic.List[string]
+    # One SHA256 instance for every file: Get-FileHash costs ~1.3 ms per call in
+    # Windows PowerShell 5.1 (cmdlet + provider + FileInfo rebuild), hashing the
+    # raw stream ~0.08 ms. Measured on this set: 0.79 s -> 0.05 s.
+    $ManifestSha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($syncRoot in $SyncVerifyRoots) {
+            if (Test-Path -LiteralPath $syncRoot) {
+                foreach ($manifestFile in (Get-ChildItem -LiteralPath $syncRoot -Recurse -File)) {
+                    $relPath = ($manifestFile.FullName.Substring($CwdPath.Length).TrimStart("\", "/")).Replace("\", "/")
+                    if ($relPath -match $SyncVerifySkip) { continue }
+                    $fileStream = [System.IO.File]::Open($manifestFile.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+                    try {
+                        $fileHash = [System.BitConverter]::ToString($ManifestSha256.ComputeHash($fileStream)).Replace("-", "")
+                    } finally {
+                        $fileStream.Dispose()
+                    }
+                    $ManifestEntries.Add($relPath + "|" + $fileHash)
+                }
+            }
+        }
+        foreach ($singleFile in $SyncVerifyFiles) {
+            if (Test-Path -LiteralPath $singleFile) {
+                $singleFullPath = (Resolve-Path -LiteralPath $singleFile).Path
+                $fileStream = [System.IO.File]::Open($singleFullPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+                try {
+                    $fileHash = [System.BitConverter]::ToString($ManifestSha256.ComputeHash($fileStream)).Replace("-", "")
+                } finally {
+                    $fileStream.Dispose()
+                }
+                $ManifestEntries.Add($singleFile.Replace("\", "/") + "|" + $fileHash)
+            }
+        }
+    } finally {
+        $ManifestSha256.Dispose()
+    }
+    if (-not (Test-Path -LiteralPath "thirdparty/monocypher")) {
+        Show-BuildFailure -Step "SyncVerify" -Message "Required vendored dependency thirdparty/monocypher is missing on Device A." -Code 1
+    }
+    if ($ManifestEntries.Count -eq 0) {
+        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Sync manifest is empty; nothing was hashed on Device A. Refusing vacuous pass." -Code 1
+    }
+    $ManifestEntries | Set-Content -LiteralPath "sync_manifest.tmp" -Encoding Ascii
+    $manifestTimer.Stop()
+}
+
+# gzip is kept on purpose. zstd would save ~0.2 s of CPU, but this bsdtar build
+# writes a CORRUPT archive when compressing to stdout: `tar --zstd -cf -`
+# reproduces "Truncated tar archive detected while reading data" on extraction
+# (verified with a two-file tree), while `--zstd -cf <file>` works fine -- and
+# the SSH stream cannot use a file. After the excludes above the payload is
+# ~10 MB, so gzip costs well under a second anyway.
 $tarCmd = "tar -czf - $tarExcludes . | ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost ""tar -xzf - -C $RemoteDirTar"""
+$syncTimer = [System.Diagnostics.Stopwatch]::StartNew()
 $syncSuccess = $false
 for ($syncAttempt = 1; $syncAttempt -le 2; $syncAttempt++) {
     cmd.exe /c $tarCmd
@@ -1006,81 +1106,84 @@ for ($syncAttempt = 1; $syncAttempt -le 2; $syncAttempt++) {
         Start-Sleep -Seconds 2
     }
 }
+$syncTimer.Stop()
+# The manifest existed only to ride this stream (see [3b/6 prep] above). Delete
+# it before any exit path so a failed or interrupted build leaves no stray file
+# in the repo root.
+Remove-Item "sync_manifest.tmp" -Force -ErrorAction SilentlyContinue
 
 if (-not $syncSuccess) {
     Show-BuildFailure -Step "Step [3/6] Source Sync" -Message "Failed to sync source files to Device B ($ActiveHost)." -Code 1
 }
+Write-Status ("    [3/6 Sync] archive+transfer: {0:F1}s (gzip)" -f $syncTimer.Elapsed.TotalSeconds) -ForegroundColor DarkCyan
 
-# [3b/6] Verify the sync end-to-end: hash compiled inputs locally, re-hash
-# the Device B copies, and fail loudly on any MISSING/HASH mismatch. The
-# tar stream exit code alone cannot catch a short sync, and SCons plus its
-# cache will happily compile stale sources into a "successful" build.
+# [3b/6] Verify the sync end-to-end. The manifest hashed on Device A before the
+# tar ran (see [3b/6 prep] above) travelled inside the archive; here it is
+# re-hashed on Device B, and any MISSING/HASH entry fails the build. The tar
+# stream exit code alone cannot catch a short sync, and SCons plus its cache
+# will happily compile stale sources into a "successful" build.
 if (-not $SkipVerify) {
     Write-VerboseHost "[3b/6] Verifying source sync integrity on Device B..." -ForegroundColor Cyan
-    $SyncVerifyRoots = @("src", "tests", "thirdparty/gdeflate", "thirdparty/libdeflate", "thirdparty/monocypher", "extern/gdextest/src", "extern/gdextest/tools")
-    $SyncVerifyFiles = @("SConstruct", ".gdextest.toml", "extern/gdextest/SConscript")
-    $CwdPath = (Resolve-Path ".").Path
-    $ManifestEntries = New-Object System.Collections.Generic.List[string]
-    foreach ($syncRoot in $SyncVerifyRoots) {
-        if (Test-Path -LiteralPath $syncRoot) {
-            foreach ($manifestFile in (Get-ChildItem -LiteralPath $syncRoot -Recurse -File)) {
-                $relPath = ($manifestFile.FullName.Substring($CwdPath.Length).TrimStart("\", "/")).Replace("\", "/")
-                $ManifestEntries.Add($relPath + "|" + (Get-FileHash -LiteralPath $manifestFile.FullName -Algorithm SHA256).Hash)
-            }
-        }
-    }
-    foreach ($singleFile in $SyncVerifyFiles) {
-        if (Test-Path -LiteralPath $singleFile) {
-            $ManifestEntries.Add($singleFile.Replace("\", "/") + "|" + (Get-FileHash -LiteralPath $singleFile -Algorithm SHA256).Hash)
-        }
-    }
-    if (-not (Test-Path -LiteralPath "thirdparty/monocypher")) {
-        Show-BuildFailure -Step "SyncVerify" -Message "Required vendored dependency thirdparty/monocypher is missing on Device A." -Code 1
-    }
-    # Relative name (no drive colon) so scp treats it as a local path.
-    $ManifestTmp = "sync_manifest.tmp"
-    $ManifestEntries | Set-Content -LiteralPath $ManifestTmp -Encoding Ascii
-    $RemoteManifestTar = "$RemoteDirTar/sync_manifest.txt"
-    $manifestOut = & scp -4 -o BatchMode=yes -o ConnectTimeout=5 "$ManifestTmp" "$ActiveHost`:$RemoteManifestTar" 2>&1
-    Remove-Item $ManifestTmp -Force -ErrorAction SilentlyContinue
-    if ($LASTEXITCODE -ne 0) {
-        $manifestErr = ($manifestOut | Out-String).Trim()
-        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Failed to upload sync manifest to Device B ($ActiveHost). SCP error: $manifestErr" -Code $LASTEXITCODE
-    }
-    if ($ManifestEntries.Count -eq 0) {
-        Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Sync manifest is empty; nothing was hashed on Device A. Refusing vacuous pass." -Code 1
-    }
-    # The verifier runs with spaceless arguments only
-    $VerifyOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -ManifestName sync_manifest.txt 2>&1
+    $verifyTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    # One SSH round-trip for both jobs: the helper touches test sources first
+    # (SCons has silently skipped recompiling changed/new tests/*.cpp, leaving a
+    # stale DLL whose suite runs 0 tests), then re-hashes the manifest the tar
+    # stream just deposited. Quoteless invocation: no nested quoting.
+    $VerifyOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -ManifestName sync_manifest.tmp -TouchTests 2>&1
     if ($VerifyOut -notcontains "SYNC_MANIFEST_OK") {
         $detailLines = @($VerifyOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 20) -join "`n"
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Device B verification failed ($ActiveHost) with no clean OK. Raw remote output:`n$detailLines" -Code 1
     }
-    Write-VerboseHost "Source sync verified ($($ManifestEntries.Count) files)." -ForegroundColor Green
-
-    # [3b/6] verified: the keyed header is already on Device B, so scrub Device A now (fast path) (R16-01).
-    if ($EffectiveKey -and -not $KeepLocalKeyHeader) {
-        New-DspkgKeyHeader -Reset
-    }
-
-    # [3c/6] Force test-source freshness on Device B: SCons has silently
-    # skipped recompiling changed/new tests/*.cpp (stale DLL, suite runs 0
-    # tests), so test TUs are touched to guarantee the next compile sees
-    # them. Quoteless invocation, same as [3b/6].
-    Write-VerboseHost "[3c/6] Touching test sources on Device B..." -ForegroundColor Cyan
-    $TouchOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -TouchTests 2>&1
     $TouchCount = 0
-    foreach ($touchLine in @($TouchOut)) {
+    foreach ($touchLine in @($VerifyOut)) {
         $touchText = $touchLine.ToString()
         if ($touchText.StartsWith("TOUCHED_TESTS=")) {
             [int]::TryParse($touchText.Substring(14), [ref]$TouchCount) | Out-Null
         }
     }
     if ($TouchCount -eq 0) {
-        $touchDetail = @($TouchOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 10) -join "`n"
+        $touchDetail = @($VerifyOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 10) -join "`n"
         Show-BuildFailure -Step "Step [3/6] Test Source Refresh" -Message "Device B test-source touch reported zero files ($ActiveHost). Raw remote output:`n$touchDetail" -Code 1
     }
-    Write-VerboseHost "Test sources refreshed ($TouchCount file(s))." -ForegroundColor Green
+    $verifyTimer.Stop()
+    # Device B reports its own split (verify_remote.ps1 VERIFY_TIMING). Since the
+    # manifest now rides the tar, the two Device A costs are no longer adjacent:
+    # $manifestTimer covers the hash pass before the sync, $verifyTimer covers the
+    # single ssh round-trip after it (which contains the whole Device B time).
+    # Integer milliseconds only: no culture-dependent decimal separator crosses SSH.
+    $remoteTotalMs = -1
+    $remoteTouchMs = 0
+    $remoteHashMs = 0
+    foreach ($timingLine in @($VerifyOut)) {
+        $timingText = $timingLine.ToString()
+        if (-not $timingText.StartsWith("VERIFY_TIMING:")) { continue }
+        foreach ($timingPair in $timingText.Substring(14).Split(";")) {
+            $timingParts = $timingPair.Split("=")
+            if ($timingParts.Count -ne 2) { continue }
+            $msValue = 0
+            if (-not [int]::TryParse($timingParts[1], [ref]$msValue)) { continue }
+            switch ($timingParts[0]) {
+                "TOTAL_MS" { $remoteTotalMs = $msValue }
+                "TOUCH_MS" { $remoteTouchMs = $msValue }
+                "HASH_MS" { $remoteHashMs = $msValue }
+            }
+        }
+    }
+    $manifestHashMs = [int][math]::Round($manifestTimer.Elapsed.TotalMilliseconds)
+    $sshMs = [int][math]::Round($verifyTimer.Elapsed.TotalMilliseconds)
+    $totalMs = $manifestHashMs + $sshMs
+    if ($remoteTotalMs -ge 0) {
+        $remoteOverheadMs = $remoteTotalMs - $remoteTouchMs - $remoteHashMs
+        if ($remoteOverheadMs -lt 0) { $remoteOverheadMs = 0 }
+        Write-Status ("    [3b/6 Sync] verify+touch: {0:F1}s = hash {1:F1}s + ssh {2:F1}s (Device B {3:F1}s of that: startup+parse {4:F1}s, touch {5:F1}s, hash {6:F1}s; {7} file(s))" -f ($totalMs / 1000.0), ($manifestHashMs / 1000.0), ($sshMs / 1000.0), ($remoteTotalMs / 1000.0), ($remoteOverheadMs / 1000.0), ($remoteTouchMs / 1000.0), ($remoteHashMs / 1000.0), $ManifestEntries.Count) -ForegroundColor DarkCyan
+    } else {
+        Write-Status ("    [3b/6 Sync] verify+touch: {0:F1}s = hash {1:F1}s + ssh {2:F1}s ({3} file(s) hashed, {4} test source(s) touched; no Device B timing reported)" -f ($totalMs / 1000.0), ($manifestHashMs / 1000.0), ($sshMs / 1000.0), $ManifestEntries.Count, $TouchCount) -ForegroundColor DarkCyan
+    }
+
+    # [3b/6] verified: the keyed header is already on Device B, so scrub Device A now (fast path) (R16-01).
+    if ($EffectiveKey -and -not $KeepLocalKeyHeader) {
+        New-DspkgKeyHeader -Reset
+    }
 }
 
 # 4. Prep + SCons build on Device B. Prep (orphan cleanup + marker reset) runs
@@ -1498,6 +1601,19 @@ $DeployAuditTargets = @($DefaultAddonDir) + @(Get-ConfiguredAddonDir)
 $postBuildAuditError = Invoke-DeployAudit -AddonDirs $DeployAuditTargets -Json:$Json -RequireManifest:([bool]($EffectiveKey -or $RequireManifest))
 if ($postBuildAuditError -and ($EffectiveKey -or $RequireManifest)) {
     Show-BuildFailure -Step "Audit" -Message "Keyed/release build deployment audit failed due to binary/manifest key-id mismatch or error." -Code 1
+}
+
+# Persist the build-freshness stamp consumed by build_freshness.ps1. Advisory
+# only: a stamping failure must never fail an otherwise successful build, and
+# every step above (compile, pull, sync, audit) has already passed.
+$freshnessScript = Join-Path $PSScriptRoot "build_freshness.ps1"
+if (Test-Path -LiteralPath $freshnessScript) {
+    $freshnessArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $freshnessScript, "-Record", "-Target", $Target)
+    if ($IncludeTests) { $freshnessArgs += "-IncludeTests" }
+    & powershell @freshnessArgs | ForEach-Object { Write-VerboseHost ([string]$_) -ForegroundColor DarkGray }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "Warning: build freshness stamp was not recorded (exit $LASTEXITCODE); the next check reports STALE." -ForegroundColor Yellow
+    }
 }
 
 $syncMsg = if ($ShouldSync -and $copiedCount -gt 0) { " (Synced $copiedCount file(s))" } else { "" }

@@ -30,7 +30,16 @@ plugin_class = "GdextestPlugin"
 [gdextest.fixture]
 directory = "build/gdextest/project"
 project_name = "directstorage-accelerator-tests"
-assets = ["project/test_assets/**/*"]
+# Only what the suites actually load: the checked-in test.png fixture plus its
+# import stub (the stub pins the directstorage_texture params that the fixture
+# warmup import uses). Everything else under project/test_assets is local-only:
+# the 47 MB steampunk_underwater_explorer.glb is an interactive benchmark model
+# (project/test_scenes/test_3d_steampunk_benchmark.gd) that no suite loads, and
+# the six tracked steampunk_underwater_explorer_{0..5}.png.import stubs are
+# orphans -- their PNG sources are gitignored (project/test_assets/*.png) and
+# absent, so staging them only feeds Godot import stubs with no source.
+# resource_loader_tests.cpp GDEX_SKIPs when test.png is missing, so it must stay.
+assets = ["project/test_assets/test.png", "project/test_assets/test.png.import"]
 scan_timeout_ms = 30000
 
 [gdextest.output]

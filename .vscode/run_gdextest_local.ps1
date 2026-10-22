@@ -14,7 +14,7 @@
       [1/5] doctor  - `gdextest doctor` (config/Godot/SCons checks, no build).
       [2/5] fixture - `generate_fixture.py` with the newest
                       bin/libdirectstorage_tests*.dll, then manual staging of
-                      `project/test_assets/**/*` per [gdextest.fixture] assets.
+                      `project/test_assets/test.png` per [gdextest.fixture] assets.
       [3/5] warmup  - cold-cache deterministic pass (exit 134 tolerated).
       [4/5] run     - headless editor run; renderer flag BEFORE `--`,
                       runner flags AFTER `--`, and nothing else after `--`.
@@ -318,12 +318,22 @@ if ($LASTEXITCODE -ne 0) {
 # [2/5] fixture assets: the generator call above stages none (no
 # --fixture-asset flags), so copy per [gdextest.fixture] assets manually,
 # preserving repo-relative paths exactly as copy_globbed_assets would.
-Write-VerboseHost "Staging [gdextest.fixture] assets (project/test_assets/**/*)..." -ForegroundColor Cyan
+# $AssetPatterns must stay identical to [gdextest.fixture] assets in
+# .gdextest.toml: only the test.png fixture and its import stub. The 47 MB
+# steampunk .glb is an interactive benchmark model no suite loads, and the
+# steampunk_underwater_explorer_{0..5}.png.import stubs are orphans (their PNG
+# sources are gitignored and absent). test.png is mandatory --
+# tests/resource_loader_tests.cpp checks res://project/test_assets/test.png
+# and GDEX_SKIPs when it is missing.
+$AssetPatterns = @("test.png", "test.png.import")
+Write-VerboseHost "Staging [gdextest.fixture] assets (project/test_assets/test.png)..." -ForegroundColor Cyan
 $AssetSource = Join-Path $RepoRoot "project/test_assets"
 if (-not (Test-Path $AssetSource)) {
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "Asset source project/test_assets/ not found; cannot stage fixture assets." -Code 1
 }
-$AssetFiles = Get-ChildItem -Path $AssetSource -Recurse -File
+$AssetFiles = @(foreach ($assetPattern in $AssetPatterns) {
+    Get-ChildItem -Path $AssetSource -Filter $assetPattern -File
+})
 $stagedCount = 0
 foreach ($file in $AssetFiles) {
     $relative = $file.FullName.Substring($RepoRoot.Length).TrimStart("\", "/")
@@ -338,6 +348,9 @@ foreach ($file in $AssetFiles) {
 $FixtureAssets = Join-Path (Join-Path $RepoRoot $FixtureRoot) "project/test_assets"
 if (-not (Test-Path $FixtureAssets)) {
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "Fixture assets did not land in $FixtureRoot/project/test_assets/." -Code 1
+}
+if (-not (Test-Path -LiteralPath (Join-Path $FixtureAssets "test.png"))) {
+    Show-StepFailure -Step "Step [2/5] Fixture" -Message "Fixture asset test.png did not land in $FixtureRoot/project/test_assets/ (required by resource_loader_tests.cpp; suites would otherwise GDEX_SKIP silently)." -Code 1
 }
 Write-VerboseHost "Fixture assets staged: $stagedCount file(s) -> $FixtureRoot/project/test_assets/" -ForegroundColor Green
 
