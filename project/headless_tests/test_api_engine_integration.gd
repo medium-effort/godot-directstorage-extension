@@ -94,10 +94,12 @@ func _run() -> void:
 	ctx.batch_completed.connect(_on_batch_completed)
 	var fixture_path := "user://task_008_api_engine_integration.bin"
 	var fixture := _make_fixture(fixture_path, 4096)
-	var manager: Node = get_root().get_node_or_null("DSBatchManager")
-	_check(manager != null, "DSBatchManager autoload is available")
+	var manager: Node = get_root().get_node_or_null("DSRuntime")
+	if manager == null:
+		manager = get_root().get_node_or_null("DSBatchManager")
+	_check(manager != null, "DSRuntime autoload is available")
 	if manager != null:
-		_check(manager.has_method("_process"), "DSBatchManager exposes its per-frame process method")
+		_check(manager.has_method("_process"), "DSRuntime exposes its per-frame process method")
 
 	while ctx.has_pending_results():
 		ctx.collect_completed_results()
@@ -142,12 +144,12 @@ func _run() -> void:
 
 	if manager != null:
 		var manager_request := _make_request(fixture_path, fixture.size())
-		_check(ctx.enqueue_request(manager_request), "DSBatchManager request enqueues successfully")
-		_check(ctx.get_pending_request_count() == 1, "DSBatchManager sees one pending request")
+		_check(ctx.enqueue_request(manager_request), "DSRuntime request enqueues successfully")
+		_check(ctx.get_pending_request_count() == 1, "DSRuntime sees one pending request")
 		manager.call("_process", 0.016)
-		_check(ctx.get_pending_request_count() == 0, "DSBatchManager _process submits the pending batch")
+		_check(ctx.get_pending_request_count() == 0, "DSRuntime _process submits the pending batch")
 		await _wait_for_requests(ctx, [manager_request])
-		_check(manager_request.get_status() == DSRequest.STATUS_COMPLETED, "DSBatchManager-submitted request completes")
+		_check(manager_request.get_status() == DSRequest.STATUS_COMPLETED, "DSRuntime-submitted request completes")
 		while ctx.has_pending_results():
 			ctx.collect_completed_results()
 

@@ -1337,6 +1337,7 @@ $EnableSyncVal = if ($env:ENABLE_POST_BUILD_ADDON_SYNC) { $env:ENABLE_POST_BUILD
 $ShouldSync = ($EnableSyncVal.Trim().ToLower() -notin @("0", "false", "no", "off"))
 $SyncTargetDir = if ($env:SYNC_ADDON_DIR) { $env:SYNC_ADDON_DIR }
 $copiedCount = 0
+$orphanedSyncFiles = [System.Collections.Generic.List[string]]::new()
 
 if ($ShouldSync) {
     if (-not $SyncTargetDir) {
@@ -1435,6 +1436,22 @@ if ($ShouldSync) {
                 }
             }
 
+            # Track orphaned files in destination that no longer exist in source addon
+            Get-ChildItem -Path $SyncTargetDir -Recurse -File | ForEach-Object {
+                $destFile = $_
+                $relPath = $destFile.FullName.Substring($SyncTargetDir.Length).TrimStart("\", "/")
+
+                # Exclude binaries, temporary, and old files
+                if ($relPath.StartsWith("bin") -or $destFile.Name.EndsWith(".old") -or $destFile.Name.EndsWith(".tmp")) {
+                    return
+                }
+
+                $sourcePath = Join-Path $LocalAddonDir $relPath
+                if (-not (Test-Path $sourcePath)) {
+                    $orphanedSyncFiles.Add($destFile.FullName)
+                }
+            }
+
             # Attempt to clean up unlocked .old files in destination bin
             $destBin = Join-Path $SyncTargetDir "bin"
             if (Test-Path $destBin) {
@@ -1485,5 +1502,15 @@ if ($postBuildAuditError -and ($EffectiveKey -or $RequireManifest)) {
 
 $syncMsg = if ($ShouldSync -and $copiedCount -gt 0) { " (Synced $copiedCount file(s))" } else { "" }
 Show-BuildSuccess -Message "All build and sync steps completed successfully!$syncMsg"
+
+if ($orphanedSyncFiles -and $orphanedSyncFiles.Count -gt 0) {
+    Write-Host ""
+    Write-Host "WARNING: Found $($orphanedSyncFiles.Count) orphaned file(s) in sync target ($SyncTargetDir) that no longer exist in source addon:" -ForegroundColor Yellow
+    foreach ($orphan in $orphanedSyncFiles) {
+        Write-Host "  - $orphan" -ForegroundColor Yellow
+    }
+    Write-Host "Please remove them manually if they are no longer needed." -ForegroundColor Yellow
+    Write-Host ""
+}
 
 

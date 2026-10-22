@@ -4,7 +4,7 @@
 		Static helper utility for collecting and prewarming scene texture assets.
 	</brief_description>
 	<description>
-		[DSPreloader] provides a high-level static GDScript API over DirectStorage streaming and GPU decompression. It walks scene dependencies to discover texture paths, issues stream prewarm requests through [DSTextureCache], and coordinates with the [code]DSBatchManager[/code] autoload for non-blocking scene loading.
+		[DSPreloader] provides a high-level static GDScript API over DirectStorage streaming and GPU decompression. It walks scene dependencies to discover texture paths, issues stream prewarm requests through [DSTextureCache], and coordinates with the [code]DSRuntime[/code] autoload for non-blocking scene loading.
 	</description>
 	<tutorials>
 	</tutorials>

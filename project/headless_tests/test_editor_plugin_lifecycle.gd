@@ -7,7 +7,7 @@ extends SceneTree
 ## Description: Tests enabling, disabling, and re-enabling the DSPlugin editor plugin,
 ## verifying autoload singleton registration in ProjectSettings at each lifecycle transition.
 
-const AUTOLOAD_NAME = "DSBatchManager"
+const AUTOLOAD_NAME = "DSRuntime"
 const PLUGIN_SCRIPT_PATH = "res://addons/directstorage_accelerator/scripts/ds_plugin.gd"
 
 func _init() -> void:
@@ -54,7 +54,7 @@ func _init() -> void:
 		print("[Test Lifecycle] Running in standalone headless mode. Verifying ProjectSettings autoload removal logic...")
 
 		# Simulate enable: add setting
-		ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, "*res://addons/directstorage_accelerator/scripts/ds_batch_manager.gd")
+		ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, "*res://addons/directstorage_accelerator/scripts/ds_runtime.gd")
 		if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
 			push_error("[Test Lifecycle] FAIL: Unable to set autoload in ProjectSettings")
 			quit(1)
@@ -68,7 +68,7 @@ func _init() -> void:
 			return
 
 		# Simulate re-enable: add setting
-		ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, "*res://addons/directstorage_accelerator/scripts/ds_batch_manager.gd")
+		ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, "*res://addons/directstorage_accelerator/scripts/ds_runtime.gd")
 		if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
 			push_error("[Test Lifecycle] FAIL: Unable to re-set autoload in ProjectSettings")
 			quit(1)

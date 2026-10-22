@@ -5,7 +5,7 @@
 	</brief_description>
 	<description>
 		[DSContext] manages the lifecycle of the DirectStorage runtime, memory queues, staging buffers, and software fallback backend. The extension registers it as the [Engine] singleton named [code]"DSContext"[/code]. Use [method initialize_ds] before submitting requests, then call [method flush_batch] after enqueuing requests. The addon autoload normally performs this per-frame flush automatically.
-		Async texture prewarm flow: collect engine texture paths ([code].png/.jpg/.webp[/code], never [code].dstex[/code]) with [code]DSPreloader.collect_scene_textures()[/code], enqueue them with [method prewarm_async] (or [code]DSTextureCache.prewarm_async()[/code]) and track the returned tag via the [code]DSBatchManager[/code] autoload's [code]track_prewarm(tag)[/code] so per-tag progress signals emit. The batch manager drains the stream queue each frame with [method flush_stream_async], then bind the scene with [code]ResourceLoader.load(level.tscn, "PackedScene", CACHE_MODE_REUSE)[/code]: [constant CACHE_MODE_REUSE] is required so the scene binds the prewarmed textures without reading the disk again. Keep the loading screen visible across [code]instantiate()[/code] + [code]add_child()[/code] + one drawn frame so shader compilation finishes before gameplay is revealed.
+		Async texture prewarm flow: collect engine texture paths ([code].png/.jpg/.webp[/code], never [code].dstex[/code]) with [code]DSPreloader.collect_scene_textures()[/code], enqueue them with [method prewarm_async] (or [code]DSTextureCache.prewarm_async()[/code]) and track the returned tag via the [code]DSRuntime[/code] autoload's [code]track_prewarm(tag)[/code] so per-tag progress signals emit. The batch manager drains the stream queue each frame with [method flush_stream_async], then bind the scene with [code]ResourceLoader.load(level.tscn, "PackedScene", CACHE_MODE_REUSE)[/code]: [constant CACHE_MODE_REUSE] is required so the scene binds the prewarmed textures without reading the disk again. Keep the loading screen visible across [code]instantiate()[/code] + [code]add_child()[/code] + one drawn frame so shader compilation finishes before gameplay is revealed.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -68,7 +68,7 @@
 		<method name="flush_stream_async">
 			<return type="int" enum="@GlobalScope.Error" />
 			<description>
-				Submits queued requests from the async stream (prewarm) queue without blocking the calling thread. Called once per frame by the [code]DSBatchManager[/code] autoload. Harvests finished batches first to free backend slots, then submits at most half the queue capacity per call (clamped to 64-256 requests); any remainder stays queued for the next frame. Regular synchronous loads use a separate queue drained by [method flush_batch] / [method flush_batch_async] and are unaffected. Returns [constant OK] on submit (including when the queue is empty), [constant ERR_BUSY] when all backend batch slots are occupied (the queue is kept for retry next frame), or [constant ERR_UNCONFIGURED] when uninitialized.
+				Submits queued requests from the async stream (prewarm) queue without blocking the calling thread. Called once per frame by the [code]DSRuntime[/code] autoload. Harvests finished batches first to free backend slots, then submits at most half the queue capacity per call (clamped to 64-256 requests); any remainder stays queued for the next frame. Regular synchronous loads use a separate queue drained by [method flush_batch] / [method flush_batch_async] and are unaffected. Returns [constant OK] on submit (including when the queue is empty), [constant ERR_BUSY] when all backend batch slots are occupied (the queue is kept for retry next frame), or [constant ERR_UNCONFIGURED] when uninitialized.
 			</description>
 		</method>
 		<method name="get_active_backend_name" qualifiers="const">
@@ -146,7 +146,7 @@
 			<return type="Vector2i" />
 			<param index="0" name="tag" type="int" />
 			<description>
-				Returns prewarm progress for [param tag] as [code]Vector2i(done, total)[/code] for progress-bar display. Unknown tags return [code](0, 0)[/code]. Poll this or await the [code]DSBatchManager[/code] autoload's [code]prewarm_finished[/code] signal (tags are tracked opt-in via [code]track_prewarm(tag)[/code]).
+				Returns prewarm progress for [param tag] as [code]Vector2i(done, total)[/code] for progress-bar display. Unknown tags return [code](0, 0)[/code]. Poll this or await the [code]DSRuntime[/code] autoload's [code]prewarm_finished[/code] signal (tags are tracked opt-in via [code]track_prewarm(tag)[/code]).
 			</description>
 		</method>
 		<method name="get_queue_capacity" qualifiers="const">
@@ -250,7 +250,7 @@
 			<return type="int" />
 			<param index="0" name="paths" type="PackedStringArray" />
 			<description>
-				Issues a fresh stream tag and registers its expected request total for progress queries. Accepts engine texture paths ([code].png/.jpg/.webp[/code]); file remapping is resolved internally. Non-blocking: call [code]track_prewarm(tag)[/code] on the [code]DSBatchManager[/code] autoload for per-tag progress signals, then bind with [code]CACHE_MODE_REUSE[/code] once [method is_prewarm_complete] holds.
+				Issues a fresh stream tag and registers its expected request total for progress queries. Accepts engine texture paths ([code].png/.jpg/.webp[/code]); file remapping is resolved internally. Non-blocking: call [code]track_prewarm(tag)[/code] on the [code]DSRuntime[/code] autoload for per-tag progress signals, then bind with [code]CACHE_MODE_REUSE[/code] once [method is_prewarm_complete] holds.
 			</description>
 		</method>
 		<method name="set_auto_tune_for_integrated_gpu">

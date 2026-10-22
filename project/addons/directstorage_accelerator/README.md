@@ -4,7 +4,7 @@ This addon exposes DirectStorage-backed texture streaming and asynchronous I/O r
 
 ## Editor Workflow
 
-Enable the `DirectStorage Accelerator` plugin. It registers the `DSBatchManager` autoload, the `DirectStorage Texture` importer, and the `DirectStorageExporter` export plugin.
+Enable the `DirectStorage Accelerator` plugin. It registers the `DSRuntime` autoload, the `DirectStorage Texture` importer, and the `DirectStorageExporter` export plugin.
 
 The importer converts `.png`, `.jpg`, `.jpeg`, and `.webp` sources into `.dstex` (version 2) resources with D3D12-aligned footprints (256-byte row pitch alignment and 512-byte mip placement alignment) for direct hardware decompression. Its Import dock options control source compression mode (S3TC vs uncompressed), source color space, and GDeflate compression level.
 

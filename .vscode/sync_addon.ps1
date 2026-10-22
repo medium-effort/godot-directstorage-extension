@@ -167,6 +167,23 @@ Get-ChildItem -Path $LocalAddonDir -Recurse | ForEach-Object {
     }
 }
 
+# Track orphaned files in destination that no longer exist in source addon
+$orphanedFiles = [System.Collections.Generic.List[string]]::new()
+Get-ChildItem -Path $SyncTargetDir -Recurse -File | ForEach-Object {
+    $destFile = $_
+    $relPath = $destFile.FullName.Substring($SyncTargetDir.Length).TrimStart("\", "/")
+
+    # Exclude binaries, temporary, and old files
+    if ($relPath.StartsWith("bin") -or $destFile.Name.EndsWith(".old") -or $destFile.Name.EndsWith(".tmp")) {
+        return
+    }
+
+    $sourcePath = Join-Path $LocalAddonDir $relPath
+    if (-not (Test-Path $sourcePath)) {
+        $orphanedFiles.Add($destFile.FullName)
+    }
+}
+
 # Attempt to clean up unlocked .old files in destination bin
 $destBin = Join-Path $SyncTargetDir "bin"
 if (Test-Path $destBin) {
@@ -181,4 +198,13 @@ if ($copiedCount -gt 0) {
 }
 else {
     Write-Host "Sync: Target $SyncTargetDir is already up to date ($skippedCount file(s) checked, ${elapsedSecs}s)." -ForegroundColor DarkGray
+}
+
+if ($orphanedFiles.Count -gt 0) {
+    Write-Host ""
+    Write-Host "WARNING: Found $($orphanedFiles.Count) orphaned file(s) in sync target ($SyncTargetDir) that no longer exist in source addon:" -ForegroundColor Yellow
+    foreach ($orphan in $orphanedFiles) {
+        Write-Host "  - $orphan" -ForegroundColor Yellow
+    }
+    Write-Host "Please remove them manually if they are no longer needed." -ForegroundColor Yellow
 }

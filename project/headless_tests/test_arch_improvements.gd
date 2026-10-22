@@ -459,14 +459,14 @@ func test_suite_008_backwards_compatibility_and_autoload(ctx: Object) -> void:
 	assert_eq(req_sync.get_status(), DSRequest.STATUS_COMPLETED, "Legacy synchronous flush_batch() completed immediately")
 	assert_eq(req_sync.get_destination_buffer(), fix["raw_data"], "Legacy synchronous payload matches ground truth")
 
-	# 2. Test DSBatchManager process pattern
+	# 2. Test DSRuntime process pattern
 	# Simulates: if ctx.is_batch_complete(): ctx.collect_completed_results(); ctx.flush_batch_async()
 	var batch_complete: bool = ctx.is_batch_complete()
 	assert_true(batch_complete or not batch_complete, "is_batch_complete() is callable in autoload loop")
 	if ctx.is_batch_complete():
 		ctx.collect_completed_results()
 	ctx.flush_batch_async()
-	assert_true(true, "DSBatchManager per-frame autoload sequence executed without errors")
+	assert_true(true, "DSRuntime per-frame autoload sequence executed without errors")
 
 	# 3. Test SYNC-01 interleaved async submission and synchronous flush_batch()
 	var fix_async: Dictionary = _generate_synthetic_dstex("user://test_sync01_async.dstex", 64, 64, 1)

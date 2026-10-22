@@ -19,7 +19,7 @@ config/author="MediumEffort"
 
 [autoload]
 
-DSBatchManager="*uid://c3w3tb6oorh1f"
+DSRuntime="*res://addons/directstorage_accelerator/scripts/ds_runtime.gd"
 _mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
 
 [editor_plugins]

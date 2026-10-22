@@ -36,6 +36,7 @@ var _bundle_dspkg_enabled: bool = false
 var _enforce_pairing_enabled: bool = true
 var _steampipe_1mb_alignment_enabled: bool = false
 var _encryption_enabled: bool = false
+var _active_editor_dll_keyless: bool = false
 var _current_fingerprint: int = 0
 var _archive_name: String = "textures.dspkg"
 ## Manifest accumulator: dstex/archive entry path -> uncompressed size.
@@ -140,6 +141,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
 	_encryption_enabled = bool(get_option(OPTION_ENCRYPTION_ENABLED))
+	_active_editor_dll_keyless = false
 	_has_textures = false
 	_archive_failed = false
 	_dspkg = null
@@ -241,7 +243,8 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 					_cleanup_staging()
 					return
 				elif active_id.is_empty():
-					print("[DirectStorage Exporter] Notice: No active runtime key detected in editor build. Ensure runtime sets key via set_global_encryption_key() or baked template.")
+					_active_editor_dll_keyless = true
+					push_warning("[DirectStorage Exporter] Notice: No active runtime key detected in editor build. Ensure runtime sets key via set_global_encryption_key() or custom baked template.")
 
 				err = _dspkg.set_encryption_key(key_hex)
 				if err != OK:
@@ -377,6 +380,14 @@ func _export_end() -> void:
 	if not dspkg_ok:
 		# Do not leave a missing/broken textures.dspkg unreported.
 		return
+
+	if _bundle_dspkg_enabled and _has_textures:
+		if _encryption_enabled and _active_editor_dll_keyless:
+			push_error("[DirectStorage Exporter] ERROR: '" + String(OPTION_ENCRYPTION_ENABLED) + "' is ON, but the active DirectStorage extension binary is an unencrypted/keyless build. The exported game will fail to decrypt textures at startup and crash! If you are using public release binaries, please re-export with '" + String(OPTION_ENCRYPTION_ENABLED) + "' turned OFF.")
+		elif not _encryption_enabled and ClassDB.class_exists("DSPkg") and ClassDB.class_has_method("DSPkg", "get_global_encryption_key_id"):
+			var active_id: String = DSPkg.get_global_encryption_key_id()
+			if not active_id.is_empty():
+				push_warning("[DirectStorage Exporter] WARNING: Active DirectStorage extension DLL has a baked encryption key (ID: " + active_id + "), but '" + String(OPTION_ENCRYPTION_ENABLED) + "' was turned OFF. The exported '" + _archive_name + "' archive is UNENCRYPTED in plaintext.")
 
 ## Removes the per-export staging file (textures.dspkg.tmp) in the target
 ## export directory. A rename needs no extra disk space, so normally nothing

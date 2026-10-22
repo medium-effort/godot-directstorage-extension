@@ -65,7 +65,7 @@
 		<method name="get_unbuilt_cpu_prewarm_count" qualifiers="const">
 			<return type="int" />
 			<param index="0" name="tag" type="int" default="0" />
-			<description>Returns the number of CPU memory prewarm textures for [param tag] awaiting background [method poll_completed] decompression into ImageTexture. Used by DSBatchManager to avoid scheduling worker ingestion tasks when all pending items are GPU textures.</description>
+			<description>Returns the number of CPU memory prewarm textures for [param tag] awaiting background [method poll_completed] decompression into ImageTexture. Used by DSRuntime to avoid scheduling worker ingestion tasks when all pending items are GPU textures.</description>
 		</method>
 		<method name="get_unbuilt_gpu_prewarm_count" qualifiers="const">
 			<return type="int" />
@@ -106,7 +106,7 @@
 		</method>
 		<method name="pump_gpu_prewarm">
 			<return type="void" />
-			<description>Dispatches at most one queued GPU prewarm allocation chunk to the render thread per call. Automatically ticked once per frame by [code]DSBatchManager[/code]. Safe to call manually; no-op when idle or when a chunk is already in flight.</description>
+			<description>Dispatches at most one queued GPU prewarm allocation chunk to the render thread per call. Automatically ticked once per frame by [code]DSRuntime[/code]. Safe to call manually; no-op when idle or when a chunk is already in flight.</description>
 		</method>
 		<method name="has_alias" qualifiers="const">
 			<return type="bool" />

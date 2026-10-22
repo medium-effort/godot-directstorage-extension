@@ -8,8 +8,9 @@ extends EditorPlugin
 ## DSPkg export plugin in the Godot Editor. Enable this plugin to get the
 ## automatic texture import and archive bundling workflow.
 
-const AUTOLOAD_NAME: String = "DSBatchManager"
-const AUTOLOAD_PATH: String = "res://addons/directstorage_accelerator/scripts/ds_batch_manager.gd"
+const AUTOLOAD_NAME: String = "DSRuntime"
+const AUTOLOAD_PATH: String = "res://addons/directstorage_accelerator/scripts/ds_runtime.gd"
+const LEGACY_AUTOLOAD_NAME: String = "DSBatchManager"
 
 var _importer: EditorImportPlugin = null
 var _export_plugin: EditorExportPlugin = null
@@ -19,6 +20,13 @@ var _checked_scenes: Dictionary = {}
 ## Registers the autoload, import plugin, export plugin, and DirectStorage
 ## runtime when the addon is enabled.
 func _enter_tree() -> void:
+	# Purge legacy autoload if present from older addon versions
+	if ProjectSettings.has_setting("autoload/" + LEGACY_AUTOLOAD_NAME):
+		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
+			remove_autoload_singleton(LEGACY_AUTOLOAD_NAME)
+		else:
+			ProjectSettings.set_setting("autoload/" + LEGACY_AUTOLOAD_NAME, null)
+
 	if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
 		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
 			add_autoload_singleton(AUTOLOAD_NAME, AUTOLOAD_PATH)

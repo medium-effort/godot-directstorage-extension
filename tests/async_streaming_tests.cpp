@@ -186,7 +186,7 @@ GDEX_TEST_ASYNC_T(streaming, prewarm_completes, TAG_ASYNC | TAG_INTEGRATION | TA
     // actual streaming work.
     cache->call("clear");
 
-    // Pump the tag the way DSBatchManager._process does: harvest finished
+    // Pump the tag the way DSRuntime._process does: harvest finished
     // batches, flush pending stream work, drain completed textures into the
     // cache, then yield one frame. Each wait uses the 30s framework default;
     // the loop cap below turns a stall into a wait-chain failure, never a

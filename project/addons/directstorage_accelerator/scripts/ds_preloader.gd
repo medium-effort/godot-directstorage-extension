@@ -6,7 +6,7 @@ extends RefCounted
 ## Static GDScript surface over the native async streaming pipeline:
 ## [code]DSTextureCache.prewarm_gpu_async()[/code] (GPU DMA to VRAM) /
 ## [code]DSTextureCache.prewarm_async()[/code] (CPU memory streaming) +
-## [code]DSBatchManager[/code] autoload [code]_process[/code]
+## [code]DSRuntime[/code] autoload [code]_process[/code]
 ## (collect -> [code]flush_stream_async()[/code] -> [code]pump_gpu_prewarm()[/code] ->
 ## [code]poll_completed()[/code] -> per-tag progress) + [code]DSContext[/code] tag queries.
 ##
@@ -216,9 +216,9 @@ static func is_stream_prewarm_available() -> bool:
 
 ## Enqueues [param paths] (engine texture paths) for async prewarm and returns
 ## the stream tag. Non-blocking: requests sit in the stream queue until the
-## [code]DSBatchManager[/code] autoload drains them via
-## [code]flush_stream_async()[/code]. Tag discovery is opt-in on the batch
-## manager, so this also calls [code]track_prewarm(tag)[/code] immediately —
+## [code]DSRuntime[/code] autoload drains them via
+## [code]flush_stream_async()[/code]. Tag discovery is opt-in on the runtime
+## coordinator, so this also calls [code]track_prewarm(tag)[/code] immediately —
 ## without it the tag still flows through flush/collect but emits no
 ## [code]prewarm_progress[/code] / [code]prewarm_finished[/code] signals.
 ## Returns 0 when the native singletons are unavailable.
@@ -325,7 +325,12 @@ static func await_prewarm_finished(tag: int, on_progress: Callable = Callable())
 			await (loop as SceneTree).process_frame
 		else:
 			return
-		var manager: Node = (loop as SceneTree).root.get_node_or_null("DSBatchManager") if (loop is SceneTree) else null
+		var manager: Node = null
+		if loop is SceneTree:
+			var root_node: Window = (loop as SceneTree).root
+			manager = root_node.get_node_or_null("DSRuntime")
+			if manager == null:
+				manager = root_node.get_node_or_null("DSBatchManager")
 		if manager == null and ClassDB.class_exists("DSTextureCache"):
 			var cache: Object = Engine.get_singleton("DSTextureCache")
 			if cache != null:
@@ -399,7 +404,10 @@ static func _track_batch_manager_tag(tag: int) -> void:
 	var loop: MainLoop = Engine.get_main_loop()
 	if not (loop is SceneTree):
 		return
-	var manager: Node = (loop as SceneTree).root.get_node_or_null("DSBatchManager")
+	var root_node: Window = (loop as SceneTree).root
+	var manager: Node = root_node.get_node_or_null("DSRuntime")
+	if manager == null:
+		manager = root_node.get_node_or_null("DSBatchManager")
 	if manager != null and manager.has_method("track_prewarm"):
 		manager.call("track_prewarm", tag)
 

@@ -1765,7 +1765,7 @@ Ref<Texture2D> DSPreloader::await_pending_texture(const String &p_path, uint32_t
 		return Ref<Texture2D>();
 	}
 
-	// On a worker thread: wait for the render thread (e.g. DSBatchManager::_process)
+	// On a worker thread: wait for the render thread (e.g. DSRuntime::_process)
 	// to complete the in-flight stream request and store the texture into DSTextureCache.
 	std::unique_lock<std::mutex> lock(state().mutex);
 	State &s = state();

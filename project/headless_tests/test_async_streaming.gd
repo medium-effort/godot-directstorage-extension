@@ -183,7 +183,7 @@ func _run() -> void:
 	ctx.shutdown_ds()
 	_log("shutdown clean")
 
-# Pumps one tag the way DSBatchManager._process does; true when complete.
+# Pumps one tag the way DSRuntime._process does; true when complete.
 func _pump_until(ctx: Object, cache: Object, tag: int) -> bool:
 	var frames := 0
 	while not ctx.is_prewarm_complete(tag):
