@@ -140,23 +140,47 @@ jobs:
           path: ${{ github.workspace }}/.scons-cache
           key: scons-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}-run-${{ github.run_id }}-${{ github.run_attempt }}
           
-      - name: Publish build failure summary
-        if: failure() && steps.build.outcome == 'failure'
-        shell: bash
-        run: python .github/scripts/extract_build_errors.py scons-build.log
-
       - name: Validate addon GDScripts
+        id: gdscript
         shell: bash
         run: |
-          echo "Validating addon GDScript files with Godot..."
+          # Tee the whole loop to a log so the failure summary step can report it.
+          exec > >(tee gdscript-check.log) 2>&1
+          echo "Addon bin contents:"
+          ls -la project/addons/directstorage_accelerator/bin 2>/dev/null || echo "(bin directory missing)"
           FAILED=0
+          # GDExtension plugins are only discovered by the editor filesystem
+          # scan. `--check-only --script` just loads the entries listed in
+          # res://.godot/extension_list.cfg, and a fresh CI checkout has no
+          # .godot directory - so no extension is loaded and every native
+          # class (DSPkg) looks undeclared on every platform. Import once to
+          # register the extension, then the checks below are meaningful.
+          echo "Importing project (registers GDExtension classes)..."
+          "$GODOT" --path project --headless --import || FAILED=1
+          echo "Extension list:"
+          cat project/.godot/extension_list.cfg 2>/dev/null || echo "(extension_list.cfg missing)"
+          echo "Validating addon GDScript files with Godot..."
           for script in project/addons/directstorage_accelerator/scripts/*.gd; do
             rel_script="${script#project/}"
             echo "Checking $rel_script..."
             "$GODOT" --path project --headless --check-only --script "$rel_script" || FAILED=1
           done
+          # A missing or unloadable GDExtension registers no classes, so every
+          # DSPkg reference shows up as a misleading "Identifier not declared"
+          # parse error (Godot prints no load error for a missing library).
+          # Assert the built library exists so the log names the real problem.
+          case "${{ runner.os }}" in
+            Linux)   EXPECTED_LIB="libdirectstorage_accelerator.linux.editor.x86_64.so" ;;
+            macOS)   EXPECTED_LIB="libdirectstorage_accelerator.macos.editor.universal.dylib" ;;
+            Windows) EXPECTED_LIB="dsgd_64.debug.dll" ;;
+            *)       EXPECTED_LIB="" ;;
+          esac
+          if [ -n "$EXPECTED_LIB" ] && [ ! -f "project/addons/directstorage_accelerator/bin/$EXPECTED_LIB" ]; then
+            echo "ERROR: Built extension library is missing (expected bin/$EXPECTED_LIB)."
+            FAILED=1
+          fi
           if [ $FAILED -ne 0 ]; then
-            echo "ERROR: One or more addon GDScript files failed syntax validation!"
+            echo "ERROR: Addon validation failed (missing extension library and/or GDScript syntax errors; see above)."
             exit 1
           fi
           echo "All addon GDScript files passed syntax validation."
@@ -172,6 +196,23 @@ jobs:
             --gdextest-raw-log="${{ github.workspace }}/godot-raw.log"
         env:
           GODOT: ${{ env.GODOT }}
+
+      - name: Publish failure summary
+        # Runs for ANY failed step, not just a broken SCons build: a failure in
+        # the GDScript validation step previously produced no job summary at
+        # all because that step ran after the build-only summary step.
+        if: failure()
+        shell: bash
+        run: |
+          if [ "${{ steps.build.outcome }}" != "success" ]; then
+            LOG=scons-build.log
+          elif [ "${{ steps.gdscript.outcome }}" = "failure" ]; then
+            LOG=gdscript-check.log
+          else
+            LOG=scons-build.log
+          fi
+          echo "Publishing failure summary from $LOG"
+          python .github/scripts/extract_build_errors.py "$LOG"
 
       - name: Show godot raw log head (crash diagnosis)
         # The failure tail only shows the backtrace; the head shows which
@@ -218,6 +259,7 @@ jobs:
             test-results.xml
             godot-raw.log
             scons-build.log
+            gdscript-check.log
           if-no-files-found: ignore
             
       - name: Publish test report (GitHub Annotations)

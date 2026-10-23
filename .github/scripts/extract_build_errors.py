@@ -15,6 +15,8 @@ ERROR_PATTERNS = [
     re.compile(r"\b(error C\d+|error LNK\d+):", re.IGNORECASE),          # MSVC
     re.compile(r"^\s*clang(\+\+)?: error:", re.IGNORECASE),              # Clang driver
     re.compile(r"^\s*scons:\s*\*\*\*\s*\[.*\]\s*Error\s+\d+", re.IGNORECASE), # SCons target error
+    re.compile(r"^\s*SCRIPT ERROR:", re.IGNORECASE),                     # Godot GDScript
+    re.compile(r"^\s*ERROR:\s"),                                         # Godot engine error
 ]
 
 # Patterns that indicate warning (to be avoided or used as boundary)

@@ -279,6 +279,17 @@ if env["platform"] == "windows":
         if "/FS" not in env["CXXFLAGS"]:
             env.Append(CXXFLAGS=["/FS"])
 
+# Linux link-time hardening: GNU ld, unlike ld64 on macOS, happily emits a
+# shared object whose symbols are still undefined. A missing translation unit
+# (e.g. a vendored .c dropped from the source list: issue #0114) therefore linked
+# "successfully" and only failed much later, at runtime, when Godot loaded the
+# extension with dlopen(RTLD_NOW). Reject undefined symbols at link time instead.
+# GDExtension libraries do not link against engine symbols - they receive the
+# GDExtensionInterface function table at init - so this only rejects genuinely
+# missing objects or libraries (libstdc++/libc are linked normally).
+if env["platform"] == "linux":
+    env.Append(LINKFLAGS=["-Wl,--no-undefined"])
+
 # Source files (GDExtension C++ code + GDeflate & libdeflate sources).
 # Keep the Windows backend out of non-Windows builds; its implementation uses
 # Win32 and DirectStorage APIs that are not available on those platforms.
@@ -296,19 +307,25 @@ thirdparty_sources = (
     Glob("thirdparty/libdeflate/lib/x86/*.c")
 )
 
-thirdparty_objects = thirdparty_sources + Glob("thirdparty/monocypher/monocypher.c")
+monocypher_sources = Glob("thirdparty/monocypher/monocypher.c")
 if env["platform"] == "windows":
     project_sources += Glob("src/platform/win32/*.cpp")
 
 # Keep non-critical MSVC warning suppressions scoped to third-party sources so
 # legitimate diagnostics in the extension's src/ code remain visible.
-thirdparty_objects = thirdparty_sources
+# Monocypher backs DSPkg's TOC encryption (src/formats/dspkg_format.cpp), so it
+# belongs to the source set on EVERY platform; only the warning suppressions and
+# the C11 std flag are MSVC-specific. Do not reset thirdparty_objects to
+# thirdparty_sources here: that silently dropped Monocypher from macOS/Linux
+# builds and broke the link with undefined crypto_aead_lock/crypto_aead_unlock/
+# crypto_blake2b/crypto_wipe.
+thirdparty_objects = thirdparty_sources + monocypher_sources
 if env["platform"] == "windows" and "msvc" in env["TOOLS"]:
     thirdparty_env = env.Clone()
     thirdparty_env.Append(CCFLAGS=["/wd4244", "/wd4127", "/wd4267", "/wd4100", "/wd4245", "/wd4456", "/wd4018", "/wd4146", "/wd4310", "/FS"])
     monocypher_env = thirdparty_env.Clone()
     monocypher_env.Append(CFLAGS=["/std:c11"])
-    monocypher_objects = monocypher_env.SharedObject(Glob("thirdparty/monocypher/monocypher.c"))
+    monocypher_objects = monocypher_env.SharedObject(monocypher_sources)
     thirdparty_objects = thirdparty_env.SharedObject(thirdparty_sources) + monocypher_objects
 
 sources = project_sources + thirdparty_objects
