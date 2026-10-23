@@ -2485,8 +2485,15 @@ void Win32Backend::shutdown() {
 		// and skip unloading runtime modules. The OS kernel process teardown reclaims all resources cleanly.
 		UtilityFunctions::push_error("[DirectStorage] Shutdown drain timed out after " + String::num_uint64(timeout_ms) +
 				" ms (GPU/DMA hung); leaking handles and skipping DLL unload to avoid use-after-free.");
-		completion_thread_stop.store(true);
-		sync_batch_in_flight.store(false);
+		{
+			// Publish the stop flag under batch_mutex: the completion thread
+			// checks it in its wait predicate under the same mutex, so a store
+			// outside the lock can be missed between predicate check and waiter
+			// registration (lost wakeup, then join/detach never returns).
+			std::lock_guard<std::mutex> lock(batch_mutex);
+			completion_thread_stop.store(true);
+			sync_batch_in_flight.store(false);
+		}
 		if (completion_stop_event) {
 			SetEvent(completion_stop_event);
 		}
@@ -2501,8 +2508,11 @@ void Win32Backend::shutdown() {
 	}
 
 	// 3. Normal graceful path: all DMA is drained. Signal and join the completion thread.
-	completion_thread_stop.store(true);
-	sync_batch_in_flight.store(false);
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		completion_thread_stop.store(true);
+		sync_batch_in_flight.store(false);
+	}
 	if (completion_stop_event) {
 		SetEvent(completion_stop_event);
 	}

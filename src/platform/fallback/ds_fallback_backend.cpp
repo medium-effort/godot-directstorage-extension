@@ -1,9 +1,11 @@
 #include "ds_fallback_backend.h"
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include "GDeflate.h"
 #include "TileStream.h"
 
@@ -133,7 +135,17 @@ bool FallbackBackend::initialize() {
 }
 
 void FallbackBackend::shutdown() {
-	completion_thread_stop.store(true);
+	{
+		// Store the stop flag under batch_mutex. The worker evaluates its wait
+		// predicate while holding that mutex, so this store is either observed
+		// by a worker that is already blocked (the notify below wakes it) or by
+		// a worker that has not yet entered wait() (its predicate then sees the
+		// flag immediately). Notifying without the lock leaves a window where a
+		// worker that already checked the predicate but has not yet registered
+		// as a waiter misses the notify and blocks in join() forever.
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		completion_thread_stop.store(true);
+	}
 	batch_cv.notify_all();
 	if (completion_thread.joinable()) {
 		completion_thread.join();
@@ -256,12 +268,34 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 }
 
 void FallbackBackend::submit_batch() {
+	ProjectSettings *ps = ProjectSettings::get_singleton();
+	uint32_t sync_timeout_ms = 3000;
+	if (ps && ps->has_setting("directstorage/sync_flush_timeout_ms")) {
+		sync_timeout_ms = static_cast<uint32_t>(std::clamp<int64_t>(int64_t(ps->get_setting("directstorage/sync_flush_timeout_ms")), 500, 10000));
+	}
+	uint32_t half_timeout_ms = sync_timeout_ms / 2;
+
 	Vector<Ref<DSRequest>> batch;
+	bool timed_out = false;
 	{
 		std::unique_lock<std::mutex> lock(batch_mutex);
-		batch_cv.wait(lock, [this]() { return !batch_in_flight.load(); });
+		if (!batch_cv.wait_for(lock, std::chrono::milliseconds(half_timeout_ms), [this]() {
+				return !batch_in_flight.load();
+			})) {
+			timed_out = true;
+		}
 		batch = pending_requests;
 		pending_requests.clear();
+	}
+	if (timed_out) {
+		UtilityFunctions::push_error("[DirectStorage] Timed out waiting for the previous batch to complete.");
+		for (int i = 0; i < batch.size(); i++) {
+			if (batch[i].is_valid() && batch[i]->get_status() == DSRequest::STATUS_SUBMITTED) {
+				batch[i]->set_status(DSRequest::STATUS_FAILED);
+				batch[i]->set_error_message("Timed out waiting for the previous batch to complete.");
+			}
+		}
+		return;
 	}
 	for (int i = 0; i < batch.size(); i++) {
 		process_request(batch[i]);

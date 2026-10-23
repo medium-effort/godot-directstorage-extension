@@ -537,3 +537,28 @@ GDEX_TEST_T(context_lifecycle, gpu_adapter_info_schema_and_uma_invariants, TAG_I
     }
 }
 
+// Regression for the lost-wakeup hang in FallbackBackend::shutdown(): the stop
+// flag used to be stored OUTSIDE batch_mutex, so a completion worker that had
+// just sampled its wait predicate (which reads the flag under that mutex) but
+// had not yet registered as a waiter could miss notify_all() and sleep forever,
+// blocking join() and freezing the whole suite. An initialize/shutdown pair
+// with nothing in between is the worst case for that window, so repeat it.
+GDEX_TEST_T(context_lifecycle, repeated_initialize_shutdown_has_no_lost_wakeup,
+        TAG_INTEGRATION) {
+    godot::Object *ds = require_singleton(ctx, "DSContext");
+    ds->call(godot::StringName("shutdown_ds"));
+
+    // Each cycle costs one thread spawn + join (~0.1 ms), so 1000 cycles is a
+    // fraction of a second while exercising the start/stop race thousands of
+    // times per run instead of once per suite.
+    constexpr int kCycles = 1000;
+    for (int i = 0; i < kCycles; ++i) {
+        GDEX_ASSERT_TRUE(static_cast<bool>(ds->call(godot::StringName("initialize_ds"))));
+        ds->call(godot::StringName("shutdown_ds"));
+        GDEX_EXPECT_FALSE(static_cast<bool>(ds->call(godot::StringName("is_initialized"))));
+    }
+
+    // Leave the singleton initialized; the rest of the suite expects that.
+    GDEX_EXPECT_TRUE(static_cast<bool>(ds->call(godot::StringName("initialize_ds"))));
+}
+
