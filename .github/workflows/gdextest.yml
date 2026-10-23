@@ -144,43 +144,79 @@ jobs:
         id: gdscript
         shell: bash
         run: |
-          # Tee the whole loop to a log so the failure summary step can report it.
+          # Tee the whole step to a log so the failure summary step can report it.
           exec > >(tee gdscript-check.log) 2>&1
+          ADDON_BIN="project/addons/directstorage_accelerator/bin"
           echo "Addon bin contents:"
-          ls -la project/addons/directstorage_accelerator/bin 2>/dev/null || echo "(bin directory missing)"
+          ls -la "$ADDON_BIN" 2>/dev/null || echo "(bin directory missing)"
+
           FAILED=0
+          FAILURES=""
+          note_failure() {
+            echo "ERROR: $1"
+            FAILURES="${FAILURES:+$FAILURES, }$1"
+            FAILED=1
+          }
+
           # GDExtension plugins are only discovered by the editor filesystem
           # scan. `--check-only --script` just loads the entries listed in
           # res://.godot/extension_list.cfg, and a fresh CI checkout has no
           # .godot directory - so no extension is loaded and every native
           # class (DSPkg) looks undeclared on every platform. Import once to
-          # register the extension, then the checks below are meaningful.
+          # register the extension. Editor-only noise from addons that are not
+          # part of this repository must not fail the step, so the import exit
+          # status is reported but not treated as a failure on its own.
           echo "Importing project (registers GDExtension classes)..."
-          "$GODOT" --path project --headless --import || FAILED=1
+          if "$GODOT" --path project --headless --import; then
+            echo "Import finished."
+          else
+            echo "WARN: import exited non-zero; extension registration is verified below."
+          fi
+
           echo "Extension list:"
-          cat project/.godot/extension_list.cfg 2>/dev/null || echo "(extension_list.cfg missing)"
+          if grep -q 'directstorage_accelerator.gdextension' project/.godot/extension_list.cfg 2>/dev/null; then
+            cat project/.godot/extension_list.cfg
+          else
+            note_failure "directstorage_accelerator.gdextension is missing from .godot/extension_list.cfg"
+          fi
+
+          # Assert the build produced a library for this platform, so a build
+          # that never linked is named explicitly instead of surfacing as a
+          # misleading "Identifier not declared" parse error.
+          case "${{ runner.os }}" in
+            Linux)   LIB_GLOB="libdirectstorage_accelerator.linux.*.so" ;;
+            macOS)   LIB_GLOB="libdirectstorage_accelerator.macos.*.dylib" ;;
+            Windows) LIB_GLOB="dsgd_64*.dll" ;;
+            *)       LIB_GLOB="" ;;
+          esac
+          if [ -n "$LIB_GLOB" ] && ! compgen -G "$ADDON_BIN/$LIB_GLOB" > /dev/null; then
+            note_failure "no built extension library matching $ADDON_BIN/$LIB_GLOB"
+          fi
+
+          # Unambiguous signal that the built library registered its native
+          # classes (Godot prints nothing when a GDExtension fails to load).
+          printf 'extends SceneTree\nfunc _init():\n    var present := ClassDB.class_exists("DSPkg")\n    print("DSPKG_REGISTERED=", present)\n    quit(0 if present else 1)\n' > project/dspkg_probe.gd
+          if "$GODOT" --path project --headless --script dspkg_probe.gd; then
+            echo "DSPkg registered."
+          else
+            note_failure "DSPkg is not registered, the extension library did not load"
+          fi
+          rm -f project/dspkg_probe.gd
+
           echo "Validating addon GDScript files with Godot..."
           for script in project/addons/directstorage_accelerator/scripts/*.gd; do
             rel_script="${script#project/}"
             echo "Checking $rel_script..."
-            "$GODOT" --path project --headless --check-only --script "$rel_script" || FAILED=1
+            if "$GODOT" --path project --headless --check-only --script "$rel_script"; then
+              echo "  ok"
+            else
+              echo "  FAILED (exit $?)"
+              FAILED=1
+            fi
           done
-          # A missing or unloadable GDExtension registers no classes, so every
-          # DSPkg reference shows up as a misleading "Identifier not declared"
-          # parse error (Godot prints no load error for a missing library).
-          # Assert the built library exists so the log names the real problem.
-          case "${{ runner.os }}" in
-            Linux)   EXPECTED_LIB="libdirectstorage_accelerator.linux.editor.x86_64.so" ;;
-            macOS)   EXPECTED_LIB="libdirectstorage_accelerator.macos.editor.universal.dylib" ;;
-            Windows) EXPECTED_LIB="dsgd_64.debug.dll" ;;
-            *)       EXPECTED_LIB="" ;;
-          esac
-          if [ -n "$EXPECTED_LIB" ] && [ ! -f "project/addons/directstorage_accelerator/bin/$EXPECTED_LIB" ]; then
-            echo "ERROR: Built extension library is missing (expected bin/$EXPECTED_LIB)."
-            FAILED=1
-          fi
+
           if [ $FAILED -ne 0 ]; then
-            echo "ERROR: Addon validation failed (missing extension library and/or GDScript syntax errors; see above)."
+            echo "ERROR: Addon validation failed: ${FAILURES:-one or more GDScript files failed syntax validation}"
             exit 1
           fi
           echo "All addon GDScript files passed syntax validation."

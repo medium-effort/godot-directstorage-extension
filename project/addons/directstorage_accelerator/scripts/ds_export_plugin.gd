@@ -584,7 +584,7 @@ func _scan_dir_for_manifest(dir_path: String) -> void:
 				if sub_dir != null and sub_dir.list_dir_begin() == OK:
 					var sub_name := sub_dir.get_next()
 					while not sub_name.is_empty():
-						if sub_dir.current_is_dir() and sub_name != "directstorage_accelerator" and sub_name != "godot_ai" and not sub_name.begins_with("."):
+						if sub_dir.current_is_dir() and sub_name != "directstorage_accelerator" and not sub_name.begins_with("."):
 							_scan_dir_for_manifest(sub_dir_path.path_join(sub_name))
 						sub_name = sub_dir.get_next()
 					sub_dir.list_dir_end()

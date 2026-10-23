@@ -48,7 +48,11 @@ project/test_assets/*.png
 # ==============================================================================
 # Godot Local Addons
 # ==============================================================================
-/project/addons/godot_ai
+# Allowlist: ignore every addon directory except the accelerator itself.
+# The parent directory must NOT be ignored, otherwise the negated entry below
+# could never be re-included.
+/project/addons/*
+!/project/addons/directstorage_accelerator/
 
 # ==============================================================================
 # Test Frameworks & Static Analysis (gdextest, cppcheck, logs)
