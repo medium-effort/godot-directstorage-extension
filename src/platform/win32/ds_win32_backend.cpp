@@ -1481,10 +1481,75 @@ static bool claim_probed_runtime_modules(const String &p_bin_dir, HMODULE &r_cor
 	return true;
 }
 
+// Renderer capability gate shared by the capability probe and backend init.
+// DirectStorage queues require the live D3D12 RenderingDevice, and the
+// rendering driver is fixed for the process lifetime, so a non-empty
+// non-D3D12 driver is a permanent negative: cache it BEFORE paying for
+// LoadLibrary of the runtime and DStorageGetFactory (repeated initialize()
+// attempts would otherwise re-acquire the whole runtime just to fail the same
+// check). An empty driver name means the RenderingServer is not up yet and is
+// deliberately NOT cached.
+struct DSRendererGate {
+	std::mutex mutex;
+	bool negative = false;
+	std::string driver_utf8;
+};
+
+static DSRendererGate &ds_renderer_gate() {
+	// Function-local static: constructed on first use, i.e. after the
+	// GDExtension interface exists (a namespace-scope godot::String here
+	// would run inside DllMain and crash with Error 1114).
+	static DSRendererGate gate;
+	return gate;
+}
+
+static String ds_renderer_gate_reason(const String &p_driver_name) {
+	return "Rendering driver is '" + p_driver_name + "' (Direct3D 12 is required for DirectStorage GPU queues).";
+}
+
+// Returns true when the live renderer can host DirectStorage GPU queues; on
+// failure fills r_reason with the user-facing cause.
+static bool ds_renderer_supports_dstorage(String &r_reason) {
+	DSRendererGate &gate = ds_renderer_gate();
+	{
+		std::lock_guard<std::mutex> lock(gate.mutex);
+		if (gate.negative) {
+			r_reason = ds_renderer_gate_reason(String(gate.driver_utf8.c_str()));
+			return false;
+		}
+	}
+
+	RenderingServer *rs = RenderingServer::get_singleton();
+	const String driver_name = rs ? rs->get_current_rendering_driver_name().to_lower() : String();
+	if (driver_name != "d3d12") {
+		r_reason = ds_renderer_gate_reason(driver_name);
+		if (!driver_name.is_empty()) {
+			std::lock_guard<std::mutex> lock(gate.mutex);
+			gate.negative = true;
+			gate.driver_utf8 = driver_name.utf8().get_data();
+		}
+		return false;
+	}
+	if (!rs->get_rendering_device()) {
+		r_reason = "A usable D3D12 RenderingDevice is not active.";
+		return false;
+	}
+	return true;
+}
+
 static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_capacity) {
 	DSRuntimeProbe result;
 	HMODULE core = nullptr;
 	HMODULE dstorage = nullptr;
+
+	// Cheapest and most permanent precondition first: without a live D3D12
+	// renderer, loading the runtime and creating a factory can only fail.
+	String renderer_reason;
+	if (!ds_renderer_supports_dstorage(renderer_reason)) {
+		result.reason = renderer_reason;
+		return result;
+	}
+
 	String core_path = p_bin_dir + String("/dstoragecore.dll");
 	String dstorage_path = p_bin_dir + String("/dstorage.dll");
 	std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(p_bin_dir.utf16().get_data()));
@@ -1500,21 +1565,6 @@ static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_ca
 	if (!dstorage) {
 		result.reason = "DirectStorage runtime DLL 'dstorage.dll' could not be loaded from '" + p_bin_dir + "'.";
 		unload_runtime_modules(core, nullptr);
-		return result;
-	}
-
-	RenderingServer *rs = RenderingServer::get_singleton();
-	String driver_name = rs ? rs->get_current_rendering_driver_name().to_lower() : "";
-	if (driver_name != "d3d12") {
-		result.reason = "Rendering driver is '" + driver_name + "' (Direct3D 12 is required for DirectStorage GPU queues).";
-		unload_runtime_modules(core, dstorage);
-		return result;
-	}
-
-	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
-	if (!rd) {
-		result.reason = "A usable D3D12 RenderingDevice is not active.";
-		unload_runtime_modules(core, dstorage);
 		return result;
 	}
 
@@ -2090,6 +2140,16 @@ bool Win32Backend::execute_transitions_internal(const Vector<GPUTargetTransition
 
 bool Win32Backend::initialize(const String &p_path) {
 #ifdef _WIN32
+	// Renderer gate first: without a live D3D12 RenderingDevice everything
+	// below (volume IOCTLs, LoadLibrary of the DirectStorage runtime,
+	// DStorageGetFactory) can only fail. A non-D3D12 driver is cached
+	// process-wide, so repeated initialize() attempts return immediately.
+	String renderer_reason;
+	if (!ds_renderer_supports_dstorage(renderer_reason)) {
+		UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: " + renderer_reason);
+		return false;
+	}
+
 	s_backend_instance = this;
 	active_batch_slot.store(0);
 	sync_batch_in_flight.store(false);
@@ -2204,17 +2264,6 @@ bool Win32Backend::initialize(const String &p_path) {
 		DSTORAGE_QUEUE_DESC queueDesc = {};
 		queueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
 		queueDesc.Capacity = capacity;
-		RenderingServer *rs = RenderingServer::get_singleton();
-		String driver_name = rs ? rs->get_current_rendering_driver_name().to_lower() : "";
-		if (driver_name != "d3d12") {
-			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Rendering driver is '" + driver_name + "' (Direct3D 12 is required).");
-			return false;
-		}
-		RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
-		if (!rd) {
-			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: A usable D3D12 RenderingDevice is not active.");
-			return false;
-		}
 		Microsoft::WRL::ComPtr<ID3D12Device> d3d12_device = ds_win32_get_d3d12_device();
 		if (!d3d12_device) {
 			UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Could not acquire a usable D3D12 device.");
