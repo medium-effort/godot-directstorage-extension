@@ -224,12 +224,17 @@ jobs:
           GODOT: ${{ env.GODOT }}
 
       - name: Run gdextest
+        id: gdextest
         shell: bash
         run: |
+          # Tee the runner output: the ❌ blocks that name the failing suite and
+          # assertions are printed by gdextest.py (not by Godot), so the failure
+          # summary step needs this log to report the real cause.
+          set -o pipefail
           python extern/gdextest/tools/gdextest.py test \
             --json=test-results.json \
             --junit=test-results.xml \
-            --gdextest-raw-log="${{ github.workspace }}/godot-raw.log"
+            --gdextest-raw-log="${{ github.workspace }}/godot-raw.log" 2>&1 | tee gdextest.log
         env:
           GODOT: ${{ env.GODOT }}
 
@@ -242,13 +247,21 @@ jobs:
         run: |
           if [ "${{ steps.build.outcome }}" != "success" ]; then
             LOG=scons-build.log
+            KIND=build
           elif [ "${{ steps.gdscript.outcome }}" = "failure" ]; then
             LOG=gdscript-check.log
+            KIND=validation
+          elif [ "${{ steps.gdextest.outcome }}" = "failure" ]; then
+            # A failed test run must not be reported as a build failure with
+            # the build log tail: the failure only exists in the test log.
+            LOG=gdextest.log
+            KIND=test
           else
             LOG=scons-build.log
+            KIND=build
           fi
-          echo "Publishing failure summary from $LOG"
-          python .github/scripts/extract_build_errors.py "$LOG"
+          echo "Publishing $KIND failure summary from $LOG"
+          python .github/scripts/extract_build_errors.py "$LOG" --kind "$KIND"
 
       - name: Show godot raw log head (crash diagnosis)
         # The failure tail only shows the backtrace; the head shows which
@@ -296,6 +309,7 @@ jobs:
             godot-raw.log
             scons-build.log
             gdscript-check.log
+            gdextest.log
           if-no-files-found: ignore
             
       - name: Publish test report (GitHub Annotations)

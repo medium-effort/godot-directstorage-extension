@@ -4,10 +4,20 @@ Extract compiler errors and diagnostics from build logs for GitHub Actions Step 
 Supports GCC, Clang, and MSVC diagnostic outputs with surrounding context.
 """
 
+import argparse
 import os
 import re
 import sys
 from typing import List, Tuple
+
+# ANSI color sequences: gdextest colorizes its result lines, and the log is
+# captured through tee, so the escapes would otherwise prefix every marker.
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+# Failing-test marker emitted by gdextest; the indented lines below it carry
+# the file:line assertions that failed. Self-contained: never backtrack into
+# the preceding suite output for compiler-style context.
+TEST_FAILURE_PATTERN = re.compile(r"^\s*❌")
 
 # Patterns that indicate an actual error line
 ERROR_PATTERNS = [
@@ -17,7 +27,34 @@ ERROR_PATTERNS = [
     re.compile(r"^\s*scons:\s*\*\*\*\s*\[.*\]\s*Error\s+\d+", re.IGNORECASE), # SCons target error
     re.compile(r"^\s*SCRIPT ERROR:", re.IGNORECASE),                     # Godot GDScript
     re.compile(r"^\s*ERROR:\s"),                                         # Godot engine error
+    TEST_FAILURE_PATTERN,                                                # gdextest failing test
 ]
+
+# Per-failure-kind wording for the step summary. The failing step decides the
+# kind, so a gdextest assertion is never reported as a build failure.
+FAILURE_KINDS = {
+    "build": {
+        "heading": "Build Failure",
+        "diagnostics": "Compiler Diagnostics",
+        "unit": "error(s)",
+        "empty": "No compiler error patterns detected in log. Check the build log tail below.",
+        "tail": "Build Log",
+    },
+    "validation": {
+        "heading": "Validation Failure",
+        "diagnostics": "Diagnostics",
+        "unit": "error(s)",
+        "empty": "No error patterns detected in the validation log. Check the log tail below.",
+        "tail": "Validation Log",
+    },
+    "test": {
+        "heading": "Test Failure",
+        "diagnostics": "Test Failures",
+        "unit": "failing test block(s)",
+        "empty": "No test failure markers detected in the log. Check the test log tail below.",
+        "tail": "Test Log",
+    },
+}
 
 # Patterns that indicate warning (to be avoided or used as boundary)
 WARNING_PATTERN = re.compile(r":\s*warning\s*:", re.IGNORECASE)
@@ -75,6 +112,18 @@ def extract_error_blocks(log_content: str, max_blocks: int = 20) -> Tuple[List[s
     spans: List[Tuple[int, int]] = []
 
     for idx in error_indices[:max_blocks]:
+        # Test-failure markers are self-contained: their detail lines follow,
+        # so never pull in the preceding suite output as compiler context.
+        if TEST_FAILURE_PATTERN.search(lines[idx]):
+            end = idx + 1
+            while end < len(lines) and (end - idx) < 15:
+                nxt = lines[end]
+                if is_error_line(nxt) or not is_continuation_line(nxt):
+                    break
+                end += 1
+            spans.append((idx, end))
+            continue
+
         # 1. Backtrack up to 10 lines to find context headers ('In function...', 'In file included...')
         start = idx
         while start > 0 and (idx - start) < 10:
@@ -123,19 +172,20 @@ def extract_error_blocks(log_content: str, max_blocks: int = 20) -> Tuple[List[s
     return (blocks, total_errors)
 
 
-def format_markdown(log_content: str, os_name: str) -> str:
+def format_markdown(log_content: str, os_name: str, kind: str = "build") -> str:
+    labels = FAILURE_KINDS.get(kind, FAILURE_KINDS["build"])
     blocks, total_errors = extract_error_blocks(log_content)
     lines = log_content.splitlines()
     tail_lines = lines[-40:] if len(lines) > 40 else lines
     tail_text = "\n".join(tail_lines)
 
     md = []
-    md.append(f"### ❌ Build Failure on {os_name}")
+    md.append(f"### ❌ {labels['heading']} on {os_name}")
     md.append("")
     if total_errors > 0:
-        md.append(f"**Compiler Diagnostics:** Found {total_errors} error(s).")
+        md.append(f"**{labels['diagnostics']}:** Found {total_errors} {labels['unit']}.")
         md.append("")
-        md.append("<details open><summary><b>Extracted Compiler Error Context</b></summary>")
+        md.append("<details open><summary><b>Extracted Error Context</b></summary>")
         md.append("")
         md.append("```text")
         md.append("\n\n---\n\n".join(blocks))
@@ -143,10 +193,10 @@ def format_markdown(log_content: str, os_name: str) -> str:
         md.append("</details>")
         md.append("")
     else:
-        md.append("**Notice:** No compiler error patterns detected in log. Check the build log tail below.")
+        md.append(f"**Notice:** {labels['empty']}")
         md.append("")
 
-    md.append("<details><summary><b>Build Log (Tail - Last 40 lines)</b></summary>")
+    md.append(f"<details><summary><b>{labels['tail']} (Tail - Last 40 lines)</b></summary>")
     md.append("")
     md.append("```text")
     md.append(tail_text)
@@ -158,21 +208,29 @@ def format_markdown(log_content: str, os_name: str) -> str:
 
 
 def main():
-    log_file = sys.argv[1] if len(sys.argv) > 1 else "scons-build.log"
-    os_name = os.environ.get("RUNNER_OS", sys.argv[2] if len(sys.argv) > 2 else "Unknown OS")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("log_file", nargs="?", default="scons-build.log")
+    parser.add_argument("os_name", nargs="?", default=None)
+    parser.add_argument("--kind", choices=sorted(FAILURE_KINDS), default="build",
+                        help="Which step failed; selects the summary heading and wording.")
+    args = parser.parse_args()
+
+    log_file = args.log_file
+    os_name = os.environ.get("RUNNER_OS") or args.os_name or "Unknown OS"
+    labels = FAILURE_KINDS[args.kind]
 
     if not os.path.exists(log_file):
-        print(f"Warning: Build log file '{log_file}' not found.", file=sys.stderr)
+        print(f"Warning: log file '{log_file}' not found.", file=sys.stderr)
         summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary_path:
             with open(summary_path, "a", encoding="utf-8") as f:
-                f.write(f"### ❌ Build Failure on {os_name}\n\nBuild log file `{log_file}` was not found.\n")
+                f.write(f"### ❌ {labels['heading']} on {os_name}\n\nLog file `{log_file}` was not found.\n")
         sys.exit(0)
 
     with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-        log_content = f.read()
+        log_content = ANSI_ESCAPE.sub("", f.read())
 
-    markdown_output = format_markdown(log_content, os_name)
+    markdown_output = format_markdown(log_content, os_name, args.kind)
 
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
