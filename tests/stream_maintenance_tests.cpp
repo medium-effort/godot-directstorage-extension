@@ -163,13 +163,28 @@ GDEX_TEST_T(stream_maintenance, sync_and_stream_reports_agree, TAG_INTEGRATION) 
 
     // Parity: identical bookkeeping despite skipped per-request maintenance.
     // Read BEFORE pumping to completion: finalize removes the stream report
-    // once terminal, same lifecycle as the sync path above.
+    // once terminal, same lifecycle as the sync path above. Unlike the sync
+    // path (report read before submit_batch), the stream report can only be
+    // observed after flush_stream_async, which ends with the hoisted
+    // finalize: the fallback worker may already have completed the 256-byte
+    // probe inside submit_async, in which case the report is legitimately
+    // gone. get_request_execution_report() always returns a non-empty default
+    // dict (actual_backend "None"), so an empty dict means "finalized".
     const godot::Dictionary stream_report = ds->get_request_execution_report(stream_req);
     const godot::String stream_backend = ds->get_actual_backend(stream_req);
-    GDEX_EXPECT_FALSE(stream_backend == godot::String("None"));
-    GDEX_EXPECT_TRUE(stream_backend == sync_backend);
-    GDEX_EXPECT_TRUE(static_cast<godot::String>(stream_report.get("actual_backend", "None")) == sync_backend);
-    GDEX_EXPECT_EQ(static_cast<int64_t>(ds->get_actual_destination_type(stream_req)), sync_dest);
+    const int64_t stream_status = static_cast<int64_t>(stream_req->get_status());
+    const bool stream_terminal =
+            stream_status == static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED) ||
+            stream_status == static_cast<int64_t>(godot::DSRequest::STATUS_FAILED);
+    if (!stream_report.is_empty()) {
+        GDEX_EXPECT_FALSE(stream_backend == godot::String("None"));
+        GDEX_EXPECT_TRUE(stream_backend == sync_backend);
+        GDEX_EXPECT_TRUE(static_cast<godot::String>(stream_report.get("actual_backend", "None")) == sync_backend);
+        GDEX_EXPECT_EQ(static_cast<int64_t>(ds->get_actual_destination_type(stream_req)), sync_dest);
+    } else {
+        // Only finalize drops the report, and only for terminal requests.
+        GDEX_EXPECT_TRUE(stream_terminal);
+    }
 
     if (!pump_stream_to_terminal(ds, stream_req)) {
         const int64_t st = static_cast<int64_t>(stream_req->get_status());
