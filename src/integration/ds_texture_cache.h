@@ -48,6 +48,7 @@ private:
 	String _resolve_canonical_locked(const String &p_path) const;
 	static bool _is_cache_mode_ignored(int p_cache_mode);
 	static bool _is_cache_mode_replace(int p_cache_mode);
+	bool _can_own_locked(int p_cache_mode) const;
 
 protected:
 	static void _bind_methods();
@@ -66,7 +67,15 @@ public:
 	~DSTextureCache();
 
 	Ref<Texture2D> get_cached(const String &p_path, int p_cache_mode = CACHE_MODE_REUSE);
-	void store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode = CACHE_MODE_REUSE, const String &p_alias_path = String());
+	// Returns true when the cache took ownership of p_texture. False means the
+	// call was a no-op (disabled cache, ignored mode, null/invalid texture or
+	// empty path). On false, a caller that created a Texture2DRD still owns the
+	// RenderingDevice texture RID and must free it; an ImageTexture owns its
+	// RenderingServer RID and frees it when the Ref drops, so it needs no
+	// cleanup. Returning the decision instead of only logging it is what makes
+	// GPU ownership transfer race-free: the caller never assumes a store
+	// succeeded (#0126).
+	bool store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode = CACHE_MODE_REUSE, const String &p_alias_path = String());
 	void add_alias(const String &p_canonical_path, const String &p_alias_path);
 	void remove_alias(const String &p_alias_path);
 	bool has_alias(const String &p_alias_path) const;
@@ -102,6 +111,13 @@ public:
 	void set_enabled(bool p_enabled);
 	bool is_enabled() const;
 	bool is_cache_mode_ignored(int p_cache_mode) const;
+
+	// True when store() would take ownership of a valid texture under this
+	// cache mode (cache enabled and the mode is not an ignored one). GPU
+	// texture creation is gated on this: a Texture2DRD created by the loader
+	// or the preloader has no self-freeing owner, so a texture the cache
+	// refuses would leak its device RID (GODOT_QUIRKS.md section 27, #0126).
+	bool can_own(int p_cache_mode) const;
 
 	void set_max_entries(int p_max);
 	int get_max_entries() const;

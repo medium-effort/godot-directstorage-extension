@@ -260,7 +260,12 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 		if (should_drop_request(p_request, true)) {
 			return false;
 		}
-		p_request->set_destination_buffer(raw_bytes);
+		// Deliver through the unguarded reference. enqueue_request already moved
+		// this request to STATUS_SUBMITTED, so set_destination_buffer() is
+		// rejected by the payload-immutability guard and the payload was
+		// silently dropped: the request reported COMPLETED with an empty
+		// destination buffer. Same accessor the GDeflate branch above uses.
+		p_request->get_destination_buffer_ref() = raw_bytes;
 	}
 
 	p_request->set_status(DSRequest::STATUS_COMPLETED);

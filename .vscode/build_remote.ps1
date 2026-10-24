@@ -7,6 +7,7 @@ param(
     [switch]$IncludeTests,
     [switch]$Verbose,
     [switch]$SkipVerify,
+    [switch]$SkipDocClasses,
     [switch]$Local,
     [switch]$Remote,
     [string]$EncryptionKey = "",
@@ -624,6 +625,78 @@ if ($AuditOnly) {
     if ($hasError) { exit 1 } else { exit 0 }
 }
 
+# --- Build concurrency guard -------------------------------------------------
+# Two build runs against one checkout destroy each other's work: they share the
+# SCons object tree and .sconsign on Device A, the single gdextest_scons.ok
+# success marker on Device B (one run's marker can satisfy the other run's "did
+# SCons succeed?" check), the generated src/gen/dspkg_encryption_key.h that every
+# run rewrites and then resets, and verify_remote.ps1 -CleanOrphans, which
+# taskkills every cl.exe/link.exe/scons.exe whose command line names the build
+# directory - i.e. a second run kills the first one's compiler.
+#
+# The guard is a workspace-keyed named kernel mutex held for the whole run, so a
+# second build (another agent, full_build.ps1, a hand-run script) fails in under
+# a second instead of corrupting the first. The kernel releases it when the
+# owning process terminates, so there is no lock file to go stale and none to
+# clean up by hand. -AuditOnly returns above this block: it only reads deployed
+# files and stays runnable while a build is in progress.
+function Get-BuildGuardName {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Root.TrimEnd('\', '/').ToLowerInvariant()))
+    }
+    finally {
+        $sha.Dispose()
+    }
+    return "dsgd_build_" + ([System.BitConverter]::ToString($digest[0..7])).Replace('-', '')
+}
+
+# Returns Owned = $true (acquired), $false (held by another process), or $null
+# (the guard object could not be created at all - the caller warns instead of
+# bricking builds on a policy quirk).
+function Enter-BuildGuard {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Name)
+    # Global\ also covers a build started in another Windows session; the
+    # per-session namespace is the fallback when policy denies Global objects.
+    foreach ($prefix in @('Global\', '')) {
+        $mutex = $null
+        try {
+            $mutex = New-Object System.Threading.Mutex($false, ($prefix + $Name)) -ErrorAction Stop
+        }
+        catch {
+            continue
+        }
+        $owned = $false
+        try {
+            $owned = $mutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # The previous owner died mid-build; the kernel already released it.
+            $owned = $true
+        }
+        if ($owned) {
+            return [pscustomobject]@{ Owned = $true; Mutex = $mutex; FullName = ($prefix + $Name) }
+        }
+        $mutex.Dispose()
+        return [pscustomobject]@{ Owned = $false; Mutex = $null; FullName = ($prefix + $Name) }
+    }
+    return [pscustomobject]@{ Owned = $null; Mutex = $null; FullName = $Name }
+}
+
+# $BuildGuard (and the Mutex it references) must stay referenced for the rest of
+# the run: dropping the last reference would let the GC release the mutex early.
+$BuildGuardName = Get-BuildGuardName -Root $WorkspaceRoot
+$BuildGuard = Enter-BuildGuard -Name $BuildGuardName
+if ($BuildGuard.Owned -eq $false) {
+    Show-BuildFailure -Step "Build Concurrency Guard" -Message ("Another build is already running for this workspace, so this run stopped before touching SCons, Device B, or the generated key header. Workspace: {0}. Guard: {1}. Concurrent runs would share the SCons object tree, the gdextest_scons.ok marker on Device B and src/gen/dspkg_encryption_key.h, and verify_remote.ps1 -CleanOrphans would kill this run's cl.exe/scons.exe. Retry once the other run finishes - the OS releases the lock when that process exits, so it can never go stale. Read-only audits (-AuditOnly) are not blocked." -f $WorkspaceRoot, $BuildGuard.FullName) -Code 2
+}
+elseif ($null -eq $BuildGuard.Owned) {
+    Write-Status "[Guard] Warning: could not create build guard '$BuildGuardName'; continuing without concurrency protection." -ForegroundColor Yellow
+}
+
 $ResolvedKeyFile = ""
 $KeyFileRelWin = ""
 $EffectiveKey = ""
@@ -699,6 +772,86 @@ if (-not $AuditOnly -and $AmbientKeySnapshot -and -not $EffectiveKey -and -not $
 if ($env:DSPKG_ENCRYPTION_KEY -and -not $AmbientKeySnapshot) {
     Write-Status "[Config] Ignoring DSPKG_ENCRYPTION_KEY declared in .env: the Godot editor cannot read .env. Export it in your shell if the export plugin needs it." -ForegroundColor Yellow
     Remove-Item Env:DSPKG_ENCRYPTION_KEY -ErrorAction SilentlyContinue
+}
+
+Push-Location $WorkspaceRoot
+try {
+    # 0b. Verify doc_classes XML against the C++/GDScript bindings (local, read-only).
+    # The XML under project/addons/directstorage_accelerator/doc_classes is hand-written, so
+    # nothing else in the pipeline notices when it drifts from the real bindings. Running this
+    # before the sync costs ~1s locally and surfaces the drift next to the build that caused it.
+    # ADVISORY ONLY: this check never fails a build. Each outcome below is a warning; doc drift
+    # is reported here and fixed (or not) by a human, never by blocking a compile.
+    if (-not $SkipDocClasses) {
+        Write-Status "[0/6] Verifying doc_classes XML against code bindings..." -ForegroundColor Cyan
+        $DocCheckScript = Join-Path $WorkspaceRoot "tools/check_doc_classes.py"
+        $DocSkipReason = ""
+        if (-not (Test-Path -LiteralPath $DocCheckScript -PathType Leaf)) {
+            $DocSkipReason = "tools/check_doc_classes.py not found"
+        }
+
+        # Same interpreter discovery as New-DspkgKeyHeader: never use the WindowsApps stub.
+        $DocPyExe = $null
+        $DocPyPrefix = @()
+        if (-not $DocSkipReason) {
+            $DocPyCandidate = Get-Command python -ErrorAction SilentlyContinue
+            if ($DocPyCandidate -and $DocPyCandidate.Source -notmatch 'WindowsApps') {
+                $DocPyExe = $DocPyCandidate.Source
+            }
+            else {
+                $DocPyLauncher = Get-Command py -ErrorAction SilentlyContinue
+                if ($DocPyLauncher) {
+                    $DocPyExe = $DocPyLauncher.Source
+                    $DocPyPrefix = @("-3")
+                }
+            }
+            if (-not $DocPyExe) {
+                $DocSkipReason = "Python 3 not found on PATH"
+            }
+        }
+
+        if ($DocSkipReason) {
+            Write-Status "    Skipped: $DocSkipReason (advisory check, build continues)." -ForegroundColor Yellow
+        }
+        else {
+            $DocCheckArgs = $DocPyPrefix + @($DocCheckScript, "--no-color", "--check-behavior", "--check")
+            $DocCheckOutput = & $DocPyExe @DocCheckArgs 2>&1
+            $DocCheckExit = $LASTEXITCODE
+            $DocErrorCount = 0
+            $DocWarnCount = 0
+            foreach ($DocLine in $DocCheckOutput) {
+                $DocText = $DocLine.ToString()
+                $DocColor = "DarkGray"
+                if ($DocText -match '^\[ERROR:') {
+                    $DocErrorCount++
+                    $DocColor = "Red"
+                }
+                elseif ($DocText -match '^\[WARN:') {
+                    $DocWarnCount++
+                    $DocColor = "Yellow"
+                }
+                if ($DocText.Trim()) {
+                    Write-Status "    $DocText" -ForegroundColor $DocColor
+                }
+            }
+            # Deliberately never calls Show-BuildFailure: doc drift must not stop a build.
+            if ($DocErrorCount -gt 0) {
+                Write-Status ("    doc_classes: {0} error(s), {1} warning(s) - ADVISORY ONLY, build continues. Consider fixing the XML before release." -f $DocErrorCount, $DocWarnCount) -ForegroundColor Yellow
+            }
+            elseif ($DocWarnCount -gt 0) {
+                Write-Status ("    doc_classes: 0 errors, {0} warning(s) - advisory only, build continues." -f $DocWarnCount) -ForegroundColor Yellow
+            }
+            elseif ($DocCheckExit -ne 0) {
+                Write-Status ("    doc_classes: check could not run (exit {0}) - advisory only, build continues." -f $DocCheckExit) -ForegroundColor Yellow
+            }
+            else {
+                Write-Status "    doc_classes: OK" -ForegroundColor Green
+            }
+        }
+    }
+}
+finally {
+    Pop-Location
 }
 
 if (-not $IsRemote) {

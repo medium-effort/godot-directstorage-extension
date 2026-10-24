@@ -24,6 +24,14 @@ from typing import Dict, List, Optional, Set, Tuple
 import xml.etree.ElementTree as ET
 
 
+# Helper calls that return an error code computed at runtime. A method doing
+# `return FileAccess::get_open_error();` has no literal ERR_* token to compare
+# against, so the doc must instead state that the code varies and name the
+# helper (e.g. `[method FileAccess.get_open_error]`). Extend this set rather
+# than weakening the literal check.
+DYNAMIC_ERROR_CALLEES = frozenset({"get_open_error", "get_error", "get_last_error"})
+
+
 # -----------------------------------------------------------------------------
 # Data Models
 # -----------------------------------------------------------------------------
@@ -50,6 +58,7 @@ class MethodInfoDef:
     line_end: int = 0
     body: str = ""
     returned_errors: List[str] = field(default_factory=list)
+    dynamic_error_returns: List[str] = field(default_factory=list)
     emitted_signals: List[str] = field(default_factory=list)
 
 
@@ -350,6 +359,15 @@ class CppParser:
             # Extract return ERR_* or Error
             errors_found = set(re.findall(r"\breturn\s+(ERR_[A-Za-z0-9_]+|OK)\b", body))
             mdef.returned_errors = sorted(list(errors_found))
+
+            # Extract returns that delegate to a runtime helper instead of a literal
+            # code, e.g. `return FileAccess::get_open_error();` (DYNAMIC_ERROR_CALLEES).
+            dynamic_found = set()
+            for call in re.finditer(r"\breturn\s+((?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)\s*\(", body):
+                callee = call.group(1)
+                if callee.rsplit("::", 1)[-1] in DYNAMIC_ERROR_CALLEES:
+                    dynamic_found.add(callee)
+            mdef.dynamic_error_returns = sorted(dynamic_found)
 
             # Extract emit_signal("...")
             signals_emitted = set(re.findall(r'emit_signal\s*\(\s*"([A-Za-z0-9_]+)"', body))
@@ -880,6 +898,22 @@ class DocValidator:
                     message=f"Method '{class_name}.{mcode.name}' returns '{err}' in code, but '{err}' is not mentioned in XML description.",
                     file_path=xml_path,
                 ))
+
+        # Check returns that delegate to a runtime helper (e.g. FileAccess::get_open_error()).
+        # The exact code cannot be known statically, so the doc must at least name the
+        # helper instead of staying silent about that failure path.
+        for callee in mcode.dynamic_error_returns:
+            leaf = callee.rsplit("::", 1)[-1]
+            if leaf in desc or callee in desc:
+                continue
+            self.issues.append(Issue(
+                severity="WARNING",
+                code="BEHAVIOR_UNDOCUMENTED_ERROR",
+                class_name=class_name,
+                item_name=mcode.name,
+                message=f"Method '{class_name}.{mcode.name}' returns the result of '{callee}()' in code, so the error code varies at runtime, but '{leaf}' and its possible codes are not mentioned in XML description.",
+                file_path=xml_path,
+            ))
 
         # Check emitted signals mentioned in doc
         for sig in mcode.emitted_signals:

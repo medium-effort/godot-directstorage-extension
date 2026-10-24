@@ -192,6 +192,38 @@ GDEX_TEST_T(stream_maintenance, sync_and_stream_reports_agree, TAG_INTEGRATION) 
     }
 }
 
+// Regression (#0132): the CPU fallback delivered nothing for uncompressed
+// memory requests. process_request() copied the payload with the guarded
+// set_destination_buffer() AFTER enqueue_request had already set the request to
+// STATUS_SUBMITTED, so the immutability guard rejected the write and the
+// request still reported COMPLETED - with an empty buffer. Nothing here
+// pre-allocates a destination buffer, which is exactly the shape that used to
+// fail (Linux/macOS/headless and any export that lands on SoftwareFallback).
+GDEX_TEST_T(stream_maintenance, sync_memory_request_delivers_payload, TAG_INTEGRATION) {
+    godot::DSContext *ds = require_initialized_context(ctx);
+
+    constexpr const char *kPath = "user://gdextest_stream_payload.bin";
+    if (!write_probe_file(kPath)) {
+        GDEX_FAIL("failed to stage probe file.");
+    }
+    ctx.add_teardown([kPath]() { remove_probe_file(kPath); });
+
+    godot::Ref<godot::DSRequest> req = make_memory_request(kPath);
+    GDEX_EXPECT_TRUE(ds->enqueue_request(req, false));
+    ds->flush_batch();
+    ds->wait_for_completion(5000);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(req->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+
+    const godot::PackedByteArray delivered = req->get_destination_buffer();
+    GDEX_EXPECT_EQ(delivered.size(), static_cast<int64_t>(kProbeBytes));
+    bool matches = delivered.size() == static_cast<int64_t>(kProbeBytes);
+    for (int64_t i = 0; matches && i < kProbeBytes; ++i) {
+        matches = delivered[i] == static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+    }
+    GDEX_EXPECT_TRUE(matches);
+}
+
 GDEX_TEST_T(preloader_budget, empty_poll_budgets_return_zero, TAG_INTEGRATION) {
     // No pending entries anywhere: every budget combination must be an
     // immediate no-op (exercises the single-scan + per-item-extract path

@@ -201,6 +201,64 @@ GDEX_TEST_T(cache, cache_mode_gating_and_replace, TAG_INTEGRATION) {
                          .is_null());
 }
 
+// --- can_own(): the GPU-ownership gate used by the loader (#0126) ------------
+
+GDEX_TEST_T(cache, can_own_matches_store_acceptance, TAG_INTEGRATION) {
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+
+    // Enabled cache: non-ignored modes are owned, ignored modes are not.
+    GDEX_EXPECT_TRUE(cache->can_own(godot::DSTextureCache::CACHE_MODE_REUSE));
+    GDEX_EXPECT_TRUE(cache->can_own(godot::DSTextureCache::CACHE_MODE_REPLACE));
+    GDEX_EXPECT_FALSE(cache->can_own(godot::DSTextureCache::CACHE_MODE_IGNORE));
+    GDEX_EXPECT_FALSE(cache->can_own(godot::DSTextureCache::CACHE_MODE_IGNORE_DEEP));
+
+    // Disabled cache owns nothing, including the default mode. This is the
+    // second half of #0126: the loader must not create a Texture2DRD whose RID
+    // store() would refuse (Texture2DRD never frees its own RID).
+    cache->set_enabled(false);
+    GDEX_EXPECT_FALSE(cache->can_own(godot::DSTextureCache::CACHE_MODE_REUSE));
+    GDEX_EXPECT_FALSE(cache->can_own(godot::DSTextureCache::CACHE_MODE_REPLACE));
+    cache->set_enabled(true);
+
+    // can_own(mode) must agree with store() in both directions, so the loader
+    // gate and store()'s early-out can never drift apart.
+    const int modes[4] = {
+        godot::DSTextureCache::CACHE_MODE_IGNORE,
+        godot::DSTextureCache::CACHE_MODE_REUSE,
+        godot::DSTextureCache::CACHE_MODE_REPLACE,
+        godot::DSTextureCache::CACHE_MODE_IGNORE_DEEP,
+    };
+    const char *paths[4] = {
+        "res://gdextest_cache_can_own_ignore",
+        "res://gdextest_cache_can_own_reuse",
+        "res://gdextest_cache_can_own_replace",
+        "res://gdextest_cache_can_own_ignore_deep",
+    };
+    for (int i = 0; i < 4; ++i) {
+        const int before = cache->get_cached_count();
+        const bool owns = cache->can_own(modes[i]);
+        // store() must REPORT the same decision, not just apply it: the
+        // loader/preloader free the RID whenever this returns false (#0126).
+        const bool stored = cache->store(godot::String(paths[i]), make_test_texture(0.4f), modes[i]);
+        GDEX_EXPECT_EQ(stored, owns);
+        const int after = cache->get_cached_count();
+        if (owns) {
+            GDEX_EXPECT_EQ(after, before + 1);
+        } else {
+            GDEX_EXPECT_EQ(after, before);
+        }
+    }
+
+    // Same agreement with the cache disabled: nothing is owned, nothing stored.
+    cache->set_enabled(false);
+    for (int i = 0; i < 4; ++i) {
+        const int before = cache->get_cached_count();
+        GDEX_EXPECT_FALSE(cache->can_own(modes[i]));
+        GDEX_EXPECT_FALSE(cache->store(godot::String(paths[i]), make_test_texture(0.4f), modes[i]));
+        GDEX_EXPECT_EQ(cache->get_cached_count(), before);
+    }
+}
+
 GDEX_TEST_T(cache, shrink_max_entries_evicts_oldest_and_clamps, TAG_INTEGRATION) {
     godot::DSTextureCache *cache = new_enabled_cache(ctx);
 

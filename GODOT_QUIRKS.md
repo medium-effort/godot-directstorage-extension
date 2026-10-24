@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 14 October 2026
+Last updated: 25 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1113,10 +1113,12 @@ if (rs != nullptr) {
 ```
 See Q02 (thread affinity), Q33 (render pump).
 
-## 47. Defender Breaks Safe-Save Commits on Fresh res:// Files
+## 47. Fixture Deletes on Fresh res:// Files Fail (Defender Locks and the DirectStorage File Cache)
 
 ### The Engine Reality
 Godot's safe-save writes to a temp file and renames over the target at `close()` (`drivers/windows/file_access_windows.cpp:277`). In editor test runs, antivirus scan windows on brand-new `res://` files fail the rename, and `DirAccess::remove` on the same locked files fails too — both silently if return codes are ignored. A stale `textures.dspkg` then survives deletes and overwrites and poisons every later resolve in the process.
+
+A second, deterministic lock source is ours: the Win32 backend keeps every staged archive open in its `IDStorageFile` cache for the life of the context, so Windows refuses the delete even with a correct absolute path and no antivirus involved. `DSContext::shutdown_ds()` releases those handles; nothing else does.
 
 ### The Trap / Symptom
 ```
@@ -1125,8 +1127,14 @@ ERROR: Safe save failed. ... running a paranoid antivirus ...
 ```
 Followed by `has_texture()` false on a just-staged archive whose staging reported success, and a stale entry dump (`mem`/`ctl` paths where `dma` paths were staged).
 
+The same leftover appears with no antivirus at all when the archive was streamed through the Win32 backend: the delete is refused while `DSContext` is alive, a cleanup that ignores the return code reports success, and the *next* run dies on the stale file:
+
+```
+ERROR: DSPkg: Could not open file for writing: .../project/textures.dspkg
+```
+
 ### The Rule
-In editor test runs, treat every `res://` write as suspect: remove + copy + reopen-verify + one 500 ms retry, never trust the copy return code alone; make removal failures loud (`push_warning`, never ignored). Implemented in `tests/gpu_prewarm_tests.cpp` (`stage_gpu_dspkg`, `remove_abs`).
+In editor test runs, treat every `res://` write and delete as suspect: remove + copy + reopen-verify + one 500 ms retry, never trust the copy return code alone, make removal failures loud (`push_warning`), and shut DirectStorage down before deleting staged archives because its `IDStorageFile` cache keeps them open. Implemented in `tests/gpu_prewarm_tests.cpp` (`stage_gpu_dspkg`, `remove_abs`); the shutdown-before-delete ordering is in `project/headless_tests/test_prewarm_and_threading.gd`, `test_dspkg_alignment.gd` and `test_integration.gd` (`_shutdown_ds()` before the remove loop).
 
 ## 48. Background Ingestion Tasks Must Not Starve Main-Thread GPU Texture Completion
 
@@ -1231,4 +1239,130 @@ windows.editor.x86_64 = "bin/dsgd_64.debug.dll"
 windows.debug.x86_64 = "bin/dsgd_64.debug.dll"
 windows.release.x86_64 = "bin/dsgd_64.dll"
 ```
+
+---
+
+## 52. copy_absolute Globalizes Logical Paths, remove_absolute Does Not
+
+### The Engine Reality
+Godot's class reference says the same thing about both helpers — "Supports only absolute paths" — but the implementation disagrees (`core/io/dir_access.cpp`):
+```cpp
+Error DirAccess::copy_absolute(const String &p_from, const String &p_to, int p_chmod_flags) {
+	Ref<DirAccess> d = DirAccess::create(DirAccess::ACCESS_FILESYSTEM);
+	// Support copying from res:// to user:// etc.
+	String from = ProjectSettings::get_singleton()->globalize_path(p_from);
+	String to = ProjectSettings::get_singleton()->globalize_path(p_to);
+	return d->copy(from, to, p_chmod_flags);
+}
+
+Error DirAccess::remove_absolute(const String &p_path) {
+	Ref<DirAccess> d = DirAccess::create_for_path(p_path);
+	return d->remove(p_path);          // raw string, no globalize_path
+}
+```
+`rename_absolute` globalizes too. Only `remove_absolute` (and `move_absolute`, same shape) hands the literal `user://...` / `res://...` string to the platform filesystem, where it cannot resolve.
+
+### The Trap / Symptom
+A fixture-cleaning block copied from a working staging block looks correct and does nothing:
+```
+[PROBE] logical paths    err=0 (OK) dst_exists=true     # copy_absolute("user://a", "res://b")
+[PROBE] globalized paths err=0 (OK) dst_exists=true
+```
+`remove_absolute` returns a failure that fixture cleanup usually ignores, so fixtures accumulate silently. When the leftover is the staged archive, the *next* run dies with `DSPkg: Could not open file for writing` (or, on D3D12, keeps the archive locked in the backend's `IDStorageFile` cache until the context is shut down — Q47). Five headless suites carried this pattern before being fixed in one pass.
+
+### The Rule
+Always pass `ProjectSettings.globalize_path()` to `DirAccess.remove_absolute()`; never rely on the `user://` or `res://` form, and check the returned Error.
+```gdscript
+DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+```
+Pair it with a loud failure (`_fail`/`push_warning`) rather than a bare call, so a survived fixture is visible (Q47). Fixed in `test_corruption_fuzz.gd`, `test_dspkg_alignment.gd`, `test_integration.gd`, `test_formats.gd`, and `test_prewarm_and_threading.gd`.
+
+---
+
+## 53. `--check-only --script` Cannot Validate Extension GDScript
+
+### The Engine Reality
+`godot --headless --check-only --script some.gd` parses the single file in isolation. It does not scan the project, so `preload("uid://...")` cannot be resolved, and it does not initialize GDExtension modules, so classes registered by the extension do not exist in `ClassDB`.
+
+### The Trap / Symptom
+A perfectly valid test file reports a wall of errors, and the workspace rule "zero Parse Errors before concluding a turn" looks violated:
+```
+SCRIPT ERROR: Parse Error: Preload file "uid://ctg5hksd01gao" does not exist.
+SCRIPT ERROR: Parse Error: Could not find type "DSRequest" in the current scope.
+SCRIPT ERROR: Parse Error: Identifier "DSRequest" not declared in the current scope.
+ERROR: Failed to load script "res://project/.../benchmark_common.gd" with error "Parse error".
+```
+Nothing about the file is wrong. Worse, the check is *silently permissive* about what actually breaks at runtime: a misspelled method, a wrong arity, or a property that does not exist on the extension class all pass, because the parser never learns the class members.
+
+### The Rule
+Never treat `godot --check-only --script x.gd` as evidence that a GDScript file using GDExtension classes is valid; verify calls against the C++ bindings or run the suite.
+```powershell
+# lexical only — expect and ignore the uid/native-class noise
+run_headless_test.ps1 -Target project/headless_tests/test_formats.gd
+# binding check for anything the parser cannot see
+git grep -n 'D_METHOD("enqueue_request"' -- src/
+# behaviour: real run with the project path, not check-only
+godot_v4_7_2-stable_win64_console.exe --path project --rendering-driver d3d12 `
+    --script res://headless_tests/test_dspkg_alignment.gd
+```
+The concrete case: `ctx.enqueue_request(req, true)` type-checks only because the binding declares `DEFVAL(false)` (`ds_context.cpp:1717`); the parse check would accept the call either way. See Q09 for the D3D12 run mode.
+
+---
+
+## 54. One `await process_frame` May Not Advance `get_process_frames()`
+
+### The Engine Reality
+`SceneTree::process()` emits the `process_frame` signal, and the engine's iteration counter (what `Engine.get_process_frames()` returns) is incremented afterwards in `Main::iteration()`. A coroutine resumed by that signal therefore reads the counter *before* the current iteration is counted.
+
+### The Trap / Symptom
+In a `SceneTree`-derived test script, `_initialize()` runs before the main loop iterates, so the first resume lands with the counter still at zero:
+```
+measured: before=0, after one await=0, after two awaits=1
+```
+An assertion written the obvious way becomes a coin flip — `frame_after > frame_before` fails on the first yield even though a frame was processed and the UI did render. This surfaced as an unreliable "Frame advanced during yield (UI rendered smoothly)" check in the prewarm suite.
+
+### The Rule
+In a SceneTree script's `_initialize()`, await `process_frame` twice before asserting `Engine.get_process_frames()` increased.
+```gdscript
+var frame_before := Engine.get_process_frames()
+await process_frame
+await process_frame   # first boundary: counter only advances after the second resume
+var frame_after := Engine.get_process_frames()
+_check(frame_after > frame_before, "Frame advanced during yield (UI rendered smoothly)")
+```
+Single-await loops that run after the first boundary are fine — they already cross one iteration. `test_prewarm_and_threading.gd` Phase 3.
+
+---
+
+## 55. `has_feature("editor")` Is True for Every CLI Run of an Editor Binary
+
+### The Engine Reality
+`OS.has_feature("editor")` reports the *build* of the running binary, not how it was started. Any invocation of the editor executable — including `godot --headless --script res://...`, `--check-only`, and CI runs on a workstation — returns `true`. Only an export template returns `false`.
+
+### The Trap / Symptom
+A bypass written for the editor-authoring case silently applies to the entire test suite:
+```cpp
+if (!force_resolution && ((engine && engine->is_editor_hint()) || (os && os->has_feature("editor")))) {
+    return String();   // loader skips res://textures.dspkg
+}
+```
+Because the archive is skipped, the failure appears downstream and looks unrelated to the flag: `test_async_streaming`'s `.dspkg` phase reported `progress (0, 3)` and "batching: 3 textures in 0 submit(s)", and `test_integration` failed loading `res://packaged_test_texture.png` with no error near the cause. Nothing logs where the empty path came from, so the suite looks broken rather than bypassed. `DSPreloader::resolve_archive_path()` has the same check, so both the loader and the prewarm path are affected.
+
+### The Rule
+Never gate a shipping-path bypass on `OS.has_feature("editor")` without an explicit opt-in override, because every command-line run of an editor binary reports the editor feature.
+```gdscript
+const FORCE_ARCHIVE_SETTING := "directstorage/force_archive_resolution"
+
+func _force_archive_resolution() -> void:
+	_force_archive_present = ProjectSettings.has_setting(FORCE_ARCHIVE_SETTING)
+	_force_archive_prev = ProjectSettings.get_setting(FORCE_ARCHIVE_SETTING) if _force_archive_present else null
+	ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, true)
+
+func _restore_archive_resolution() -> void:
+	if _force_archive_present:
+		ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, _force_archive_prev)
+	else:
+		ProjectSettings.clear(FORCE_ARCHIVE_SETTING)   # unregistered key: clear, do not write false (Q49)
+```
+The override is read per call (`ds_resource_format_loader.cpp:153`, `ds_preloader.cpp:69`), so it takes effect immediately; C++ precedent in `tests/gpu_prewarm_tests.cpp`, and the four archive suites now do the same. The rule for the project side is documented in `.agents/rules/gdextest.md`.
 

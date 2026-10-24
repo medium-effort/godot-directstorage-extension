@@ -95,14 +95,14 @@
 		<method name="prewarm_async">
 			<return type="int" />
 			<param index="0" name="paths" type="PackedStringArray" />
-			<description>Enqueues engine texture paths for asynchronous streaming prewarm and returns the stream tag. File remapping is resolved internally, and paths already in the cache are skipped without enqueueing. Track the tag with [method DSContext.is_prewarm_complete] and [method DSContext.get_prewarm_progress], or stop it early with [method DSContext.cancel_prewarm]. Returns [code]0[/code] when the extension is unavailable.</description>
+			<description>Enqueues engine texture paths for asynchronous streaming prewarm and returns the stream tag. File remapping is resolved internally, and paths already in the cache are skipped without enqueueing. Track the tag with [method DSContext.is_prewarm_complete] and [method DSContext.get_prewarm_progress], or stop it early with [method DSContext.cancel_prewarm]. Returns [code]0[/code] when the extension is unavailable, or when the texture cache cannot take ownership of prewarmed textures (cache disabled via [code]directstorage/texture_cache_enabled[/code] or missing) - in that case nothing is streamed or decoded, and exactly one warning is emitted.</description>
 		</method>
 		<method name="prewarm_gpu_async">
 			<return type="int" />
 			<param index="0" name="paths" type="PackedStringArray" />
 			<param index="1" name="chunk_size" type="int" default="16" />
 			<param index="2" name="prefer_gpu" type="bool" default="true" />
-			<description>Enqueues engine texture paths for GPU-accelerated asynchronous streaming prewarm and returns the stream tag. When running under the D3D12 rendering driver with GPU decompression enabled, eligible color textures (v2 format, color-sampled, without the as_image_texture flag) are allocated directly as [Texture2DRD] resources on the render thread and filled via DirectStorage DMA decompression straight into VRAM. Ineligible textures or non-D3D12 platforms automatically fall back to the CPU [ImageTexture] memory stream path under the same stream tag. Textures are allocated in render-thread chunks of [param chunk_size] (default 16) to bound frame time. Returns [code]0[/code] when the extension is unavailable.</description>
+			<description>Enqueues engine texture paths for GPU-accelerated asynchronous streaming prewarm and returns the stream tag. When running under the D3D12 rendering driver with GPU decompression enabled, eligible color textures (v2 format, color-sampled, without the as_image_texture flag) are allocated directly as [Texture2DRD] resources on the render thread and filled via DirectStorage DMA decompression straight into VRAM. Ineligible textures or non-D3D12 platforms automatically fall back to the CPU [ImageTexture] memory stream path under the same stream tag. Textures are allocated in render-thread chunks of [param chunk_size] (default 16) to bound frame time. Returns [code]0[/code] when the extension is unavailable, or when the texture cache cannot take ownership of prewarmed textures (cache disabled via [code]directstorage/texture_cache_enabled[/code] or missing) - in that case the whole call, including its CPU fallback route, is skipped before any I/O or allocation, and exactly one warning is emitted.</description>
 		</method>
 		<method name="pump_gpu_prewarm">
 			<return type="void" />
@@ -129,12 +129,12 @@
 			<description>Sets the cache capacity. Values less than [code]1[/code] are clamped to [code]1[/code]; excess oldest entries are evicted immediately. Entries still held outside the cache are skipped during eviction, so the cache can temporarily exceed capacity rather than freeing a texture that is still in use.</description>
 		</method>
 		<method name="store">
-			<return type="void" />
+			<return type="bool" />
 			<param index="0" name="path" type="String" />
 			<param index="1" name="texture" type="Texture2D" />
 			<param index="2" name="cache_mode" type="int" enum="DSTextureCache.CacheMode" default="1" />
 			<param index="3" name="alias_path" type="String" default="&quot;&quot;" />
-			<description>Stores [param texture] under [param path] (optionally registering [param alias_path] as a shared secondary key without consuming extra capacity) and marks it as recently used if caching is enabled and [param cache_mode] is not ignored. Null textures are ignored.</description>
+			<description>Stores [param texture] under [param path] (optionally registering [param alias_path] as a shared secondary key without consuming extra capacity) and marks it as recently used if caching is enabled and [param cache_mode] is not ignored. Null textures are ignored. Returns [code]true[/code] when the cache took ownership of [param texture], and [code]false[/code] when nothing was stored (caching disabled, ignored [param cache_mode], null or invalid texture, or empty path). On [code]false[/code], a caller that created a [Texture2DRD] still owns the underlying [RenderingDevice] texture and must free it; an [ImageTexture] frees its own [RenderingServer] RID when the reference drops, so it needs no cleanup.</description>
 		</method>
 	</methods>
 	<members>

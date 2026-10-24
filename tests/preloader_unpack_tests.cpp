@@ -1,14 +1,19 @@
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
 
+#include "core/ds_context.h"
+#include "core/ds_request.h"
 #include "formats/dstex_format.h"
 #include "integration/ds_preloader.h"
+#include "integration/ds_texture_cache.h"
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
+#include <godot_cpp/core/memory.hpp>
 
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace godot {
@@ -16,6 +21,49 @@ namespace godot {
 struct PreloaderUnpackTest {
 	static Ref<Texture2D> build_texture(const DSPreloader::Payload &p_meta, const std::vector<PackedByteArray> &p_buffers) {
 		return DSPreloader::build_texture(p_meta, p_buffers);
+	}
+
+	// Injects one already-terminal CPU prewarm entry straight into the pending
+	// table. This is the only way to drive poll_completed() with a non-empty
+	// table without a backend, disk I/O or a real stream: the friend access
+	// exists for tests (ds_preloader.h:208).
+	static int64_t inject_terminal_cpu_entry(uint64_t p_tag, const DSPreloader::Payload &p_meta, const PackedByteArray &p_payload) {
+		Ref<DSRequest> req;
+		req.instantiate();
+		req->set_status(DSRequest::STATUS_COMPLETED);
+		req->get_destination_buffer_ref() = p_payload;
+
+		DSPreloader::Tracked tracked;
+		tracked.tag = p_tag;
+		tracked.meta = p_meta;
+		tracked.is_gpu = false;
+		tracked.requests.push_back(req);
+		return publish(tracked);
+	}
+
+	// Injects a GPU entry that is already marked failed: poll_completed() drops
+	// it through complete_gpu_entry() without storing anything, but still
+	// charges estimate_payload_bytes(meta) to the slice byte budget. Used to
+	// prove the byte budget is driven by consumed entries, not stored ones.
+	static int64_t inject_gpu_failed_entry(uint64_t p_tag, const DSPreloader::Payload &p_meta) {
+		DSPreloader::Tracked tracked;
+		tracked.tag = p_tag;
+		tracked.meta = p_meta;
+		tracked.is_gpu = true;
+		tracked.gpu_failed = true;
+		return publish(tracked);
+	}
+
+private:
+	static int64_t publish(DSPreloader::Tracked &p_tracked) {
+		std::lock_guard<std::mutex> lock(DSPreloader::state().mutex);
+		DSPreloader::State &s = DSPreloader::state();
+		int64_t id = s.next_id++;
+		if (s.next_id == 0) {
+			s.next_id = 1;
+		}
+		s.pending[id] = p_tracked;
+		return id;
 	}
 };
 
@@ -206,4 +254,150 @@ GDEX_TEST(preloader_unpack, partial_mip_chain_falls_back_to_base_no_mipmaps) {
 	GDEX_EXPECT_EQ(img->get_height(), 64);
 	GDEX_EXPECT_FALSE(img->has_mipmaps());
 	GDEX_EXPECT_EQ(img->get_data().size(), 16384);
+}
+
+// --- poll_completed budgeting and refusal accounting (#0137) ----------------
+//
+// What these tests can and cannot discriminate:
+// - refused_stores_consume_budget_but_do_not_count: cache DISABLED, so every
+//   store() is refused. This is the case where `stored` and `processed` differ;
+//   it fails if the CPU branch counts a refused store as stored (pre-#0136
+//   behaviour returned 1 here). The item/byte budget itself is pinned by the
+//   max_items=0 test below: with max_items=1 the terminal-id scan cap already
+//   limits the collection, so a budget-only regression cannot show up here.
+// - unstored_entry_still_charges_the_byte_budget: max_items=0, so only the
+//   64 MiB slice byte budget can bound the call. A GPU-failed entry that stores
+//   nothing but estimates 64 MiB must still stop the slice; budgeting the gate
+//   on `stored` (pre-#0137) processes the next entry instead.
+// - poll_slice_honors_max_items is the happy path (cache enabled): it pins the
+//   max_items behaviour and the residency contract, but on its own it CANNOT
+//   tell `stored` from `processed` because both advance together.
+// All three need no backend, disk I/O or real stream, so they run in headless CI.
+
+namespace {
+
+godot::DSPreloader::Payload make_budget_payload(const char *p_path) {
+	godot::DSPreloader::Payload meta;
+	meta.engine_path = godot::String(p_path);
+	meta.payload_key = meta.engine_path;
+	meta.width = 256;
+	meta.height = 4;
+	meta.mip_count = 1;
+	meta.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGBA8);
+	meta.is_v2 = true;
+	return meta;
+}
+
+godot::PackedByteArray make_budget_data(uint8_t p_seed) {
+	// 256x4 RGBA8: row bytes 1024 (already 256-aligned) -> footprint 4096, so
+	// build_texture()'s unpad loop is a 1:1 copy.
+	godot::PackedByteArray data;
+	data.resize(4096);
+	uint8_t *w = data.ptrw();
+	for (int i = 0; i < 4096; ++i) {
+		w[i] = static_cast<uint8_t>((i * 7 + p_seed) & 0xFF);
+	}
+	return data;
+}
+
+godot::DSTextureCache *make_budget_cache(::gdextest::TestContext &ctx, bool p_enabled) {
+	// Constructed per test on purpose: the ctor installs the static singleton and
+	// the dtor nulls it, and both prewarm entry points consult the singleton.
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	cache->set_enabled(p_enabled);
+	cache->clear();
+	ctx.add_teardown([cache]() {
+		cache->clear();
+		memdelete(cache);
+	});
+	return cache;
+}
+
+} // namespace
+
+GDEX_TEST_T(preloader_budget, poll_slice_honors_max_items, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx, true);
+	const uint64_t tag = 0x7FFF0137ULL;
+
+	godot::PreloaderUnpackTest::inject_terminal_cpu_entry(tag, make_budget_payload("user://gdextest_budget_a.png"), make_budget_data(11));
+	godot::PreloaderUnpackTest::inject_terminal_cpu_entry(tag, make_budget_payload("user://gdextest_budget_b.png"), make_budget_data(29));
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 2);
+
+	// max_items=1: exactly one entry per call, second call finishes the table.
+	GDEX_EXPECT_EQ(cache->poll_completed(tag, 1, 0), 1);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 1);
+	GDEX_EXPECT_EQ(cache->poll_completed(tag, 1, 0), 1);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+
+	// Cache enabled: both entries were really built and stored.
+	GDEX_EXPECT_EQ(cache->get_cached_count(), 2);
+	GDEX_EXPECT_TRUE(cache->get_cached("user://gdextest_budget_a.png").is_valid());
+	GDEX_EXPECT_TRUE(cache->get_cached("user://gdextest_budget_b.png").is_valid());
+}
+
+// The discriminating case for the store count: with the cache DISABLED every
+// store is refused, so a refusal must consume an entry without being counted.
+GDEX_TEST_T(preloader_budget, refused_stores_consume_budget_but_do_not_count, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx, false);
+	const uint64_t tag = 0x7FFF0138ULL;
+
+	godot::PreloaderUnpackTest::inject_terminal_cpu_entry(tag, make_budget_payload("user://gdextest_budget_c.png"), make_budget_data(3));
+	godot::PreloaderUnpackTest::inject_terminal_cpu_entry(tag, make_budget_payload("user://gdextest_budget_d.png"), make_budget_data(5));
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 2);
+
+	// Consumed one, stored none. Pre-#0136 code returned 1 here (it counted the
+	// refused store), which is exactly the regression this pins.
+	GDEX_EXPECT_EQ(cache->poll_completed(tag, 1, 0), 0);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 1);
+	GDEX_EXPECT_EQ(cache->poll_completed(tag, 1, 0), 0);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+	GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+}
+
+// max_items=0 leaves only the byte budget to bound the slice. The GPU-failed
+// entry stores nothing but still charges its estimated size, so a `stored`-gated
+// budget would consume the following entry in the same call.
+GDEX_TEST_T(preloader_budget, unstored_entry_still_charges_the_byte_budget, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx, false);
+	const uint64_t tag = 0x7FFF0139ULL;
+
+	godot::DSPreloader::Payload expensive = make_budget_payload("user://gdextest_budget_e.png");
+	// estimate_payload_bytes() sums mip_uncompressed_sizes for v2 payloads; one
+	// entry of exactly the 64 MiB slice cap is enough and allocates nothing.
+	expensive.mip_uncompressed_sizes.push_back(64 * 1024 * 1024);
+	godot::PreloaderUnpackTest::inject_gpu_failed_entry(tag, expensive);
+	godot::PreloaderUnpackTest::inject_terminal_cpu_entry(tag, make_budget_payload("user://gdextest_budget_f.png"), make_budget_data(7));
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 2);
+
+	// Nothing is stored (cache disabled), so only `processed` can stop the slice.
+	GDEX_EXPECT_EQ(cache->poll_completed(tag, 0, 0), 0);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 1);
+	GDEX_EXPECT_EQ(cache->poll_completed(tag, 0, 0), 0);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+}
+
+GDEX_TEST_T(preloader_budget, disabled_cache_refuses_both_entry_points, TAG_UNIT) {
+	// Skip before asserting: an EXPECT here would record a failure on the very
+	// path that means "environment not set up", turning a skip into a red suite.
+	if (godot::DSContext::get_singleton() == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable (module init did not run)");
+		return;
+	}
+
+	godot::DSTextureCache *cache = make_budget_cache(ctx, false);
+	const int before_unbuilt = cache->get_unbuilt_prewarm_count(0);
+	const int before_pending = cache->get_pending_prewarm_count(0);
+
+	godot::PackedStringArray paths;
+	// Deliberately nonexistent: the refusal must fire before payload resolution,
+	// so attempting to resolve/read this path would be a defect.
+	paths.append(godot::String("user://gdextest_prewarm_refused.dstex"));
+
+	GDEX_EXPECT_EQ(cache->prewarm_async(paths), static_cast<uint64_t>(0));
+	GDEX_EXPECT_EQ(cache->prewarm_gpu_async(paths, 16, true), static_cast<uint64_t>(0));
+
+	// Nothing queued, nothing pending, nothing resident: no work was started.
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(0), before_unbuilt);
+	GDEX_EXPECT_EQ(cache->get_pending_prewarm_count(0), before_pending);
+	GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
 }

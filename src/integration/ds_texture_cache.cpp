@@ -396,6 +396,15 @@ bool DSTextureCache::_is_cache_mode_replace(int p_cache_mode) {
 	return p_cache_mode == CACHE_MODE_REPLACE;
 }
 
+bool DSTextureCache::_can_own_locked(int p_cache_mode) const {
+	return enabled && !_is_cache_mode_ignored(p_cache_mode);
+}
+
+bool DSTextureCache::can_own(int p_cache_mode) const {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	return _can_own_locked(p_cache_mode);
+}
+
 Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode) {
 	std::vector<Ref<Texture2D>> evicted;
 	Ref<Texture2D> result;
@@ -436,7 +445,7 @@ Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode
 	return result;
 }
 
-void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode, const String &p_alias_path) {
+bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode, const String &p_alias_path) {
 	Ref<Texture2D> resident;
 	bool make_resident = false;
 	// Refs of replaced/evicted textures: held until their owned RIDs are
@@ -445,8 +454,8 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 	{
 		std::lock_guard<std::mutex> lock(cache_mutex);
 
-		if (!enabled || _is_cache_mode_ignored(p_cache_mode) || p_texture.is_null() || !p_texture.is_valid() || p_path.is_empty()) {
-			return;
+		if (!_can_own_locked(p_cache_mode) || p_texture.is_null() || !p_texture.is_valid() || p_path.is_empty()) {
+			return false;
 		}
 
 		// If p_path was previously an alias, unbind it so it becomes its own canonical entry.
@@ -550,6 +559,7 @@ void DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 		resident->take_over_path(p_path);
 	}
 	ds_texture_cache_release_evicted(evicted);
+	return true;
 }
 
 void DSTextureCache::add_alias(const String &p_canonical_path, const String &p_alias_path) {

@@ -339,6 +339,9 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	}
 
 	Ref<Texture2D> result_texture;
+	// True once the GPU branch has handed its RID to the cache. Guards the
+	// end-of-function store() so a GPU texture is never stored twice.
+	bool ownership_transferred = false;
 
 	RenderingServer *rs = RenderingServer::get_singleton();
 	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
@@ -370,6 +373,20 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		is_physical_source = FileAccess::file_exists(global_path);
 	}
 
+	// Ownership pre-check (#0126). A Texture2DRD created below is a non-owning
+	// wrapper: only DSTextureCache's evict/replace/clear paths ever call
+	// free_rid() on its device RID (GODOT_QUIRKS.md section 27). Ownership is
+	// transferred by the store() call inside the GPU branch, so the GPU path
+	// is only worth attempting when the cache will accept the texture: cache
+	// singleton present, enabled, and a non-ignored cache mode. Ignored modes
+	// (IGNORE / IGNORE_DEEP) and a disabled cache fall through to the CPU
+	// path, whose ImageTexture owns and frees its own RenderingServer RID.
+	// This is a PRE-CHECK, not a reservation: set_enabled() can be called from
+	// another thread and invalidate it. The hard guarantee lives in the GPU
+	// branch, which frees the RID itself whenever store() reports refusal.
+	DSTextureCache *ownership_cache = DSTextureCache::get_singleton();
+	const bool cache_will_own = ownership_cache != nullptr && ownership_cache->can_own(p_cache_mode);
+
 	bool can_attempt_gpu = false;
 	if (p_as_image_texture) {
 		UtilityFunctions::print_verbose("DSResourceFormatLoader: Texture requested as ImageTexture for '" + p_cache_key + "'; bypassing GPU direct upload.");
@@ -385,6 +402,8 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression unavailable (no RenderingDevice) for '" + p_cache_key + "'; using CPU memory decompression.");
 		} else if (p_mip_count == 0) {
 			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression requires at least one mip for '" + p_cache_key + "'; using CPU memory decompression.");
+		} else if (!cache_will_own) {
+			UtilityFunctions::print_verbose("DSResourceFormatLoader: Texture cache will not own the texture for '" + p_cache_key + "' (cache missing, disabled or ignored cache mode " + String::num_int64(p_cache_mode) + "); using CPU memory decompression to avoid an orphaned GPU RID.");
 		} else {
 			can_attempt_gpu = true;
 		}
@@ -447,7 +466,25 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					Ref<Texture2DRD> tex_rd;
 					tex_rd.instantiate();
 					tex_rd->set_texture_rd_rid(tex_rid);
-					result_texture = tex_rd;
+					// Adopt-or-free, and do it HERE rather than at the end of
+					// the function: the ownership decision happens exactly
+					// once, and a refusal falls through to the CPU path with
+					// the RID freed below. The can_own() gate above is only
+					// work-avoidance; THIS is the soft-null guarantee (a
+					// cross-thread set_enabled(false) between gate and store
+					// cannot orphan the RID).
+					const String alias = (!p_original_cache_key.is_empty() && p_original_cache_key != p_cache_key) ? p_original_cache_key : String();
+					// Re-fetch rather than reusing the gate's pointer: a singleton
+					// replacement between the gate and here (shutdown-only window)
+					// would otherwise leave this store on a stale instance. The CPU
+					// path below re-fetches for the same reason.
+					DSTextureCache *store_cache = DSTextureCache::get_singleton();
+					if (store_cache != nullptr && store_cache->store(p_cache_key, tex_rd, p_cache_mode, alias)) {
+						result_texture = tex_rd;
+						ownership_transferred = true;
+					} else {
+						UtilityFunctions::push_warning("DSResourceFormatLoader: Texture cache refused ownership of '", p_cache_key, "' (disabled or raced); releasing the GPU texture and falling back to CPU decompression.");
+					}
 				} else {
 					UtilityFunctions::push_warning("DSResourceFormatLoader: GPU texture load failed for ", p_cache_key, "; falling back to CPU decompression.");
 				}
@@ -701,7 +738,12 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	}
 
 	if (result_texture.is_valid()) {
-		if (p_cache_mode == ResourceFormatLoader::CACHE_MODE_REUSE || p_cache_mode == ResourceFormatLoader::CACHE_MODE_REPLACE) {
+		// GPU texture: ownership was already transferred (or refused and freed)
+		// inside the GPU branch. Only the CPU-built ImageTexture reaches here
+		// without an owner; a refused store is harmless for it because its
+		// RenderingServer RID frees itself when the Ref drops.
+		if (!ownership_transferred &&
+				(p_cache_mode == ResourceFormatLoader::CACHE_MODE_REUSE || p_cache_mode == ResourceFormatLoader::CACHE_MODE_REPLACE)) {
 			DSTextureCache *cache = DSTextureCache::get_singleton();
 			if (cache) {
 				String alias = (!p_original_cache_key.is_empty() && p_original_cache_key != p_cache_key) ? p_original_cache_key : String();

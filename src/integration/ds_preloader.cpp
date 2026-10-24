@@ -680,6 +680,17 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 		UtilityFunctions::push_error("DSPreloader: DSContext singleton unavailable; prewarm_async aborted.");
 		return 0;
 	}
+	// #0126 symmetry with prewarm_gpu_async(): a prewarm whose textures cannot
+	// be stored has no contract value, so it is refused once, before payload
+	// resolution, instead of streaming and CPU-decoding textures that are
+	// dropped at completion (one verbose line each). Page-cache warming is not
+	// a documented promise of this API; a caller that wants it can read the
+	// files directly.
+	DSTextureCache *prewarm_cache = DSTextureCache::get_singleton();
+	if (prewarm_cache == nullptr || !prewarm_cache->can_own(DSTextureCache::CACHE_MODE_REUSE)) {
+		UtilityFunctions::push_warning("DSPreloader: texture cache cannot own prewarmed textures (disabled or unavailable); prewarm_async skipped.");
+		return 0;
+	}
 	std::vector<Payload> payloads;
 	int skipped_cached = 0;
 	int skipped_unresolvable = 0;
@@ -906,6 +917,18 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 	DSContext *ctx = DSContext::get_singleton();
 	if (ctx == nullptr) {
 		UtilityFunctions::push_error("DSPreloader: DSContext singleton unavailable; prewarm_gpu_async aborted.");
+		return 0;
+	}
+
+	// #0126: with a disabled (or absent) cache nothing can be stored, so the
+	// whole call is refused here - not just the VRAM work. That includes this
+	// function's internal memory/CPU route (prefer_gpu=false, auto-tuned iGPUs
+	// and GPU-ineligible payloads): those textures could not be stored either,
+	// so they would only burn I/O and CPU before being dropped. Refusing before
+	// payload resolution also avoids one completion warning per texture.
+	DSTextureCache *prewarm_cache = DSTextureCache::get_singleton();
+	if (prewarm_cache == nullptr || !prewarm_cache->can_own(DSTextureCache::CACHE_MODE_REUSE)) {
+		UtilityFunctions::push_warning("DSPreloader: texture cache cannot own prewarmed textures (disabled or unavailable); prewarm_gpu_async skipped.");
 		return 0;
 	}
 
@@ -1317,11 +1340,27 @@ void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 			return;
 		}
 	}
+	// Ownership gate (#0126): store() refuses when the cache is disabled, and a
+	// Texture2DRD has no self-freeing owner, so wrapping an RID the cache will
+	// not take would leak it. Release it on the render thread instead and leave
+	// the synchronous load available. p_cache cannot be null here: the only
+	// caller, poll_completed(), returns early when the singleton is missing.
+	if (!p_cache->can_own(DSTextureCache::CACHE_MODE_REUSE)) {
+		queue_gpu_orphan_rid(p_entry.gpu_tex_rid);
+		UtilityFunctions::push_warning("DSPreloader: texture cache will not own GPU prewarm texture '", p_entry.meta.engine_path, "'; releasing its RID (sync load remains available).");
+		return;
+	}
 	Ref<Texture2DRD> tex_rd;
 	tex_rd.instantiate();
 	tex_rd->set_texture_rd_rid(p_entry.gpu_tex_rid);
 	const String alias = (p_entry.meta.payload_key != p_entry.meta.engine_path) ? p_entry.meta.payload_key : String();
-	p_cache->store(p_entry.meta.engine_path, tex_rd, DSTextureCache::CACHE_MODE_REUSE, alias);
+	// can_own() is a pre-check, not a reservation. If the cache was disabled
+	// between it and store(), store() reports refusal and we still own the RID.
+	if (!p_cache->store(p_entry.meta.engine_path, tex_rd, DSTextureCache::CACHE_MODE_REUSE, alias)) {
+		queue_gpu_orphan_rid(p_entry.gpu_tex_rid);
+		UtilityFunctions::push_warning("DSPreloader: texture cache refused ownership of GPU prewarm texture '", p_entry.meta.engine_path, "' (disabled or raced); releasing its RID.");
+		return;
+	}
 	r_stored++;
 }
 
@@ -1463,6 +1502,11 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 
 	uint64_t start_usec = (p_max_usec > 0 && Time::get_singleton()) ? Time::get_singleton()->get_ticks_usec() : 0;
 	int stored = 0;
+	// Items consumed by this slice. Drives the item/byte budgets because `stored`
+	// only counts cache hits, and a refused store (cache disabled or raced)
+	// consumes work without storing anything - budgeting on `stored` would then
+	// process the whole backlog in one frame.
+	int processed = 0;
 	// GPU entries wrap Texture2DRD (main/render-thread-only): worker polls
 	// skip them in the scan below and leave them for the main-thread poll.
 	const bool can_build_gpu = main_or_render_thread();
@@ -1506,7 +1550,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				} else {
 					cpu_terminal_ids.push_back(it->first);
 				}
-				if (p_max_items > 0 && (int)(gpu_terminal_ids.size() + cpu_terminal_ids.size() + stored) >= p_max_items) {
+				if (p_max_items > 0 && (int)(gpu_terminal_ids.size() + cpu_terminal_ids.size() + processed) >= p_max_items) {
 					break;
 				}
 			}
@@ -1520,7 +1564,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 	constexpr uint64_t kMaxBytesPerSlice = 64ULL * 1024ULL * 1024ULL; // 64 MiB slice cap
 
 	for (size_t ti = 0; ti < terminal_ids.size(); ++ti) {
-		if (p_max_items > 0 && stored >= p_max_items) {
+		if (p_max_items > 0 && processed >= p_max_items) {
 			break;
 		}
 		if (p_max_usec > 0 && Time::get_singleton()) {
@@ -1529,7 +1573,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				break;
 			}
 		}
-		if (stored > 0 && slice_bytes_processed >= kMaxBytesPerSlice) {
+		if (processed > 0 && slice_bytes_processed >= kMaxBytesPerSlice) {
 			break;
 		}
 
@@ -1551,7 +1595,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 					uint64_t elapsed = (p_max_usec > 0 && Time::get_singleton()) ? (Time::get_singleton()->get_ticks_usec() - start_usec) : 0;
 
 					// Pre-estimate defer: If adding this texture exceeds byte or time budget, defer it to next slice
-					if (stored > 0 && (slice_bytes_processed + est_bytes > kMaxBytesPerSlice || (p_max_usec > 0 && elapsed + est_usec > p_max_usec))) {
+					if (processed > 0 && (slice_bytes_processed + est_bytes > kMaxBytesPerSlice || (p_max_usec > 0 && elapsed + est_usec > p_max_usec))) {
 						budget_exhausted = true;
 					} else {
 						t = it->second;
@@ -1587,8 +1631,13 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 			Ref<Texture2D> tex = build_texture(t.meta, buffers);
 			if (tex.is_valid()) {
 				String alias = (t.meta.payload_key != t.meta.engine_path) ? t.meta.payload_key : String();
-				cache->store(t.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias);
-				stored++;
+				// Report the decision: a refused store (cache disabled or raced)
+				// keeps nothing resident, so it must not count as stored.
+				if (cache->store(t.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias)) {
+					stored++;
+				} else {
+					UtilityFunctions::print_verbose("DSPreloader: cache refused prewarmed texture '", t.meta.engine_path, "'; not counted as stored.");
+				}
 				uint64_t entry_bytes = estimate_payload_bytes(t.meta);
 				if (entry_bytes == 0) {
 					for (size_t b = 0; b < buffers.size(); ++b) {
@@ -1602,6 +1651,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 		} else {
 			UtilityFunctions::print_verbose("DSPreloader: Prewarm texture '", t.meta.engine_path, "' did not complete; dropping (sync load remains available).");
 		}
+		processed++;
 
 		// Safely unblock any worker threads awaiting this specific texture
 		{
