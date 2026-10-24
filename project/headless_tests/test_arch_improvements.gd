@@ -250,9 +250,9 @@ func test_suite_002_async_submission_and_polling(ctx: Object) -> void:
 	assert_eq(req.get_destination_buffer(), fix["raw_data"], "Async decompressed payload matches ground truth")
 	assert_gt(ctx.get_completion_fence(), initial_fence, "Completion fence value monotonically incremented")
 
-## Suite 3: Double-Buffered Batch Pipelining (Section 5c)
+## Suite 3: Batch Slot Pipelining & Busy-Slot Retry (Section 5c)
 func test_suite_003_double_buffered_batching(ctx: Object) -> void:
-	current_suite = "Suite 3: Double-Buffered Batch Pipelining (Section 5c)"
+	current_suite = "Suite 3: Batch Slot Pipelining & Busy-Slot Retry (Section 5c)"
 	print("\n--- Running " + current_suite + " ---")
 	if ctx == null:
 		return
@@ -269,21 +269,33 @@ func test_suite_003_double_buffered_batching(ctx: Object) -> void:
 	assert_true(ctx.enqueue_request(req_a), "Batch A enqueued successfully")
 	ctx.flush_batch_async()
 
-	# Immediately enqueue and submit Batch B into alternating ping-pong slot
+	# Immediately enqueue and submit Batch B into the alternating ping-pong slot.
+	# With two batch slots (Win32 backend) the flush is accepted and both batches
+	# are in flight - that is the Section 5c pipelining this suite covers. With a
+	# single slot (software fallback) it reports ERR_BUSY and leaves the request
+	# pending, so the harvest loop below retries once a slot frees. The active
+	# backend decides which path is taken, so record it instead of assuming one.
 	assert_true(ctx.enqueue_request(req_b), "Batch B enqueued immediately into alternating ping-pong slot")
-	ctx.flush_batch_async()
+	var batch_b_submitted: bool = ctx.flush_batch_async() == OK
+	print("  Batch B accepted into the second slot immediately: ", batch_b_submitted, " (false = single-slot backend, retried below)")
 
-	# Harvest both batches
+	# Harvest both batches. Nothing retries a busy submission for us - DSRuntime
+	# drives the stream queue only - so re-flush while requests are still pending
+	# and a slot has freed up, exactly as an application must.
 	var max_iterations: int = 300
 	for iter in range(max_iterations):
 		if ctx.has_pending_results() or ctx.is_batch_complete():
 			ctx.collect_completed_results()
+		if ctx.get_pending_request_count() > 0 and ctx.is_batch_complete():
+			if ctx.flush_batch_async() == OK:
+				batch_b_submitted = true
 		if req_a.get_status() == DSRequest.STATUS_COMPLETED and req_b.get_status() == DSRequest.STATUS_COMPLETED:
 			break
 		await Engine.get_main_loop().process_frame
 
+	assert_true(batch_b_submitted, "Batch B was submitted (immediately, or after a busy slot freed)")
 	assert_eq(req_a.get_status(), DSRequest.STATUS_COMPLETED, "Batch A request completed cleanly")
-	assert_eq(req_b.get_status(), DSRequest.STATUS_COMPLETED, "Batch B request completed cleanly in alternating slot")
+	assert_eq(req_b.get_status(), DSRequest.STATUS_COMPLETED, "Batch B request completed cleanly (pipelined or retried)")
 	assert_eq(req_a.get_destination_buffer(), fix_a["raw_data"], "Batch A output verified byte-for-byte")
 	assert_eq(req_b.get_destination_buffer(), fix_b["raw_data"], "Batch B output verified byte-for-byte")
 

@@ -9,10 +9,35 @@ const PAYLOAD_SIZE := ROW_PITCH * TEXTURE_HEIGHT
 var failures := 0
 var cleanup_paths: Array[String] = []
 
+# Archive resolution: the loader bypasses res://textures.dspkg whenever the
+# "editor" build feature is set (ds_resource_format_loader.cpp:156), which is
+# true for every run launched from an editor binary - including all CLI test
+# runs. Staging an archive therefore requires opting in, and clearing it again.
+const FORCE_ARCHIVE_SETTING := "directstorage/force_archive_resolution"
+var _force_archive_present := false
+var _force_archive_prev: Variant = null
+
+func _force_archive_resolution() -> void:
+	_force_archive_present = ProjectSettings.has_setting(FORCE_ARCHIVE_SETTING)
+	_force_archive_prev = ProjectSettings.get_setting(FORCE_ARCHIVE_SETTING) if _force_archive_present else null
+	ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, true)
+
+func _restore_archive_resolution() -> void:
+	if _force_archive_present:
+		ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, _force_archive_prev)
+	else:
+		ProjectSettings.clear(FORCE_ARCHIVE_SETTING)
+
+func _shutdown_ds() -> void:
+	var ctx = Engine.get_singleton("DSContext")
+	if ctx != null and ctx.is_initialized():
+		ctx.shutdown_ds()
+
 func _initialize() -> void:
 	print("\n=================================================================")
 	print("[Test Prewarm & Threading] Starting DirectStorage Verification")
 	print("=================================================================")
+	_force_archive_resolution()
 
 	if not ClassDB.class_exists("DSContext") or not ClassDB.class_exists("DSTex") or not ClassDB.class_exists("DSPkg"):
 		_fail("Required classes (DSContext, DSTex, DSPkg) are not registered.")
@@ -145,6 +170,11 @@ material_override = SubResource("StandardMaterial3D_1")
 
 	print("[Test] Step 2: Yielding frame (process_frame) to simulate time-slice...")
 	var frame_before := Engine.get_process_frames()
+	# process_frame is emitted inside SceneTree::process(), before the engine's
+	# iteration counter advances, so a single await can resume within the same
+	# iteration (measured: before=0, after one await=0, after two awaits=1).
+	# Await two frames so the assertion actually crosses an iteration boundary.
+	await process_frame
 	await process_frame
 	var frame_after := Engine.get_process_frames()
 	_check(frame_after > frame_before, "Frame advanced during yield (UI rendered smoothly)")
@@ -209,6 +239,11 @@ func _fail(message: String) -> void:
 
 func _finish() -> void:
 	print("\n--- Cleaning up Fixtures ---")
+	_restore_archive_resolution()
+	# DirectStorage keeps the archive open in its IDStorageFile cache: shut the
+	# context down before deleting, or Windows refuses the delete and the stale
+	# res://textures.dspkg breaks the next run's DSPkg.finalize().
+	_shutdown_ds()
 	for path in cleanup_paths:
 		var glob := ProjectSettings.globalize_path(path)
 		if FileAccess.file_exists(glob):

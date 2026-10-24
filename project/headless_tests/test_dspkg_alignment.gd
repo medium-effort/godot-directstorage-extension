@@ -12,8 +12,28 @@ const PAYLOAD_SIZE := BASE_MIP_BYTES + ROW_PITCH * MIP1_HEIGHT
 
 var failures := 0
 
+# Archive resolution: the loader bypasses res://textures.dspkg whenever the
+# "editor" build feature is set (ds_resource_format_loader.cpp:156), which is
+# true for every run launched from an editor binary - including all CLI test
+# runs. Loading through the archive therefore requires opting in.
+const FORCE_ARCHIVE_SETTING := "directstorage/force_archive_resolution"
+var _force_archive_present := false
+var _force_archive_prev: Variant = null
+
+func _force_archive_resolution() -> void:
+	_force_archive_present = ProjectSettings.has_setting(FORCE_ARCHIVE_SETTING)
+	_force_archive_prev = ProjectSettings.get_setting(FORCE_ARCHIVE_SETTING) if _force_archive_present else null
+	ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, true)
+
+func _restore_archive_resolution() -> void:
+	if _force_archive_present:
+		ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, _force_archive_prev)
+	else:
+		ProjectSettings.clear(FORCE_ARCHIVE_SETTING)
+
 func _initialize() -> void:
 	print("[DSPkg Alignment] Starting multi-mip DSPkg 512-byte alignment test")
+	_force_archive_resolution()
 	if not ClassDB.class_exists("DSPkg") or not ClassDB.class_exists("DSTex") or not ClassDB.class_exists("DSContext") or not ClassDB.class_exists("DSRequest"):
 		_fail("Required classes (DSPkg, DSTex, DSContext, DSRequest) are not registered.")
 		_finish()
@@ -193,13 +213,23 @@ func _test_dspkg_multi_mip_alignment_and_streaming(ctx: Object, rd: RenderingDev
 			_check(match_ok, "ResourceLoader loaded texture texels match source payload byte-for-byte")
 			if loaded_tex is Texture2DRD and (loaded_tex as Texture2DRD).texture_rd_rid.is_valid():
 				rd.free_rid((loaded_tex as Texture2DRD).texture_rd_rid)
-		DirAccess.remove_absolute(project_dspkg_path)
 	else:
 		printerr("[WARN] Could not copy dspkg to res://textures.dspkg: ", copy_err)
 
-	# Clean up files
-	DirAccess.remove_absolute(dstex_path)
-	DirAccess.remove_absolute(dspkg_path)
+	# Clean up files. DirectStorage keeps the archive open in its IDStorageFile
+	# cache, so the context must be shut down before deleting it - otherwise
+	# Windows refuses the delete and res://textures.dspkg survives into the next
+	# run, where DSPkg.finalize() then fails with "Could not open file for
+	# writing". remove_absolute() also needs an OS path, not the res:// form.
+	_shutdown_ds()
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(project_dspkg_path))
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(dstex_path))
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(dspkg_path))
+
+func _shutdown_ds() -> void:
+	var ctx = Engine.get_singleton("DSContext")
+	if ctx != null and ctx.is_initialized():
+		ctx.shutdown_ds()
 
 func _make_texture_payload() -> PackedByteArray:
 	var payload := PackedByteArray()
@@ -232,6 +262,7 @@ func _fail(message: String) -> void:
 	printerr("[FAIL] " + message)
 
 func _finish() -> void:
+	_restore_archive_resolution()
 	if failures == 0:
 		print("[DSPkg Alignment] ALL TESTS PASSED!")
 		quit(0)

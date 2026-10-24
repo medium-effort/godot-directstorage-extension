@@ -14,6 +14,7 @@ func _initialize() -> void:
 		Common.finish(self, 1)
 		return
 	var decompressor: Variant = ClassDB.instantiate("GDeflateDecompressor")
+	print("[Throughput] fixture_gdeflate=", fixture.get("path", ""), " fixture_dstex=", fixture.get("dstex_path", ""))
 	var start_usec := Time.get_ticks_usec()
 	for _index in int(fixture["count"]):
 		decompressor.decompress(fixture["compressed"], fixture["payload"].size())

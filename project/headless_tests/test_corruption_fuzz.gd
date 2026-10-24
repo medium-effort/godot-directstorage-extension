@@ -387,14 +387,16 @@ func _probe_dstex_control_only(path: String, label: String) -> void:
 # ------------------------------------------------------------------- cleanup ---
 
 func _cleanup() -> void:
+	# remove_absolute() takes an OS path: the user:// / res:// forms were silent
+	# no-ops, leaving fixtures behind for the next run to trip over.
 	for f in [VALID_DSTEX_USER, VALID_DSPKG_USER]:
 		if FileAccess.file_exists(f):
-			DirAccess.remove_absolute(f)
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(f))
 	var dir := DirAccess.open(TMP_DIR)
 	if dir != null:
 		for fn in dir.get_files():
-			DirAccess.remove_absolute(TMP_DIR + "/" + fn)
-		DirAccess.remove_absolute(TMP_DIR)
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(TMP_DIR + "/" + fn))
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(TMP_DIR))
 		print("[Corruption Fuzz] Cleaned tmp fixtures under " + TMP_DIR)
 
 # ------------------------------------------------------------------- outcome ---

@@ -358,7 +358,7 @@ func _init() -> void:
 		print("FAIL: Valid unencrypted v4 archive failed to open cleanly.")
 		quit(1)
 		return
-	DirAccess.remove_absolute(valid_v4_path)
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(valid_v4_path))
 	print("SUCCESS: Valid unencrypted v4 archive opened cleanly.")
 
 	# Truncated 40-byte v4 header (< 64 bytes)

@@ -30,6 +30,25 @@ var _done := false
 var _staged: Array[String] = []
 var _created_dspkg := false
 
+# Archive resolution: the loader bypasses res://textures.dspkg whenever the
+# "editor" build feature is set (ds_resource_format_loader.cpp:156), which is
+# true for every run launched from an editor binary - including all CLI test
+# runs. Staging an archive therefore requires opting in, and clearing it again.
+const FORCE_ARCHIVE_SETTING := "directstorage/force_archive_resolution"
+var _force_archive_present := false
+var _force_archive_prev: Variant = null
+
+func _force_archive_resolution() -> void:
+	_force_archive_present = ProjectSettings.has_setting(FORCE_ARCHIVE_SETTING)
+	_force_archive_prev = ProjectSettings.get_setting(FORCE_ARCHIVE_SETTING) if _force_archive_present else null
+	ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, true)
+
+func _restore_archive_resolution() -> void:
+	if _force_archive_present:
+		ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, _force_archive_prev)
+	else:
+		ProjectSettings.clear(FORCE_ARCHIVE_SETTING)
+
 func _log(msg: String) -> void:
 	print("[%s] %s" % [TAG, msg])
 
@@ -78,6 +97,7 @@ func _run() -> void:
 
 	# --- Phase 0: fixtures (archive first: path resolution caches per process).
 	_log("--- Phase 0: fixtures ---")
+	_force_archive_resolution()
 	_check(DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(PROBE_DIR)) == OK,
 		"probe dir ready: " + PROBE_DIR)
 	var payload := _make_payload()
@@ -275,8 +295,16 @@ func _write_probe_scene(engine_paths: Array) -> void:
 func _finish(code: int) -> void:
 	_done = true
 	print("[%s] --- cleanup ---" % TAG)
+	_restore_archive_resolution()
 	if _created_dspkg:
+		# This test streams out of res://textures.dspkg, so the archive is open in
+		# the backend's IDStorageFile cache: shut the context down before deleting
+		# it, or Windows refuses the delete and the stale archive breaks the next
+		# run's DSPkg.finalize() ("Could not open file for writing").
+		_shutdown_ds()
 		_rm(DSPKG_PATH)
+		if FileAccess.file_exists(DSPKG_PATH):
+			_fail("archive survived cleanup: " + DSPKG_PATH)
 		_created_dspkg = false
 	for p in _staged:
 		_rm(p)
@@ -287,7 +315,14 @@ func _finish(code: int) -> void:
 			DirAccess.remove_absolute(abs_dir)
 			print("[%s] Removed dir %s" % [TAG, PROBE_DIR])
 	print("[%s] Result: %s" % [TAG, "PASSED" if _failures == 0 else ("FAILED (%d)" % _failures)])
-	quit(code)
+	# Cleanup runs after the caller computed `code`, so a failure found here (stale
+	# archive) must still turn into a non-zero exit.
+	quit(code if _failures == 0 else maxi(code, 1))
+
+func _shutdown_ds() -> void:
+	var ctx = Engine.get_singleton("DSContext")
+	if ctx != null and ctx.is_initialized():
+		ctx.shutdown_ds()
 
 func _rm(res_path: String) -> void:
 	var abs_path := ProjectSettings.globalize_path(res_path)

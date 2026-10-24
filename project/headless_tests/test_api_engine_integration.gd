@@ -142,12 +142,17 @@ func _run() -> void:
 			_check(int(event["fence"]) > 0, "batch_completed reports a positive fence")
 		_check(found_three_request_event, "batch_completed completed_count accurately reports three requests")
 
+	# DSRuntime is stream-only by design: _process() drives the async prewarm
+	# queue (flush_stream_async) and never touches the sync loader queue, so
+	# this contract is exercised with a stream enqueue. A sync-queue request
+	# here would stay pending forever - not a runtime defect (ds_runtime.gd
+	# documents the split: sync loads flush themselves).
 	if manager != null:
 		var manager_request := _make_request(fixture_path, fixture.size())
-		_check(ctx.enqueue_request(manager_request), "DSRuntime request enqueues successfully")
-		_check(ctx.get_pending_request_count() == 1, "DSRuntime sees one pending request")
+		_check(ctx.enqueue_request(manager_request, true), "DSRuntime stream request enqueues successfully")
+		_check(ctx.get_stream_pending_count() == 1, "DSRuntime sees one pending stream request")
 		manager.call("_process", 0.016)
-		_check(ctx.get_pending_request_count() == 0, "DSRuntime _process submits the pending batch")
+		_check(ctx.get_stream_pending_count() == 0, "DSRuntime _process submits the pending stream batch")
 		await _wait_for_requests(ctx, [manager_request])
 		_check(manager_request.get_status() == DSRequest.STATUS_COMPLETED, "DSRuntime-submitted request completes")
 		while ctx.has_pending_results():

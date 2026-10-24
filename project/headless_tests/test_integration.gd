@@ -1,8 +1,33 @@
 @tool
 extends SceneTree
 
+# Archive resolution: the loader bypasses res://textures.dspkg whenever the
+# "editor" build feature is set (ds_resource_format_loader.cpp:156), which is
+# true for every run launched from an editor binary - including all CLI test
+# runs. Staging an archive therefore requires opting in, and clearing it again.
+const FORCE_ARCHIVE_SETTING := "directstorage/force_archive_resolution"
+var _force_archive_present := false
+var _force_archive_prev: Variant = null
+
+func _force_archive_resolution() -> void:
+	_force_archive_present = ProjectSettings.has_setting(FORCE_ARCHIVE_SETTING)
+	_force_archive_prev = ProjectSettings.get_setting(FORCE_ARCHIVE_SETTING) if _force_archive_present else null
+	ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, true)
+
+func _restore_archive_resolution() -> void:
+	if _force_archive_present:
+		ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, _force_archive_prev)
+	else:
+		ProjectSettings.clear(FORCE_ARCHIVE_SETTING)
+
+func _shutdown_ds() -> void:
+	var ctx = Engine.get_singleton("DSContext")
+	if ctx != null and ctx.is_initialized():
+		ctx.shutdown_ds()
+
 func _init() -> void:
 	print("--- Running DirectStorage Phase 2 Step 3 Integration Test ---")
+	_force_archive_resolution()
 
 	# Verify recognized extensions in ResourceLoader
 	var tex_extensions = ResourceLoader.get_recognized_extensions_for_type("Texture2D")
@@ -271,7 +296,11 @@ func _init() -> void:
 		return
 	print("SUCCESS: Loaded packaged texture res://packaged_test_texture.png via DSRequest/DSContext pipeline: ", loaded_packaged_tex)
 
-	# Clean up all temporary archives and the loose fixture.
+	# Clean up all temporary archives and the loose fixture. DirectStorage keeps
+	# the archive open in its IDStorageFile cache, so shut the context down first
+	# or Windows refuses the delete and the stale file breaks the next run.
+	_restore_archive_resolution()
+	_shutdown_ds()
 	DirAccess.remove_absolute(ProjectSettings.globalize_path(test_dspkg_path))
 	DirAccess.remove_absolute(ProjectSettings.globalize_path(textures_pkg_path))
 	DirAccess.remove_absolute(ProjectSettings.globalize_path(test_dstex_path))
