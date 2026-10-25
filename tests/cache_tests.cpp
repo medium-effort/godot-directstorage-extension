@@ -2,6 +2,7 @@
 #include "gdextest/registry.h"
 
 #include "integration/ds_texture_cache.h"
+#include "integration/ds_texture_owner.h"
 #include "core/ds_context.h"
 
 #include <godot_cpp/classes/image.hpp>
@@ -9,6 +10,7 @@
 #include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/color.hpp>
+#include <godot_cpp/variant/rid.hpp>
 
 #include <string>
 #include <thread>
@@ -257,6 +259,40 @@ GDEX_TEST_T(cache, can_own_matches_store_acceptance, TAG_INTEGRATION) {
         GDEX_EXPECT_FALSE(cache->store(godot::String(paths[i]), make_test_texture(0.4f), modes[i]));
         GDEX_EXPECT_EQ(cache->get_cached_count(), before);
     }
+}
+
+// --- DSTextureOwner: RID lifetime for textures the cache refuses (#0126) -----
+
+GDEX_TEST_T(cache, texture_owner_handover_and_disarm, TAG_INTEGRATION) {
+    godot::Ref<godot::Texture2D> tex = make_test_texture(0.4f);
+
+    // Invalid input is ignored: no owner, no table entry.
+    godot::DSTextureOwner::attach(tex, godot::RID());
+    GDEX_EXPECT_FALSE(godot::DSTextureOwner::has_owner(tex));
+    godot::DSTextureOwner::disarm(tex); // idempotent on an unowned texture
+    GDEX_EXPECT_FALSE(godot::DSTextureOwner::has_owner(tex));
+
+    // Arming uses the texture's RenderingServer RID: headless has no
+    // RenderingDevice, so the eventual release is a documented no-op here.
+    // What this pins is the bookkeeping contract - a texture the cache REFUSES
+    // keeps its owner, and one the cache ACCEPTS hands it over exactly once
+    // (otherwise the cache and the owner would both free the same RID).
+    const godot::RID local_rid = tex->get_rid();
+    GDEX_EXPECT_TRUE(local_rid.is_valid());
+    godot::DSTextureOwner::attach(tex, local_rid);
+    GDEX_EXPECT_TRUE(godot::DSTextureOwner::has_owner(tex));
+
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+    GDEX_EXPECT_FALSE(cache->store("res://gdextest_owner_refused", tex, godot::DSTextureCache::CACHE_MODE_IGNORE));
+    GDEX_EXPECT_TRUE(godot::DSTextureOwner::has_owner(tex));
+
+    GDEX_EXPECT_TRUE(cache->store("res://gdextest_owner_handover", tex, godot::DSTextureCache::CACHE_MODE_REUSE));
+    GDEX_EXPECT_FALSE(godot::DSTextureOwner::has_owner(tex));
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 1);
+
+    // Disarming after the handover is harmless.
+    godot::DSTextureOwner::disarm(tex);
+    GDEX_EXPECT_FALSE(godot::DSTextureOwner::has_owner(tex));
 }
 
 GDEX_TEST_T(cache, shrink_max_entries_evicts_oldest_and_clamps, TAG_INTEGRATION) {

@@ -151,6 +151,10 @@ private:
 	std::atomic<int> active_batch_slot{0};
 	mutable std::mutex batch_mutex;
 	std::condition_variable batch_cv;
+	// Result of the last shutdown() drain. False means hardware DMA may still
+	// be running; readers must not release device resources in that case.
+	// Atomic like the neighbouring flags: the accessor takes no lock.
+	std::atomic<bool> last_shutdown_drained{ true };
 
 #ifdef _WIN32
 	void completion_thread_func();
@@ -191,6 +195,7 @@ public:
 	bool initialize() override;
 	bool initialize(const String &p_path);
 	void shutdown() override;
+	bool was_drain_clean() const override;
 
 	bool enqueue_request(Ref<DSRequest> p_request) override;
 	void submit_batch() override;

@@ -100,28 +100,89 @@ $JsonRel = Join-Path $FixtureRoot $JsonName
 $LogOut = Join-Path $PSScriptRoot "d3d12_stdout.log"
 $LogErr = Join-Path $PSScriptRoot "d3d12_stderr.log"
 
-# This runner does not regenerate the fixture. Refresh the test library
-# inside the last fixture so a rebuild is not masked by a stale DLL.
-$TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.editor*.dll" -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-if (-not $TestDll) {
-    $TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.dll" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-}
-if (-not $TestDll) {
-    Write-Error "No test library found at bin/libdirectstorage_tests*.dll. Build with .vscode/build_remote.ps1 -IncludeTests first."
-    exit 1
-}
+# This runner does not regenerate the fixture, so it must use exactly the
+# library the fixture manifest declares. Copying a differently-named binary
+# writes a file Godot never loads and leaves the stale fixture copy in place;
+# the run then reports "0 tests ran" while the freshly built DLL sits unused
+# in bin/ (observed: a leftover *editor* target DLL was preferred by name).
 $FixtureBin = Join-Path $FixtureRoot "addons/gdextest/bin"
 if (-not (Test-Path -LiteralPath $FixtureBin)) {
     Write-Error "Fixture bin not found at $FixtureBin. Run .vscode/run_gdextest_local.ps1 once to generate the fixture."
     exit 1
 }
+$ManifestPath = Join-Path $FixtureRoot "addons/gdextest/gdextest.gdextension"
+if (-not (Test-Path -LiteralPath $ManifestPath)) {
+    Write-Host "ERROR: Fixture manifest not found at $ManifestPath. Run .vscode/run_gdextest_local.ps1 once to generate the fixture." -ForegroundColor Red
+    exit 1
+}
+$DeclaredLibrary = $null
+foreach ($manifestLine in (Get-Content -LiteralPath $ManifestPath)) {
+    $libraryMatch = [regex]::Match($manifestLine, '^\s*windows\.[A-Za-z0-9_.]+\s*=\s*"res://addons/gdextest/bin/([^"]+)"')
+    if ($libraryMatch.Success) {
+        $DeclaredLibrary = $libraryMatch.Groups[1].Value
+        break
+    }
+}
+if (-not $DeclaredLibrary) {
+    Write-Host "ERROR: No windows.* library entry in $ManifestPath. Regenerate the fixture with .vscode/run_gdextest_local.ps1." -ForegroundColor Red
+    exit 1
+}
+$TestDllPath = Join-Path (Join-Path $RepoRoot "bin") $DeclaredLibrary
+if (-not (Test-Path -LiteralPath $TestDllPath)) {
+    Write-Host "ERROR: The fixture manifest declares '$DeclaredLibrary' but bin/$DeclaredLibrary is missing. Rebuild with .vscode/build_remote.ps1 -IncludeTests, or regenerate the fixture so the manifest matches the current build." -ForegroundColor Red
+    exit 1
+}
+$TestDll = Get-Item -LiteralPath $TestDllPath
+
+# Leftovers from another target/configuration are never cleaned by
+# build_remote.ps1's target-scoped [5/6] cleanup. They are not loaded, but
+# they are exactly how a mis-selection happens - surface them.
+$OtherTestDlls = @(Get-ChildItem -Path (Join-Path $RepoRoot "bin") -Filter "libdirectstorage_tests*.dll" -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne $TestDll.Name })
+if ($OtherTestDlls.Count -gt 0) {
+    $others = ($OtherTestDlls | ForEach-Object { "{0} ({1:yyyy-MM-dd HH:mm})" -f $_.Name, $_.LastWriteTime }) -join ", "
+    Write-Host "Warning: $($OtherTestDlls.Count) other test library/ies in bin/ (not loaded): $others" -ForegroundColor Yellow
+}
+
+# Freshness gate: a test library older than any input it must contain is stale,
+# and running it silently tests the previous build.
+$NewestInput = $null
+foreach ($inputRoot in @("tests", "src", "extern/gdextest")) {
+    $inputPath = Join-Path $RepoRoot $inputRoot
+    if (-not (Test-Path -LiteralPath $inputPath)) {
+        continue
+    }
+    $candidate = Get-ChildItem -Path $inputPath -Recurse -File -Include *.cpp, *.h, *.hpp -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '\\src\\gen\\' } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($candidate -and (-not $NewestInput -or $candidate.LastWriteTime -gt $NewestInput.LastWriteTime)) {
+        $NewestInput = $candidate
+    }
+}
+$TomlPath = Join-Path $RepoRoot ".gdextest.toml"
+if (Test-Path -LiteralPath $TomlPath) {
+    $tomlItem = Get-Item -LiteralPath $TomlPath
+    if (-not $NewestInput -or $tomlItem.LastWriteTime -gt $NewestInput.LastWriteTime) {
+        $NewestInput = $tomlItem
+    }
+}
+if ($NewestInput -and $NewestInput.LastWriteTime -gt $TestDll.LastWriteTime) {
+    $newestRel = $NewestInput.FullName.Substring($RepoRoot.Length + 1)
+    Write-Host ("ERROR: Stale test library: {0} ({1:yyyy-MM-dd HH:mm:ss}) is older than {2} ({3:yyyy-MM-dd HH:mm:ss}). Rebuild with .vscode/build_remote.ps1 -IncludeTests." -f $TestDll.Name, $TestDll.LastWriteTime, $newestRel, $NewestInput.LastWriteTime) -ForegroundColor Red
+    exit 1
+}
 $FixtureDll = Join-Path $FixtureBin $TestDll.Name
 Copy-Item -LiteralPath $TestDll.FullName -Destination $FixtureDll -Force
-Write-VerboseHost "Using test library: $($TestDll.FullName)" -ForegroundColor DarkGray
+# The fixture copy is what Godot actually loads. Prove it is the file we chose:
+# "selected" and "loaded" silently diverging is the whole failure mode.
+$sourceHash = (Get-FileHash -LiteralPath $TestDll.FullName -Algorithm SHA256).Hash
+$fixtureHash = (Get-FileHash -LiteralPath $FixtureDll -Algorithm SHA256).Hash
+if ($sourceHash -ne $fixtureHash) {
+    Write-Host "ERROR: Fixture copy of $($TestDll.Name) does not match bin/ after copy (SHA256 mismatch). Refusing to run a binary that is not the one selected." -ForegroundColor Red
+    exit 1
+}
+Write-Host ("Test library: {0} ({1:yyyy-MM-dd HH:mm:ss}) -> {2}" -f $TestDll.Name, $TestDll.LastWriteTime, $FixtureDll) -ForegroundColor DarkGray
 
 # Stage the DirectStorage runtime beside the fixture's addon copy: without
 # dstorage*.dll the Win32Backend init fails and every GPU suite silently
@@ -211,10 +272,19 @@ if (Test-Path $JsonRel) {
         $t = $doc.totals
         if ($t) {
             $crashedNote = if ($t.crashed) { ", crashed: $($t.crashed)" } else { "" }
-            $isSuccess = ($exitCode -eq 0 -and $t.fail -eq 0 -and (-not $t.crashed -or $t.crashed -eq 0))
-            $color = if ($isSuccess) { "Green" } else { "Red" }
-            Write-Host "Tests: passed $($t.pass), failed $($t.fail), skipped $($t.skip)$crashedNote (exit code $exitCode)" -ForegroundColor $color
-            $testPassed = $isSuccess
+            $totalRan = [int]$t.pass + [int]$t.fail + [int]$t.skip
+            if ($Filter -and $totalRan -eq 0) {
+                # A filter that matches nothing is never a pass: it means the
+                # loaded library lacks the suite (stale build) or the name is
+                # wrong. Both need a human, not a green banner.
+                Write-Host ("Tests: filter '{0}' matched 0 tests (stale test library or wrong suite name) - loaded {1} from {2:yyyy-MM-dd HH:mm:ss}" -f $Filter, $TestDll.Name, $TestDll.LastWriteTime) -ForegroundColor Red
+                $testPassed = $false
+            } else {
+                $isSuccess = ($exitCode -eq 0 -and $t.fail -eq 0 -and (-not $t.crashed -or $t.crashed -eq 0))
+                $color = if ($isSuccess) { "Green" } else { "Red" }
+                Write-Host "Tests: passed $($t.pass), failed $($t.fail), skipped $($t.skip)$crashedNote (exit code $exitCode)" -ForegroundColor $color
+                $testPassed = $isSuccess
+            }
         }
     } catch {
         Write-Host "Tests: could not parse totals from $JsonRel" -ForegroundColor Yellow

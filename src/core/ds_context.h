@@ -43,6 +43,10 @@ private:
 	std::atomic<bool> initialized{ false };
 	std::atomic<InitStatus> init_status{ INIT_STATUS_UNINITIALIZED };
 	std::atomic<bool> shut_down{ false };
+	// Result of the last backend shutdown drain. False means DMA may still be
+	// active, so teardown must not free device resources. Atomic like its
+	// neighbours: the teardown getter takes no lock.
+	std::atomic<bool> last_shutdown_clean{ true };
 
 	uint32_t staging_buffer_size_mb = 128;
 	bool disable_gpu_decompression = false;
@@ -191,6 +195,10 @@ public:
 	bool initialize_ds();
 	Error initialize_ds_for_path(const String &p_path);
 	void shutdown_ds();
+
+	// False when the last shutdown_ds() could not drain in-flight GPU work.
+	// Teardown code uses this to decide whether device RIDs are safe to free.
+	bool was_last_shutdown_clean() const { return last_shutdown_clean.load(); }
 
 	bool enqueue_request(Ref<DSRequest> p_request, bool p_from_stream = false);
 	int get_pending_request_count() const;

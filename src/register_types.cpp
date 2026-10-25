@@ -9,6 +9,7 @@
 #include "formats/dstex_format.h"
 #include "integration/ds_resource_format_loader.h"
 #include "integration/ds_texture_cache.h"
+#include "integration/ds_texture_owner.h"
 
 #include <gdextension_interface.h>
 #include <godot_cpp/classes/engine.hpp>
@@ -75,6 +76,10 @@ void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_lev
 	ClassDB::register_class<DSPkg>();
 	ClassDB::register_class<DSTextureCache>();
 	ClassDB::register_class<DSResourceFormatLoader>();
+	// Internal helper (not exposed to scripting): lifetime owner for device
+	// texture RIDs the cache does not take (#0126).
+	ClassDB::register_internal_class<DSTextureOwner>();
+	DSTextureOwner::initialize();
 
 	ds_context_singleton = memnew(DSContext);
 	ds_error_handler_singleton = memnew(DSErrorHandler);
@@ -94,6 +99,10 @@ void uninitialize_directstorage_accelerator_module(ModuleInitializationLevel p_l
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
+
+	// Stop uncached-texture destructors from posting render-thread work before
+	// any singleton is torn down. Their RIDs die with the device.
+	DSTextureOwner::shutdown();
 
 	if (ds_resource_format_loader.is_valid()) {
 		ResourceLoader::get_singleton()->remove_resource_format_loader(ds_resource_format_loader);
@@ -128,10 +137,25 @@ void uninitialize_directstorage_accelerator_module(ModuleInitializationLevel p_l
 		memdelete(ds_error_handler_singleton);
 		ds_error_handler_singleton = nullptr;
 	}
+
+	// DirectStorage must be shut down BEFORE the flush below. The deferred
+	// queue only holds RIDs that were held back because a request still
+	// targeted them, so freeing them while the backend is live is exactly the
+	// use-after-free the queue exists to avoid. shutdown_ds() is idempotent
+	// (the destructor calls it again) and was_last_shutdown_clean() reports
+	// whether its drain actually completed.
+	bool ds_drain_clean = true;
 	if (ds_context_singleton) {
+		ds_context_singleton->shutdown_ds();
+		ds_drain_clean = ds_context_singleton->was_last_shutdown_clean();
 		memdelete(ds_context_singleton);
 		ds_context_singleton = nullptr;
 	}
+	// The cache destructor (clear) can defer RIDs behind an in-flight request.
+	// Nothing is writing any more, so release them here rather than letting
+	// RenderingDevice::finalize report them as leaked. A drain timeout leaves
+	// the queue untouched on purpose. (#0126 drain hardening)
+	DSTextureCache::flush_deferred_rid_releases(ds_drain_clean);
 }
 
 extern "C" {

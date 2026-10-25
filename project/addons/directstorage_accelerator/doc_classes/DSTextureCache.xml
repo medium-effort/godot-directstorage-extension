@@ -138,16 +138,17 @@
 		</method>
 	</methods>
 	<members>
-		<member name="enabled" type="bool" setter="set_enabled" getter="is_enabled" default="false">
+		<member name="enabled" type="bool" setter="set_enabled" getter="is_enabled" default="true">
 			Whether the texture cache is enabled. When disabled, queries return [code]null[/code] and new entries are not stored.
+			[b]Note:[/b] The singleton initializes this from the [code]directstorage/texture_cache_enabled[/code] project setting, which defaults to [code]true[/code]. Disabling also empties the cache and makes async prewarm refuse to start (a prewarmed texture that nothing holds would be released immediately). GPU decompression itself is unaffected: uncached textures are owned directly by the loader and free their device RID when released.
 		</member>
-		<member name="max_entries" type="int" setter="set_max_entries" getter="get_max_entries" default="256">
-			Maximum number of textures retained by the least-recently-used cache.
+		<member name="max_entries" type="int" setter="set_max_entries" getter="get_max_entries" default="128">
+			Maximum number of textures retained by the least-recently-used cache. The singleton initializes this from the [code]directstorage/texture_cache_max_entries[/code] project setting (default [code]128[/code], range [code]16[/code]-[code]2048[/code]); the member default applies only when that setting is absent. Values below [code]1[/code] are clamped to [code]1[/code].
 		</member>
 	</members>
 	<constants>
 		<constant name="CACHE_MODE_IGNORE" value="0" enum="CacheMode">
-			Bypasses cache lookup and storage.
+			Bypasses cache lookup and storage. The GPU path still runs: the returned texture owns its device RID directly and releases it when the last reference drops.
 		</constant>
 		<constant name="CACHE_MODE_REUSE" value="1" enum="CacheMode">
 			Queries the cache and stores the loaded texture if caching is enabled.

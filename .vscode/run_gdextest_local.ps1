@@ -300,6 +300,33 @@ $TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.dll" -ErrorAction 
 if (-not $TestDll) {
     Show-StepFailure -Step "Step [2/5] Fixture" -Message "No test library found at bin/libdirectstorage_tests*.dll. Build with .vscode/build_remote.ps1 -IncludeTests first." -Code 1
 }
+# Freshness gate: a test library older than its own inputs cannot contain them,
+# so the run would silently test the previous build.
+$NewestTestInput = $null
+foreach ($inputRoot in @("tests", "src", "extern/gdextest")) {
+    $inputPath = Join-Path $RepoRoot $inputRoot
+    if (-not (Test-Path -LiteralPath $inputPath)) {
+        continue
+    }
+    $candidate = Get-ChildItem -Path $inputPath -Recurse -File -Include *.cpp, *.h, *.hpp -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '\\src\\gen\\' } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($candidate -and (-not $NewestTestInput -or $candidate.LastWriteTime -gt $NewestTestInput.LastWriteTime)) {
+        $NewestTestInput = $candidate
+    }
+}
+$TomlPath = Join-Path $RepoRoot ".gdextest.toml"
+if (Test-Path -LiteralPath $TomlPath) {
+    $tomlItem = Get-Item -LiteralPath $TomlPath
+    if (-not $NewestTestInput -or $tomlItem.LastWriteTime -gt $NewestTestInput.LastWriteTime) {
+        $NewestTestInput = $tomlItem
+    }
+}
+if ($NewestTestInput -and $NewestTestInput.LastWriteTime -gt $TestDll.LastWriteTime) {
+    $newestRel = $NewestTestInput.FullName.Substring($RepoRoot.Length + 1)
+    Show-StepFailure -Step "Step [2/5] Fixture" -Message ("Stale test library: {0} ({1:yyyy-MM-dd HH:mm:ss}) is older than {2} ({3:yyyy-MM-dd HH:mm:ss}). Rebuild with .vscode/build_remote.ps1 -IncludeTests." -f $TestDll.Name, $TestDll.LastWriteTime, $newestRel, $NewestTestInput.LastWriteTime) -Code 1
+}
 Write-VerboseHost "Using test library: $($TestDll.FullName)" -ForegroundColor DarkGray
 if ($Verbose) {
     & python extern/gdextest/tools/generate_fixture.py --project-root $FixtureRoot --library $TestDll.FullName --godot-version 4.7 --library-key windows.debug.x86_64 --project-name "directstorage-accelerator-tests" --scan-timeout-ms 30000

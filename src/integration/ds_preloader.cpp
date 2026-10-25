@@ -1340,10 +1340,11 @@ void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 			return;
 		}
 	}
-	// Ownership gate (#0126): store() refuses when the cache is disabled, and a
-	// Texture2DRD has no self-freeing owner, so wrapping an RID the cache will
-	// not take would leak it. Release it on the render thread instead and leave
-	// the synchronous load available. p_cache cannot be null here: the only
+	// Prewarm needs a cache owner: store() refuses when the cache is disabled,
+	// and a prewarmed texture nothing holds would be released immediately
+	// anyway. Drop the RID on the render thread instead of wrapping it; the
+	// synchronous load path now handles the uncached case with its own
+	// DSTextureOwner. (#0126) p_cache cannot be null here: the only
 	// caller, poll_completed(), returns early when the singleton is missing.
 	if (!p_cache->can_own(DSTextureCache::CACHE_MODE_REUSE)) {
 		queue_gpu_orphan_rid(p_entry.gpu_tex_rid);

@@ -2458,6 +2458,10 @@ bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 }
 #endif
 
+bool Win32Backend::was_drain_clean() const {
+	return last_shutdown_drained.load();
+}
+
 void Win32Backend::shutdown() {
 #ifdef _WIN32
 	// 1. Immediately refuse any new incoming work.
@@ -2471,6 +2475,7 @@ void Win32Backend::shutdown() {
 		timeout_ms = static_cast<uint32_t>(MAX(100, int64_t(ps->get_setting("directstorage/shutdown_drain_timeout_ms"))));
 	}
 	bool drained = drain_all_queues(timeout_ms);
+	last_shutdown_drained.store(drained);
 
 	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 	if (err_handler) {

@@ -848,6 +848,7 @@ bool DSContext::initialize_ds_locked() {
 		return true;
 	}
 	shut_down.store(false, std::memory_order_release);
+	last_shutdown_clean.store(true);
 
 	// Load settings from ProjectSettings or set defaults
 	ProjectSettings *ps = ProjectSettings::get_singleton();
@@ -958,6 +959,10 @@ void DSContext::shutdown_ds_locked() {
 
 	if (backend_to_delete) {
 		backend_to_delete->shutdown();
+		// Record whether every in-flight request actually drained. A false
+		// result means hardware DMA may still be running (drain timeout), so
+		// teardown must leave device RIDs alone.
+		last_shutdown_clean.store(backend_to_delete->was_drain_clean());
 		memdelete(backend_to_delete);
 	}
 

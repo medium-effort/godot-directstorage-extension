@@ -10,6 +10,10 @@
     Manifest mode re-hashes a Device A manifest (lines "relpath|SHA256") and
     prints MANIFEST_LINES=N plus SYNC_MANIFEST_OK or MISSING:/HASH: lines.
     Artifact mode prints ARTIFACT:name|SHA256 lines for shippable binaries.
+    -PruneStale (manifest mode only) deletes Device B files the manifest no
+    longer lists, but ONLY under the same roots the manifest is built from;
+    prints PRUNED_PATH:<rel> per deletion and PRUNED=<n>, or PRUNE_ABORT=<why>
+    and exits 3 without deleting anything.
     Every run also ends with VERIFY_TIMING:TOTAL_MS=..;TOUCH_MS=..;HASH_MS=..
     so build_remote.ps1 can show where the Device B time actually goes.
 #>
@@ -19,7 +23,8 @@ param(
     [switch]$Artifacts,
     [switch]$TouchTests,
     [switch]$CleanOrphans,
-    [switch]$ResetMarker
+    [switch]$ResetMarker,
+    [switch]$PruneStale
 )
 
 $ErrorActionPreference = "Stop"
@@ -159,6 +164,107 @@ if ($ManifestName -ne "") {
     } else {
         foreach ($b in $bad) { Write-Output $b }
     }
+}
+
+# Stale-file prune: delete Device B files the sync no longer owns, so a rename
+# or deletion does not leave a zombie that SCons keeps compiling (observed: a
+# renamed test file survived and the DLL exposed two suites with the same test).
+#
+# SAFETY: this is a manifest DIFF, not a cleanup.
+#  - It only enumerates the exact roots/files the Device A manifest is built
+#    from ($SyncVerifyRoots / $SyncVerifyFiles in build_remote.ps1) and never
+#    anything else. Everything Device B generates lives outside them (build/,
+#    root bin/, logs/, .cache/, project/, thirdparty/directstorage/bin, .env,
+#    .git), so it is unreachable here by construction rather than by pattern.
+#  - A file is deleted only when it is absent from the manifest AND does not
+#    match the same skip pattern the manifest itself uses.
+#  - Files only, never directories.
+#  - Fail-closed: an implausibly small manifest, or a candidate count above the
+#    cap, aborts WITHOUT deleting anything.
+#  - The manifest has already been hash-verified against Device A by the block
+#    above, so the delete set is derived from verified input.
+if ($PruneStale -and $ManifestName -ne "") {
+    # MUST mirror $SyncVerifyRoots / $SyncVerifyFiles / $SyncVerifySkip in
+    # build_remote.ps1. src/gen/ is added to the skip list because the key
+    # header can be generated on either side and must never be pruned.
+    $pruneRoots = @("src", "tests", "thirdparty/gdeflate", "thirdparty/libdeflate", "thirdparty/monocypher", "extern/gdextest/src", "extern/gdextest/tools")
+    $pruneFiles = @("SConstruct", ".gdextest.toml", "extern/gdextest/SConscript")
+    $pruneSkip = '^(build|bin|\.cache|\.projectmem|logs)/|^project/addons/directstorage_accelerator/bin/|^project/\.godot/|\.os$|\.glb$|\.pyc$|__pycache__|^compile_commands\.json$|^test-results\.xml$|^src/gen/'
+    # BELT AND BRACES: only prune file types the sync actually carries as
+    # source. SCons writes object files NEXT TO the sources
+    # (src/core/foo.windows.template_debug.dev.x86_64.obj), so a root-scoped
+    # prune without this deleted 146 objects on the first trial run and forced a
+    # full rebuild. An allowlist (not a denylist) means an unknown extension is
+    # simply left alone - stale is better than deleting something load-bearing.
+    $pruneSourceExtensions = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($extension in @(".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp", ".inc", ".py", ".ps1", ".md", ".txt", ".json", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".xml", ".gd", ".gdshader", ".glsl", ".hlsl", ".vert", ".frag", ".comp", ".tscn", ".tres", ".import", ".def", ".patch", ".cmake", ".gitignore")) {
+        $pruneSourceExtensions.Add($extension) | Out-Null
+    }
+    $pruneFloor = 50
+    $pruneMax = 200
+
+    $pruneManifest = Join-Path $RemoteDir $ManifestName
+    $pruneBase = (Resolve-Path -LiteralPath $RemoteDir).Path.TrimEnd("\", "/")
+    $owned = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $manifestLines = 0
+    if (Test-Path -LiteralPath $pruneManifest) {
+        foreach ($entry in @(Get-Content -LiteralPath $pruneManifest)) {
+            $sep = $entry.IndexOf("|")
+            if ($sep -lt 0) { continue }
+            $owned.Add($entry.Substring(0, $sep).Replace("\", "/")) | Out-Null
+            $manifestLines++
+        }
+    }
+    if ($manifestLines -lt $pruneFloor) {
+        Write-Output ("PRUNE_ABORT=manifest_unusable lines=" + $manifestLines + " floor=" + $pruneFloor)
+        exit 3
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($pruneRoot in $pruneRoots) {
+        $rootPath = Join-Path $pruneBase ($pruneRoot.Replace("/", "\"))
+        if (-not (Test-Path -LiteralPath $rootPath)) { continue }
+        foreach ($pruneFile in (Get-ChildItem -LiteralPath $rootPath -Recurse -File -ErrorAction SilentlyContinue)) {
+            $rel = $pruneFile.FullName.Substring($pruneBase.Length).TrimStart("\", "/").Replace("\", "/")
+            if ($rel -match $pruneSkip) { continue }
+            if ($owned.Contains($rel)) { continue }
+            $extensionCandidate = [System.IO.Path]::GetExtension($pruneFile.Name)
+            if (-not $extensionCandidate) { continue }
+            if (-not $pruneSourceExtensions.Contains($extensionCandidate)) { continue }
+            $candidates.Add($rel) | Out-Null
+        }
+    }
+    foreach ($singleFile in $pruneFiles) {
+        $singleFull = Join-Path $pruneBase ($singleFile.Replace("/", "\"))
+        if ([System.IO.File]::Exists($singleFull) -and -not $owned.Contains($singleFile)) {
+            $candidates.Add($singleFile) | Out-Null
+        }
+    }
+    $candidates.Sort()
+
+    if ($candidates.Count -gt $pruneMax) {
+        Write-Output ("PRUNE_ABORT=too_many candidates=" + $candidates.Count + " max=" + $pruneMax)
+        $shown = 0
+        foreach ($candidate in $candidates) {
+            if ($shown -ge 20) { break }
+            Write-Output ("PRUNE_WOULD_DELETE:" + $candidate)
+            $shown++
+        }
+        exit 3
+    }
+
+    $pruned = 0
+    foreach ($candidate in $candidates) {
+        $candidateFull = Join-Path $pruneBase ($candidate.Replace("/", "\"))
+        try {
+            Remove-Item -LiteralPath $candidateFull -Force -ErrorAction Stop
+            Write-Output ("PRUNED_PATH:" + $candidate)
+            $pruned++
+        } catch {
+            Write-Output ("PRUNE_ERROR:" + $candidate + "|" + $_.Exception.Message)
+        }
+    }
+    Write-Output ("PRUNED=" + $pruned)
 }
 
 if ($Artifacts) {

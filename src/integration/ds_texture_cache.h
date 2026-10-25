@@ -10,6 +10,7 @@
 #include <godot_cpp/templates/list.hpp>
 #include <godot_cpp/templates/vector.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
+#include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/string.hpp>
 
 #include <mutex>
@@ -113,11 +114,24 @@ public:
 	bool is_cache_mode_ignored(int p_cache_mode) const;
 
 	// True when store() would take ownership of a valid texture under this
-	// cache mode (cache enabled and the mode is not an ignored one). GPU
-	// texture creation is gated on this: a Texture2DRD created by the loader
-	// or the preloader has no self-freeing owner, so a texture the cache
-	// refuses would leak its device RID (GODOT_QUIRKS.md section 27, #0126).
+	// cache mode (cache enabled and the mode is not an ignored one). The
+	// preloader uses it to decide whether a GPU prewarm result has a home at
+	// all. The loader no longer gates on it: a texture the cache refuses gets a
+	// DSTextureOwner instead, so uncached loads keep the GPU path (#0126).
 	bool can_own(int p_cache_mode) const;
+
+	// Releases a device texture RID this extension owns, from any thread:
+	// inline on the render thread, otherwise queued + drained there, and
+	// deferred while a DirectStorage request still targets it. Static so
+	// DSTextureOwner destructors work after the cache singleton is gone.
+	static void release_owned_rid(const RID &p_rid);
+
+	// Frees every deferred RID WITHOUT the in-flight test. Teardown only.
+	// p_ds_drain_clean must be DSContext::was_last_shutdown_clean(): when the
+	// backend could not drain in-flight DMA the queue is left untouched on
+	// purpose, because freeing a RID under live DMA is a use-after-free; those
+	// RIDs die with the device.
+	static void flush_deferred_rid_releases(bool p_ds_drain_clean);
 
 	void set_max_entries(int p_max);
 	int get_max_entries() const;

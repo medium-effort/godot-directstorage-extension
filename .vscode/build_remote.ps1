@@ -7,6 +7,7 @@ param(
     [switch]$IncludeTests,
     [switch]$Verbose,
     [switch]$SkipVerify,
+    [switch]$NoPrune,
     [switch]$SkipDocClasses,
     [switch]$Local,
     [switch]$Remote,
@@ -1278,14 +1279,59 @@ Write-Status ("    [3/6 Sync] archive+transfer: {0:F1}s (gzip)" -f $syncTimer.El
 if (-not $SkipVerify) {
     Write-VerboseHost "[3b/6] Verifying source sync integrity on Device B..." -ForegroundColor Cyan
     $verifyTimer = [System.Diagnostics.Stopwatch]::StartNew()
-    # One SSH round-trip for both jobs: the helper touches test sources first
-    # (SCons has silently skipped recompiling changed/new tests/*.cpp, leaving a
-    # stale DLL whose suite runs 0 tests), then re-hashes the manifest the tar
-    # stream just deposited. Quoteless invocation: no nested quoting.
-    $VerifyOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -ManifestName sync_manifest.tmp -TouchTests 2>&1
+    # One SSH round-trip for three jobs: touch test sources first (SCons has
+    # silently skipped recompiling changed/new tests/*.cpp, leaving a stale DLL
+    # whose suite runs 0 tests), re-hash the manifest the tar stream just
+    # deposited, then prune files that manifest no longer lists (a rename or
+    # deletion otherwise leaves a zombie that keeps compiling - observed with a
+    # renamed suite). -NoPrune keeps verification and drops only the deletion.
+    # Quoteless invocation: no nested quoting.
+    $verifyArgs = @("-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", $ActiveHost,
+        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $RemoteVerifyWin,
+        "-RemoteDir", $RemoteDirWin, "-ManifestName", "sync_manifest.tmp", "-TouchTests")
+    if (-not $NoPrune) {
+        $verifyArgs += "-PruneStale"
+    }
+    $VerifyOut = & ssh @verifyArgs 2>&1
     if ($VerifyOut -notcontains "SYNC_MANIFEST_OK") {
         $detailLines = @($VerifyOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 20) -join "`n"
         Show-BuildFailure -Step "Step [3/6] Sync Verification" -Message "Device B verification failed ($ActiveHost) with no clean OK. Raw remote output:`n$detailLines" -Code 1
+    }
+    if ($NoPrune) {
+        Write-Status "    [3/6 Prune] skipped (-NoPrune): verification kept, stale files left on Device B." -ForegroundColor DarkYellow
+    } else {
+    # Stale-file prune result. The remote helper aborts without deleting
+    # anything when the manifest looks unusable or the delete set is implausibly
+    # large; surface that as a build failure rather than continuing on a tree it
+    # refused to trust.
+    $pruneAbort = @($VerifyOut | ForEach-Object { $_.ToString() } | Where-Object { $_.StartsWith("PRUNE_ABORT=") })
+    if ($pruneAbort.Count -gt 0) {
+        Show-BuildFailure -Step "Step [3/6] Stale File Prune" -Message ("Device B refused the stale-file prune: " + ($pruneAbort -join "; ") + ". Nothing was deleted; fix the sync scope or manifest and rerun.") -Code 1
+    }
+    $prunedCount = -1
+    $prunedPaths = @()
+    foreach ($pruneLine in @($VerifyOut)) {
+        $pruneText = $pruneLine.ToString()
+        if ($pruneText.StartsWith("PRUNED=")) {
+            [int]::TryParse($pruneText.Substring(7), [ref]$prunedCount) | Out-Null
+        } elseif ($pruneText.StartsWith("PRUNED_PATH:")) {
+            $prunedPaths += $pruneText.Substring(12)
+        } elseif ($pruneText.StartsWith("PRUNE_ERROR:")) {
+            Show-BuildFailure -Step "Step [3/6] Stale File Prune" -Message ("Device B could not delete a stale file: " + $pruneText.Substring(12) + ". A locked file means an orphaned process; rerun once it exits.") -Code 1
+        }
+    }
+    if ($prunedCount -lt 0) {
+        Show-BuildFailure -Step "Step [3/6] Stale File Prune" -Message "Device B did not report PRUNED=<n>, so the prune step did not run. Check that verify_remote.ps1 supports -PruneStale on $ActiveHost." -Code 1
+    }
+    if ($prunedCount -gt 0) {
+        Write-Status ("    [3/6 Prune] removed {0} stale synced file(s) on Device B:" -f $prunedCount) -ForegroundColor DarkCyan
+        foreach ($prunedPath in ($prunedPaths | Select-Object -First 20)) {
+            Write-Status ("        - " + $prunedPath) -ForegroundColor DarkGray
+        }
+        if ($prunedPaths.Count -gt 20) {
+            Write-Status ("        ... and {0} more" -f ($prunedPaths.Count - 20)) -ForegroundColor DarkGray
+        }
+    }
     }
     $TouchCount = 0
     foreach ($touchLine in @($VerifyOut)) {
@@ -1485,9 +1531,24 @@ if ($IncludeTests) {
     }
     $targetForTestPattern = if ($IsMultiTarget) { "template_debug" } else { $Target }
     $targetTestPattern = "libdirectstorage_tests*.$targetForTestPattern*.dll"
-    Get-ChildItem -Path "./bin" -Filter $targetTestPattern -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    # Delete ALL previous test libraries, not just this target's. A
+    # target-scoped pattern leaves artifacts from another configuration (e.g. an
+    # *editor* build) in bin/ forever, and a consumer that ranks candidates by
+    # name (run_d3d12_windowed.ps1 used to prefer editor*) then runs a stale
+    # library against the fresh sources - reported as "0 tests ran". Test
+    # libraries are pure build artifacts (multi-target builds only produce the
+    # template_debug one), so removing every variant is safe.
+    Get-ChildItem -Path "./bin" -Filter "libdirectstorage_tests*.dll" -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$RemoteDirTar/bin/$targetTestPattern" -LocalDest "./bin/")) {
         Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll ($targetTestPattern) from Device B ($ActiveHost). The remote test build likely failed." -Code 1
+    }
+    # Exactly one test library must exist after the pull. More than one means a
+    # leftover variant survived a previous build and can be picked up by a
+    # runner; fail here so it cannot silently happen.
+    $pulledTestDlls = @(Get-ChildItem -Path "./bin" -Filter "libdirectstorage_tests*.dll" -File -ErrorAction SilentlyContinue)
+    if ($pulledTestDlls.Count -ne 1) {
+        $foundNames = ($pulledTestDlls | ForEach-Object { $_.Name }) -join ", "
+        Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message ("Expected exactly one test library in ./bin after the pull, found {0}: {1}. These are build artifacts; delete the extras and rerun." -f $pulledTestDlls.Count, $foundNames) -Code 1
     }
 }
 & scp -C -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$ArtifactRemoteDir/build_manifest.json" "$ArtifactLocalDir/" 2>$null

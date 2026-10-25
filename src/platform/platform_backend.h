@@ -16,6 +16,11 @@ public:
 
 	virtual bool initialize() = 0;
 	virtual void shutdown() = 0;
+	// True when the last shutdown() drained every in-flight GPU request. A
+	// false result means DMA may still be active in hardware, so device
+	// resources must be left alone (Win32Backend's drain-timeout path leaks on
+	// purpose for exactly this reason).
+	virtual bool was_drain_clean() const { return true; }
 
 	virtual bool enqueue_request(Ref<DSRequest> p_request) = 0;
 	virtual void submit_batch() = 0;

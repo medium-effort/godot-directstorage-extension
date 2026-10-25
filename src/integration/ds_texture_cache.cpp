@@ -1,5 +1,6 @@
 #include "ds_texture_cache.h"
 #include "ds_preloader.h"
+#include "ds_texture_owner.h"
 #include "../core/ds_context.h"
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
@@ -41,25 +42,87 @@ namespace godot {
 // - Everything below runs OUTSIDE the cache lock (free_rid takes
 //   RenderingDevice locks; the deferred path crosses threads). No
 //   drain-logic change: context/backend queues are untouched.
+//
+// Second owner (#0126): the loader's uncached GPU path attaches a
+// DSTextureOwner to the texture instead, and that owner calls the static
+// release_owned_rid() below - same discipline, same queue, so both owners
+// share one free path.
 static std::mutex s_evict_free_mutex;
 static std::vector<RID> s_evict_free_queue;
+// One drain hop at a time. Cleared at the start of every drain.
+static bool s_evict_drain_scheduled = false;
+// Consecutive drains that found only in-flight RIDs (reset on progress), so a
+// permanently in-flight slot cannot spin a retry forever.
+static int s_evict_drain_retries = 0;
+static const int kEvictDrainMaxRetries = 240; // ~4 s at 60 fps; stays queued after that
+
+static void ds_texture_cache_drain_evict_frees_on_render_thread();
+
+// Schedules exactly one drain. Any thread: on the render thread it runs inline,
+// otherwise it is posted to the render thread. Public entry points call this,
+// so deferred-only releases get a retry too (#0126 drain hardening).
+static void ds_texture_cache_schedule_drain() {
+	{
+		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+		if (s_evict_drain_scheduled) {
+			return;
+		}
+		s_evict_drain_scheduled = true;
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (rs == nullptr) {
+		// Engine/device gone: the queue dies with it. Clear the flag so a late
+		// release cannot wedge future scheduling.
+		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+		s_evict_drain_scheduled = false;
+		return;
+	}
+	if (rs->is_on_render_thread()) {
+		ds_texture_cache_drain_evict_frees_on_render_thread();
+		return;
+	}
+	rs->call_on_render_thread(callable_mp_static(ds_texture_cache_drain_evict_frees_on_render_thread));
+}
+
+// Next-frame retry for RIDs that were still in flight. MUST run on the render
+// thread: request_frame_drawn_callback() appends to an unlocked list and cannot
+// be called from workers. Deliberately does not set s_evict_drain_scheduled, so
+// a normal release can still schedule a drain if frames are not drawn.
+static void ds_texture_cache_retry_drain_next_frame() {
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (rs == nullptr) {
+		return;
+	}
+	rs->request_frame_drawn_callback(callable_mp_static(ds_texture_cache_drain_evict_frees_on_render_thread));
+}
 
 static void ds_texture_cache_drain_evict_frees_on_render_thread() {
 	std::vector<RID> pending;
 	{
 		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+		s_evict_drain_scheduled = false;
 		pending.swap(s_evict_free_queue);
 	}
 	if (pending.empty()) {
+		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+		s_evict_drain_retries = 0;
 		return;
 	}
 	RenderingServer *rs = RenderingServer::get_singleton();
 	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
 	if (rd == nullptr) {
-		return; // Device gone (shutdown/teardown); RIDs die with it.
+		// Cannot free here (no device, or teardown already tore it down).
+		// Re-queue instead of dropping the batch so a later release - or the
+		// teardown flush - still sees these RIDs. Deliberately no retry is
+		// armed: a null device means there is nothing to free, and Godot never
+		// brings a RenderingDevice up later in the process.
+		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+		s_evict_free_queue.insert(s_evict_free_queue.end(), pending.begin(), pending.end());
+		return;
 	}
 	DSContext *ctx = DSContext::get_singleton();
 	std::vector<RID> still_in_flight;
+	bool freed_any = false;
 	for (size_t i = 0; i < pending.size(); ++i) {
 		if (pending[i].is_valid()) {
 			if (ctx && ctx->is_resource_in_flight(pending[i])) {
@@ -68,13 +131,33 @@ static void ds_texture_cache_drain_evict_frees_on_render_thread() {
 			}
 			if (rd->texture_is_valid(pending[i])) {
 				rd->free_rid(pending[i]);
+				freed_any = true;
 			}
 		}
 	}
-	if (!still_in_flight.empty()) {
+	if (still_in_flight.empty()) {
+		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+		s_evict_drain_retries = 0;
+		return;
+	}
+	int retries = 0;
+	{
 		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
 		s_evict_free_queue.insert(s_evict_free_queue.end(), still_in_flight.begin(), still_in_flight.end());
+		if (freed_any) {
+			s_evict_drain_retries = 0;
+		}
+		retries = ++s_evict_drain_retries;
 	}
+	if (retries > kEvictDrainMaxRetries) {
+		if (retries == kEvictDrainMaxRetries + 1) {
+			UtilityFunctions::push_warning("DSTextureCache: ", (int64_t)still_in_flight.size(), " texture RID(s) still in flight after ", (int64_t)kEvictDrainMaxRetries, " retries; leaving them queued for the next release or teardown.");
+		}
+		return;
+	}
+	// Retry on the next drawn frame: the request that owns the RID is polled
+	// from the main loop, so this is the earliest useful moment.
+	ds_texture_cache_retry_drain_next_frame();
 }
 
 static void ds_texture_cache_free_texture_rids(const std::vector<RID> &p_rids) {
@@ -96,10 +179,19 @@ static void ds_texture_cache_free_texture_rids(const std::vector<RID> &p_rids) {
 	}
 
 	if (!deferred_rids.empty()) {
-		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
-		for (size_t i = 0; i < deferred_rids.size(); ++i) {
-			s_evict_free_queue.push_back(deferred_rids[i]);
+		{
+			std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+			for (size_t i = 0; i < deferred_rids.size(); ++i) {
+				s_evict_free_queue.push_back(deferred_rids[i]);
+			}
+			// A new wave of in-flight releases deserves fresh retries: without
+			// this, a capped counter from an older stuck RID would also suppress
+			// frame retries for these.
+			s_evict_drain_retries = 0;
 		}
+		// Deferred releases always get a retry, including when there are no
+		// immediate RIDs and when the device/thread guards below bail out.
+		ds_texture_cache_schedule_drain();
 	}
 
 	if (immediate_rids.empty()) {
@@ -108,6 +200,9 @@ static void ds_texture_cache_free_texture_rids(const std::vector<RID> &p_rids) {
 
 	RenderingServer *rs = RenderingServer::get_singleton();
 	if (rs == nullptr) {
+		// No server means no device and no live GPU resource: dropping the
+		// immediate set is safe. Any deferred RIDs were already queued above
+		// and stay visible to the teardown flush.
 		return;
 	}
 	if (rs->is_on_render_thread()) {
@@ -128,7 +223,7 @@ static void ds_texture_cache_free_texture_rids(const std::vector<RID> &p_rids) {
 			s_evict_free_queue.push_back(immediate_rids[i]);
 		}
 	}
-	rs->call_on_render_thread(callable_mp_static(ds_texture_cache_drain_evict_frees_on_render_thread));
+	ds_texture_cache_schedule_drain();
 }
 
 static RID ds_texture_cache_extract_rd_rid(const Ref<Texture2D> &p_texture) {
@@ -405,6 +500,58 @@ bool DSTextureCache::can_own(int p_cache_mode) const {
 	return _can_own_locked(p_cache_mode);
 }
 
+void DSTextureCache::release_owned_rid(const RID &p_rid) {
+	if (!p_rid.is_valid()) {
+		return;
+	}
+	// Reuses the evict-path release discipline: free inline on the render
+	// thread, otherwise queue + drain on the render thread, and defer while a
+	// DirectStorage request still targets the RID. Static on purpose: late
+	// destructors must work without a live cache singleton.
+	std::vector<RID> rids;
+	rids.push_back(p_rid);
+	ds_texture_cache_free_texture_rids(rids);
+}
+
+void DSTextureCache::flush_deferred_rid_releases(bool p_ds_drain_clean) {
+	if (!p_ds_drain_clean) {
+		// DirectStorage could not drain in-flight DMA. Do not touch the queue:
+		// freeing a RID that hardware may still be writing to is exactly the
+		// use-after-free the deferred queue exists to avoid. Device teardown
+		// reclaims them, which is what the backend's own timeout path assumes.
+		UtilityFunctions::print_verbose("DSTextureCache: DS shutdown did not drain; leaving deferred RIDs for device teardown.");
+		return;
+	}
+	// Check the device/thread BEFORE swapping: a swap-then-bail would silently
+	// lose the queue (neither freed nor left for a later drain).
+	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	if (rd == nullptr || !rs->is_on_render_thread()) {
+		UtilityFunctions::print_verbose("DSTextureCache: no live device on the render thread at teardown; leaving deferred RIDs for device teardown.");
+		return;
+	}
+	std::vector<RID> pending;
+	{
+		std::lock_guard<std::mutex> lock(s_evict_free_mutex);
+		pending.swap(s_evict_free_queue);
+		s_evict_drain_scheduled = false;
+		s_evict_drain_retries = 0;
+	}
+	if (pending.empty()) {
+		return;
+	}
+	int64_t released = 0;
+	for (size_t i = 0; i < pending.size(); ++i) {
+		if (pending[i].is_valid() && rd->texture_is_valid(pending[i])) {
+			rd->free_rid(pending[i]);
+			++released;
+		}
+	}
+	if (released > 0) {
+		UtilityFunctions::print_verbose("DSTextureCache: released ", released, " deferred texture RID(s) at teardown.");
+	}
+}
+
 Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode) {
 	std::vector<Ref<Texture2D>> evicted;
 	Ref<Texture2D> result;
@@ -539,6 +686,11 @@ bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 		}
 		ds_texture_cache_drop_live_refs(evicted, live_refs);
 	}
+
+	// Ownership transfer: a texture that arrived with its own RID owner (the
+	// uncached GPU path, #0126) now belongs to the cache. Disarm it so the RID
+	// is released exactly once - by evict/replace/clear, never by both.
+	DSTextureOwner::disarm(p_texture);
 
 	struct TakeoverGuard {
 		std::mutex &mutex;
