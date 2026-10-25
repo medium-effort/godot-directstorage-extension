@@ -23,6 +23,7 @@
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
@@ -31,6 +32,7 @@
 #include <godot_cpp/variant/string_name.hpp>
 #include <godot_cpp/variant/variant.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -441,18 +443,34 @@ GDEX_TEST_T(context_lifecycle, concurrent_lazy_initialization_stress, TAG_INTEGR
 GDEX_TEST_T(context_lifecycle, concurrent_reader_queries_during_shutdown_stress, TAG_INTEGRATION) {
     godot::Object *ds = require_singleton(ctx, "DSContext");
 
-    std::atomic<bool> stop_flag{false};
-    constexpr int NUM_READERS = 8;
-    std::vector<std::thread> readers;
-    readers.reserve(NUM_READERS);
+    // Reader count follows the host: this test exists to race reader queries
+    // against shutdown/init, not to saturate the CPU. GitHub-hosted runners
+    // report 2 processors, and 8 pure-spinning readers there preempt the lock
+    // holders the main thread needs (exclusive backend_lifecycle_mutex +
+    // context_mutex), so 20 cycles cost ~4.3 s on windows-latest CI while the
+    // same 1000 cycles without readers cost ~0.4 s. Clamp 2..8 keeps the 8-way
+    // churn on 8+ core dev machines and shrinks to 2 on a 2-vCPU runner.
+    godot::OS *os = godot::OS::get_singleton();
+    const int host_cpus = os ? os->get_processor_count() : 4;
+    const int num_readers = std::max(2, std::min(host_cpus, 8));
 
-    for (int i = 0; i < NUM_READERS; ++i) {
+    std::atomic<bool> stop_flag{false};
+    std::vector<std::thread> readers;
+    readers.reserve(num_readers);
+
+    for (int i = 0; i < num_readers; ++i) {
         readers.emplace_back([ds, &stop_flag]() {
             while (!stop_flag.load(std::memory_order_relaxed)) {
                 ds->call(godot::StringName("get_async_batches_submitted"));
                 ds->call(godot::StringName("get_in_flight_async_batch_count"));
                 ds->call(godot::StringName("get_completion_fence"));
                 ds->call(godot::StringName("wait_for_completion"), 0);
+                // Yield between passes. A bare spin keeps the reader runnable
+                // even while a shutdown/init holds a lock, so on an
+                // oversubscribed runner the holder is preempted mid critical
+                // section and every acquisition becomes a scheduler wait.
+                // The cycles still interleave with thousands of query passes.
+                std::this_thread::yield();
             }
         });
     }
