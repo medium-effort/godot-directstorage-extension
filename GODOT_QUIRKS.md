@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 25 October 2026
+Last updated: 26 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1378,4 +1378,114 @@ func _restore_archive_resolution() -> void:
 		ProjectSettings.clear(FORCE_ARCHIVE_SETTING)   # unregistered key: clear, do not write false (Q49)
 ```
 The override is read per call (`ds_resource_format_loader.cpp:153`, `ds_preloader.cpp:69`), so it takes effect immediately; C++ precedent in `tests/gpu_prewarm_tests.cpp`, and the four archive suites now do the same. The rule for the project side is documented in `.agents/rules/gdextest.md`.
+
+## 56. `--script` Runs Only Load Extensions Listed in `.godot/extension_list.cfg`
+
+### The Engine Reality
+`GDExtensionManager` loads the `.gdextension` paths named in `res://.godot/extension_list.cfg`. That file is written by the editor's filesystem scan, not by a `--script` run, which starts a `MainLoop` without rescanning `res://`. A `.gdextension` copied into a project after the last scan is present on disk and invisible to `ClassDB`.
+
+### The Trap / Symptom
+Copying `addons/directstorage_accelerator/` into a scratch project and running `--headless --script make_fixtures.gd` produced:
+
+```
+[fixture] NO_DSTEX
+ERROR: Cannot get class 'DSTex'.
+```
+
+`.godot/extension_list.cfg` existed but listed nothing. One `--headless --import --quit` wrote the addon path; the unchanged script then created both `.dstex` files.
+
+### The Rule
+Always run one `--headless --import --quit` after adding or copying a GDExtension before any `--script` probe, because `--script` runs only load extensions listed in `.godot/extension_list.cfg`.
+
+In practice:
+
+```
+godot_console --headless --path <project> --import --quit
+```
+
+Then assert `.godot/extension_list.cfg` contains the `.gdextension`. The probe runner does this before every export (`run_probe.ps1`, import step). Related: Q53, Q55.
+
+## 57. An Encrypted PCK Export With No Key Writes a Truncated Pack and Exits 0
+
+### The Engine Reality
+`EditorExportPlatform` builds the pack wherever the preset's key is needed; with `encrypt_pck=true` and no key configured it writes a header-only pack and reports success. `EditorExportPlugin` exposes no abort, cancel or fail method and `_export_begin` returns void, so a plugin can refuse to inject bytes but cannot make the export fail.
+
+### The Trap / Symptom
+Measured on 4.7.2 (`.agents/scratch/toc_key_pck_probe/`): missing key in `.godot/export_credentials.cfg`, `encrypt_pck=true` → pack of 112 bytes, exit status 0, no error. A release pipeline that trusts the exit code ships an empty pack.
+
+### The Rule
+Never treat an export command's exit status as evidence that an encrypted pack is usable; assert the artifact's size and expected entries afterwards.
+
+Concretely: size floor, expected entries present, key entry encrypted. The plugin's gate only prevents deployment (`ds_export_plugin.gd:346`), so the release workflow must own the failure. Related: Q58.
+
+## 58. A Failed Encrypted-PCK Read Returns `true` and Garbage Bytes
+
+### The Engine Reality
+`FileAccessPack` opens the entry and `FileAccessEncrypted` decrypts and verifies an MD5 of the plaintext. With the wrong key it logs and returns an error, but `FileAccess.get_file_as_bytes()` still hands back the buffer it read: correct length, undecrypted content. `FileAccess.file_exists()` consults the pack directory, which is plaintext when `encrypt_directory=false`, so it also says true.
+
+### The Trap / Symptom
+Mounting an encrypted pack in a binary without the key (probe stage S4b):
+
+```
+[readback] key_exists=true
+[readback] key_size=32
+ERROR: The MD5 sum of the decrypted file does not match the expected value.
+ERROR: Can't open encrypted pack-referenced file "res://.dspkg/toc.key" ... "File corrupt".
+```
+
+The 32 bytes were unrelated data, not the key. A size check installs garbage and the next open reports `ERR_UNAUTHORIZED`.
+
+### The Rule
+Never validate a PCK-encrypted file by `file_exists()` or byte length; compare the bytes or treat the stderr `File corrupt` line as the only failure signal.
+
+For the key file: compare the candidate against the archive `key_id` (or a known key) and discard on mismatch. Related: Q57.
+
+## 59. The Console Executable Is a Shim; Pipe Redirection Makes It Hang
+
+### The Engine Reality
+`Godot_v4.7.2-stable_win64_console.exe` is ~198 KB against the 180 MB engine binary: it launches the real executable with a console attached. Spawned through `System.Diagnostics.ProcessStartInfo` with `RedirectStandardOutput = $true`, the process never exits, even for `--version`.
+
+### The Trap / Symptom
+`WaitForExit(20000)` returned false three times for `--version`; the same binary through `Start-Process -RedirectStandardOutput <file>` exits immediately and writes `4.7.2.stable.official.ed1daf0bf`. Cost: two dead-end debugging rounds during the probe build.
+
+### The Rule
+Always launch the Godot `*console*.exe` with file-based redirection, never `ProcessStartInfo` pipe redirection, or the shim will not exit.
+
+In practice:
+
+```
+Start-Process -FilePath <console.exe> -ArgumentList <args> `
+  -RedirectStandardOutput <out> -RedirectStandardError <err> -NoNewWindow -PassThru
+```
+
+Implemented in `run_probe.ps1` `Invoke-GodotProcess`. Applies to any script that shells out to Godot.
+
+## 60. `_export_file` Is Not an Inventory When Another Plugin Calls `skip()`
+
+### The Engine Reality
+Godot calls every registered `EditorExportPlugin._export_file()` for a file, and `skip()` marks it as handled. In this project the addon calls `skip()` on packaged textures (`ds_export_plugin.gd:333`); a sibling plugin's callback then did not receive those paths, although the files were bundled.
+
+### The Trap / Symptom
+The addon wrote both `.dstex` into `textures.dspkg` and logged `Skipped texture payload from PCK` for each, while a second export plugin recorded zero `.dstex` paths in `_export_file`. Asserting the archive from that log produced eleven false failures; the archive was correct the whole time.
+
+### The Rule
+Never assert exported contents from an export plugin's `_export_file` log when another plugin may call `skip()`; read the artifact or the archive instead.
+
+So: open `textures.dspkg` with `DSPkg.get_entries()` or scan the pack. Keep `_export_file` logging for platform-level file sets (scenes/resources), never for the archive. Related: Q50.
+
+## 61. Export Selection Is `export_files`; `customized_files` Is Dedicated-Server Only
+
+### The Engine Reality
+`EditorExportPlatform::export_project_files()` has one branch per mode (`editor_export_platform.cpp:1324-1334`): all-resources scans everything; exclude erases `get_files_to_export()` from that set (`:1327-1332`); selected scenes/resources resolve the dependencies of `get_files_to_export()`; only `EXPORT_CUSTOMIZED` reads `customized_files` (`:1333`). `save_config()` writes `export_files` for the non-customized modes and `customized_files` for the customized one (`editor_export.cpp:78-86`).
+
+### The Trap / Symptom
+Writing `customized_files={"res://assets/unused.dstex": "remove"}` under `export_filter="exclude"` excluded nothing; all four fixture files were exported. The same list under `customized` (with `dedicated_server=true`) did exclude the file. Also, entries in `export_files` whose file no longer exists are dropped at load (`editor_export.cpp:370`), so renaming a scene silently changes the export set.
+
+### The Rule
+Always write export selection to `export_files` for selected-scenes, selected-resources and exclude modes; `customized_files` only drives dedicated-server mode.
+
+- selected scenes / resources / exclude → `export_files=PackedStringArray("res://...")`
+- "Export as dedicated server" → `export_filter="customized"`, `dedicated_server=true`, `customized_files={"res://x": "remove"}`
+
+Measure the resulting set from the artifact, not from preset intent. Related: Q57, Q60.
 
