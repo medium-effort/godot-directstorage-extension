@@ -34,6 +34,15 @@ jobs:
     name: Run gdextest ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    env:
+      # gdextest test library name; mirrors [gdextest.output] name in
+      # .gdextest.toml. Referenced as $TEST_LIB_NAME in the bash steps.
+      TEST_LIB_NAME: libdsgd_tests
+      # Addon binary stem and arch suffix; mirror ADDON_BINARY_STEM /
+      # ADDON_BINARY_ARCH_SUFFIX in SConstruct. Referenced as
+      # $ADDON_BINARY_STEM and $ADDON_BINARY_ARCH_SUFFIX in the bash steps.
+      ADDON_BINARY_STEM: dsgd
+      ADDON_BINARY_ARCH_SUFFIX: "_64"
     strategy:
       fail-fast: false
       matrix:
@@ -183,10 +192,12 @@ jobs:
           # Assert the build produced a library for this platform, so a build
           # that never linked is named explicitly instead of surfacing as a
           # misleading "Identifier not declared" parse error.
+          # Windows has no lib prefix (SHLIBPREFIX is empty); Linux/macOS do.
+          ADDON_LIB_STEM="${ADDON_BINARY_STEM}${ADDON_BINARY_ARCH_SUFFIX}"
           case "${{ runner.os }}" in
-            Linux)   LIB_GLOB="libdirectstorage_accelerator.linux.*.so" ;;
-            macOS)   LIB_GLOB="libdirectstorage_accelerator.macos.*.dylib" ;;
-            Windows) LIB_GLOB="dsgd_64*.dll" ;;
+            Linux)   LIB_GLOB="lib${ADDON_LIB_STEM}*.so" ;;
+            macOS)   LIB_GLOB="lib${ADDON_LIB_STEM}*.dylib" ;;
+            Windows) LIB_GLOB="${ADDON_LIB_STEM}*.dll" ;;
             *)       LIB_GLOB="" ;;
           esac
           if [ -n "$LIB_GLOB" ] && ! compgen -G "$ADDON_BIN/$LIB_GLOB" > /dev/null; then
@@ -279,17 +290,17 @@ jobs:
           fi
 
       - name: Symbolize macOS crash backtrace
-        # Resolves the libdirectstorage_tests offsets from the SIGSEGV
+        # Resolves the ${TEST_LIB_NAME} offsets from the SIGSEGV
         # backtrace (e.g. +dfdec +aa0b0 +ac7b8 +6038c) to file:line via atos.
         # Best-effort: prints a notice instead of failing if stripped/missing.
         if: failure() && runner.os == 'macOS'
         shell: bash
         run: |
-          DYLIB=$(ls bin/libdirectstorage_tests.*.dylib 2>/dev/null | head -n 1 || true)
+          DYLIB=$(ls bin/${TEST_LIB_NAME}.*.dylib 2>/dev/null | head -n 1 || true)
           if [ -z "$DYLIB" ]; then echo "test dylib not found; skipping atos"; exit 0; fi
           echo "dylib: $DYLIB"
           LOG="${{ github.workspace }}/godot-raw.log"
-          OFFSETS=$(grep -o 'libdirectstorage_tests[^)]*)' "$LOG" 2>/dev/null | grep -o '+[0-9a-fA-F]*' | tr -d '+' | sort -u || true)
+          OFFSETS=$(grep -o "${TEST_LIB_NAME}[^)]*)" "$LOG" 2>/dev/null | grep -o '+[0-9a-fA-F]*' | tr -d '+' | sort -u || true)
           if [ -z "$OFFSETS" ]; then
             echo "no dylib offsets in raw log; falling back to last-known crash offsets"
             OFFSETS="dfdec aa0b0 ac7b8 6038c"

@@ -29,6 +29,7 @@ src/gen/
 # ==============================================================================
 project/addons/directstorage_accelerator/bin/directstorage_accelerator.*
 project/addons/directstorage_accelerator/bin/dsgd*
+project/addons/directstorage_accelerator/bin/libdsgd*
 project/addons/directstorage_accelerator/bin/*.lib
 project/addons/directstorage_accelerator/bin/build_manifest.json
 project/addons/directstorage_accelerator/bin/*.dll.old
@@ -58,6 +59,9 @@ project/test_assets/*.png
 # Test Frameworks & Static Analysis (gdextest, cppcheck, logs)
 # ==============================================================================
 build/gdextest/
+# gdextest test libraries. libdirectstorage_tests* = pre-dsgd leftovers, kept
+# ignored so a stale artifact never resurfaces as untracked.
+bin/libdsgd_tests*
 bin/libdirectstorage_tests*
 gdextest_matrix.json
 test-results.xml

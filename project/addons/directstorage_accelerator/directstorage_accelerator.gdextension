@@ -4,17 +4,18 @@ compatibility_minimum = "4.3"
 reloadable = true
 
 [libraries]
-; Windows binary names below are generated from ADDON_BINARY_STEM /
-; ADDON_BINARY_ARCH_SUFFIX / ADDON_BINARY_DEBUG_SUFFIX in SConstruct — keep in sync.
+; Library names below are generated from the ADDON_BINARY_* constants in
+; SConstruct — keep in sync. SCons supplies the POSIX "lib" prefix and the
+; platform extension on Linux/macOS; the stem and debug tag match Windows.
 windows.editor.x86_64 = "bin/dsgd_64.debug.dll"
 windows.debug.x86_64 = "bin/dsgd_64.debug.dll"
 windows.release.x86_64 = "bin/dsgd_64.dll"
-linux.editor.x86_64 = "bin/libdirectstorage_accelerator.linux.editor.x86_64.so"
-linux.debug.x86_64 = "bin/libdirectstorage_accelerator.linux.template_debug.x86_64.so"
-linux.release.x86_64 = "bin/libdirectstorage_accelerator.linux.template_release.x86_64.so"
-macos.editor = "bin/libdirectstorage_accelerator.macos.editor.universal.dylib"
-macos.debug = "bin/libdirectstorage_accelerator.macos.template_debug.universal.dylib"
-macos.release = "bin/libdirectstorage_accelerator.macos.template_release.universal.dylib"
+linux.editor.x86_64 = "bin/libdsgd_64.debug.so"
+linux.debug.x86_64 = "bin/libdsgd_64.debug.so"
+linux.release.x86_64 = "bin/libdsgd_64.so"
+macos.editor = "bin/libdsgd_64.debug.dylib"
+macos.debug = "bin/libdsgd_64.debug.dylib"
+macos.release = "bin/libdsgd_64.dylib"
 
 [dependencies]
 windows.editor.x86_64 = {"bin/dstorage.dll": "", "bin/dstoragecore.dll": ""}

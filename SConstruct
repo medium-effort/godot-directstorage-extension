@@ -350,24 +350,24 @@ output_dir = "project/addons/directstorage_accelerator/bin/"
 #   ADDON_BINARY_ARCH_SUFFIX = target arch identifier ("_64" for x86_64)
 #   ADDON_BINARY_DEBUG_SUFFIX = debug/editor tag (".debug"; release has none)
 #   ADDON_BINARY_NAME = full binary stem: product + arch ("dsgd_64")
-# Flat root DLL deployment. Windows x86_64 uses
-# a clean 2-binary model regardless of dev_build flag:
-#   template_release -> dsgd_64.dll
-#   template_debug / editor -> dsgd_64.debug.dll
-# Non-Windows / fallback platforms retain the generic godot-cpp suffix naming.
+# Flat root DLL deployment. Every platform uses the same clean 2-binary model
+# regardless of dev_build flag (SCons supplies the POSIX "lib" prefix and the
+# platform extension via SHLIBPREFIX/SHLIBSUFFIX):
+#   template_release -> dsgd_64.dll   / libdsgd_64.so   / libdsgd_64.dylib
+#   template_debug / editor -> dsgd_64.debug.dll / libdsgd_64.debug.so /
+#                              libdsgd_64.debug.dylib
 ADDON_BINARY_STEM = "dsgd"
 ADDON_BINARY_ARCH_SUFFIX = "_64"
 ADDON_BINARY_DEBUG_SUFFIX = ".debug"
 ADDON_BINARY_NAME = ADDON_BINARY_STEM + ADDON_BINARY_ARCH_SUFFIX
-if env["platform"] == "windows":
-    if env["target"] == "template_release":
-        target_name = ADDON_BINARY_NAME + env["SHLIBSUFFIX"]
-    elif env["target"] in ["template_debug", "editor"]:
-        target_name = ADDON_BINARY_NAME + ADDON_BINARY_DEBUG_SUFFIX + env["SHLIBSUFFIX"]
-    else:
-        target_name = "directstorage_accelerator" + env["suffix"] + env["SHLIBSUFFIX"]
+if env["target"] == "template_release":
+    target_name = ADDON_BINARY_NAME + env["SHLIBSUFFIX"]
+elif env["target"] in ["template_debug", "editor"]:
+    target_name = ADDON_BINARY_NAME + ADDON_BINARY_DEBUG_SUFFIX + env["SHLIBSUFFIX"]
 else:
-    target_name = "directstorage_accelerator" + env["suffix"] + env["SHLIBSUFFIX"]
+    # Unknown/custom target: keep the godot-cpp suffix so the variant cannot
+    # silently overwrite the two canonical artifacts above.
+    target_name = ADDON_BINARY_NAME + env["suffix"] + env["SHLIBSUFFIX"]
 
 
 # Fail fast when the .gdextension manifest drifts from the ADDON_BINARY_*
@@ -385,8 +385,20 @@ def _assert_dll_naming_consistent():
         or any(t in skip_targets for t in SCons.Script.COMMAND_LINE_TARGETS)
     ):
         return
-    expected_release = ADDON_BINARY_NAME + ".dll"
-    expected_debug = ADDON_BINARY_NAME + ADDON_BINARY_DEBUG_SUFFIX + ".dll"
+    # Every platform in the manifest is validated, not just Windows: the stem
+    # and debug tag are shared, only the prefix/extension differ.
+    _posix = "lib" + ADDON_BINARY_NAME
+    expected = {
+        "windows.editor.x86_64": ADDON_BINARY_NAME + ADDON_BINARY_DEBUG_SUFFIX + ".dll",
+        "windows.debug.x86_64": ADDON_BINARY_NAME + ADDON_BINARY_DEBUG_SUFFIX + ".dll",
+        "windows.release.x86_64": ADDON_BINARY_NAME + ".dll",
+        "linux.editor.x86_64": _posix + ADDON_BINARY_DEBUG_SUFFIX + ".so",
+        "linux.debug.x86_64": _posix + ADDON_BINARY_DEBUG_SUFFIX + ".so",
+        "linux.release.x86_64": _posix + ".so",
+        "macos.editor": _posix + ADDON_BINARY_DEBUG_SUFFIX + ".dylib",
+        "macos.debug": _posix + ADDON_BINARY_DEBUG_SUFFIX + ".dylib",
+        "macos.release": _posix + ".dylib",
+    }
     manifest_path = os.path.join("project", "addons", "directstorage_accelerator", "directstorage_accelerator.gdextension")
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -395,15 +407,11 @@ def _assert_dll_naming_consistent():
         print(f"[SCons] ERROR: Cannot read {manifest_path}: {e}")
         Exit(1)
     problems = []
-    for key, expected in (
-        ("windows.editor.x86_64", expected_debug),
-        ("windows.debug.x86_64", expected_debug),
-        ("windows.release.x86_64", expected_release),
-    ):
+    for key, expected_name in expected.items():
         m = re.search(rf'^{re.escape(key)}\s*=\s*"([^"]+)"', manifest_text, re.MULTILINE)
         actual = m.group(1) if m else None
-        if actual != f"bin/{expected}":
-            problems.append(f'{key}: expected "bin/{expected}", found "{actual}"')
+        if actual != f"bin/{expected_name}":
+            problems.append(f'{key}: expected "bin/{expected_name}", found "{actual}"')
     if "directstorage_accelerator.windows." in manifest_text:
         problems.append("legacy directstorage_accelerator.windows.* keys still present")
     if problems:
@@ -827,13 +835,16 @@ def write_build_manifest():
 
     # Prune legacy long-form binary entries from the pre-dsgd naming scheme.
     for legacy_name in list(targets_dict.keys()):
-        if legacy_name.startswith("directstorage_accelerator.windows."):
+        if (
+            legacy_name.startswith("directstorage_accelerator.windows.")
+            or legacy_name.startswith("libdirectstorage_accelerator.")
+        ):
             targets_dict.pop(legacy_name, None)
 
     # Discover any additional compiled shared library binaries in output_dir
     if os.path.exists(output_dir):
         for fname in os.listdir(output_dir):
-            if (fname.startswith(ADDON_BINARY_STEM) or fname.startswith("libdirectstorage_accelerator")) and (
+            if (fname.startswith(ADDON_BINARY_STEM) or fname.startswith("lib" + ADDON_BINARY_STEM)) and (
                 fname.endswith(".dll") or fname.endswith(".so") or fname.endswith(".dylib")
             ):
                 if fname not in targets_dict:

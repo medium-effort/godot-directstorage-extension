@@ -99,6 +99,9 @@ $FixtureRoot = "build/gdextest/project"
 $JsonRel = Join-Path $FixtureRoot $JsonName
 $LogOut = Join-Path $PSScriptRoot "d3d12_stdout.log"
 $LogErr = Join-Path $PSScriptRoot "d3d12_stderr.log"
+# gdextest test library name (see [gdextest.output] name in .gdextest.toml);
+# used to spot leftover build artifacts in bin/ that are not the loaded one.
+$TestLibraryName = "libdsgd_tests"
 
 # This runner does not regenerate the fixture, so it must use exactly the
 # library the fixture manifest declares. Copying a differently-named binary
@@ -137,7 +140,7 @@ $TestDll = Get-Item -LiteralPath $TestDllPath
 # Leftovers from another target/configuration are never cleaned by
 # build_remote.ps1's target-scoped [5/6] cleanup. They are not loaded, but
 # they are exactly how a mis-selection happens - surface them.
-$OtherTestDlls = @(Get-ChildItem -Path (Join-Path $RepoRoot "bin") -Filter "libdirectstorage_tests*.dll" -File -ErrorAction SilentlyContinue |
+$OtherTestDlls = @(Get-ChildItem -Path (Join-Path $RepoRoot "bin") -Filter "$TestLibraryName*.dll" -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -ne $TestDll.Name })
 if ($OtherTestDlls.Count -gt 0) {
     $others = ($OtherTestDlls | ForEach-Object { "{0} ({1:yyyy-MM-dd HH:mm})" -f $_.Name, $_.LastWriteTime }) -join ", "

@@ -980,6 +980,9 @@ $RemoteVerifyWin = "$RemoteDirWin\verify_remote.ps1"
 # (dsgd_64.dll / dsgd_64.debug.dll, see ADDON_BINARY_STEM in SConstruct).
 # All tar-exclude / SCP-pull / verify patterns below derive from this.
 $AddonBinaryStem = "dsgd"
+# gdextest test library name (see [gdextest.output] name in .gdextest.toml).
+# Every tar-exclude / pull / verify test-library pattern below derives from this.
+$TestLibraryName = "libdsgd_tests"
 
 function Invoke-ScpArtifactWithRetry {
     param(
@@ -1159,7 +1162,7 @@ $tarExcludesList = @(
     # removing dstorage.dll and build_manifest.json from the sync (verified).
     # Root bin/ therefore needs a filename-anchored pattern instead.
     "--exclude=./build/*",
-    "--exclude=./bin/libdirectstorage_tests*",
+    "--exclude=./bin/$TestLibraryName*",
     "--exclude=./.cache/*",
     "--exclude=./.projectmem/*",
     "--exclude=./logs/*",
@@ -1530,7 +1533,7 @@ if ($IncludeTests) {
         New-Item -ItemType Directory -Force -Path "./bin" | Out-Null
     }
     $targetForTestPattern = if ($IsMultiTarget) { "template_debug" } else { $Target }
-    $targetTestPattern = "libdirectstorage_tests*.$targetForTestPattern*.dll"
+    $targetTestPattern = "$TestLibraryName*.$targetForTestPattern*.dll"
     # Delete ALL previous test libraries, not just this target's. A
     # target-scoped pattern leaves artifacts from another configuration (e.g. an
     # *editor* build) in bin/ forever, and a consumer that ranks candidates by
@@ -1538,14 +1541,14 @@ if ($IncludeTests) {
     # library against the fresh sources - reported as "0 tests ran". Test
     # libraries are pure build artifacts (multi-target builds only produce the
     # template_debug one), so removing every variant is safe.
-    Get-ChildItem -Path "./bin" -Filter "libdirectstorage_tests*.dll" -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path "./bin" -Filter "$TestLibraryName*.dll" -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$RemoteDirTar/bin/$targetTestPattern" -LocalDest "./bin/")) {
         Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll ($targetTestPattern) from Device B ($ActiveHost). The remote test build likely failed." -Code 1
     }
     # Exactly one test library must exist after the pull. More than one means a
     # leftover variant survived a previous build and can be picked up by a
     # runner; fail here so it cannot silently happen.
-    $pulledTestDlls = @(Get-ChildItem -Path "./bin" -Filter "libdirectstorage_tests*.dll" -File -ErrorAction SilentlyContinue)
+    $pulledTestDlls = @(Get-ChildItem -Path "./bin" -Filter "$TestLibraryName*.dll" -File -ErrorAction SilentlyContinue)
     if ($pulledTestDlls.Count -ne 1) {
         $foundNames = ($pulledTestDlls | ForEach-Object { $_.Name }) -join ", "
         Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message ("Expected exactly one test library in ./bin after the pull, found {0}: {1}. These are build artifacts; delete the extras and rerun." -f $pulledTestDlls.Count, $foundNames) -Code 1
@@ -1564,7 +1567,7 @@ if (-not $SkipVerify) {
     )
     if ($IncludeTests) {
         $targetForTestPattern = if ($IsMultiTarget) { "template_debug" } else { $Target }
-        $targetTestPattern = "libdirectstorage_tests*.$targetForTestPattern*.dll"
+        $targetTestPattern = "$TestLibraryName*.$targetForTestPattern*.dll"
         $PullChecks += @{ Pattern = $targetTestPattern; LocalDir = "./bin"; Required = $true }
     }
     # Remote hashes come from the verifier script (quoteless invocation, same

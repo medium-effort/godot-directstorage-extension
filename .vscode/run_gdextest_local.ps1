@@ -12,8 +12,8 @@
 
     Stages:
       [1/5] doctor  - `gdextest doctor` (config/Godot/SCons checks, no build).
-      [2/5] fixture - `generate_fixture.py` with the newest
-                      bin/libdirectstorage_tests*.dll, then manual staging of
+      [2/5] fixture - `generate_fixture.py` with the newest test library
+                      in bin/ ($TestLibraryName), then manual staging of
                       `project/test_assets/test.png` per [gdextest.fixture] assets.
       [3/5] warmup  - cold-cache deterministic pass (exit 134 tolerated).
       [4/5] run     - headless editor run; renderer flag BEFORE `--`,
@@ -268,6 +268,11 @@ if (-not (Test-Path -LiteralPath $GdextestCli)) {
 
 $FixtureRoot = "build/gdextest/project"
 
+# Artifact names mirror .gdextest.toml: [gdextest.output] name and
+# [gdextest.fixture] project_name. Keep both in sync with that file.
+$TestLibraryName = "libdsgd_tests"
+$FixtureProjectName = "dsgd-tests"
+
 # [1/5] doctor: validates config/Godot/SCons without building.
 # NOTE: invoke via `python .../gdextest.py`, never `& ./extern/gdextest/gdextest`
 # (a POSIX sh wrapper that cannot activate on Windows PowerShell; spike
@@ -294,11 +299,11 @@ if ((-not $?) -or ($null -eq $DoctorCode) -or ($DoctorCode -ne 0)) {
 # [2/5] fixture: generate the disposable Godot project for the test library.
 Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
 Write-VerboseHost "[2/5] fixture: generating Godot fixture project..." -ForegroundColor Cyan
-$TestDll = Get-ChildItem -Path "./bin/libdirectstorage_tests*.dll" -ErrorAction SilentlyContinue |
+$TestDll = Get-ChildItem -Path "./bin/$TestLibraryName*.dll" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 if (-not $TestDll) {
-    Show-StepFailure -Step "Step [2/5] Fixture" -Message "No test library found at bin/libdirectstorage_tests*.dll. Build with .vscode/build_remote.ps1 -IncludeTests first." -Code 1
+    Show-StepFailure -Step "Step [2/5] Fixture" -Message "No test library found at bin/$TestLibraryName*.dll. Build with .vscode/build_remote.ps1 -IncludeTests first." -Code 1
 }
 # Freshness gate: a test library older than its own inputs cannot contain them,
 # so the run would silently test the previous build.
@@ -329,9 +334,9 @@ if ($NewestTestInput -and $NewestTestInput.LastWriteTime -gt $TestDll.LastWriteT
 }
 Write-VerboseHost "Using test library: $($TestDll.FullName)" -ForegroundColor DarkGray
 if ($Verbose) {
-    & python extern/gdextest/tools/generate_fixture.py --project-root $FixtureRoot --library $TestDll.FullName --godot-version 4.7 --library-key windows.debug.x86_64 --project-name "directstorage-accelerator-tests" --scan-timeout-ms 30000
+    & python extern/gdextest/tools/generate_fixture.py --project-root $FixtureRoot --library $TestDll.FullName --godot-version 4.7 --library-key windows.debug.x86_64 --project-name "$FixtureProjectName" --scan-timeout-ms 30000
 } else {
-    $fixtureOut = & python extern/gdextest/tools/generate_fixture.py --project-root $FixtureRoot --library $TestDll.FullName --godot-version 4.7 --library-key windows.debug.x86_64 --project-name "directstorage-accelerator-tests" --scan-timeout-ms 30000 2>&1
+    $fixtureOut = & python extern/gdextest/tools/generate_fixture.py --project-root $FixtureRoot --library $TestDll.FullName --godot-version 4.7 --library-key windows.debug.x86_64 --project-name "$FixtureProjectName" --scan-timeout-ms 30000 2>&1
 }
 if ($LASTEXITCODE -ne 0) {
     if (-not $Verbose -and $fixtureOut) {
