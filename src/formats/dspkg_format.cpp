@@ -934,7 +934,10 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 		if (loaded_guid != expected_guid) {
 			return fail(ERR_FILE_UNRECOGNIZED, String("Archive belongs to a different project (archive GUID: 0x") + String::num_uint64(loaded_guid, 16) + ", expected GUID: 0x" + String::num_uint64(expected_guid, 16) + ").");
 		}
-		if (loaded_hash != expected_hash) {
+		// A zero expected content half means "pair on the project GUID only".
+		// The exporter emits that for subset exports, where the whole-project
+		// manifest cannot describe the shipped archive.
+		if (expected_hash != 0 && loaded_hash != expected_hash) {
 			return fail(ERR_FILE_UNRECOGNIZED, String("Archive texture manifest does not match current game build (archive hash: 0x") + String::num_uint64(loaded_hash, 16) + ", expected hash: 0x" + String::num_uint64(expected_hash, 16) + ").");
 		}
 	}

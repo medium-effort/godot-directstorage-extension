@@ -1,6 +1,9 @@
 @tool
 extends EditorExportPlugin
 
+## Pure shipping rules, shared with project/headless_tests/test_export_policy.gd.
+const Policy = preload("uid://bpbf4g8bgjeec")
+
 ## DirectStorage Export Plugin
 ##
 ## Author: MediumEffort
@@ -27,8 +30,21 @@ var _target_dspkg_path: String = ""
 ## Legacy temp location from before direct-to-export writes. Only used to
 ## clean up stale artifacts on C:.
 const LEGACY_TEMP_DSPKG_PATH: String = "user://temp_textures.dspkg"
-var _has_textures: bool = false
+## Archive entry paths successfully added in this export. Distinct from
+## `_project_has_textures`, which is a project scan: an export can contain
+## textures while the archive ends up empty (creation failed, every add failed).
+var _archive_entries: Dictionary = {}
+## Set by the project scan; drives the published `bundle_dspkg` contract.
+var _project_has_textures: bool = false
+## Cleared when this export cannot produce an archive, so `project.binary`
+## never claims an archive that the export did not write.
+var _bundle_possible: bool = true
 var _archive_failed: bool = false
+## "pck" when the export requested archive encryption, "none" otherwise.
+## Decides whether a failed bundle may leave PCK copies (unprotected fallback)
+## or must skip them so a protected build fails loudly instead of shipping
+## plaintext textures.
+var _protection_mode: String = "none"
 var _target_export_dir: String = ""
 var _export_features: PackedStringArray = []
 var _is_debug_export: bool = false
@@ -141,8 +157,11 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
 	_encryption_enabled = bool(get_option(OPTION_ENCRYPTION_ENABLED))
+	_protection_mode = "pck" if _encryption_enabled else "none"
 	_active_editor_dll_keyless = false
-	_has_textures = false
+	_archive_entries.clear()
+	_project_has_textures = false
+	_bundle_possible = true
 	_archive_failed = false
 	_dspkg = null
 	_staging_dspkg_path = ""
@@ -159,17 +178,19 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 
 	if _bundle_dspkg_enabled:
 		_precompute_manifest()
-		if _enforce_pairing_enabled and _has_textures:
+		if _enforce_pairing_enabled and _project_has_textures:
 			var guid := _ensure_project_guid()
 			var manifest := _compute_manifest_hash()
-			_current_fingerprint = (guid << 32) | manifest
+			if _export_filter_is_all_resources():
+				_current_fingerprint = (guid << 32) | manifest
+			else:
+				# The manifest is a whole-project scan, but a subset export
+				# ships only part of it. Pair on the project GUID alone so the
+				# check does not pretend to prove content it cannot see.
+				_current_fingerprint = guid << 32
+				print("[DirectStorage Exporter] Subset export: pairing is project-level (GUID only); archive content is not fingerprinted.")
 
-	ProjectSettings.set_setting("directstorage/export/bundle_dspkg", _bundle_dspkg_enabled and _has_textures)
-	ProjectSettings.set_as_internal("directstorage/export/bundle_dspkg", true)
-	ProjectSettings.set_setting("directstorage/expected_archive_fingerprint", _current_fingerprint)
-	ProjectSettings.set_as_internal("directstorage/expected_archive_fingerprint", true)
-	ProjectSettings.set_setting("directstorage/archive_name", _archive_name)
-	ProjectSettings.set_as_internal("directstorage/archive_name", true)
+	_publish_export_settings()
 
 	if not _bundle_dspkg_enabled and _encryption_enabled:
 		push_warning("[DirectStorage Exporter] Encryption is enabled but DirectStorage package bundling is disabled. Package will not be generated.")
@@ -181,11 +202,14 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 
 	if not ClassDB.class_exists("DSPkg"):
 		push_warning("[DirectStorage Exporter] DSPkg class not found. Skipping archive bundling.")
+		_archive_failed = true
+		_disable_bundle_delivery()
 		return
 
 	if _target_export_dir.is_empty():
 		push_error("[DirectStorage Exporter] FATAL: no export directory resolved; " + _archive_name + " cannot be written. The export is incomplete.")
 		_archive_failed = true
+		_disable_bundle_delivery()
 		return
 
 	_target_dspkg_path = _target_export_dir.path_join(_archive_name)
@@ -200,6 +224,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 			push_error("[DirectStorage Exporter] Failed to create DSPkg staging archive at: " + _staging_dspkg_path + ": " + error_string(err))
 			_dspkg = null
 			_archive_failed = true
+			_disable_bundle_delivery()
 		else:
 			if _steampipe_1mb_alignment_enabled:
 				if _dspkg.has_method("set_payload_alignment"):
@@ -273,6 +298,60 @@ func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
 		return {}
 	return metadata
 
+## Publishes the runtime contract into `project.binary`.
+##
+## Godot writes `project.binary` after the file walk, and `_export_end` runs
+## after the pack is already sealed, so this is the only place the shipped game
+## can learn what the export actually produced. Called from `_export_begin` and
+## again from every failure path that changes the answer.
+func _publish_export_settings() -> void:
+	# See DSExportPolicy.resolve_bundle_effective for the rule and its rationale.
+	var bundle_effective: bool = Policy.resolve_bundle_effective(_bundle_dspkg_enabled, _project_has_textures, _bundle_possible, _archive_entries.size())
+	ProjectSettings.set_setting("directstorage/export/bundle_dspkg", bundle_effective)
+	ProjectSettings.set_as_internal("directstorage/export/bundle_dspkg", true)
+	ProjectSettings.set_setting("directstorage/expected_archive_fingerprint", _current_fingerprint)
+	ProjectSettings.set_as_internal("directstorage/expected_archive_fingerprint", true)
+	ProjectSettings.set_setting("directstorage/archive_name", _archive_name)
+	ProjectSettings.set_as_internal("directstorage/archive_name", true)
+
+
+## True when the preset exports every resource - the only mode in which a
+## whole-project manifest can describe the shipped archive.
+func _export_filter_is_all_resources() -> bool:
+	var preset: EditorExportPreset = get_export_preset()
+	if preset == null:
+		return true
+	return preset.get_export_filter() == EditorExportPreset.EXPORT_ALL_RESOURCES
+
+
+## Records that this export cannot produce an archive, so the game boots in CPU
+## mode instead of failing on an archive that was never written.
+##
+## Deliberately a no-op under `pck`: there the textures are being skipped from
+## the PCK, so the runtime must fail loudly rather than silently run without
+## them.
+func _disable_bundle_delivery() -> void:
+	if _protection_mode == "pck":
+		return
+	_bundle_possible = false
+	_publish_export_settings()
+
+
+## Marks the archive as failed and keeps the published contract honest.
+##
+## The partial archive is kept only when at least one texture was already
+## skipped from the PCK: those bytes then exist nowhere else, so deleting it
+## would lose them. With no entries yet, the staging file and any stale archive
+## from a previous build are removed.
+func _abort_archive(reason: String) -> void:
+	_archive_failed = true
+	push_error("[DirectStorage Exporter] " + reason)
+	if _archive_entries.is_empty():
+		_dspkg = null
+		_cleanup_staging()
+		_disable_bundle_delivery()
+
+
 ## Adds an imported .dstex resource to the archive when bundling is enabled.
 func _export_file(path: String, type: String, features: PackedStringArray) -> void:
 	# Standalone archives must never be embedded in the PCK (breaks Win32
@@ -283,8 +362,14 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 		print("[DirectStorage Exporter] Excluded standalone archive from PCK: ", path)
 		return
 
-	if _dspkg == null or not _bundle_dspkg_enabled:
-		# When DSPkg bundling is disabled, let Godot export .dstex directly into PCK
+	var action: String = Policy.resolve_file_action(_bundle_dspkg_enabled, _archive_failed, _dspkg != null, _protection_mode)
+	if action == Policy.ACTION_PACK:
+		# Intended CPU fallback: let Godot export .dstex directly into the PCK.
+		return
+	if action == Policy.ACTION_SKIP:
+		# Bundling was requested but the archive can no longer be written, and a
+		# protected build must not leave a plaintext copy of the payload in the PCK.
+		skip()
 		return
 
 	# Never skip .import files so Godot preserves remap tables in PCK
@@ -310,32 +395,39 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 	if not dstex_path.is_empty() and FileAccess.file_exists(dstex_path):
 		var mip_metadata := _read_v2_footprint_metadata(dstex_path)
 		var add_err: Error = _dspkg.add_texture(resource_path, dstex_path, mip_metadata)
-		if add_err == OK and dstex_path != resource_path:
-			var remapped_add_err: Error = _dspkg.add_texture(dstex_path, dstex_path, mip_metadata)
-			if remapped_add_err != OK:
-				_archive_failed = true
-				_dspkg = null
-				push_error("[DirectStorage Exporter] Failed to add remapped texture entry '" + dstex_path + "': " + error_string(remapped_add_err) + ". DSPkg bundling was aborted and the texture will remain in the PCK.")
-				return
-
 		if add_err != OK:
-			_archive_failed = true
-			_dspkg = null
-			push_error("[DirectStorage Exporter] Failed to add texture to archive ('" + resource_path + "' and remap target '" + dstex_path + "'): " + error_string(add_err) + ". DSPkg bundling was aborted and the texture will remain in the PCK.")
+			_abort_archive("Failed to add texture to archive ('" + resource_path + "' and remap target '" + dstex_path + "'): " + error_string(add_err) + ". DSPkg bundling was aborted.")
+			if _protection_mode == "pck":
+				skip()
 			return
 
-		_has_textures = true
+		_archive_entries[resource_path] = true
+		if _archive_entries.size() == 1:
+			# First entry: a subset export only becomes "archive expected" now.
+			_publish_export_settings()
 		_track_manifest_entry(resource_path, dstex_path)
+
 		if dstex_path != resource_path:
-			_track_manifest_entry(dstex_path, dstex_path)
+			var remapped_add_err: Error = _dspkg.add_texture(dstex_path, dstex_path, mip_metadata)
+			if remapped_add_err == OK:
+				_archive_entries[dstex_path] = true
+				_track_manifest_entry(dstex_path, dstex_path)
+			else:
+				# The primary entry is already in the archive, so the texture
+				# is complete for the loader; only the remapped alias is
+				# missing. Stop bundling and keep the archive for salvage.
+				_abort_archive("Failed to add remapped texture entry '" + dstex_path + "': " + error_string(remapped_add_err) + ". DSPkg bundling was aborted.")
+
 		print("[DirectStorage Exporter] Added texture to archive: ", resource_path, " (from ", dstex_path, ")")
-		# Skip texture payload from PCK so it is only stored in textures.dspkg.
+		# Skip the payload as soon as the primary entry exists, so a later alias
+		# failure can never leave the same payload in both containers.
 		skip()
 		print("[DirectStorage Exporter] Skipped texture payload from PCK: ", resource_path)
 
-## Finalizes the archive, renames textures.dspkg.tmp to textures.dspkg
-## (if enabled). A DSPkg failure is fatal for this plugin's outputs:
-## partial archives are removed so a broken build is never silently shipped.
+## Finalizes the archive and renames textures.dspkg.tmp to textures.dspkg.
+## A failure never leaves a stale archive from an earlier build behind: the
+## archive is either removed, so the game fails loudly, or deployed as a
+## partial archive when textures were already skipped and exist nowhere else.
 ## NOTE: Godot does not
 ## let an EditorExportPlugin abort the core PCK/exe steps from _export_end(),
 ## so push_error() here marks the export as failed in the log but the
@@ -345,33 +437,44 @@ func _export_end() -> void:
 	var dspkg_ok := true
 	if _archive_failed:
 		dspkg_ok = false
-		push_error("[DirectStorage Exporter] FATAL: export finished without a textures.dspkg archive because bundling was aborted after an earlier failure. Partial archives were removed. See earlier errors for the cause (a likely candidate is out of disk space).")
-	elif _dspkg != null and _bundle_dspkg_enabled:
-		if _has_textures:
-			var err: Error = _dspkg.finalize()
-			if err != OK:
+		if Policy.resolve_failure_action(_protection_mode, _archive_entries.size()) == Policy.ACTION_DELETE:
+			# Nothing can be salvaged: a protected build must fail loudly, and
+			# an unprotected build with no entries still has every texture in
+			# the PCK. Never leave a loadable archive behind either way.
+			push_error("[DirectStorage Exporter] FATAL: export finished without a usable textures.dspkg archive because bundling was aborted after an earlier failure. No archive is deployed. See earlier errors for the cause (a likely candidate is out of disk space).")
+			_dspkg = null
+			_cleanup_staging()
+			_remove_file_silent(_target_dspkg_path)
+		else:
+			# Textures were already skipped from the PCK, so those bytes exist
+			# only in the partial archive. Deploy it rather than deleting data.
+			push_warning("[DirectStorage Exporter] WARNING: bundling was aborted after " + str(_archive_entries.size()) + " texture(s) were added. Deploying a PARTIAL archive; the remaining textures stay in the PCK. Re-export to produce a complete archive.")
+
+	if _dspkg != null and _bundle_dspkg_enabled and not _archive_entries.is_empty():
+		var err: Error = _dspkg.finalize()
+		if err != OK:
+			dspkg_ok = false
+			_report_storage_failure("finalize DSPkg staging archive", err, _staging_dspkg_path)
+			_cleanup_staging()
+			_remove_file_silent(_target_dspkg_path)
+		elif _staging_dspkg_path.is_empty() or _target_dspkg_path.is_empty():
+			dspkg_ok = false
+			push_error("[DirectStorage Exporter] FATAL: export directory was lost before finalize; " + _archive_name + " was not deployed.")
+		elif not FileAccess.file_exists(_staging_dspkg_path):
+			dspkg_ok = false
+			push_error("[DirectStorage Exporter] FATAL: finalized staging archive is missing at '" + _staging_dspkg_path + "'; " + _archive_name + " was not deployed.")
+		else:
+			_remove_file_silent(_target_dspkg_path)
+			var rename_err := DirAccess.rename_absolute(_staging_dspkg_path, _target_dspkg_path)
+			if rename_err == OK:
+				print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", _target_dspkg_path)
+			else:
 				dspkg_ok = false
-				_report_storage_failure("finalize DSPkg staging archive", err, _staging_dspkg_path)
+				_report_storage_failure("rename staging archive to " + _target_dspkg_path.get_file(), rename_err, _target_dspkg_path)
 				_cleanup_staging()
 				_remove_file_silent(_target_dspkg_path)
-			elif _staging_dspkg_path.is_empty() or _target_dspkg_path.is_empty():
-				dspkg_ok = false
-				push_error("[DirectStorage Exporter] FATAL: export directory was lost before finalize; " + _archive_name + " was not deployed.")
-			elif not FileAccess.file_exists(_staging_dspkg_path):
-				dspkg_ok = false
-				push_error("[DirectStorage Exporter] FATAL: finalized staging archive is missing at '" + _staging_dspkg_path + "'; " + _archive_name + " was not deployed.")
-			else:
-				_remove_file_silent(_target_dspkg_path)
-				var rename_err := DirAccess.rename_absolute(_staging_dspkg_path, _target_dspkg_path)
-				if rename_err == OK:
-					print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", _target_dspkg_path)
-				else:
-					dspkg_ok = false
-					_report_storage_failure("rename staging archive to " + _target_dspkg_path.get_file(), rename_err, _target_dspkg_path)
-					_cleanup_staging()
-					_remove_file_silent(_target_dspkg_path)
-		else:
-			print("[DirectStorage Exporter] Export finished. No DirectStorage (.dstex) textures were found to bundle.")
+	elif not _archive_failed and _dspkg != null and _bundle_dspkg_enabled:
+		print("[DirectStorage Exporter] Export finished. No DirectStorage (.dstex) textures were found to bundle.")
 
 	_dspkg = null
 	_cleanup_staging()
@@ -381,7 +484,7 @@ func _export_end() -> void:
 		# Do not leave a missing/broken textures.dspkg unreported.
 		return
 
-	if _bundle_dspkg_enabled and _has_textures:
+	if _bundle_dspkg_enabled and not _archive_entries.is_empty():
 		if _encryption_enabled and _active_editor_dll_keyless:
 			push_error("[DirectStorage Exporter] ERROR: '" + String(OPTION_ENCRYPTION_ENABLED) + "' is ON, but the active DirectStorage extension binary is an unencrypted/keyless build. The exported game will fail to decrypt textures at startup and crash! If you are using public release binaries, please re-export with '" + String(OPTION_ENCRYPTION_ENABLED) + "' turned OFF.")
 		elif not _encryption_enabled and ClassDB.class_exists("DSPkg") and ClassDB.class_has_method("DSPkg", "get_global_encryption_key_id"):
@@ -563,7 +666,7 @@ func _compute_manifest_hash() -> int:
 func _precompute_manifest() -> void:
 	_manifest_entries.clear()
 	_scan_dir_for_manifest("res://")
-	_has_textures = not _manifest_entries.is_empty()
+	_project_has_textures = not _manifest_entries.is_empty()
 
 func _scan_dir_for_manifest(dir_path: String) -> void:
 	var dir := DirAccess.open(dir_path)

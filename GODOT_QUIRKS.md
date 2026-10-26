@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 26 October 2026
+Last updated: 27 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1488,4 +1488,72 @@ Always write export selection to `export_files` for selected-scenes, selected-re
 - "Export as dedicated server" → `export_filter="customized"`, `dedicated_server=true`, `customized_files={"res://x": "remove"}`
 
 Measure the resulting set from the artifact, not from preset intent. Related: Q57, Q60.
+
+## 62. Changing `SCRIPT_AES256_ENCRYPTION_KEY` Does Not Rebuild the Generated Key Under Ninja
+
+### The Engine Reality
+Godot generates `core/script_encryption_key.gen.cpp` in `core/SCsub`:
+
+```
+gen_encrypt = env.CommandNoCache(
+    "script_encryption_key.gen.cpp",
+    env.Value(os.environ.get("SCRIPT_AES256_ENCRYPTION_KEY")),
+    env.Run(core_builders.encryption_key_builder),
+)
+```
+
+`encryption_key_builder` starts with `src = source[0].read() or "0" * 64`, so an unset or empty key becomes 64 ASCII zeros, i.e. 32 zero key bytes. Under `ninja=yes`, SCons translates the `env.Value` source into a Ninja target that depends on `.ninja/scons_daemon_dirty`; Ninja only compares file mtimes, so changing the environment variable alone does not invalidate the existing `.cpp`.
+
+### The Trap / Symptom
+The keyed run prints `*** IMPORTANT: Compiling Godot with custom SCRIPT_AES256_ENCRYPTION_KEY`, but the binary is still the previous keyless build. In this project a 4.7.2 template that was supposed to carry `fc13d94a…` accepted a zero-key PCK and returned 32 garbage bytes for the real key; with `encrypt_directory=true` it failed with `Can't open encrypted pack directory`. After deleting the generated file and rebuilding, the 32 key bytes were present at offset 51,106,768 and the positive read passed 20/20.
+
+### The Rule
+When rebuilding a Godot template with a different `SCRIPT_AES256_ENCRYPTION_KEY`, delete `core/script_encryption_key.gen.cpp` and the template binary, or build without `ninja=yes`; Ninja tracks only timestamps and will reuse the old keyless generated file.
+
+```
+rm core/script_encryption_key.gen.cpp
+rm bin/godot.windows.template_release.x86_64*
+# rerun the full scons command with SCRIPT_AES256_ENCRYPTION_KEY set
+```
+
+Verify the result from the binary (search the 32 key bytes) or with a zero-key-vs-real-key export; do not trust the banner. Related: Q57, Q58.
+
+## 63. `SceneTree.quit()` in an Autoload Defers and Can Be Overridden
+
+### The Engine Reality
+`SceneTree.quit(exit_code)` quits "at the end of the current iteration". Autoloads are added to `root` in project order; `_enter_tree` runs as each is added, then their `_ready` runs before the main scene. A `quit()` from an early autoload marks the tree for exit but does not abort the rest of that iteration.
+
+### The Trap / Symptom
+With three autoloads, the first calling `quit(1)` in `_enter_tree`, the observed order was `A_ENTER, A_QUIT, B_ENTER, C_ENTER, A_READY, B_READY, C_READY, MAIN_READY`, and the process exited 0 because the main scene's `quit(0)` came later. A validator that relies on the exit code sees success.
+
+### The Rule
+Never use `SceneTree.quit(n)` in an autoload as a stop condition or as the final exit code; it quits at the end of the current iteration, later autoloads and the main scene still run, and a later `quit(0)` overrides `n`.
+
+Use a static `is_validating` flag checked by the addon's own entry points, and a sentinel line/file as the verdict. Set the exit code as late as possible. Related: Q09, Q29, Q54.
+
+## 64. `OS.alert()` Blocks a Headless Run
+
+### The Engine Reality
+The 4.7 docs: `OS.alert()` "Displays a modal dialog box using the host platform's implementation. The engine execution is blocked until the dialog is closed."
+
+### The Trap / Symptom
+A headless exported player with a missing archive reached `ALERT_BEGIN` and then produced nothing; the 10 s test timeout had to kill it. The failure path looked like a hang, not an error.
+
+### The Rule
+Never call `OS.alert()` on a path reachable from a headless test or validator; it blocks until the dialog is dismissed.
+
+Return before the alert when `DisplayServer.get_name() == "headless"` or when a validate flag is set; print the failure and the sentinel instead. Related: Q09.
+
+## 65. `OS.get_cmdline_args()` Is Empty in an Exported Player
+
+### The Engine Reality
+In the measured 4.7.2 release player, `OS.get_cmdline_args()` returned an empty array while `OS.get_cmdline_user_args()` correctly returned everything after `--`.
+
+### The Trap / Symptom
+`--headless -- --dspkg-validate=protected` produced `USER_ARGS=--dspkg-validate=protected` and `CMDLINE_ARGS=` empty. A parser that read `get_cmdline_args()` silently saw no flags and the game booted normally instead of validating.
+
+### The Rule
+Read user flags from `OS.get_cmdline_user_args()` after `--`; never rely on `OS.get_cmdline_args()` in an exported player.
+
+Parse `get_cmdline_user_args()` for user flags and keep engine arguments separate. Related: Q63, Q64.
 

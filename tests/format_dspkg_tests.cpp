@@ -679,6 +679,55 @@ GDEX_TEST_T(dspkg, archive_fingerprint_manifest_hash_mismatch, TAG_INTEGRATION) 
 	remove_temp_file(dspkg_path);
 }
 
+GDEX_TEST_T(dspkg, archive_fingerprint_zero_content_half_guid_only, TAG_INTEGRATION) {
+	// A subset export publishes expected = guid << 32 (content half zero)
+	// because its whole-project manifest cannot describe the shipped archive.
+	// Zero in the content half must mean "pair on the project GUID only".
+	const char *dstex_path = "user://gdextest_dspkg_zero_half.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_zero_half.dspkg";
+	const char *virtual_path = "res://textures/test_zero_half.dstex";
+	const uint64_t guid = 0x12345678ULL;
+	const uint64_t archive_fingerprint = (guid << 32) | 0xAABBCCDDULL;
+	const uint64_t guid_only = guid << 32;
+	const uint64_t wrong_content_half = (guid << 32) | 0x99887766ULL;
+	const uint64_t wrong_guid = 0x87654321ULL << 32;
+
+	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), archive_fingerprint) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	// 1. Content half zero: succeeds even though the archive carries a real hash.
+	godot::Ref<godot::DSPkg> reader1;
+	reader1.instantiate();
+	GDEX_ASSERT_TRUE(reader1.is_valid());
+	GDEX_EXPECT_EQ(reader1->open(godot::String(dspkg_path), guid_only), godot::OK);
+	GDEX_EXPECT_EQ(reader1->get_entry_count(), 1);
+
+	// 2. A non-zero but wrong content half still fails.
+	godot::Ref<godot::DSPkg> reader2;
+	reader2.instantiate();
+	GDEX_ASSERT_TRUE(reader2.is_valid());
+	GDEX_EXPECT_EQ(reader2->open(godot::String(dspkg_path), wrong_content_half), godot::ERR_FILE_UNRECOGNIZED);
+	GDEX_EXPECT_EQ(reader2->get_entry_count(), 0);
+
+	// 3. The GUID half is enforced even when the content half is zero.
+	godot::Ref<godot::DSPkg> reader3;
+	reader3.instantiate();
+	GDEX_ASSERT_TRUE(reader3.is_valid());
+	GDEX_EXPECT_EQ(reader3->open(godot::String(dspkg_path), wrong_guid), godot::ERR_FILE_UNRECOGNIZED);
+	GDEX_EXPECT_EQ(reader3->get_entry_count(), 0);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
 GDEX_TEST_T(dspkg, archive_fingerprint_unpaired_legacy_bypass, TAG_INTEGRATION) {
 	const char *dstex_path = "user://gdextest_dspkg_unpaired.dstex";
 	const char *dspkg_unpaired = "user://gdextest_dspkg_unpaired.dspkg";

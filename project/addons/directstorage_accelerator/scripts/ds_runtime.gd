@@ -147,15 +147,13 @@ func _ready() -> void:
 	else:
 		push_error("[DirectStorage] GDExtension ClassDB entry 'DSContext' not found. Ensure GDExtension library is built and deployed.")
 		if not OS.has_feature("editor"):
-			if get_tree() and get_tree().root:
-				get_tree().root.hide()
-			OS.alert(
+			_fatal_boot(
+				"missing_extension",
 				"A required game component is missing:\n" +
 				"'directstorage_accelerator' library was not found.\n\n" +
 				"Please verify game file integrity.",
 				"Missing Component"
 			)
-			get_tree().quit(1)
 			return
 
 	# Verification of bundled texture archive when exported with bundle_dspkg.
@@ -195,27 +193,58 @@ func _ready() -> void:
 			var err_msg := "Missing required game asset archive: '" + archive_name + "'.\n\nPlease verify game file integrity or reinstall the game."
 			push_error("[DirectStorage] FATAL: " + err_msg)
 			if not OS.has_feature("editor"):
-				if get_tree() and get_tree().root:
-					get_tree().root.hide()
-				OS.alert(err_msg, "Missing Game Files")
-				get_tree().quit(1)
+				_fatal_boot("missing_archive", err_msg, "Missing Game Files")
 				return
 		elif ClassDB.class_exists("DSPkg"):
 			var probe: RefCounted = ClassDB.instantiate("DSPkg")
 			if probe != null and probe.has_method("open"):
 				var expected_fingerprint: int = int(ProjectSettings.get_setting("directstorage/expected_archive_fingerprint", 0))
 				var open_err: Error = probe.call("open", candidate_path, expected_fingerprint)
-				if open_err == ERR_UNAUTHORIZED:
-					var dec_msg := "Failed to decrypt game asset archive: '" + archive_name + "'.\n\nNo valid decryption key was found. Please verify game file integrity or reinstall the game."
-					push_error("[DirectStorage] FATAL: " + dec_msg)
+				if open_err != OK:
+					var reason := "archive_unreadable"
+					var title := "Corrupt Game Files"
+					var open_msg := "Failed to open game asset archive: '" + archive_name + "' (" + error_string(open_err) + ").\n\nPlease verify game file integrity or reinstall the game."
+					if open_err == ERR_UNAUTHORIZED:
+						reason = "archive_unauthorized"
+						title = "Decryption Error"
+						open_msg = "Failed to decrypt game asset archive: '" + archive_name + "'.\n\nNo valid decryption key was found. Please verify game file integrity or reinstall the game."
+					elif open_err == ERR_FILE_UNRECOGNIZED:
+						reason = "archive_pairing_mismatch"
+						title = "Mismatched Game Files"
+						open_msg = "Game asset archive does not match this build: '" + archive_name + "'.\n\nThe archive and the game files come from different exports. Reinstall the game or re-export it."
+					push_error("[DirectStorage] FATAL: " + open_msg)
 					if not OS.has_feature("editor"):
-						if get_tree() and get_tree().root:
-							get_tree().root.hide()
-						OS.alert(dec_msg, "Decryption Error")
-						get_tree().quit(1)
+						_fatal_boot(reason, open_msg, title)
 						return
 	elif not OS.has_feature("editor"):
 		print("[DirectStorage] Textures are packaged in PCK (bundle_dspkg disabled); operating in CPU decompression mode.")
+
+
+## Reports an unrecoverable startup failure and exits.
+##
+## Headless runs must never call `OS.alert()`: it blocks until a human
+## dismisses the dialog (Godot quirk Q64), so CI and `--headless` runs would
+## hang until an external timeout kills them. In those runs the failure is
+## reported as a machine-readable `DSPKG_BOOT_FAIL` line and the process exits
+## non-zero instead. `DSPKG_NO_ALERT=1` forces the non-interactive path even
+## when a display is present.
+func _fatal_boot(reason: String, message: String, title: String, code: int = 1) -> void:
+	if _is_non_interactive():
+		printerr("[DirectStorage] DSPKG_BOOT_FAIL reason=", reason)
+		printerr("[DirectStorage] ", message.replace("\n", " "))
+	else:
+		if get_tree() and get_tree().root:
+			get_tree().root.hide()
+		OS.alert(message, title)
+	if get_tree():
+		get_tree().quit(code)
+
+
+## True when no human is available to dismiss an `OS.alert()` dialog.
+func _is_non_interactive() -> bool:
+	if OS.get_environment("DSPKG_NO_ALERT") == "1":
+		return true
+	return DisplayServer.get_name() == "headless"
 
 
 ## Drives the async stream queue once per frame. Stream-only: never touches
