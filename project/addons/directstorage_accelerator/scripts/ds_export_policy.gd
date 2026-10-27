@@ -26,11 +26,12 @@ const ACTION_SALVAGE: String = "salvage"
 ## Whether the shipped game must expect an archive beside the executable.
 ##
 ## A whole-project scan cannot prove what the export ships, and `project.binary`
-## is written after the file walk, so the claim is made only once at least one
-## texture was actually added. An export filter, a `.gdignore` directory or a
-## subset mode can all remove every texture.
-static func resolve_bundle_effective(p_bundle_enabled: bool, p_project_has_textures: bool, p_bundle_possible: bool, p_archive_entry_count: int) -> bool:
-	return p_bundle_enabled and p_project_has_textures and p_bundle_possible and p_archive_entry_count > 0
+## is written before the archive is finalized, so the claim is based on what was
+## actually removed from the PCK: if any payload was skipped, the game can only
+## load it from the archive. Zero skips means the PCK is self-sufficient, even
+## when a filter removed every texture.
+static func resolve_bundle_effective(p_bundle_enabled: bool, p_project_has_textures: bool, p_bundle_possible: bool, p_skipped_payload_count: int) -> bool:
+	return p_bundle_enabled and p_project_has_textures and p_bundle_possible and p_skipped_payload_count > 0
 
 
 ## What to do with one exported file.

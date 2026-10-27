@@ -19,11 +19,14 @@ func _init() -> void:
 	print("--- Export policy decision table ---")
 
 	# resolve_bundle_effective(bundle_enabled, project_has_textures,
-	#                          bundle_possible, archive_entry_count)
+	#                          bundle_possible, skipped_payload_count)
 	_check("bundle.healthy", Policy.resolve_bundle_effective(true, true, true, 2), true)
-	# Regression #0159: all_resources plus a filter that removes every texture
-	# must not claim an archive.
-	_check("bundle.no_entries", Policy.resolve_bundle_effective(true, true, true, 0), false)
+	# Regression #0159: a filter that removes every texture skips nothing, so
+	# the PCK is self-sufficient and no archive may be claimed.
+	_check("bundle.no_skips", Policy.resolve_bundle_effective(true, true, true, 0), false)
+	# Regression #0160: a protected export that dies before the first add skips
+	# payloads, so the game must look for an archive and fail loudly without one.
+	_check("bundle.protected_failure_skipped", Policy.resolve_bundle_effective(true, true, true, 1), true)
 	_check("bundle.no_textures", Policy.resolve_bundle_effective(true, false, true, 0), false)
 	_check("bundle.option_off", Policy.resolve_bundle_effective(false, true, true, 2), false)
 	_check("bundle.delivery_disabled", Policy.resolve_bundle_effective(true, true, false, 2), false)

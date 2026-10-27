@@ -34,6 +34,9 @@ const LEGACY_TEMP_DSPKG_PATH: String = "user://temp_textures.dspkg"
 ## `_project_has_textures`, which is a project scan: an export can contain
 ## textures while the archive ends up empty (creation failed, every add failed).
 var _archive_entries: Dictionary = {}
+## Payloads removed from the PCK. Any skip means the game can only load that
+## texture from the archive, so this - not the add count - decides the contract.
+var _skipped_payloads: int = 0
 ## Set by the project scan; drives the published `bundle_dspkg` contract.
 var _project_has_textures: bool = false
 ## Cleared when this export cannot produce an archive, so `project.binary`
@@ -157,9 +160,16 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
 	_encryption_enabled = bool(get_option(OPTION_ENCRYPTION_ENABLED))
-	_protection_mode = "pck" if _encryption_enabled else "none"
+	# Protected mode is the union of the addon toggle and the preset's PCK
+	# encryption flag. Either one means plaintext must not be left in the PCK on
+	# a failed bundle; using only the addon toggle would fail open once the
+	# preset becomes the authoritative trigger.
+	var preset: EditorExportPreset = get_export_preset()
+	var preset_encrypts: bool = preset != null and preset.get_encrypt_pck()
+	_protection_mode = "pck" if (_encryption_enabled or preset_encrypts) else "none"
 	_active_editor_dll_keyless = false
 	_archive_entries.clear()
+	_skipped_payloads = 0
 	_project_has_textures = false
 	_bundle_possible = true
 	_archive_failed = false
@@ -306,7 +316,7 @@ func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
 ## again from every failure path that changes the answer.
 func _publish_export_settings() -> void:
 	# See DSExportPolicy.resolve_bundle_effective for the rule and its rationale.
-	var bundle_effective: bool = Policy.resolve_bundle_effective(_bundle_dspkg_enabled, _project_has_textures, _bundle_possible, _archive_entries.size())
+	var bundle_effective: bool = Policy.resolve_bundle_effective(_bundle_dspkg_enabled, _project_has_textures, _bundle_possible, _skipped_payloads)
 	ProjectSettings.set_setting("directstorage/export/bundle_dspkg", bundle_effective)
 	ProjectSettings.set_as_internal("directstorage/export/bundle_dspkg", true)
 	ProjectSettings.set_setting("directstorage/expected_archive_fingerprint", _current_fingerprint)
@@ -352,6 +362,18 @@ func _abort_archive(reason: String) -> void:
 		_disable_bundle_delivery()
 
 
+## Removes one payload from the PCK and keeps the published contract honest.
+##
+## The first skip is the moment the archive becomes mandatory: that texture now
+## exists only in the archive, so the game must look for one. Republishing here
+## is still in time, because `project.binary` is written after the file walk.
+func _skip_payload(path: String) -> void:
+	_skipped_payloads += 1
+	if _skipped_payloads == 1:
+		_publish_export_settings()
+	skip()
+
+
 ## Adds an imported .dstex resource to the archive when bundling is enabled.
 func _export_file(path: String, type: String, features: PackedStringArray) -> void:
 	# Standalone archives must never be embedded in the PCK (breaks Win32
@@ -369,7 +391,7 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 	if action == Policy.ACTION_SKIP:
 		# Bundling was requested but the archive can no longer be written, and a
 		# protected build must not leave a plaintext copy of the payload in the PCK.
-		skip()
+		_skip_payload(path)
 		return
 
 	# Never skip .import files so Godot preserves remap tables in PCK
@@ -398,13 +420,10 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 		if add_err != OK:
 			_abort_archive("Failed to add texture to archive ('" + resource_path + "' and remap target '" + dstex_path + "'): " + error_string(add_err) + ". DSPkg bundling was aborted.")
 			if _protection_mode == "pck":
-				skip()
+				_skip_payload(path)
 			return
 
 		_archive_entries[resource_path] = true
-		if _archive_entries.size() == 1:
-			# First entry: a subset export only becomes "archive expected" now.
-			_publish_export_settings()
 		_track_manifest_entry(resource_path, dstex_path)
 
 		if dstex_path != resource_path:
@@ -421,7 +440,7 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 		print("[DirectStorage Exporter] Added texture to archive: ", resource_path, " (from ", dstex_path, ")")
 		# Skip the payload as soon as the primary entry exists, so a later alias
 		# failure can never leave the same payload in both containers.
-		skip()
+		_skip_payload(resource_path)
 		print("[DirectStorage Exporter] Skipped texture payload from PCK: ", resource_path)
 
 ## Finalizes the archive and renames textures.dspkg.tmp to textures.dspkg.
