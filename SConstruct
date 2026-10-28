@@ -80,13 +80,14 @@ if not keep_key_header and not reset_header:
                         break
         except Exception: pass
 
-# Guard against a genuinely exported DSPKG_ENCRYPTION_KEY leaking into export plugin without key file
-# (R7-14, R8-01, R8-02, R9-02). Evaluated strictly AFTER scons_key_file resolution (R8-01), strictly for
-# compiling invocations (R8-02), and pre-.env by construction: load_env_file() does not run until line 320,
-# so a key declared only in .env (which the Godot editor never reads) can never trip this gate (R9-02).
+# Guard against a stale ambient DSPKG_ENCRYPTION_KEY: nothing reads that variable any more, so a build
+# that accepted it would misrepresent how its key reached the game (R7-14, R8-01, R8-02, R9-02).
+# Evaluated strictly AFTER scons_key_file resolution (R8-01), strictly for compiling invocations
+# (R8-02), and pre-.env by construction: load_env_file() does not run until line 320, so a key
+# declared only in .env (which the Godot editor never reads) can never trip this gate (R9-02).
 if not _non_build and "DSPKG_ENCRYPTION_KEY" in os.environ and not scons_key_file and not keep_key_header and not reset_header:
     print("[SCons] ERROR: Ambient DSPKG_ENCRYPTION_KEY is set in environment, but SCons requires DSPKG_ENCRYPTION_KEY_FILE=<path>.")
-    print("[SCons] DirectStorage export plugin reads DSPKG_ENCRYPTION_KEY; building a keyless DLL now would cause runtime decryption failure.")
+    print("[SCons] Nothing reads DSPKG_ENCRYPTION_KEY any more: the export plugin generates a random archive key per export and delivers it inside the encrypted PCK.")
     print("[SCons] Unset DSPKG_ENCRYPTION_KEY or specify DSPKG_ENCRYPTION_KEY_FILE=<path>.")
     Exit(1)
 
@@ -176,6 +177,14 @@ env = SConscript("godot-cpp/SConstruct")
 gen_header_dir = os.path.join("src", "gen")
 gen_header_file = os.path.join(gen_header_dir, "dspkg_encryption_key.h")
 is_keyed_build = bool(scons_key_file or keep_key_header or os.environ.get("DSPKG_KEY_HEADER_ACTIVE") == "1")
+
+# Deprecated shape: the supported model generates a random archive key per export
+# and delivers it inside the encrypted PCK, so no key belongs in the binary. Warn
+# here too, because a direct `scons` run never goes through .vscode/build_remote.ps1
+# (which warns and sets DSPKG_BAKE_KEY_WARNED to avoid a duplicate line). Phrased for
+# anyone building from source, not only for whoever packages the addon.
+if not _non_build and is_keyed_build and os.environ.get("DSPKG_BAKE_KEY_WARNED") != "1":
+    print("[SCons] WARNING: DEPRECATED BUILD SHAPE - a fixed archive key is baked into this DLL. The supported path delivers a random archive key inside the encrypted PCK. Whatever you ship from this build carries the key, so rebuild without a key input before releasing.")
 
 # Stage A: Create-if-missing only (runs unconditionally, including for _non_build like --help, compiledb, -n) (R7-03, R8-04)
 # This guarantees fresh clones immediately possess Branch B for IDE/clangd without mutating existing state,
@@ -532,7 +541,7 @@ def load_env_file(env_path=".env"):
 load_env_file()
 
 if "DSPKG_ENCRYPTION_KEY" in os.environ and not _non_build:
-    print("[SCons] Notice: DSPKG_ENCRYPTION_KEY declared in environment or .env is ignored by SCons. DirectStorage export plugin reads this variable, but SCons builds require DSPKG_ENCRYPTION_KEY_FILE=<path>.")
+    print("[SCons] Notice: DSPKG_ENCRYPTION_KEY declared in environment or .env is ignored because nothing reads that variable any more (the export plugin generates a random archive key per export). A source build that bakes a key uses DSPKG_ENCRYPTION_KEY_FILE=<path>.")
 
 BUILD_START_TIME = datetime.datetime.now().astimezone()
 
@@ -917,7 +926,10 @@ def write_build_manifest():
             except Exception: pass
         curr_entry["encryption"] = {
             "enabled": is_enc,
-            "key_id": key_id_hex
+            "key_id": key_id_hex,
+            # Provenance: where this binary's key came from. 'baked' means the key
+            # was compiled in by a source build; 'none' means no key is in the DLL.
+            "key_source": "baked" if is_enc else "none"
         }
     elif os.path.isfile(curr_fpath):
         # Target was up-to-date (not rebuilt this run): reconcile encryption metadata
@@ -932,6 +944,7 @@ def write_build_manifest():
                 curr_entry["encryption"] = {
                     "enabled": tag != "none",
                     "key_id": tag if tag != "none" else None,
+                    "key_source": "none" if tag == "none" else "baked",
                 }
         except Exception:
             pass

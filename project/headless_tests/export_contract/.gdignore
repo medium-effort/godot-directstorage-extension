@@ -1,0 +1,16 @@
+# Godot must not scan this directory (editor filesystem scan and export honour .gdignore).
+#
+# This gate lives inside the real project at project/, and run_export_contract.ps1
+# leaves per-case copies of the project under out/ (out/ itself is gitignored, so a
+# marker there could not be committed). Those copies duplicate this addon - the same
+# .gd.uid UIDs and the same global class_names - and add exported players, DLLs and
+# PCKs, so scanning them would produce duplicate-UID and duplicate-global-class
+# errors, re-import 1.1 GB per run, and pull the copies into an all_resources export
+# of this project.
+#
+# Keep the marker HERE. Do not put one in fixture/ (it is copied into every case
+# project and would hide the fixture from its own import/export) or in out/
+# (gitignored and recreated per run).
+#
+# Probe scripts are launched by absolute path with --script and read files through
+# FileAccess, so ignoring this directory does not affect them. See projectmem #0171.

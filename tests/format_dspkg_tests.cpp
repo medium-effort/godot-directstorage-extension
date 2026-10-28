@@ -18,7 +18,9 @@
 // Suite covering the same area as project/headless_tests/test_dspkg_alignment.gd
 // (+ test_formats.gd package sections): DSPkg create/finalize/open cycle,
 // 512-byte per-mip placement padding (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT),
-// entry iteration/count, virtual path resolution.
+// entry iteration/count, virtual path resolution, archive id pairing and the
+// res://.dspkg/toc.key delivery contract (48-byte magic16 || key32 file, commit
+// only after the header key_id matches and the TOC AEAD succeeds).
 //
 // Real API from src/formats/dspkg_format.h (verified):
 //   DSPkg::create/add_texture/finalize/open/has_texture/read_texture,
@@ -109,6 +111,166 @@ void remove_temp_file(const char *p_path) {
 		// DirAccess::remove is instance-level; absolute user:// path also accepted.
 		dir->remove(godot::String(p_path));
 	}
+}
+
+// --- Archive key delivery fixture -------------------------------------------
+// The reader resolves the archive key from res://.dspkg/toc.key: exactly 48
+// bytes laid out as magic16 || key32, where the magic is the first 16 bytes of
+// SHA-256 over the ASCII label below. These helpers rebuild that contract so the
+// cases exercise the real delivered-file path instead of the explicit override.
+constexpr const char *TOC_KEY_DIR = "res://.dspkg";
+constexpr const char *TOC_KEY_PATH = "res://.dspkg/toc.key";
+constexpr int64_t TOC_KEY_MAGIC_SIZE = 16;
+constexpr int64_t TOC_KEY_BYTES = 32;
+constexpr int64_t TOC_KEY_FILE_SIZE = TOC_KEY_MAGIC_SIZE + TOC_KEY_BYTES;
+constexpr const char *TOC_KEY_MAGIC_LABEL = "dspkg-toc-key-magic-v1";
+
+godot::PackedByteArray toc_key_magic() {
+	return godot::String(TOC_KEY_MAGIC_LABEL).sha256_buffer().slice(0, TOC_KEY_MAGIC_SIZE);
+}
+
+// Builds a key-file image. Cases vary the magic, the key length and the trailing
+// bytes to prove the reader validates the envelope before it uses any key.
+godot::PackedByteArray make_toc_key_file(const godot::String &p_key_hex, int64_t p_key_bytes = TOC_KEY_BYTES,
+		int64_t p_trailing = 0, bool p_corrupt_magic = false) {
+	const godot::PackedByteArray key = p_key_hex.hex_decode();
+	godot::PackedByteArray magic = toc_key_magic();
+	if (p_corrupt_magic && magic.size() > 0) {
+		magic.set(0, magic.get(0) ^ 0x5A);
+	}
+	godot::PackedByteArray file;
+	file.resize(TOC_KEY_MAGIC_SIZE + p_key_bytes + p_trailing);
+	for (int64_t i = 0; i < TOC_KEY_MAGIC_SIZE; ++i) {
+		file.set(i, magic.size() > 0 ? magic.get(i % magic.size()) : 0);
+	}
+	for (int64_t i = 0; i < p_key_bytes; ++i) {
+		file.set(TOC_KEY_MAGIC_SIZE + i, i < key.size() ? key.get(i) : 0x5A);
+	}
+	for (int64_t i = 0; i < p_trailing; ++i) {
+		file.set(TOC_KEY_MAGIC_SIZE + p_key_bytes + i, 0xA5);
+	}
+	return file;
+}
+
+bool write_file_bytes(const char *p_path, const godot::PackedByteArray &p_bytes) {
+	const godot::String path(p_path);
+	const godot::String parent = path.get_base_dir();
+	if (!parent.is_empty() && !godot::DirAccess::dir_exists_absolute(parent)) {
+		if (godot::DirAccess::make_dir_recursive_absolute(parent) != godot::OK) {
+			return false;
+		}
+	}
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(path, godot::FileAccess::WRITE);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	file->store_buffer(p_bytes);
+	file->close();
+	return godot::FileAccess::get_file_as_bytes(path).size() == p_bytes.size();
+}
+
+bool install_toc_key_file(const godot::String &p_key_hex) {
+	return write_file_bytes(TOC_KEY_PATH, make_toc_key_file(p_key_hex));
+}
+
+void remove_toc_key_file() {
+	if (!godot::DirAccess::dir_exists_absolute(godot::String(TOC_KEY_DIR))) {
+		return;
+	}
+	godot::Ref<godot::DirAccess> dir = godot::DirAccess::open(godot::String(TOC_KEY_DIR));
+	if (dir.is_valid()) {
+		dir->remove("toc.key");
+	}
+	godot::DirAccess::remove_absolute(godot::String(TOC_KEY_DIR));
+}
+
+// Returns the process to "no override, nothing committed" and removes the key
+// file at both ends of the scope, so one case cannot leak a key into the next.
+struct TocKeySandbox {
+	TocKeySandbox() {
+		remove_toc_key_file();
+		godot::DSPkg::set_global_encryption_key("");
+	}
+	~TocKeySandbox() {
+		remove_toc_key_file();
+		godot::DSPkg::set_global_encryption_key("");
+	}
+};
+
+bool mutate_file_byte(const char *p_path, int64_t p_offset) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ_WRITE);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	file->seek(p_offset);
+	const uint8_t original = file->get_8();
+	file->seek(p_offset);
+	file->store_8(original ^ 0xFF);
+	file->close();
+	return true;
+}
+
+bool append_file_bytes(const char *p_path, int64_t p_count) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ_WRITE);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	godot::PackedByteArray tail;
+	tail.resize(p_count);
+	file->seek_end();
+	file->store_buffer(tail);
+	file->close();
+	return true;
+}
+
+bool write_u64_at(const char *p_path, int64_t p_offset, uint64_t p_value) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ_WRITE);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	file->seek(p_offset);
+	file->store_64(p_value);
+	file->close();
+	return true;
+}
+
+// Header offset of DSPkgHeader::data_offset (magic 4 + version 2 + flags 2 +
+// entry_count 4). Payloads start there, so a file that stops at this length
+// streamed nothing.
+constexpr int64_t DSPKG_HEADER_DATA_OFFSET_FIELD = 12;
+
+uint64_t dspkg_payload_start(const char *p_path) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		return 0;
+	}
+	file->seek(DSPKG_HEADER_DATA_OFFSET_FIELD);
+	const uint64_t value = file->get_64();
+	file->close();
+	return value;
+}
+
+// Builds a one-entry archive. An empty p_key_hex writes a plaintext archive.
+bool build_single_entry_archive(const char *p_dstex_path, const char *p_dspkg_path, uint64_t p_archive_id,
+		const godot::String &p_key_hex, const char *p_entry_path) {
+	if (!write_temp_dstex(p_dstex_path, 64, 64, 1, 64 * 64 * 4)) {
+		return false;
+	}
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	if (builder.is_null()) {
+		return false;
+	}
+	if (builder->create(godot::String(p_dspkg_path), p_archive_id) != godot::OK) {
+		return false;
+	}
+	if (!p_key_hex.is_empty() && builder->set_encryption_key(p_key_hex) != godot::OK) {
+		return false;
+	}
+	if (builder->add_texture(godot::String(p_entry_path), godot::String(p_dstex_path)) != godot::OK) {
+		return false;
+	}
+	return builder->finalize() == godot::OK;
 }
 
 } // namespace
@@ -443,6 +605,201 @@ GDEX_TEST_T(dspkg, steampipe_1mb_bin_packing, TAG_INTEGRATION) {
 	remove_temp_file(dspkg_path);
 }
 
+// --- Integration: builder staging snapshot and payload streaming --------------
+
+GDEX_TEST_T(dspkg, staged_entry_record_is_metadata_only, TAG_INTEGRATION) {
+	// The builder's per-texture footprint is DSPkgStagedEntry: a path pair, the
+	// add-time scalar snapshot and the mip tables. No member is a payload buffer,
+	// so staging a texture costs metadata no matter how large the payload is.
+	godot::DSPkgStagedEntry entry;
+	entry.resource_path = "res://textures/a.dstex";
+	entry.dstex_path = "user://a.dstex";
+	entry.source_file_length = 4ULL * 1024ULL * 1024ULL;
+	entry.source_modified_time = 1700000000ULL;
+	entry.source_version = 2;
+	entry.source_compressed_size = 3ULL * 1024ULL * 1024ULL;
+	entry.payload_size = 3ULL * 1024ULL * 1024ULL;
+	entry.payload_offset = 48;
+	entry.original_size = 4ULL * 1024ULL * 1024ULL;
+	entry.width = 1024;
+	entry.height = 1024;
+	entry.pixel_format = 0;
+	entry.mip_count = 1;
+	entry.flags = 0;
+	entry.gpu_metadata = true;
+	entry.gpu_footprint = 4ULL * 1024ULL * 1024ULL;
+
+	GDEX_EXPECT_EQ(entry.source_file_length, uint64_t(4ULL * 1024ULL * 1024ULL));
+	GDEX_EXPECT_EQ(entry.source_compressed_size, entry.payload_size);
+	GDEX_EXPECT_EQ(entry.mip_count, 1u);
+	GDEX_EXPECT_TRUE(entry.mip_sizes.is_empty());
+	GDEX_EXPECT_TRUE(entry.source_mip_offsets.is_empty());
+
+	// Only the mip tables are variable-size. A 512-byte ceiling for the whole
+	// record rules out an inline payload buffer for any texture of consequence.
+	GDEX_EXPECT_LT(sizeof(godot::DSPkgStagedEntry), size_t(512));
+	// The payload the record describes is far larger than the record itself: a
+	// staged copy of it would have to live in a member this type does not have.
+	GDEX_EXPECT_GT(entry.payload_size, static_cast<uint64_t>(sizeof(godot::DSPkgStagedEntry)));
+
+	entry.mip_sizes.push_back(1024);
+	entry.mip_uncompressed_sizes.push_back(2048);
+	entry.mip_row_pitches.push_back(256);
+	entry.source_mip_offsets.push_back(48);
+	entry.source_mip_sizes.push_back(1024);
+	GDEX_EXPECT_EQ(entry.mip_sizes.size(), 1);
+	GDEX_EXPECT_EQ(entry.source_mip_offsets.size(), 1);
+}
+
+GDEX_TEST_T(dspkg, builder_staged_source_mutation_aborts_finalize, TAG_INTEGRATION) {
+	// add_texture() records metadata only; finalize() re-stats every source and
+	// refuses to stream bytes that changed after staging. Each sub-case checks
+	// that the output stops at the payload boundary, i.e. nothing was streamed.
+	const char *metadata_dstex = "user://gdextest_dspkg_stage_meta.dstex";
+	const char *resize_dstex = "user://gdextest_dspkg_stage_resize.dstex";
+	const char *delete_dstex = "user://gdextest_dspkg_stage_delete.dstex";
+	const char *metadata_dspkg = "user://gdextest_dspkg_stage_meta.dspkg";
+	const char *resize_dspkg = "user://gdextest_dspkg_stage_resize.dspkg";
+	const char *delete_dspkg = "user://gdextest_dspkg_stage_delete.dspkg";
+	const char *virtual_path = "res://textures/test_staged_source.dstex";
+
+	// 1. Header metadata rewritten in place (file length unchanged).
+	GDEX_ASSERT_TRUE(write_temp_dstex(metadata_dstex, 64, 64, 1, 64 * 64 * 4));
+	{
+		godot::Ref<godot::DSPkg> builder;
+		builder.instantiate();
+		GDEX_ASSERT_TRUE(builder.is_valid());
+		GDEX_ASSERT_TRUE(builder->create(godot::String(metadata_dspkg), 0ULL) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(metadata_dstex)) == godot::OK);
+		// DSTexHeader::compressed_size lives at offset 32 and is part of the
+		// add-time snapshot.
+		GDEX_ASSERT_TRUE(write_u64_at(metadata_dstex, 32, 1ULL));
+
+		GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_FILE_CORRUPT);
+		const uint64_t payload_start = dspkg_payload_start(metadata_dspkg);
+		GDEX_EXPECT_GT(payload_start, uint64_t(0));
+		GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(godot::String(metadata_dspkg)).size(),
+				static_cast<int64_t>(payload_start));
+	}
+
+	// 2. Source resized after staging.
+	GDEX_ASSERT_TRUE(write_temp_dstex(resize_dstex, 64, 64, 1, 64 * 64 * 4));
+	{
+		godot::Ref<godot::DSPkg> builder;
+		builder.instantiate();
+		GDEX_ASSERT_TRUE(builder.is_valid());
+		GDEX_ASSERT_TRUE(builder->create(godot::String(resize_dspkg), 0ULL) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(resize_dstex)) == godot::OK);
+		GDEX_ASSERT_TRUE(append_file_bytes(resize_dstex, 64));
+
+		GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_FILE_CORRUPT);
+		const uint64_t payload_start = dspkg_payload_start(resize_dspkg);
+		GDEX_EXPECT_GT(payload_start, uint64_t(0));
+		GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(godot::String(resize_dspkg)).size(),
+				static_cast<int64_t>(payload_start));
+	}
+
+	// 3. Source removed after staging.
+	GDEX_ASSERT_TRUE(write_temp_dstex(delete_dstex, 64, 64, 1, 64 * 64 * 4));
+	{
+		godot::Ref<godot::DSPkg> builder;
+		builder.instantiate();
+		GDEX_ASSERT_TRUE(builder.is_valid());
+		GDEX_ASSERT_TRUE(builder->create(godot::String(delete_dspkg), 0ULL) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(delete_dstex)) == godot::OK);
+		remove_temp_file(delete_dstex);
+
+		GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_CANT_OPEN);
+		const uint64_t payload_start = dspkg_payload_start(delete_dspkg);
+		GDEX_EXPECT_GT(payload_start, uint64_t(0));
+		GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(godot::String(delete_dspkg)).size(),
+				static_cast<int64_t>(payload_start));
+	}
+
+	remove_temp_file(metadata_dstex);
+	remove_temp_file(resize_dstex);
+	remove_temp_file(metadata_dspkg);
+	remove_temp_file(resize_dspkg);
+	remove_temp_file(delete_dspkg);
+}
+
+GDEX_TEST_T(dspkg, builder_streams_staged_payloads_one_at_a_time, TAG_INTEGRATION) {
+	// Three 2 MiB incompressible sources. finalize() streams them from disk in
+	// bounded chunks: the staged record holds no payload, so an archive that
+	// aborts on the last source has already written the earlier payloads and no
+	// more.
+	const char *dstex_a = "user://gdextest_stream_a.dstex";
+	const char *dstex_b = "user://gdextest_stream_b.dstex";
+	const char *dstex_c = "user://gdextest_stream_c.dstex";
+	const char *dspkg_ok = "user://gdextest_stream_ok.dspkg";
+	const char *dspkg_abort = "user://gdextest_stream_abort.dspkg";
+	const char *res_a = "res://textures/stream_a.dstex";
+	const char *res_b = "res://textures/stream_b.dstex";
+	const char *res_c = "res://textures/stream_c.dstex";
+	// 1024 x 512 RGBA8 is exactly 2 MiB, so the payload matches the footprint.
+	const int64_t payload_size = 1024 * 512 * 4;
+
+	GDEX_ASSERT_TRUE(write_temp_dstex_incompressible(dstex_a, 1024, 512, 1, payload_size, 0x11111111));
+	GDEX_ASSERT_TRUE(write_temp_dstex_incompressible(dstex_b, 1024, 512, 1, payload_size, 0x22222222));
+	GDEX_ASSERT_TRUE(write_temp_dstex_incompressible(dstex_c, 1024, 512, 1, payload_size, 0x33333333));
+
+	{
+		godot::Ref<godot::DSPkg> builder;
+		builder.instantiate();
+		GDEX_ASSERT_TRUE(builder.is_valid());
+		GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_ok), 0ULL) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_a), godot::String(dstex_a)) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_b), godot::String(dstex_b)) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_c), godot::String(dstex_c)) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+	}
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_ASSERT_TRUE(reader->open(godot::String(dspkg_ok)) == godot::OK);
+	GDEX_ASSERT_EQ(reader->get_entry_count(), 3);
+
+	godot::Ref<godot::DSTex> dstex_reader;
+	dstex_reader.instantiate();
+	const char *sources[3] = {dstex_a, dstex_b, dstex_c};
+	const char *entries[3] = {res_a, res_b, res_c};
+	for (int i = 0; i < 3; ++i) {
+		const godot::PackedByteArray archived =
+				reader->read_texture(godot::String(entries[i])).get("compressed_data", godot::PackedByteArray());
+		const godot::PackedByteArray expected =
+				dstex_reader->read_from_file(godot::String(sources[i])).get("compressed_data", godot::PackedByteArray());
+		GDEX_ASSERT_EQ(archived.size(), expected.size());
+		GDEX_EXPECT_EQ(memcmp(archived.ptr(), expected.ptr(), expected.size()), 0);
+	}
+
+	// Stage the same three textures again, then resize the lexicographically last
+	// source. The first two payloads are already streamed when the third aborts.
+	{
+		godot::Ref<godot::DSPkg> builder;
+		builder.instantiate();
+		GDEX_ASSERT_TRUE(builder.is_valid());
+		GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_abort), 0ULL) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_a), godot::String(dstex_a)) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_b), godot::String(dstex_b)) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_c), godot::String(dstex_c)) == godot::OK);
+		GDEX_ASSERT_TRUE(append_file_bytes(dstex_c, 64));
+		GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_FILE_CORRUPT);
+	}
+
+	const int64_t payload_start = static_cast<int64_t>(dspkg_payload_start(dspkg_abort));
+	const int64_t aborted_size = godot::FileAccess::get_file_as_bytes(godot::String(dspkg_abort)).size();
+	const int64_t complete_size = godot::FileAccess::get_file_as_bytes(godot::String(dspkg_ok)).size();
+	GDEX_EXPECT_GT(aborted_size, payload_start);
+	GDEX_EXPECT_LT(aborted_size, complete_size);
+
+	remove_temp_file(dstex_a);
+	remove_temp_file(dstex_b);
+	remove_temp_file(dstex_c);
+	remove_temp_file(dspkg_ok);
+	remove_temp_file(dspkg_abort);
+}
+
 // --- Slow: multi-mip GPU footprint metadata + 512-byte per-mip padding --------
 
 GDEX_TEST_T(dspkg, gpu_mip_metadata_512_placement, TAG_INTEGRATION | TAG_SLOW) {
@@ -562,56 +919,27 @@ GDEX_TEST_T(dspkg, v3_entry_flags_as_image_texture_roundtrip, TAG_INTEGRATION) {
 	remove_temp_file(dspkg_path);
 }
 
-// --- Integration: archive fingerprint pairing (Option B) ----------------------
+// --- Integration: archive id pairing -----------------------------------------
+//
+// The archive id reuses DSPkgHeader::archive_fingerprint and is compared as a
+// full 64-bit value. A non-zero expected id must match exactly: an archive that
+// carries id 0 is rejected, so zeroing the header field cannot satisfy a build
+// that expects a real id. Passing 0 as the expected id is the tooling path and
+// skips the check.
 
-GDEX_TEST_T(dspkg, archive_fingerprint_serialization, TAG_INTEGRATION) {
-	const char *dstex_path = "user://gdextest_dspkg_fp_ser.dstex";
-	const char *dspkg_path = "user://gdextest_dspkg_fp_ser.dspkg";
-	const char *virtual_path = "res://textures/test_fp_ser.dstex";
-	const uint64_t test_fingerprint = 0x12345678AABBCCDDULL;
+GDEX_TEST_T(dspkg, archive_id_roundtrip_serialization, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_id_ser.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_id_ser.dspkg";
+	const char *virtual_path = "res://textures/test_id_ser.dstex";
+	const uint64_t archive_id = 0x12345678AABBCCDDULL;
 
-	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
-		GDEX_ABORT_TEST("fixture DSTex write failed");
-	}
-
-	godot::Ref<godot::DSPkg> builder;
-	builder.instantiate();
-	GDEX_ASSERT_TRUE(builder.is_valid());
-	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), test_fingerprint) == godot::OK);
-	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
-	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, archive_id, godot::String(), virtual_path));
 
 	godot::Ref<godot::DSPkg> reader;
 	reader.instantiate();
 	GDEX_ASSERT_TRUE(reader.is_valid());
-	GDEX_ASSERT_TRUE(reader->open(godot::String(dspkg_path), test_fingerprint) == godot::OK);
-	GDEX_EXPECT_EQ(reader->get_archive_fingerprint(), test_fingerprint);
-
-	remove_temp_file(dstex_path);
-	remove_temp_file(dspkg_path);
-}
-
-GDEX_TEST_T(dspkg, archive_fingerprint_matching_success, TAG_INTEGRATION) {
-	const char *dstex_path = "user://gdextest_dspkg_fp_match.dstex";
-	const char *dspkg_path = "user://gdextest_dspkg_fp_match.dspkg";
-	const char *virtual_path = "res://textures/test_fp_match.dstex";
-	const uint64_t expected_fingerprint = 0xCAFEBABE11223344ULL;
-
-	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
-		GDEX_ABORT_TEST("fixture DSTex write failed");
-	}
-
-	godot::Ref<godot::DSPkg> builder;
-	builder.instantiate();
-	GDEX_ASSERT_TRUE(builder.is_valid());
-	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), expected_fingerprint) == godot::OK);
-	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
-	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
-
-	godot::Ref<godot::DSPkg> reader;
-	reader.instantiate();
-	GDEX_ASSERT_TRUE(reader.is_valid());
-	GDEX_ASSERT_TRUE(reader->open(godot::String(dspkg_path), expected_fingerprint) == godot::OK);
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), archive_id), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_archive_fingerprint(), archive_id);
 	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
 	GDEX_EXPECT_TRUE(reader->has_texture(godot::String(virtual_path)));
 
@@ -619,156 +947,424 @@ GDEX_TEST_T(dspkg, archive_fingerprint_matching_success, TAG_INTEGRATION) {
 	remove_temp_file(dspkg_path);
 }
 
-GDEX_TEST_T(dspkg, archive_fingerprint_project_guid_mismatch, TAG_INTEGRATION) {
-	const char *dstex_path = "user://gdextest_dspkg_guid_mismatch.dstex";
-	const char *dspkg_path = "user://gdextest_dspkg_guid_mismatch.dspkg";
-	const char *virtual_path = "res://textures/test_guid_mismatch.dstex";
-	const uint64_t archive_fingerprint = 0x11111111AABBCCDDULL;
-	const uint64_t wrong_guid_fingerprint = 0x22222222AABBCCDDULL;
+GDEX_TEST_T(dspkg, archive_id_equal_opens, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_id_equal.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_id_equal.dspkg";
+	const char *virtual_path = "res://textures/test_id_equal.dstex";
+	const uint64_t archive_id = 0x0CAFEBABE1122334ULL;
 
-	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
-		GDEX_ABORT_TEST("fixture DSTex write failed");
-	}
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, archive_id, godot::String(), virtual_path));
 
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), archive_id), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_TRUE(reader->has_texture(godot::String(virtual_path)));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, archive_id_mismatch_unrecognized, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_id_mismatch.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_id_mismatch.dspkg";
+	const char *virtual_path = "res://textures/test_id_mismatch.dstex";
+	const uint64_t archive_id = 0x11111111AABBCCDDULL;
+	const uint64_t other_archive_id = 0x22222222AABBCCDDULL;
+
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, archive_id, godot::String(), virtual_path));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), other_archive_id), godot::ERR_FILE_UNRECOGNIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+	GDEX_EXPECT_FALSE(reader->has_texture(godot::String(virtual_path)));
+	GDEX_EXPECT_EQ(reader->get_archive_fingerprint(), uint64_t(0));
+
+	// The rejected open leaves no reader state behind: the right id still works.
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), archive_id), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, archive_id_zero_archive_rejected_when_expected, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_id_zero_unpaired.dstex";
+	const char *dspkg_unpaired = "user://gdextest_dspkg_id_zero_unpaired.dspkg";
+	const char *virtual_path = "res://textures/test_id_zero.dstex";
+
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
+
+	// Archive written without an id, opened by a caller that expects one.
 	godot::Ref<godot::DSPkg> builder;
 	builder.instantiate();
 	GDEX_ASSERT_TRUE(builder.is_valid());
-	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), archive_fingerprint) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_unpaired), 0ULL) == godot::OK);
 	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
 	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
 
 	godot::Ref<godot::DSPkg> reader;
 	reader.instantiate();
 	GDEX_ASSERT_TRUE(reader.is_valid());
-	// Different project GUID must fail open with ERR_FILE_UNRECOGNIZED.
-	godot::Error err = reader->open(godot::String(dspkg_path), wrong_guid_fingerprint);
-	GDEX_EXPECT_EQ(err, godot::ERR_FILE_UNRECOGNIZED);
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_unpaired), 0x12345678AABBCCDDULL), godot::ERR_FILE_UNRECOGNIZED);
 	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
-
-	remove_temp_file(dstex_path);
-	remove_temp_file(dspkg_path);
-}
-
-GDEX_TEST_T(dspkg, archive_fingerprint_manifest_hash_mismatch, TAG_INTEGRATION) {
-	const char *dstex_path = "user://gdextest_dspkg_manifest_mismatch.dstex";
-	const char *dspkg_path = "user://gdextest_dspkg_manifest_mismatch.dspkg";
-	const char *virtual_path = "res://textures/test_manifest_mismatch.dstex";
-	const uint64_t archive_fingerprint = 0x11111111AABBCCDDULL;
-	const uint64_t stale_manifest_fingerprint = 0x1111111199887766ULL;
-
-	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
-		GDEX_ABORT_TEST("fixture DSTex write failed");
-	}
-
-	godot::Ref<godot::DSPkg> builder;
-	builder.instantiate();
-	GDEX_ASSERT_TRUE(builder.is_valid());
-	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), archive_fingerprint) == godot::OK);
-	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
-	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
-
-	godot::Ref<godot::DSPkg> reader;
-	reader.instantiate();
-	GDEX_ASSERT_TRUE(reader.is_valid());
-	// Same GUID but stale manifest hash must fail open with ERR_FILE_UNRECOGNIZED.
-	godot::Error err = reader->open(godot::String(dspkg_path), stale_manifest_fingerprint);
-	GDEX_EXPECT_EQ(err, godot::ERR_FILE_UNRECOGNIZED);
-	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
-
-	remove_temp_file(dstex_path);
-	remove_temp_file(dspkg_path);
-}
-
-GDEX_TEST_T(dspkg, archive_fingerprint_zero_content_half_guid_only, TAG_INTEGRATION) {
-	// A subset export publishes expected = guid << 32 (content half zero)
-	// because its whole-project manifest cannot describe the shipped archive.
-	// Zero in the content half must mean "pair on the project GUID only".
-	const char *dstex_path = "user://gdextest_dspkg_zero_half.dstex";
-	const char *dspkg_path = "user://gdextest_dspkg_zero_half.dspkg";
-	const char *virtual_path = "res://textures/test_zero_half.dstex";
-	const uint64_t guid = 0x12345678ULL;
-	const uint64_t archive_fingerprint = (guid << 32) | 0xAABBCCDDULL;
-	const uint64_t guid_only = guid << 32;
-	const uint64_t wrong_content_half = (guid << 32) | 0x99887766ULL;
-	const uint64_t wrong_guid = 0x87654321ULL << 32;
-
-	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
-		GDEX_ABORT_TEST("fixture DSTex write failed");
-	}
-
-	godot::Ref<godot::DSPkg> builder;
-	builder.instantiate();
-	GDEX_ASSERT_TRUE(builder.is_valid());
-	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), archive_fingerprint) == godot::OK);
-	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
-	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
-
-	// 1. Content half zero: succeeds even though the archive carries a real hash.
-	godot::Ref<godot::DSPkg> reader1;
-	reader1.instantiate();
-	GDEX_ASSERT_TRUE(reader1.is_valid());
-	GDEX_EXPECT_EQ(reader1->open(godot::String(dspkg_path), guid_only), godot::OK);
-	GDEX_EXPECT_EQ(reader1->get_entry_count(), 1);
-
-	// 2. A non-zero but wrong content half still fails.
-	godot::Ref<godot::DSPkg> reader2;
-	reader2.instantiate();
-	GDEX_ASSERT_TRUE(reader2.is_valid());
-	GDEX_EXPECT_EQ(reader2->open(godot::String(dspkg_path), wrong_content_half), godot::ERR_FILE_UNRECOGNIZED);
-	GDEX_EXPECT_EQ(reader2->get_entry_count(), 0);
-
-	// 3. The GUID half is enforced even when the content half is zero.
-	godot::Ref<godot::DSPkg> reader3;
-	reader3.instantiate();
-	GDEX_ASSERT_TRUE(reader3.is_valid());
-	GDEX_EXPECT_EQ(reader3->open(godot::String(dspkg_path), wrong_guid), godot::ERR_FILE_UNRECOGNIZED);
-	GDEX_EXPECT_EQ(reader3->get_entry_count(), 0);
-
-	remove_temp_file(dstex_path);
-	remove_temp_file(dspkg_path);
-}
-
-GDEX_TEST_T(dspkg, archive_fingerprint_unpaired_legacy_bypass, TAG_INTEGRATION) {
-	const char *dstex_path = "user://gdextest_dspkg_unpaired.dstex";
-	const char *dspkg_unpaired = "user://gdextest_dspkg_unpaired.dspkg";
-	const char *dspkg_paired = "user://gdextest_dspkg_paired.dspkg";
-	const char *virtual_path = "res://textures/test_unpaired.dstex";
-
-	if (!write_temp_dstex(dstex_path, 64, 4, 1, 1024)) {
-		GDEX_ABORT_TEST("fixture DSTex write failed");
-	}
-
-	// 1. Unpaired archive (fingerprint = 0) opened by caller expecting non-zero.
-	godot::Ref<godot::DSPkg> builder1;
-	builder1.instantiate();
-	GDEX_ASSERT_TRUE(builder1.is_valid());
-	GDEX_ASSERT_TRUE(builder1->create(godot::String(dspkg_unpaired), 0ULL) == godot::OK);
-	GDEX_ASSERT_TRUE(builder1->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
-	GDEX_ASSERT_TRUE(builder1->finalize() == godot::OK);
-
-	godot::Ref<godot::DSPkg> reader1;
-	reader1.instantiate();
-	GDEX_ASSERT_TRUE(reader1.is_valid());
-	GDEX_EXPECT_EQ(reader1->open(godot::String(dspkg_unpaired), 0x12345678AABBCCDDULL), godot::OK);
-	GDEX_EXPECT_EQ(reader1->get_entry_count(), 1);
-
-	// 2. Paired archive (fingerprint != 0) opened with expected_fingerprint = 0 (check disabled).
-	godot::Ref<godot::DSPkg> builder2;
-	builder2.instantiate();
-	GDEX_ASSERT_TRUE(builder2.is_valid());
-	GDEX_ASSERT_TRUE(builder2->create(godot::String(dspkg_paired), 0x9999888877776666ULL) == godot::OK);
-	GDEX_ASSERT_TRUE(builder2->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
-	GDEX_ASSERT_TRUE(builder2->finalize() == godot::OK);
-
-	godot::Ref<godot::DSPkg> reader2;
-	reader2.instantiate();
-	GDEX_ASSERT_TRUE(reader2.is_valid());
-	GDEX_EXPECT_EQ(reader2->open(godot::String(dspkg_paired), 0ULL), godot::OK);
-	GDEX_EXPECT_EQ(reader2->get_entry_count(), 1);
 
 	remove_temp_file(dstex_path);
 	remove_temp_file(dspkg_unpaired);
+}
+
+GDEX_TEST_T(dspkg, archive_id_zero_expectation_skips_check, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_id_zero_paired.dstex";
+	const char *dspkg_paired = "user://gdextest_dspkg_id_zero_paired.dspkg";
+	const char *virtual_path = "res://textures/test_id_zero_paired.dstex";
+
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
+
+	// Archive written with an id, opened by a caller that passes 0 (tooling).
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_paired), 0x9999888877776666ULL) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_paired), 0ULL), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_EQ(reader->get_archive_fingerprint(), 0x9999888877776666ULL);
+
+	remove_temp_file(dstex_path);
 	remove_temp_file(dspkg_paired);
+}
+
+// --- Integration: write-failure detection (#0157) ----------------------------
+//
+// finalize() must not report success when the payload area did not reach the
+// computed size. The injection drops bytes past a threshold while still
+// reporting success, which is the silent-short-write shape a full disk can
+// produce; only the final size verification can catch it.
+
+GDEX_TEST_T(dspkg, finalize_write_failure_aborts, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_write_fail.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_write_fail.dspkg";
+	const char *dspkg_retry = "user://gdextest_dspkg_write_fail_retry.dspkg";
+	const char *virtual_path = "res://textures/test_write_fail.dstex";
+
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
+
+	// Truncate inside the header envelope: every later write is dropped while
+	// the builder believes it succeeded.
+	godot::Ref<godot::DSPkg> failing;
+	failing.instantiate();
+	GDEX_ASSERT_TRUE(failing.is_valid());
+	GDEX_ASSERT_TRUE(failing->create(godot::String(dspkg_path), 0x0F0E0D0C0B0A0908ULL) == godot::OK);
+	GDEX_ASSERT_TRUE(failing->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	failing->_set_write_truncate_for_testing(8);
+	GDEX_EXPECT_EQ(failing->finalize(), godot::ERR_FILE_CANT_WRITE);
+	GDEX_EXPECT_FALSE(godot::FileAccess::file_exists(godot::String(dspkg_path)));
+
+	// The same build without the injection produces a complete archive.
+	godot::Ref<godot::DSPkg> clean;
+	clean.instantiate();
+	GDEX_ASSERT_TRUE(clean.is_valid());
+	GDEX_ASSERT_TRUE(clean->create(godot::String(dspkg_retry), 0x0F0E0D0C0B0A0908ULL) == godot::OK);
+	GDEX_ASSERT_TRUE(clean->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_EXPECT_EQ(clean->finalize(), godot::OK);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_retry), 0x0F0E0D0C0B0A0908ULL), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+	remove_temp_file(dspkg_retry);
+}
+
+GDEX_TEST_T(dspkg, archive_id_high_word_mismatch, TAG_INTEGRATION) {
+	// The retired pairing model compared only the low 32 bits when the expected
+	// content half was non-zero. Ids that agree on the low word and differ in the
+	// high word must now fail.
+	const char *dstex_path = "user://gdextest_dspkg_id_high.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_id_high.dspkg";
+	const char *virtual_path = "res://textures/test_id_high.dstex";
+	const uint64_t archive_id = 0x11111111AABBCCDDULL;
+	const uint64_t high_word_only_difference = 0x22222222AABBCCDDULL;
+
+	GDEX_ASSERT_TRUE((archive_id & 0xFFFFFFFFULL) == (high_word_only_difference & 0xFFFFFFFFULL));
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, archive_id, godot::String(), virtual_path));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), high_word_only_difference), godot::ERR_FILE_UNRECOGNIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+
+	// Control: the exact id opens.
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), archive_id), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, legacy_guid_style_archive_fails_as_id_mismatch, TAG_INTEGRATION) {
+	// Archives written under the retired pairing model carried
+	// (project_guid << 32) | content_hash while a subset export published the
+	// GUID half alone. Pairing is now the full id, so that combination fails
+	// loudly instead of opening on the GUID half.
+	const char *dstex_path = "user://gdextest_dspkg_id_legacy.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_id_legacy.dspkg";
+	const char *virtual_path = "res://textures/test_id_legacy.dstex";
+	const uint64_t legacy_guid = 0x5A5A5A5AULL;
+	const uint64_t legacy_archive_id = (legacy_guid << 32) | 0xAABBCCDDULL;
+	const uint64_t legacy_guid_only_expectation = legacy_guid << 32;
+
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, legacy_archive_id, godot::String(), virtual_path));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), legacy_guid_only_expectation), godot::ERR_FILE_UNRECOGNIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+
+	// Control: the archive still pairs with its own full id.
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), legacy_archive_id), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+// --- Integration: key delivered as res://.dspkg/toc.key ----------------------
+//
+// resolve_encryption_key() acquires a candidate and never installs it; open()
+// commits only after the header key_id matches and the TOC AEAD succeeds, and a
+// rejected candidate leaves the default state so a later key mount retries.
+
+GDEX_TEST_T(dspkg, toc_key_file_accepted, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_key_ok.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_key_ok.dspkg";
+	const char *virtual_path = "res://textures/test_key_ok.dstex";
+	const godot::String key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+	GDEX_ASSERT_EQ(key_hex.length(), 64);
+	TocKeySandbox sandbox;
+	// Pre-call state: the delivered-file path must not commit anything before open().
+	const godot::String initial_key_id = godot::DSPkg::get_global_encryption_key_id();
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, 0xAABBCCDD11223344ULL, key_hex, virtual_path));
+	GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
+
+	// The delivered file is the contract layout: magic16 || key32.
+	const godot::PackedByteArray key_file = godot::FileAccess::get_file_as_bytes(TOC_KEY_PATH);
+	GDEX_ASSERT_EQ(key_file.size(), TOC_KEY_FILE_SIZE);
+	GDEX_EXPECT_TRUE(key_file.slice(0, TOC_KEY_MAGIC_SIZE) == toc_key_magic());
+	GDEX_EXPECT_TRUE(key_file.slice(TOC_KEY_MAGIC_SIZE, TOC_KEY_FILE_SIZE) == key_hex.hex_decode());
+
+	// The archive header stores key_id = BLAKE2b-8(key), rendered as 16 hex chars.
+	godot::Ref<godot::FileAccess> archive = godot::FileAccess::open(godot::String(dspkg_path), godot::FileAccess::READ);
+	GDEX_ASSERT_TRUE(archive.is_valid());
+	archive->seek(52);
+	const godot::String header_key_id = archive->get_buffer(8).hex_encode().to_lower();
+	archive->close();
+	GDEX_EXPECT_STR_EQ(header_key_id, godot::DSPkg::compute_key_id(key_hex));
+
+	// Reading the file does not install anything; only open() commits.
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_TRUE(reader->has_texture(godot::String(virtual_path)));
+	GDEX_EXPECT_FALSE(reader->read_texture(godot::String(virtual_path)).is_empty());
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, toc_key_magic_rejected, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_key_magic.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_key_magic.dspkg";
+	const char *virtual_path = "res://textures/test_key_magic.dstex";
+	const godot::String key_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+	GDEX_ASSERT_EQ(key_hex.length(), 64);
+	TocKeySandbox sandbox;
+	const godot::String initial_key_id = godot::DSPkg::get_global_encryption_key_id();
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, 0ULL, key_hex, virtual_path));
+
+	// Correct 48-byte length and the real key, but one magic byte corrupted. A
+	// reader that only checked the length would open this archive.
+	GDEX_ASSERT_TRUE(write_file_bytes(TOC_KEY_PATH, make_toc_key_file(key_hex, TOC_KEY_BYTES, 0, true)));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+	GDEX_EXPECT_FALSE(reader->has_texture(godot::String(virtual_path)));
+	// A rejected candidate never becomes the active key.
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
+
+	// The failure did not latch: the valid envelope opens the same archive.
+	GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), godot::DSPkg::compute_key_id(key_hex));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, toc_key_wrong_length_rejected, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_key_length.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_key_length.dspkg";
+	const char *virtual_path = "res://textures/test_key_length.dstex";
+	const godot::String key_hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+	GDEX_ASSERT_EQ(key_hex.length(), 64);
+	TocKeySandbox sandbox;
+	const godot::String initial_key_id = godot::DSPkg::get_global_encryption_key_id();
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, 0ULL, key_hex, virtual_path));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+
+	// 1. 32 bytes: magic16 || key[0..15]. The real key is present but truncated.
+	GDEX_ASSERT_TRUE(write_file_bytes(TOC_KEY_PATH, make_toc_key_file(key_hex, 16)));
+	GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(TOC_KEY_PATH).size(), int64_t(32));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
+
+	// 2. 64 bytes: magic16 || key32 || 16 trailing bytes. Bytes 16..47 are the
+	// real key, so only the exact-length rule can reject this file.
+	GDEX_ASSERT_TRUE(write_file_bytes(TOC_KEY_PATH, make_toc_key_file(key_hex, TOC_KEY_BYTES, 16)));
+	GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(TOC_KEY_PATH).size(), int64_t(64));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
+
+	// 3. Exactly 48 bytes: accepted, so length was the only rejection reason.
+	GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, toc_key_wrong_key_rejected, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_key_wrong.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_key_wrong.dspkg";
+	const char *virtual_path = "res://textures/test_key_wrong.dstex";
+	const godot::String key_hex = "1111111122222222333333334444444455555555666666667777777788888888";
+	const godot::String wrong_key_hex = "99999999aaaaaaaabbbbbbbbccccccccddddddddeeeeeeeeffffffff00000000";
+
+	GDEX_ASSERT_EQ(key_hex.length(), 64);
+	GDEX_ASSERT_EQ(wrong_key_hex.length(), 64);
+	TocKeySandbox sandbox;
+	const godot::String initial_key_id = godot::DSPkg::get_global_encryption_key_id();
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, 0ULL, key_hex, virtual_path));
+
+	// Correct length and magic, but a key that does not reproduce header.key_id.
+	GDEX_ASSERT_TRUE(install_toc_key_file(wrong_key_hex));
+	GDEX_EXPECT_STR_NE(godot::DSPkg::compute_key_id(wrong_key_hex), godot::DSPkg::compute_key_id(key_hex));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+	GDEX_EXPECT_FALSE(reader->has_texture(godot::String(virtual_path)));
+	// The wrong key is not committed, so the resolution state is unchanged.
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
+
+	// The right key still opens the archive afterwards.
+	GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, toc_key_missing_then_mounted, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_key_late.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_key_late.dspkg";
+	const char *virtual_path = "res://textures/test_key_late.dstex";
+	const godot::String key_hex = "0f0e0d0c0b0a090807060504030201000f0e0d0c0b0a09080706050403020100";
+
+	GDEX_ASSERT_EQ(key_hex.length(), 64);
+	TocKeySandbox sandbox;
+	const godot::String initial_key_id = godot::DSPkg::get_global_encryption_key_id();
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, 0ULL, key_hex, virtual_path));
+	GDEX_ASSERT_FALSE(godot::FileAccess::file_exists(godot::String(TOC_KEY_PATH)));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+
+	// No key file yet: the archive cannot be opened.
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
+
+	// The absence is not latched: delivering the key lets the next open succeed.
+	GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), godot::DSPkg::compute_key_id(key_hex));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, toc_key_commit_on_open, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dspkg_key_commit.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_key_commit.dspkg";
+	const char *virtual_path = "res://textures/test_key_commit.dstex";
+	const godot::String key_hex = "102030405060708090a0b0c0d0e0f001102030405060708090a0b0c0d0e0f001";
+	const godot::String wrong_key_hex = "0102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f00";
+	const godot::String right_key_id = godot::DSPkg::compute_key_id(key_hex);
+
+	GDEX_ASSERT_EQ(key_hex.length(), 64);
+	TocKeySandbox sandbox;
+	const godot::String initial_key_id = godot::DSPkg::get_global_encryption_key_id();
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, 0ULL, key_hex, virtual_path));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+
+	// 1. Rejected on the header id comparison: nothing is committed.
+	GDEX_ASSERT_TRUE(install_toc_key_file(wrong_key_hex));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
+
+	// 2. Rejected on the TOC AEAD with the header id matching: the candidate is
+	// proven wrong only after the id proof, and that must not install it either.
+	GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
+	GDEX_ASSERT_TRUE(mutate_file_byte(dspkg_path, 64)); // first MAC byte
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
+
+	// 3. Successful open commits the candidate: the global id is the archive key id.
+	GDEX_ASSERT_TRUE(mutate_file_byte(dspkg_path, 64)); // restore the MAC byte
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), right_key_id);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
 }
 
 GDEX_TEST_T(dspkg, med09_corrupt_entry_caps_rejected, TAG_INTEGRATION) {
@@ -813,6 +1409,7 @@ GDEX_TEST_T(dspkg, encryption_tamper_and_auth, TAG_INTEGRATION) {
 	remove_temp_file(dstex_path);
 	remove_temp_file(dspkg_path);
 
+	TocKeySandbox sandbox;
 	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
 
 	const godot::String key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -826,28 +1423,36 @@ GDEX_TEST_T(dspkg, encryption_tamper_and_auth, TAG_INTEGRATION) {
 	GDEX_ASSERT_TRUE(builder->add_texture("test.png", godot::String(dstex_path)) == godot::OK);
 	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
 
-	// 1. Valid open with matching global key
+	// 1. Valid open with the delivered key file (no pre-installed global key).
 	{
 		GlobalKeyResetGuard key_guard("");
-		godot::DSPkg::set_global_encryption_key(key_hex);
+		GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
 		godot::Ref<godot::DSPkg> reader;
 		reader.instantiate();
 		GDEX_ASSERT_TRUE(reader.is_valid());
 		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), 0ULL), godot::OK);
 		GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
-		GDEX_EXPECT_TRUE(godot::DSPkg::get_global_encryption_key_id() == godot::DSPkg::compute_key_id(key_hex));
+		GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), godot::DSPkg::compute_key_id(key_hex));
 	}
 
-	// 2. Open with wrong key -> ERR_UNAUTHORIZED
+	// 2. A correctly shaped key file carrying the wrong key -> ERR_UNAUTHORIZED.
+	// The guard above returned the resolution state to the default, so this open
+	// resolves the key from the file rather than from a committed key.
 	{
 		GlobalKeyResetGuard key_guard("");
-		godot::DSPkg::set_global_encryption_key(wrong_key_hex);
+		const godot::String initial_key_id = godot::DSPkg::get_global_encryption_key_id();
+		GDEX_ASSERT_TRUE(install_toc_key_file(wrong_key_hex));
 		godot::Ref<godot::DSPkg> reader;
 		reader.instantiate();
 		GDEX_ASSERT_TRUE(reader.is_valid());
 		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), 0ULL), godot::ERR_UNAUTHORIZED);
+		// The rejected candidate is not committed.
+		GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
 	}
+	remove_toc_key_file();
 
+	// The tamper cases below install the archive key explicitly so a tampered
+	// header cannot also be explained by key resolution failing first.
 	// 3. MAC Tamper: alter 1 byte at offset 64
 	{
 		GlobalKeyResetGuard key_guard("");
@@ -942,42 +1547,45 @@ GDEX_TEST_T(dspkg, encryption_tamper_and_auth, TAG_INTEGRATION) {
 	remove_temp_file(dspkg_path);
 }
 
-GDEX_TEST_T(dspkg, encrypted_archive_fingerprint_matching, TAG_INTEGRATION) {
+GDEX_TEST_T(dspkg, encrypted_archive_id_pairing, TAG_INTEGRATION) {
 	const char *dstex_path = "user://temp_enc_fp.dstex";
 	const char *dspkg_path = "user://temp_enc_fp.dspkg";
 	remove_temp_file(dstex_path);
 	remove_temp_file(dspkg_path);
 
+	TocKeySandbox sandbox;
 	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
 
 	const godot::String key_hex = "1111111122222222333333334444444455555555666666667777777788888888";
-	const uint64_t expected_fp = 0xAABBCCDDEEFF0011ULL;
+	const uint64_t archive_id = 0xAABBCCDDEEFF0011ULL;
 
 	godot::Ref<godot::DSPkg> builder;
 	builder.instantiate();
 	GDEX_ASSERT_TRUE(builder.is_valid());
-	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), expected_fp) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), archive_id) == godot::OK);
 	GDEX_ASSERT_TRUE(builder->set_encryption_key(key_hex) == godot::OK);
 	GDEX_ASSERT_TRUE(builder->add_texture("test.png", godot::String(dstex_path)) == godot::OK);
 	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
 
-	GlobalKeyResetGuard key_guard("");
-	godot::DSPkg::set_global_encryption_key(key_hex);
+	GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
 
-	// Open with matching fingerprint -> OK
+	// Open with the matching id -> OK, and the file-delivered key is committed.
 	{
 		godot::Ref<godot::DSPkg> reader;
 		reader.instantiate();
 		GDEX_ASSERT_TRUE(reader.is_valid());
-		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), expected_fp), godot::OK);
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), archive_id), godot::OK);
+		GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+		GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), godot::DSPkg::compute_key_id(key_hex));
 	}
 
-	// Open with mismatching fingerprint -> ERR_FILE_UNRECOGNIZED
+	// Mismatching id -> ERR_FILE_UNRECOGNIZED (the id is checked before the key).
 	{
 		godot::Ref<godot::DSPkg> reader;
 		reader.instantiate();
 		GDEX_ASSERT_TRUE(reader.is_valid());
-		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), expected_fp ^ 0x01ULL), godot::ERR_FILE_UNRECOGNIZED);
+		GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path), archive_id ^ 0x01ULL), godot::ERR_FILE_UNRECOGNIZED);
+		GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
 	}
 
 	remove_temp_file(dstex_path);

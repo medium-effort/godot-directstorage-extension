@@ -25,6 +25,32 @@ constexpr uint32_t D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT = 512;
 
 static const uint8_t DOMAIN_SEPARATOR[8] = {'D', 'S', 'P', 'K', 'G', 'v', '4', 0x01};
 
+// Archive-key delivery contract: the exporter injects this PCK entry as
+// magic16 || key32. The magic is derived from a public label instead of being
+// stored, so no shipped file carries the byte sequence the pack scan searches
+// for.
+constexpr const char *DSPKG_TOC_KEY_PATH = "res://.dspkg/toc.key";
+constexpr size_t DSPKG_TOC_KEY_MAGIC_SIZE = 16;
+constexpr int64_t DSPKG_TOC_KEY_FILE_SIZE = 48;
+constexpr const char *DSPKG_TOC_KEY_MAGIC_LABEL = "dspkg-toc-key-magic-v1";
+
+static_assert(DSPKG_TOC_KEY_FILE_SIZE == static_cast<int64_t>(DSPKG_TOC_KEY_MAGIC_SIZE) + 32,
+		"Key file layout is magic16 || key32");
+
+// Derived once per process; the static initialisation is thread-safe and keeps
+// the derivation out of the open() critical path.
+static const std::array<uint8_t, DSPKG_TOC_KEY_MAGIC_SIZE> &get_toc_key_magic() {
+	static const std::array<uint8_t, DSPKG_TOC_KEY_MAGIC_SIZE> magic = []() {
+		std::array<uint8_t, DSPKG_TOC_KEY_MAGIC_SIZE> derived = {};
+		const PackedByteArray digest = String(DSPKG_TOC_KEY_MAGIC_LABEL).sha256_buffer();
+		if (digest.size() >= static_cast<int64_t>(DSPKG_TOC_KEY_MAGIC_SIZE)) {
+			memcpy(derived.data(), digest.ptr(), DSPKG_TOC_KEY_MAGIC_SIZE);
+		}
+		return derived;
+	}();
+	return magic;
+}
+
 enum KeyResolutionState {
 	KEY_STATE_DEFAULT,
 	KEY_STATE_OVERRIDE,
@@ -77,27 +103,69 @@ static void unmask_baked_key(std::array<uint8_t, 32> &r_key_bytes) {
 }
 #endif
 
+static void compute_key_id_from_bytes(const uint8_t *p_key_bytes, uint64_t &r_key_id) {
+	uint8_t id_buf[8] = {0};
+	crypto_blake2b(id_buf, 8, p_key_bytes, 32);
+	memcpy(&r_key_id, id_buf, 8);
+}
+
+static void wipe_key_bytes(std::array<uint8_t, 32> &r_key_bytes) {
+	crypto_wipe(r_key_bytes.data(), r_key_bytes.size());
+}
+
+// Acquires a decryption-key candidate without installing it. Installation is the
+// caller's job and happens only after the candidate reproduces the archive
+// header's key_id and decrypts the TOC, so a stale or undecryptable key file
+// cannot pin the process to a key that a later PCK mount would have replaced.
 static bool resolve_encryption_key(std::array<uint8_t, 32> &r_key_bytes, uint64_t &r_key_id) {
-	std::lock_guard<std::mutex> lock(s_key_mutex);
-	if (s_key_resolution_state == KEY_STATE_DISABLED) {
-		crypto_wipe(r_key_bytes.data(), 32);
+	KeyResolutionState state = KEY_STATE_DEFAULT;
+	{
+		std::lock_guard<std::mutex> lock(s_key_mutex);
+		state = s_key_resolution_state;
+		if (state == KEY_STATE_OVERRIDE) {
+			r_key_bytes = s_global_encryption_key_bytes;
+		}
+	}
+	if (state == KEY_STATE_DISABLED) {
+		wipe_key_bytes(r_key_bytes);
 		return false;
 	}
-	if (s_key_resolution_state == KEY_STATE_OVERRIDE) {
-		r_key_bytes = s_global_encryption_key_bytes;
-		uint8_t id_buf[8] = {0};
-		crypto_blake2b(id_buf, 8, r_key_bytes.data(), 32);
-		memcpy(&r_key_id, id_buf, 8);
+	// An explicit override is already validated by the public setter.
+	if (state == KEY_STATE_OVERRIDE) {
+		compute_key_id_from_bytes(r_key_bytes.data(), r_key_id);
 		return true;
 	}
+
+	// KEY_STATE_DEFAULT: the archive key travels inside the encrypted PCK. The
+	// read is kernel I/O, so it stays outside s_key_mutex. A missing file leaves
+	// the resolution state untouched: the next open() after a PCK mount retries.
+	PackedByteArray key_file;
+	if (FileAccess::file_exists(DSPKG_TOC_KEY_PATH)) {
+		key_file = FileAccess::get_file_as_bytes(DSPKG_TOC_KEY_PATH);
+	}
+	const std::array<uint8_t, DSPKG_TOC_KEY_MAGIC_SIZE> &magic = get_toc_key_magic();
+	const bool key_file_is_valid = key_file.size() == DSPKG_TOC_KEY_FILE_SIZE &&
+			memcmp(key_file.ptr(), magic.data(), DSPKG_TOC_KEY_MAGIC_SIZE) == 0;
+	if (key_file_is_valid) {
+		memcpy(r_key_bytes.data(), key_file.ptr() + DSPKG_TOC_KEY_MAGIC_SIZE, 32);
+	}
+	if (key_file.size() > 0) {
+		crypto_wipe(key_file.ptrw(), static_cast<size_t>(key_file.size()));
+	}
+	key_file = PackedByteArray();
+	if (key_file_is_valid) {
+		compute_key_id_from_bytes(r_key_bytes.data(), r_key_id);
+		return true;
+	}
+
 #if DSPKG_ENCRYPTION_ENABLED
+	// A source build that bakes a key has no PCK delivery, so exactly one key
+	// source exists per configuration rather than a fallback chain.
 	unmask_baked_key(r_key_bytes);
-	uint8_t id_buf[8] = {0};
-	crypto_blake2b(id_buf, 8, r_key_bytes.data(), 32);
-	memcpy(&r_key_id, id_buf, 8);
+	compute_key_id_from_bytes(r_key_bytes.data(), r_key_id);
 	return true;
 #else
-	crypto_wipe(r_key_bytes.data(), 32);
+	wipe_key_bytes(r_key_bytes);
 	return false;
 #endif
 }
@@ -207,6 +275,68 @@ bool calculate_packed_payload_offset(uint64_t p_current_offset, uint64_t p_item_
 	return true;
 }
 
+// Compares a staged entry's add-time snapshot with the source as it is now. A
+// texture that was modified, resized or replaced between add_texture() and
+// finalize() must abort the archive instead of streaming bytes nobody staged.
+bool staged_source_is_unchanged(const DSPkgStagedEntry &p_entry, const Dictionary &p_header,
+		uint64_t p_file_length, uint64_t p_modified_time, String &r_reason) {
+	if (p_modified_time != p_entry.source_modified_time) {
+		r_reason = "modification time changed";
+		return false;
+	}
+	if (p_file_length != p_entry.source_file_length) {
+		r_reason = "file length changed from " + String::num_uint64(p_entry.source_file_length) + " to " +
+				String::num_uint64(p_file_length) + " bytes";
+		return false;
+	}
+	uint16_t version = p_header.get("version", 0);
+	if (version != p_entry.source_version) {
+		r_reason = "container version changed";
+		return false;
+	}
+	uint64_t compressed_size = p_header.get("compressed_size", 0);
+	if (compressed_size != p_entry.source_compressed_size) {
+		r_reason = "compressed size changed from " + String::num_uint64(p_entry.source_compressed_size) + " to " +
+				String::num_uint64(compressed_size) + " bytes";
+		return false;
+	}
+	uint32_t mip_count = p_header.get("mip_count", 0);
+	if (mip_count != p_entry.mip_count) {
+		r_reason = "mip count changed from " + String::num_int64(p_entry.mip_count) + " to " +
+				String::num_int64(mip_count);
+		return false;
+	}
+	PackedInt32Array mip_sizes = p_header.get("mip_sizes", PackedInt32Array());
+	if (!(mip_sizes == p_entry.source_mip_sizes)) {
+		r_reason = "mip size table changed";
+		return false;
+	}
+	PackedInt64Array mip_offsets = p_header.get("mip_offsets", PackedInt64Array());
+	if (!(mip_offsets == p_entry.source_mip_offsets)) {
+		r_reason = "mip offset table changed";
+		return false;
+	}
+	if (p_entry.gpu_metadata) {
+		PackedInt32Array uncompressed_sizes = p_header.get("mip_uncompressed_sizes", PackedInt32Array());
+		if (!(uncompressed_sizes == p_entry.mip_uncompressed_sizes)) {
+			r_reason = "GPU footprint metadata changed";
+			return false;
+		}
+		uint64_t footprint = 0;
+		for (int64_t mip = 0; mip < uncompressed_sizes.size(); ++mip) {
+			if (!checked_add(footprint, static_cast<uint32_t>(uncompressed_sizes[mip]), footprint)) {
+				r_reason = "GPU footprint size overflow";
+				return false;
+			}
+		}
+		if (footprint != p_entry.gpu_footprint) {
+			r_reason = "GPU footprint size changed";
+			return false;
+		}
+	}
+	return true;
+}
+
 } // namespace
 
 void DSPkg::_bind_methods() {
@@ -275,6 +405,17 @@ Error DSPkg::set_encryption_key(const String &p_key_hex) {
 	return OK;
 }
 
+void DSPkg::set_global_encryption_key_raw(const uint8_t *p_key_bytes, size_t p_size) {
+	if (p_key_bytes == nullptr || p_size < 32) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(s_key_mutex);
+	memcpy(s_global_encryption_key_bytes.data(), p_key_bytes, 32);
+	// The id is derived from these bytes by the same code path the explicit
+	// override uses, so no separate id copy is cached here.
+	s_key_resolution_state = KEY_STATE_OVERRIDE;
+}
+
 Error DSPkg::set_global_encryption_key(const String &p_key_hex) {
 	std::lock_guard<std::mutex> lock(s_key_mutex);
 	{
@@ -338,6 +479,10 @@ String DSPkg::compute_key_id(const String &p_key_hex) {
 void DSPkg::_set_archive_salt_for_testing(const PackedByteArray &p_salt) {
 	m_test_salt_override = p_salt;
 }
+
+void DSPkg::_set_write_truncate_for_testing(int64_t p_bytes) {
+	m_test_write_truncate_after_bytes = p_bytes;
+}
 #endif
 
 void DSPkg::set_archive_fingerprint(uint64_t p_archive_fingerprint) {
@@ -384,40 +529,96 @@ Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_pa
 		return ERR_UNCONFIGURED;
 	}
 
+	// Metadata only: stat the source and parse its header and mip table. The
+	// payload stays on disk; finalize() re-stats the file and streams it, so a
+	// mutated import aborts instead of streaming unexpected bytes.
+	Ref<FileAccess> source = FileAccess::open(p_dstex_path, FileAccess::READ);
+	if (source.is_null() || !source->is_open()) {
+		UtilityFunctions::push_error("DSPkg: Failed to open .dstex file at ", p_dstex_path);
+		return ERR_CANT_OPEN;
+	}
+	DSPkgStagedEntry entry;
+	entry.source_file_length = source->get_length();
+	entry.source_modified_time = FileAccess::get_modified_time(p_dstex_path);
+	source->close();
+
 	Ref<DSTex> dstex;
 	dstex.instantiate();
-	Dictionary dstex_data = dstex->read_from_file(p_dstex_path);
-	if (!dstex_data.has("header") || !dstex_data.has("compressed_data")) {
-		UtilityFunctions::push_error("DSPkg: Failed to read .dstex file at ", p_dstex_path);
+	Dictionary dstex_header = dstex->read_header(p_dstex_path);
+	if (dstex_header.is_empty()) {
+		UtilityFunctions::push_error("DSPkg: Failed to read .dstex header at ", p_dstex_path);
 		return ERR_CANT_OPEN;
 	}
 
-	Dictionary entry_item;
-	entry_item["resource_path"] = p_resource_path;
-	entry_item["dstex_path"] = p_dstex_path;
-	entry_item["header"] = dstex_data["header"];
-	entry_item["compressed_data"] = dstex_data["compressed_data"];
-	Dictionary dstex_header = dstex_data["header"];
-	uint32_t mip_count = dstex_header.get("mip_count", 0);
-	uint32_t flags = dstex_header.get("flags", 0);
-	entry_item["flags"] = flags;
-	Dictionary source_metadata = p_mip_metadata.is_empty() ? dstex_data : p_mip_metadata;
 	int dstex_version = dstex_header.get("version", 0);
+	uint32_t mip_count = dstex_header.get("mip_count", 0);
+	PackedInt64Array source_mip_offsets = dstex_header.get("mip_offsets", PackedInt64Array());
+	PackedInt32Array source_mip_sizes = dstex_header.get("mip_sizes", PackedInt32Array());
+	if (source_mip_offsets.size() != static_cast<int64_t>(mip_count) ||
+			source_mip_sizes.size() != static_cast<int64_t>(mip_count)) {
+		UtilityFunctions::push_error("DSPkg: .dstex mip table does not match its declared mip count: ", p_dstex_path);
+		return ERR_INVALID_DATA;
+	}
+
+	Dictionary source_metadata = p_mip_metadata.is_empty() ? dstex_header : p_mip_metadata;
 	if (p_mip_metadata.is_empty() && dstex_version == 2) {
 		source_metadata["version"] = 2;
 	}
-	if (metadata_arrays_are_valid(source_metadata, mip_count)) {
-		entry_item["gpu_metadata"] = true;
-		entry_item["mip_offsets"] = source_metadata.get("mip_offsets", PackedInt64Array());
-		entry_item["mip_sizes"] = source_metadata.get("mip_sizes", PackedInt32Array());
-		entry_item["mip_uncompressed_sizes"] = source_metadata.get("mip_uncompressed_sizes", PackedInt32Array());
-		entry_item["mip_row_pitches"] = source_metadata.get("mip_row_pitches", PackedInt32Array());
+
+	entry.gpu_metadata = metadata_arrays_are_valid(source_metadata, mip_count);
+	uint64_t gpu_footprint = 0;
+	if (entry.gpu_metadata) {
+		entry.mip_sizes = source_metadata.get("mip_sizes", PackedInt32Array());
+		entry.mip_uncompressed_sizes = source_metadata.get("mip_uncompressed_sizes", PackedInt32Array());
+		entry.mip_row_pitches = source_metadata.get("mip_row_pitches", PackedInt32Array());
+		// The payload is streamed mip by mip straight from the source table, so
+		// the metadata that describes the TOC must match those slices exactly.
+		if (!(entry.mip_sizes == source_mip_sizes)) {
+			UtilityFunctions::push_error("DSPkg: Supplied mip metadata does not match the .dstex mip table: ", p_dstex_path);
+			return ERR_INVALID_DATA;
+		}
+		for (int64_t mip = 0; mip < entry.mip_uncompressed_sizes.size(); ++mip) {
+			uint64_t footprint_size = static_cast<uint32_t>(entry.mip_uncompressed_sizes[mip]);
+			if (!checked_add(gpu_footprint, footprint_size, gpu_footprint)) {
+				UtilityFunctions::push_error("DSPkg: GPU footprint size overflow: ", p_dstex_path);
+				return ERR_INVALID_DATA;
+			}
+		}
 	} else {
-		entry_item["gpu_metadata"] = false;
-		entry_item["mip_sizes"] = dstex_data.get("mip_sizes", PackedInt32Array());
+		entry.mip_sizes = source_mip_sizes;
+	}
+	entry.gpu_footprint = gpu_footprint;
+
+	uint64_t payload_size = 0;
+	if (dstex_version == 1) {
+		payload_size = dstex_header.get("compressed_size", 0);
+		entry.payload_offset = static_cast<uint64_t>(sizeof(DSTexHeader)) +
+				static_cast<uint64_t>(sizeof(DSTexMipEntry)) * static_cast<uint64_t>(mip_count);
+	} else {
+		for (int64_t mip = 0; mip < source_mip_sizes.size(); ++mip) {
+			uint64_t mip_size = static_cast<uint32_t>(source_mip_sizes[mip]);
+			if (!checked_add(payload_size, mip_size, payload_size)) {
+				UtilityFunctions::push_error("DSPkg: .dstex mip sizes overflow the payload length: ", p_dstex_path);
+				return ERR_INVALID_DATA;
+			}
+		}
 	}
 
-	staging_entries.append(entry_item);
+	entry.resource_path = p_resource_path;
+	entry.dstex_path = p_dstex_path;
+	entry.source_version = static_cast<uint16_t>(dstex_version);
+	entry.source_compressed_size = dstex_header.get("compressed_size", 0);
+	entry.payload_size = payload_size;
+	entry.original_size = dstex_header.get("original_size", 0);
+	entry.width = dstex_header.get("width", 0);
+	entry.height = dstex_header.get("height", 0);
+	entry.pixel_format = dstex_header.get("pixel_format", 0);
+	entry.mip_count = mip_count;
+	entry.flags = dstex_header.get("flags", 0);
+	entry.source_mip_offsets = source_mip_offsets;
+	entry.source_mip_sizes = source_mip_sizes;
+
+	staging_entries.push_back(entry);
 	return OK;
 }
 
@@ -454,19 +655,18 @@ Error DSPkg::finalize() {
 		return ERR_UNCONFIGURED;
 	}
 
-	std::vector<Dictionary> sorted_entries;
+	std::vector<const DSPkgStagedEntry *> sorted_entries;
 	sorted_entries.reserve(count);
 	for (uint32_t i = 0; i < count; ++i) {
-		sorted_entries.push_back(staging_entries[i]);
+		sorted_entries.push_back(&staging_entries[i]);
 	}
-	std::sort(sorted_entries.begin(), sorted_entries.end(), [](const Dictionary &a, const Dictionary &b) {
-		return String(a.get("resource_path", "")) < String(b.get("resource_path", ""));
+	std::sort(sorted_entries.begin(), sorted_entries.end(), [](const DSPkgStagedEntry *a, const DSPkgStagedEntry *b) {
+		return a->resource_path < b->resource_path;
 	});
 
 	bool write_gpu_metadata = false;
 	for (uint32_t i = 0; i < count; ++i) {
-		const Dictionary &item = sorted_entries[i];
-		if (item.get("gpu_metadata", false)) {
+		if (sorted_entries[i]->gpu_metadata) {
 			write_gpu_metadata = true;
 			break;
 		}
@@ -474,8 +674,7 @@ Error DSPkg::finalize() {
 
 	HashSet<String> seen_staging_paths;
 	for (uint32_t i = 0; i < count; ++i) {
-		const Dictionary &item = sorted_entries[i];
-		String res_path = item["resource_path"];
+		const String &res_path = sorted_entries[i]->resource_path;
 		if (seen_staging_paths.has(res_path)) {
 			UtilityFunctions::push_error("DSPkg: Duplicate entry path encountered during finalization: " + res_path);
 			return ERR_ALREADY_EXISTS;
@@ -485,17 +684,15 @@ Error DSPkg::finalize() {
 
 	uint64_t entry_table_size = 0;
 	for (uint32_t i = 0; i < count; ++i) {
-		const Dictionary &item = sorted_entries[i];
-		String res_path = item["resource_path"];
-		CharString utf8_path = res_path.utf8();
+		const DSPkgStagedEntry &item = *sorted_entries[i];
+		CharString utf8_path = item.resource_path.utf8();
 		if (utf8_path.length() > UINT16_MAX) {
 			UtilityFunctions::push_error("DSPkg: Resource path is too long to store in archive.");
 			return ERR_INVALID_PARAMETER;
 		}
 		uint16_t path_len = static_cast<uint16_t>(utf8_path.length());
 		uint64_t entry_size = 0;
-		Dictionary dstex_header = item["header"];
-		uint32_t mip_count = dstex_header.get("mip_count", 0);
+		uint32_t mip_count = item.mip_count;
 		uint64_t metadata_size = 0;
 		if (write_gpu_metadata &&
 				(!checked_multiply(mip_count, sizeof(DSPkgMipEntry), metadata_size) ||
@@ -546,30 +743,27 @@ Error DSPkg::finalize() {
 	uint64_t running_data_offset = 0;
 
 	for (uint32_t i = 0; i < count; ++i) {
-		const Dictionary &item = sorted_entries[i];
-		String res_path = item["resource_path"];
-		CharString utf8_path = res_path.utf8();
+		const DSPkgStagedEntry &item = *sorted_entries[i];
+		CharString utf8_path = item.resource_path.utf8();
 		uint16_t path_len = static_cast<uint16_t>(utf8_path.length());
-		uint64_t hash = res_path.hash();
+		uint64_t hash = item.resource_path.hash();
 
-		Dictionary dstex_header = item["header"];
-		PackedByteArray data = item["compressed_data"];
-
-		uint64_t orig_size = dstex_header.get("original_size", 0);
-		uint32_t w = dstex_header.get("width", 0);
-		uint32_t h = dstex_header.get("height", 0);
-		uint32_t fmt = dstex_header.get("pixel_format", 0);
-		uint32_t mips_count = dstex_header.get("mip_count", 0);
-		PackedInt32Array mip_sizes_entry = item.get("mip_sizes", PackedInt32Array());
-		PackedInt32Array mip_uncompressed_sizes = item.get("mip_uncompressed_sizes", PackedInt32Array());
-		PackedInt32Array mip_row_pitches = item.get("mip_row_pitches", PackedInt32Array());
+		uint64_t orig_size = item.original_size;
+		uint32_t w = item.width;
+		uint32_t h = item.height;
+		uint32_t fmt = item.pixel_format;
+		uint32_t mips_count = item.mip_count;
+		const PackedInt32Array &mip_sizes_entry = item.mip_sizes;
+		const PackedInt32Array &mip_uncompressed_sizes = item.mip_uncompressed_sizes;
+		const PackedInt32Array &mip_row_pitches = item.mip_row_pitches;
 		if (write_gpu_metadata && mip_sizes_entry.size() != static_cast<int64_t>(mips_count)) {
 			UtilityFunctions::push_error("DSPkg: Texture mip metadata does not match the declared mip count.");
 			return ERR_INVALID_DATA;
 		}
 
+		const bool per_mip_payload = write_gpu_metadata && item.gpu_metadata && mips_count > 1;
 		uint64_t comp_size = 0;
-		if (write_gpu_metadata && item.get("gpu_metadata", false) && mips_count > 1) {
+		if (per_mip_payload) {
 			uint64_t running_mip_span = 0;
 			for (uint32_t mip = 0; mip < mips_count; ++mip) {
 				if (mip > 0) {
@@ -585,7 +779,7 @@ Error DSPkg::finalize() {
 			}
 			comp_size = running_mip_span;
 		} else {
-			comp_size = static_cast<uint64_t>(data.size());
+			comp_size = item.payload_size;
 		}
 
 		if (bin_packing_enabled) {
@@ -614,7 +808,7 @@ Error DSPkg::finalize() {
 		writer.put_32(h);
 		writer.put_32(fmt);
 		writer.put_32(mips_count);
-		uint32_t entry_flags = item.get("flags", 0);
+		uint32_t entry_flags = item.flags;
 		writer.put_32(entry_flags);
 
 		if (write_gpu_metadata) {
@@ -625,7 +819,7 @@ Error DSPkg::finalize() {
 			}
 			uint64_t running_mip_offset = 0;
 			for (uint32_t mip = 0; mip < mips_count; ++mip) {
-				if (item.get("gpu_metadata", false) && mips_count > 1 && mip > 0) {
+				if (per_mip_payload && mip > 0) {
 					if (!align_up(running_mip_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_mip_offset)) {
 						UtilityFunctions::push_error("DSPkg: Mip span alignment overflow.");
 						return ERR_INVALID_PARAMETER;
@@ -639,7 +833,7 @@ Error DSPkg::finalize() {
 			}
 			uint64_t mip_offset = 0;
 			for (uint32_t mip = 0; mip < mips_count; ++mip) {
-				if (item.get("gpu_metadata", false) && mips_count > 1 && mip > 0) {
+				if (per_mip_payload && mip > 0) {
 					align_up(mip_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, mip_offset);
 				}
 				DSPkgMipEntry mip_entry{};
@@ -650,7 +844,7 @@ Error DSPkg::finalize() {
 				}
 				mip_entry.offset = md_off;
 				mip_entry.compressed_size = mip_sizes_entry[mip];
-				if (item.get("gpu_metadata", false)) {
+				if (item.gpu_metadata) {
 					mip_entry.uncompressed_size = mip_uncompressed_sizes[mip];
 					mip_entry.row_pitch = mip_row_pitches[mip];
 				}
@@ -677,15 +871,61 @@ Error DSPkg::finalize() {
 		return FileAccess::get_open_error();
 	}
 
-	// Step 5: write_zero_padding lambda
+	// Step 5: checked write helpers. godot-cpp's store_buffer() returns void, so
+	// a full disk surfaces through FileAccess::get_error(); every write is
+	// inspected because a truncated archive would still parse from its header
+	// and TOC (both written first).
+	uint64_t written_bytes = 0;
+	bool write_failed = false;
+	auto write_bytes = [&](const uint8_t *p_data, uint64_t p_size) -> bool {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		if (m_test_write_truncate_after_bytes >= 0) {
+			const uint64_t allowed = static_cast<uint64_t>(m_test_write_truncate_after_bytes);
+			if (written_bytes >= allowed) {
+				// Pretend the bytes landed: the final size check must catch it.
+				written_bytes += p_size;
+				return true;
+			}
+			if (p_size > allowed - written_bytes) {
+				const uint64_t keep = allowed - written_bytes;
+				if (keep > 0) {
+					file->store_buffer(p_data, static_cast<int64_t>(keep));
+					if (file->get_error() != OK) {
+						return false;
+					}
+				}
+				written_bytes += p_size;
+				return true;
+			}
+		}
+#endif
+		if (p_size > 0) {
+			file->store_buffer(p_data, static_cast<int64_t>(p_size));
+			if (file->get_error() != OK) {
+				return false;
+			}
+		}
+		written_bytes += p_size;
+		return true;
+	};
+	auto fail_write = [&](const char *p_stage) -> Error {
+		UtilityFunctions::push_error(String("DSPkg: Failed to write the archive ") + String(p_stage) +
+				" (out of disk space?). The partial file was removed: " + build_output_path);
+		file->close();
+		DirAccess::remove_absolute(build_output_path);
+		return ERR_FILE_CANT_WRITE;
+	};
 	static const uint8_t ZERO_PADDING[4096] = {0};
-	auto write_zero_padding = [&](uint64_t p_current, uint64_t p_aligned) -> void {
+	auto write_zero_padding = [&](uint64_t p_current, uint64_t p_aligned) -> bool {
 		uint64_t rem = p_aligned > p_current ? p_aligned - p_current : 0;
 		while (rem > 0) {
 			uint64_t chunk = std::min<uint64_t>(rem, sizeof(ZERO_PADDING));
-			file->store_buffer(ZERO_PADDING, chunk);
+			if (!write_bytes(ZERO_PADDING, chunk)) {
+				return false;
+			}
 			rem -= chunk;
 		}
+		return true;
 	};
 
 	// Step 6: populate header
@@ -745,25 +985,66 @@ Error DSPkg::finalize() {
 			entries_buf.ptr(), ciphertext_len);
 		crypto_wipe(local_key.data(), 32);
 
-		file->store_buffer(reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader));
-		file->store_buffer(mac, DSPKG_ENCRYPTION_MAC_SIZE);
-		file->store_buffer(ciphertext.ptr(), ciphertext_len);
+		if (!write_bytes(reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader)) ||
+				!write_bytes(mac, DSPKG_ENCRYPTION_MAC_SIZE) ||
+				!write_bytes(ciphertext.ptr(), ciphertext_len)) {
+			return fail_write("header");
+		}
 	} else {
-		file->store_buffer(reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader));
-		file->store_buffer(entries_buf.ptr(), entry_table_size);
+		if (!write_bytes(reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader)) ||
+				!write_bytes(entries_buf.ptr(), entry_table_size)) {
+			return fail_write("header");
+		}
 	}
 
 	// Step 8: single padding site + payloads
 	if (!m_encryption_enabled) {
-		write_zero_padding(table_end_offset, total_data_offset);
+		if (!write_zero_padding(table_end_offset, total_data_offset)) {
+			return fail_write("padding");
+		}
 	}
 
-	file->seek(total_data_offset);
+	file->seek(static_cast<int64_t>(total_data_offset));
 	uint64_t payload_offset = total_data_offset;
+
+	// Payloads are streamed in bounded chunks straight from the source, so the
+	// builder's peak memory is the entry metadata plus one chunk, never the
+	// whole project's compressed texture bytes.
+	constexpr uint64_t STREAM_CHUNK_SIZE = 1024ULL * 1024ULL;
+	auto stream_source_range = [&](FileAccess *p_source, uint64_t p_source_offset, uint64_t p_size) -> bool {
+		if (p_size == 0) {
+			return true;
+		}
+		if (p_source_offset > static_cast<uint64_t>(INT64_MAX)) {
+			UtilityFunctions::push_error("DSPkg: Source payload offset exceeds the storable range.");
+			return false;
+		}
+		p_source->seek(static_cast<int64_t>(p_source_offset));
+		uint64_t remaining = p_size;
+		while (remaining > 0) {
+			const uint64_t chunk_size = std::min<uint64_t>(remaining, STREAM_CHUNK_SIZE);
+			PackedByteArray chunk = p_source->get_buffer(static_cast<int64_t>(chunk_size));
+			if (static_cast<uint64_t>(chunk.size()) != chunk_size) {
+				UtilityFunctions::push_error("DSPkg: Source texture ended while streaming its payload.");
+				return false;
+			}
+			if (!write_bytes(chunk.ptr(), chunk_size)) {
+				write_failed = true;
+				return false;
+			}
+			remaining -= chunk_size;
+		}
+		return true;
+	};
+
 	for (uint32_t i = 0; i < count; ++i) {
-		const Dictionary &item = sorted_entries[i];
-		PackedByteArray data = item["compressed_data"];
-		uint64_t target_payload_offset = total_data_offset + entry_payload_offsets[i];
+		const DSPkgStagedEntry &item = *sorted_entries[i];
+		uint64_t target_payload_offset = 0;
+		if (!checked_add(total_data_offset, entry_payload_offsets[i], target_payload_offset)) {
+			UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
+			file->close();
+			return ERR_INVALID_PARAMETER;
+		}
 		if (target_payload_offset < payload_offset) {
 			UtilityFunctions::push_error("DSPkg: Payload offset sequence non-monotonic.");
 			file->close();
@@ -772,57 +1053,126 @@ Error DSPkg::finalize() {
 		write_zero_padding(payload_offset, target_payload_offset);
 		payload_offset = target_payload_offset;
 
-		Dictionary dstex_header = item["header"];
-		uint32_t mips = dstex_header.get("mip_count", 0);
-		bool has_gpu = write_gpu_metadata && item.get("gpu_metadata", false) && mips > 1;
+		// Re-stat the source and compare it with the add-time snapshot. A
+		// mutated, resized or replaced import aborts the archive instead of
+		// streaming bytes that were never staged.
+		Ref<FileAccess> source = FileAccess::open(item.dstex_path, FileAccess::READ);
+		if (source.is_null() || !source->is_open()) {
+			UtilityFunctions::push_error("DSPkg: Source texture was removed after it was added to the archive: ", item.dstex_path);
+			file->close();
+			return ERR_CANT_OPEN;
+		}
+		const uint64_t source_length = source->get_length();
+		const uint64_t source_modified_time = FileAccess::get_modified_time(item.dstex_path);
+		Ref<DSTex> dstex_reader;
+		dstex_reader.instantiate();
+		Dictionary current_header = dstex_reader->read_header(item.dstex_path);
+		String mismatch_reason;
+		const bool source_is_current = !current_header.is_empty() &&
+				staged_source_is_unchanged(item, current_header, source_length, source_modified_time, mismatch_reason);
+		if (!source_is_current) {
+			if (current_header.is_empty()) {
+				mismatch_reason = "header is no longer readable";
+			}
+			UtilityFunctions::push_error("DSPkg: Source texture changed after it was added to the archive (" + mismatch_reason + "); aborting instead of streaming unexpected bytes: " + item.dstex_path);
+			source->close();
+			file->close();
+			return ERR_FILE_CORRUPT;
+		}
 
-		if (has_gpu) {
-			PackedInt32Array mip_sizes = item.get("mip_sizes", PackedInt32Array());
-			int64_t slice_offset = 0;
+		const uint32_t mips = item.mip_count;
+		if (write_gpu_metadata && item.gpu_metadata && mips > 1) {
+			// v1 containers keep one contiguous payload, so mip slices are read
+			// at cumulative offsets; v2 containers point at each mip directly.
+			uint64_t contiguous_cursor = 0;
 			for (uint32_t mip = 0; mip < mips; ++mip) {
-				int32_t mip_size = mip_sizes[mip];
 				if (mip > 0) {
 					uint64_t aligned_mip_offset = 0;
 					if (!align_up(payload_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, aligned_mip_offset)) {
 						UtilityFunctions::push_error("DSPkg: Payload mip file offset alignment overflow.");
+						source->close();
 						file->close();
 						return ERR_INVALID_PARAMETER;
 					}
 					write_zero_padding(payload_offset, aligned_mip_offset);
 					payload_offset = aligned_mip_offset;
 				}
-				if (mip_size > 0) {
-					if (slice_offset < 0 || static_cast<uint64_t>(slice_offset) + mip_size > static_cast<uint64_t>(data.size())) {
-						UtilityFunctions::push_error("DSPkg: Mip slice offset exceeds compressed data size.");
+				const uint64_t mip_size = static_cast<uint32_t>(item.mip_sizes[mip]);
+				uint64_t slice_offset = 0;
+				if (item.source_version == 2) {
+					slice_offset = static_cast<uint64_t>(item.source_mip_offsets[mip]);
+				} else {
+					if (!checked_add(item.payload_offset, contiguous_cursor, slice_offset) ||
+							contiguous_cursor > item.payload_size || mip_size > item.payload_size - contiguous_cursor) {
+						UtilityFunctions::push_error("DSPkg: Mip slice offset exceeds the staged payload size.");
+						source->close();
 						file->close();
 						return ERR_INVALID_DATA;
 					}
-					file->store_buffer(data.ptr() + slice_offset, mip_size);
-					slice_offset += mip_size;
+					contiguous_cursor += mip_size;
 				}
-				if (!checked_add(payload_offset, static_cast<uint64_t>(mip_size), payload_offset)) {
+				if (!stream_source_range(source.ptr(), slice_offset, mip_size)) {
+					source->close();
+					if (write_failed) {
+						return fail_write("payload");
+					}
+					file->close();
+					return ERR_FILE_CORRUPT;
+				}
+				if (!checked_add(payload_offset, mip_size, payload_offset)) {
 					UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
+					source->close();
 					file->close();
 					return ERR_INVALID_PARAMETER;
 				}
 			}
 		} else {
-			if (data.size() > 0) {
-				file->store_buffer(data.ptr(), data.size());
-			}
-			if (!checked_add(payload_offset, static_cast<uint64_t>(data.size()), payload_offset)) {
-				UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
-				file->close();
-				return ERR_INVALID_PARAMETER;
+			const uint32_t slice_count = item.source_version == 2 ? mips : 1;
+			for (uint32_t slice = 0; slice < slice_count; ++slice) {
+				uint64_t slice_offset = item.payload_offset;
+				uint64_t slice_size = item.payload_size;
+				if (item.source_version == 2) {
+					slice_offset = static_cast<uint64_t>(item.source_mip_offsets[slice]);
+					slice_size = static_cast<uint64_t>(static_cast<uint32_t>(item.source_mip_sizes[slice]));
+				}
+				if (!stream_source_range(source.ptr(), slice_offset, slice_size)) {
+					source->close();
+					if (write_failed) {
+						return fail_write("payload");
+					}
+					file->close();
+					return ERR_FILE_CORRUPT;
+				}
+				if (!checked_add(payload_offset, slice_size, payload_offset)) {
+					UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
+					source->close();
+					file->close();
+					return ERR_INVALID_PARAMETER;
+				}
 			}
 		}
+		source->close();
+	}
+
+	// A short write that store_buffer() did not report would still ship a
+	// truncated archive whose header and TOC parse fine. Verify the exact
+	// expected size before declaring success.
+	file->seek_end();
+	const uint64_t actual_total = static_cast<uint64_t>(file->get_position());
+	if (actual_total != payload_offset || file->get_error() != OK) {
+		UtilityFunctions::push_error(String("DSPkg: Archive size mismatch after writing (expected ") +
+				String::num_uint64(payload_offset) + " bytes, got " + String::num_uint64(actual_total) +
+				"); the partial file was removed: " + build_output_path);
+		file->close();
+		DirAccess::remove_absolute(build_output_path);
+		return ERR_FILE_CANT_WRITE;
 	}
 
 	file->close();
 	finalize_completed = true;
 	return OK;
 }
-Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
+Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 	entries_by_path.clear();
 	entries_by_hash.clear();
 	entries_by_offset.clear();
@@ -926,20 +1276,13 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 	const uint64_t toc_start = (loaded_header.version != DSPKG_VERSION_V4) ? DSPKG_HEADER_SIZE_LEGACY :
 		(is_encrypted ? (DSPKG_HEADER_SIZE_V4 + DSPKG_ENCRYPTION_MAC_SIZE) : DSPKG_HEADER_SIZE_V4);
 
-	if (p_expected_fingerprint != 0 && loaded_header.archive_fingerprint != 0) {
-		uint32_t loaded_guid = static_cast<uint32_t>(loaded_header.archive_fingerprint >> 32);
-		uint32_t expected_guid = static_cast<uint32_t>(p_expected_fingerprint >> 32);
-		uint32_t loaded_hash = static_cast<uint32_t>(loaded_header.archive_fingerprint & 0xFFFFFFFFULL);
-		uint32_t expected_hash = static_cast<uint32_t>(p_expected_fingerprint & 0xFFFFFFFFULL);
-		if (loaded_guid != expected_guid) {
-			return fail(ERR_FILE_UNRECOGNIZED, String("Archive belongs to a different project (archive GUID: 0x") + String::num_uint64(loaded_guid, 16) + ", expected GUID: 0x" + String::num_uint64(expected_guid, 16) + ").");
-		}
-		// A zero expected content half means "pair on the project GUID only".
-		// The exporter emits that for subset exports, where the whole-project
-		// manifest cannot describe the shipped archive.
-		if (expected_hash != 0 && loaded_hash != expected_hash) {
-			return fail(ERR_FILE_UNRECOGNIZED, String("Archive texture manifest does not match current game build (archive hash: 0x") + String::num_uint64(loaded_hash, 16) + ", expected hash: 0x" + String::num_uint64(expected_hash, 16) + ").");
-		}
+	// Pairing is a single archive id. A caller that expects an id (non-zero)
+	// requires an exact match: an archive carrying id 0 is not a wildcard and is
+	// rejected, because a zeroed header field must never satisfy a build that
+	// expects a real id. Passing 0 as the expected id is the tooling/no-pairing
+	// path and skips the check.
+	if (p_expected_id != 0 && p_expected_id != loaded_header.archive_fingerprint) {
+		return fail(ERR_FILE_UNRECOGNIZED, String("Archive id does not match this build (archive id: 0x") + String::num_uint64(loaded_header.archive_fingerprint, 16) + ", expected: 0x" + String::num_uint64(p_expected_id, 16) + ").");
 	}
 
 	const uint64_t entry_fields_size = is_v3_or_higher ? DSPKG_ENTRY_FIELDS_SIZE_V3 : DSPKG_ENTRY_FIELDS_SIZE_LEGACY;
@@ -975,14 +1318,14 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 
 	// Read & decrypt TOC into plaintext_toc
 	if (is_encrypted) {
-		std::array<uint8_t, 32> key_bytes = {};
-		uint64_t active_key_id = 0;
-		if (!resolve_encryption_key(key_bytes, active_key_id)) {
-			crypto_wipe(key_bytes.data(), 32);
-			return fail(ERR_UNAUTHORIZED, "No valid decryption key available.");
+		std::array<uint8_t, 32> candidate_key = {};
+		uint64_t candidate_key_id = 0;
+		if (!resolve_encryption_key(candidate_key, candidate_key_id)) {
+			wipe_key_bytes(candidate_key);
+			return fail(ERR_UNAUTHORIZED, "No decryption key available. Expected res://.dspkg/toc.key inside an encrypted PCK.");
 		}
-		if (loaded_header.key_id != 0 && loaded_header.key_id != active_key_id) {
-			crypto_wipe(key_bytes.data(), 32);
+		if (loaded_header.key_id != candidate_key_id) {
+			wipe_key_bytes(candidate_key);
 			return fail(ERR_UNAUTHORIZED, "Archive encryption key ID mismatch.");
 		}
 		if (file->get_position() != DSPKG_HEADER_SIZE_V4) {
@@ -990,7 +1333,7 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 		}
 		PackedByteArray mac_bytes = file->get_buffer(DSPKG_ENCRYPTION_MAC_SIZE);
 		if (mac_bytes.size() < DSPKG_ENCRYPTION_MAC_SIZE) {
-			crypto_wipe(key_bytes.data(), 32);
+			wipe_key_bytes(candidate_key);
 			return fail(ERR_FILE_CORRUPT, "Failed to read complete MAC bytes.");
 		}
 		if (file->get_position() != toc_start) {
@@ -998,7 +1341,7 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 		}
 		PackedByteArray ciphertext = file->get_buffer(toc_len);
 		if (ciphertext.size() < toc_len) {
-			crypto_wipe(key_bytes.data(), 32);
+			wipe_key_bytes(candidate_key);
 			return fail(ERR_FILE_CORRUPT, "Failed to read complete TOC ciphertext.");
 		}
 		uint8_t nonce[DSPKG_ENCRYPTION_NONCE_SIZE] = {0};
@@ -1007,15 +1350,21 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_fingerprint) {
 
 		plaintext_toc.resize(toc_len);
 		int unlock_res = crypto_aead_unlock(
-			plaintext_toc.ptrw(), mac_bytes.ptr(), key_bytes.data(), nonce,
+			plaintext_toc.ptrw(), mac_bytes.ptr(), candidate_key.data(), nonce,
 			reinterpret_cast<const uint8_t *>(&loaded_header), sizeof(DSPkgHeader),
 			ciphertext.ptr(), toc_len
 		);
-		crypto_wipe(key_bytes.data(), 32);
 		if (unlock_res != 0) {
+			wipe_key_bytes(candidate_key);
 			crypto_wipe(plaintext_toc.ptrw(), plaintext_toc.size());
 			return fail(ERR_UNAUTHORIZED, "TOC decryption failed or authentication MAC mismatch.");
 		}
+		// Installation waits for both proofs: a candidate that reproduced the
+		// header id and decrypted the TOC is the archive's key. Anything earlier
+		// would let a wrong key file pin the process and defeat the retry after a
+		// later PCK mount.
+		set_global_encryption_key_raw(candidate_key.data(), candidate_key.size());
+		wipe_key_bytes(candidate_key);
 	} else {
 		if (file->get_position() != toc_start) {
 			file->seek(toc_start);

@@ -1,0 +1,101 @@
+[gd_scene format=4 uid="uid://bdepjlb375cg5"]
+
+[ext_resource type="Script" uid="uid://dr2nmhvgh63vw" path="res://addons/directstorage_accelerator/tools/dspkg_pack_scan_dialog.gd" id="1_scan"]
+
+[node name="DSPkgPackScanDialog" type="Window" unique_id=1600488185]
+title = "Verify exported pack (DSPkg)"
+size = Vector2i(760, 360)
+visible = false
+transient = true
+min_size = Vector2i(680, 320)
+script = ExtResource("1_scan")
+
+[node name="Background" type="Panel" parent="." unique_id=540166235]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Layout" type="VBoxContainer" parent="." unique_id=981592852]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 9.0
+offset_top = 9.0
+offset_right = -9.0
+offset_bottom = -9.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="IntroLabel" type="Label" parent="Layout" unique_id=595455991]
+layout_mode = 2
+text = "Pick the .pck that shipped next to the game executable. The scan only reads this file: it does not write, repair or mount anything."
+autowrap_mode = 3
+
+[node name="PathRow" type="HBoxContainer" parent="Layout" unique_id=1295910849]
+layout_mode = 2
+
+[node name="PathLabel" type="Label" parent="Layout/PathRow" unique_id=2097727713]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 1
+text = "No pack selected."
+autowrap_mode = 3
+
+[node name="PickButton" type="Button" parent="Layout/PathRow" unique_id=124486653]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Choose .pck..."
+
+[node name="ActionRow" type="HBoxContainer" parent="Layout" unique_id=2092606681]
+layout_mode = 2
+
+[node name="ScanButton" type="Button" parent="Layout/ActionRow" unique_id=1995803762]
+unique_name_in_owner = true
+layout_mode = 2
+disabled = true
+text = "Scan pack"
+
+[node name="ScanProgress" type="ProgressBar" parent="Layout" unique_id=1035223714]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+
+[node name="VerdictLabel" type="Label" parent="Layout" unique_id=1973707198]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3
+autowrap_mode = 3
+
+[node name="EncryptionLabel" type="Label" parent="Layout" unique_id=1713095853]
+unique_name_in_owner = true
+layout_mode = 2
+autowrap_mode = 3
+
+[node name="LimitsLabel" type="Label" parent="Layout" unique_id=2016960244]
+modulate = Color(1, 1, 1, 0.75)
+layout_mode = 2
+text = "A status=ok verdict proves the pack header is well formed and that no plaintext copy of the archive key is inside this file. It does not prove payload confidentiality, integrity or tamper-resistance, and it does not prove the game runs."
+autowrap_mode = 3
+
+[node name="CopyRow" type="HBoxContainer" parent="Layout" unique_id=331003167]
+layout_mode = 2
+
+[node name="CopyRowSpacer" type="Control" parent="Layout/CopyRow" unique_id=2025088007]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CopyButton" type="Button" parent="Layout/CopyRow" unique_id=212917677]
+unique_name_in_owner = true
+layout_mode = 2
+disabled = true
+text = "Copy verdict line"
+
+[node name="PackFileDialog" type="FileDialog" parent="." unique_id=2027819222]
+title = "Open a File"
+size = Vector2i(900, 600)
+file_mode = 0
+access = 2
+filters = PackedStringArray("*.pck ; Godot pack")

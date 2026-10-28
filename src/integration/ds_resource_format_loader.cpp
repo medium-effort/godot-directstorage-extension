@@ -29,9 +29,11 @@ namespace godot {
 
 namespace {
 
+// 0 means the archive is unpaired; pairing is the random archive id, compared
+// in full 64-bit width when the expected value is non-zero.
 uint64_t resolve_expected_fingerprint(ProjectSettings *p_ps) {
-	if (p_ps && p_ps->has_setting("directstorage/expected_archive_fingerprint")) {
-		return static_cast<uint64_t>(p_ps->get_setting("directstorage/expected_archive_fingerprint"));
+	if (p_ps && p_ps->has_setting("directstorage/export/archive_id")) {
+		return static_cast<uint64_t>(p_ps->get_setting("directstorage/export/archive_id"));
 	}
 	return 0;
 }
@@ -264,7 +266,7 @@ Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_
 			static String s_last_reported_unauth_path;
 			if (s_last_reported_unauth_path != p_archive_path) {
 				s_last_reported_unauth_path = p_archive_path;
-				UtilityFunctions::push_error("DirectStorage: Decryption failed for package '" + p_archive_path + "'. Ensure valid encryption key is configured via DSPkg::set_global_encryption_key().");
+				UtilityFunctions::push_error("DirectStorage: Decryption unauthorized or key mismatch for package '" + p_archive_path + "'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.");
 			}
 		}
 		return Ref<DSPkg>();

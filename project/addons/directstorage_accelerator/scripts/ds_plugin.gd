@@ -11,27 +11,22 @@ extends EditorPlugin
 const AUTOLOAD_NAME: String = "DSRuntime"
 const AUTOLOAD_PATH: String = "res://addons/directstorage_accelerator/scripts/ds_runtime.gd"
 const LEGACY_AUTOLOAD_NAME: String = "DSBatchManager"
+const VERIFY_MENU_ITEM: String = "Verify exported pack (DSPkg)…"
+const VERIFY_DIALOG_SCENE: String = "uid://bdepjlb375cg5"
+const VERIFY_DIALOG_SCENE_PATH: String = "res://addons/directstorage_accelerator/tools/dspkg_pack_scan_dialog.tscn"
 
 var _importer: EditorImportPlugin = null
 var _export_plugin: EditorExportPlugin = null
 var _checked_scenes: Dictionary = {}
+var _verify_dialog: Window = null
 
 
 ## Registers the autoload, import plugin, export plugin, and DirectStorage
 ## runtime when the addon is enabled.
 func _enter_tree() -> void:
 	# Purge legacy autoload if present from older addon versions
-	if ProjectSettings.has_setting("autoload/" + LEGACY_AUTOLOAD_NAME):
-		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
-			remove_autoload_singleton(LEGACY_AUTOLOAD_NAME)
-		else:
-			ProjectSettings.set_setting("autoload/" + LEGACY_AUTOLOAD_NAME, null)
-
-	if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
-		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
-			add_autoload_singleton(AUTOLOAD_NAME, AUTOLOAD_PATH)
-		else:
-			ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, "*" + AUTOLOAD_PATH)
+	_sync_autoload(LEGACY_AUTOLOAD_NAME, "")
+	_sync_autoload(AUTOLOAD_NAME, AUTOLOAD_PATH)
 
 	print(
 		"[DirectStorage] Plugin enabled by MediumEffort. Autoload, Importer, and Exporter registered."
@@ -39,26 +34,27 @@ func _enter_tree() -> void:
 
 	for internal_setting in [
 		"directstorage/export/bundle_dspkg",
-		"directstorage/expected_archive_fingerprint",
-		"directstorage/project_guid",
+		"directstorage/export/archive_id",
+		"directstorage/export/protected",
 		"directstorage/archive_name",
 	]:
 		if ProjectSettings.has_setting(internal_setting):
 			ProjectSettings.set_as_internal(internal_setting, true)
 
 	if _importer == null:
-		var importer_script = load("res://addons/directstorage_accelerator/scripts/ds_importer.gd")
+		var importer_script = load("uid://kqg57i3wmiw")
 		if importer_script:
 			_importer = importer_script.new()
 			add_import_plugin(_importer)
 
 	if _export_plugin == null:
-		var exporter_script = load(
-			"res://addons/directstorage_accelerator/scripts/ds_export_plugin.gd"
-		)
+		var exporter_script = load("uid://37jisblsb2jo")
 		if exporter_script:
 			_export_plugin = exporter_script.new()
 			add_export_plugin(_export_plugin)
+
+	if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
+		add_tool_menu_item(VERIFY_MENU_ITEM, _on_verify_exported_pack)
 
 	if not scene_changed.is_connected(_on_scene_changed):
 		scene_changed.connect(_on_scene_changed)
@@ -80,19 +76,55 @@ func _exit_tree() -> void:
 		remove_export_plugin(_export_plugin)
 		_export_plugin = null
 
+	if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
+		remove_tool_menu_item(VERIFY_MENU_ITEM)
+
+	if is_instance_valid(_verify_dialog):
+		_verify_dialog.queue_free()
+		_verify_dialog = null
+
 	if scene_changed.is_connected(_on_scene_changed):
 		scene_changed.disconnect(_on_scene_changed)
 	if scene_closed.is_connected(_on_scene_closed):
 		scene_closed.disconnect(_on_scene_closed)
 	_checked_scenes.clear()
 
-	if ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
-		if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
-			remove_autoload_singleton(AUTOLOAD_NAME)
-		else:
-			ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, null)
+	_sync_autoload(AUTOLOAD_NAME, "")
 
 	print("[DirectStorage] Plugin disabled. Autoload, Importer, and Exporter unregistered.")
+
+
+## Writes (or erases) an `autoload/` entry directly, then persists project.godot.
+##
+## `add_autoload_singleton()`/`remove_autoload_singleton()` are deliberately NOT
+## used: they go through EditorAutoloadSettings, which wraps the change in a
+## GLOBAL_HISTORY undo action ("Add Autoload"/"Remove Autoload"). Committing that
+## sets the editor's global unsaved flag, which is what puts "(*)" in the window
+## title and makes quitting ask to save modified resources - and unlike a scene
+## edit it cannot be cleared by undo. Writing the setting has no undo entry, and
+## saving immediately means the entry on disk matches the plugin state instead of
+## waiting for the editor to save project.godot.
+##
+## An empty `p_path` removes the entry.
+func _sync_autoload(p_name: String, p_path: String) -> void:
+	var key := "autoload/" + p_name
+
+	if p_path.is_empty():
+		if not ProjectSettings.has_setting(key):
+			return
+		ProjectSettings.clear(key)
+	elif ProjectSettings.has_setting(key):
+		# Already registered (possibly as *uid://...) - leave the form alone.
+		return
+	else:
+		ProjectSettings.set_setting(key, "*" + p_path)
+		ProjectSettings.set_as_basic(key, true)
+
+	var err := ProjectSettings.save()
+	if err != OK:
+		push_warning(
+			"[DirectStorage] Could not persist %s to project.godot (error %d)." % [key, err]
+		)
 
 
 func _on_scene_closed(filepath: String) -> void:
@@ -163,3 +195,30 @@ func _check_scene_compatibility(root: Node, scene_path: String) -> void:
 		msg += "  • %s\n" % asset_path
 
 	print_rich(msg)
+
+
+## Opens the pack scan dialog. A fresh window is instantiated per invocation and
+## the dialog frees itself on close, so no half-finished scan survives between
+## runs or between plugin reloads.
+##
+## The window is parented to the editor's base Control rather than shown through
+## EditorInterface.popup_dialog_centered(). That helper parents it to EditorNode,
+## which is a plain Node, and theme inheritance chains are broken by nodes that
+## are neither Control nor Window - the dialog then renders with the default
+## theme no matter what is assigned to its own `theme` property. gui_base is
+## themed, and is exactly where the editor attaches its own dialogs.
+func _on_verify_exported_pack() -> void:
+	var dialog_scene := load(VERIFY_DIALOG_SCENE) as PackedScene
+	if dialog_scene == null:
+		push_error("[DirectStorage] Pack scan dialog missing at " + VERIFY_DIALOG_SCENE_PATH)
+		return
+	var dialog := dialog_scene.instantiate() as Window
+	_verify_dialog = dialog
+	var base := EditorInterface.get_base_control()
+	if base == null:
+		# Extremely unlikely; keep the API path working rather than dropping the
+		# request on the floor.
+		EditorInterface.popup_dialog_centered(dialog)
+		return
+	base.add_child(dialog)
+	dialog.popup_centered()

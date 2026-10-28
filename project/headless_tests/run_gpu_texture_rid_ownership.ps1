@@ -29,6 +29,11 @@
     Per-scenario OS-level timeout. Hangs cannot be detected in-process because
     the script's _initialize() is synchronous.
 
+.PARAMETER GodotRoot
+    Optional directory that contains the Godot console executable. When it is
+    omitted, discovery uses $env:GODOT_ROOT, then the Godot directory listed in
+    .agents/PATH_ALLOWLIST.md, then PATH.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File project/headless_tests/run_gpu_texture_rid_ownership.ps1
     powershell -ExecutionPolicy Bypass -File project/headless_tests/run_gpu_texture_rid_ownership.ps1 -Expect bug
@@ -54,8 +59,10 @@ param(
     [ValidateRange(0, 256)]
     [int]$WindowMargin = 8,
 
-    # Allowlisted in .agents/PATH_ALLOWLIST.md (godot executable path).
-    [string]$GodotRoot = '<USER_HOME>\AppData\Roaming\Godot\app_userdata\Godots\versions\Godot_v4_7_2-stable_win64_exe'
+    # Optional Godot versions directory. When it is omitted, the script uses
+    # $env:GODOT_ROOT, then the Godot directory listed in
+    # .agents/PATH_ALLOWLIST.md, then PATH.
+    [string]$GodotRoot = ''
 )
 
 Set-StrictMode -Version Latest
@@ -66,6 +73,62 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptRoot)
 $ProjectPath = Join-Path $RepoRoot 'project'
 $GdScript = Join-Path $ScriptRoot 'test_gpu_texture_rid_ownership.gd'
 $LogDir = Join-Path $RepoRoot '.cache/gpu_texture_rid_ownership'
+
+# Resolves the Godot versions directory without a machine-specific default: an
+# explicit -GodotRoot wins, then $env:GODOT_ROOT, then the Godot entry in the
+# workspace allowlist, then PATH. The directory must contain a console
+# executable, because this suite needs a streamed stdout/stderr log.
+if ([string]::IsNullOrWhiteSpace($GodotRoot)) {
+    $Candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:GODOT_ROOT)) {
+        $Candidates += $env:GODOT_ROOT
+    }
+
+    $AllowlistPath = Join-Path $RepoRoot '.agents/PATH_ALLOWLIST.md'
+    if (Test-Path -LiteralPath $AllowlistPath) {
+        foreach ($Line in Get-Content -LiteralPath $AllowlistPath) {
+            $Entry = $Line.Trim()
+            if ($Entry -eq '' -or $Entry.StartsWith('#')) {
+                continue
+            }
+            # The file also carries HTML comment lines and bare command names;
+            # only absolute Windows paths are directory candidates. Testing them
+            # with IsPathRooted would throw on the comment characters.
+            if ($Entry -notmatch '^(?:[A-Za-z]:[\\/]|\\\\)') {
+                continue
+            }
+            $Candidates += $Entry
+        }
+    }
+
+    foreach ($Name in @('godot*console*.exe', 'godot*.exe')) {
+        $Command = Get-Command $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $Command) {
+            $Candidates += [string]$Command.Source
+        }
+    }
+
+    foreach ($Candidate in $Candidates) {
+        $Directory = $null
+        if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
+            $Directory = Split-Path -Parent $Candidate
+        } elseif (Test-Path -LiteralPath $Candidate -PathType Container) {
+            $Directory = $Candidate
+        }
+        if ($null -eq $Directory) {
+            continue
+        }
+        $Console = Get-ChildItem -Path $Directory -Filter '*console*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $Console) {
+            $GodotRoot = $Directory
+            break
+        }
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($GodotRoot)) {
+    throw "Godot console executable not found. Pass -GodotRoot <directory>, set GODOT_ROOT, or add the Godot directory to .agents/PATH_ALLOWLIST.md."
+}
 
 if (-not (Test-Path -LiteralPath $ProjectPath)) {
     throw "Project directory not found: $ProjectPath"

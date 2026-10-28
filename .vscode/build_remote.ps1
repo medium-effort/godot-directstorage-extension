@@ -39,6 +39,10 @@ function Get-FormattedElapsed {
 # The Godot export plugin reads the OS environment only, so a key declared in .env is not the
 # R7-14 hazard and must not abort compiling builds.
 $AmbientKeySnapshot = $env:DSPKG_ENCRYPTION_KEY
+# Same snapshot for the key FILE variable, so the legacy-build warning below can say whether
+# the key came from the shell/IDE environment or from .env. Without this the two are
+# indistinguishable after the .env merge, and "I commented the line out" looks like a lie.
+$AmbientKeyFileSnapshot = $env:DSPKG_ENCRYPTION_KEY_FILE
 
 function Write-Status {
     param(
@@ -108,29 +112,39 @@ function Write-VerboseHost {
     }
 }
 
-# --- Deployed-binary audit (read-only, advisory) -----------------------------
+# --- Deployed-binary audit (read-only) --------------------------------------
 # Compares the files actually present in a deployed addon directory against the
 # paths declared by that directory's .gdextension (the only files Godot loads).
 # It never deletes, moves, or repairs anything: binaries left behind by an older
 # naming scheme, hand copies, or stray experiments are reported so a human or an
 # agent can decide what to remove.
+#
+# One condition is not advisory: every binary a distribution ships (editor,
+# template_debug, template_release) must be stamped dspkg-key-id=none. A keyed
+# binary carries a baked secret, which makes it a source build, and a source
+# build is not distributed. The audit has no archive to inspect - this script
+# never exports a project - so it makes no claim about how an archive's key
+# reaches the game; the boot sentinel and the pack scan own that pairing.
 function Get-DeployBinAudit {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string]$AddonDir,
-        [switch]$RequireManifest
+        [switch]$RequireManifest,
+        # A run with explicit key input (-EncryptionKeyFile/-EncryptionKey) is a
+        # source build, so a baked key is expected instead of a defect.
+        [switch]$AllowBakedKey
     )
 
     if (-not (Test-Path -LiteralPath $AddonDir -PathType Container)) {
         $skipStatus = if ($RequireManifest) { 'error' } else { 'skipped' }
-        return [pscustomobject]@{ addon_dir = $AddonDir; status = $skipStatus; reason = 'addon directory not found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0; binaries = @() }
+        return [pscustomobject]@{ addon_dir = $AddonDir; status = $skipStatus; reason = 'addon directory not found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0; binaries = @(); policy_violations = @() }
     }
 
     $manifestFiles = @(Get-ChildItem -LiteralPath $AddonDir -Filter '*.gdextension' -File -ErrorAction SilentlyContinue)
     if ($manifestFiles.Count -eq 0) {
         $skipStatus = if ($RequireManifest) { 'error' } else { 'skipped' }
-        return [pscustomobject]@{ addon_dir = $AddonDir; status = $skipStatus; reason = 'no .gdextension manifest found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0; binaries = @() }
+        return [pscustomobject]@{ addon_dir = $AddonDir; status = $skipStatus; reason = 'no .gdextension manifest found'; expected = @(); missing = @(); undeclared = @(); ignored_foreign = 0; binaries = @(); policy_violations = @() }
     }
 
     # Only [libraries] and [dependencies] declare files that must exist on disk.
@@ -266,45 +280,89 @@ function Get-DeployBinAudit {
 
             $targetProp = if ($buildManifestJson -and $buildManifestJson.targets) { $buildManifestJson.targets.PSObject.Properties[$targetFileName] } else { $null }
             $manifestEnc = if ($targetProp) { $targetProp.Value.encryption } else { $null }
-            $manifestKeyId = if ($manifestEnc -and $manifestEnc.enabled -and $manifestEnc.key_id) {
-                $manifestEnc.key_id.ToLowerInvariant()
-            } else {
-                "none"
+            # encryption.enabled is not a protection claim. A keyless DLL ships beside an
+            # archive whose key arrives through the encrypted PCK, so 'enabled' can be true
+            # while this binary holds no key at all. Only key_id names the key compiled in.
+            $manifestKeyId = "none"
+            if ($manifestEnc -and $manifestEnc.key_id) {
+                $manifestKeyId = ([string]$manifestEnc.key_id).ToLowerInvariant()
             }
+
+            $manifestKeySource = $null
+            if ($manifestEnc -and $manifestEnc.PSObject.Properties['key_source'] -and $manifestEnc.key_source) {
+                $manifestKeySource = ([string]$manifestEnc.key_source).ToLowerInvariant()
+            }
+            elseif ($targetProp -and $targetProp.Value.PSObject.Properties['key_source'] -and $targetProp.Value.key_source) {
+                $manifestKeySource = ([string]$targetProp.Value.key_source).ToLowerInvariant()
+            }
+            $keySourceText = 'undeclared'
+            if ($manifestKeySource) { $keySourceText = $manifestKeySource }
+
+            $isKeyed = ($binaryTag -match '^[0-9a-fA-F]{16}$')
+            $isKeyless = ($binaryTag -eq 'none')
             $isMatch = ($binaryTag -eq $manifestKeyId)
 
+            # The distribution rule: a distributed binary must be stamped dspkg-key-id=none.
+            # Anything else is either a baked key or an unreadable tag, and neither can be
+            # shipped. A run with explicit key input is a source build and is exempt.
+            $policyReason = ""
+            if (-not $AllowBakedKey) {
+                if ($isKeyed) {
+                    $policyReason = "binary carries a baked key ($binaryTag); distributed binaries must be keyless - rebuild without -EncryptionKeyFile/-EncryptionKey, or use a source build for a baked key"
+                }
+                elseif (-not $isKeyless) {
+                    $policyReason = "no dspkg-key-id tag found; a distributed binary must be stamped dspkg-key-id=none"
+                }
+            }
+            if (-not $policyReason -and $manifestKeySource) {
+                if ($manifestKeySource -eq 'none' -and $isKeyed) {
+                    $policyReason = "manifest records key_source 'none' but the binary carries a baked key ($binaryTag)"
+                }
+                elseif ($manifestKeySource -eq 'baked' -and -not $AllowBakedKey) {
+                    $policyReason = "manifest records key_source 'baked'; a distributed target must record key_source 'none' and ship a keyless binary"
+                }
+                elseif ($manifestKeySource -notin @('none', 'baked')) {
+                    $policyReason = "manifest records unrecognised key_source '$manifestKeySource'; a distributed target must record 'none'"
+                }
+            }
+
             $binAudits += [pscustomobject]@{
-                target          = $targetFileName
-                path            = $full
-                section         = 'libraries'
-                tag             = $binaryTag
-                manifest_key_id = $manifestKeyId
-                isMatch         = $isMatch
-                verified        = $true
+                target              = $targetFileName
+                path                = $full
+                section             = 'libraries'
+                tag                 = $binaryTag
+                manifest_key_id     = $manifestKeyId
+                manifest_key_source = $keySourceText
+                isMatch             = $isMatch
+                policy_reason       = $policyReason
+                verified            = $true
             }
         }
         else {
             $binAudits += [pscustomobject]@{
-                target          = $targetFileName
-                path            = $full
-                section         = 'dependencies'
-                tag             = "not_applicable"
-                manifest_key_id = "not_applicable"
-                isMatch         = $true
-                verified        = $true
+                target              = $targetFileName
+                path                = $full
+                section             = 'dependencies'
+                tag                 = "not_applicable"
+                manifest_key_id     = "not_applicable"
+                manifest_key_source = "not_applicable"
+                isMatch             = $true
+                policy_reason       = ""
+                verified            = $true
             }
         }
     }
 
     $audit = [pscustomobject]@{
-        addon_dir       = $AddonDir
-        status          = 'clean'
-        reason          = ''
-        expected        = $expectedRel
-        missing         = $missing
-        undeclared      = $undeclared
-        ignored_foreign = $ignoredForeign
-        binaries        = $binAudits
+        addon_dir         = $AddonDir
+        status            = 'clean'
+        reason            = ''
+        expected          = $expectedRel
+        missing           = $missing
+        undeclared        = $undeclared
+        ignored_foreign   = $ignoredForeign
+        binaries          = $binAudits
+        policy_violations = @($binAudits | Where-Object { $_.policy_reason })
     }
 
     if (-not $RequireManifest -and @($binAudits | Where-Object { $_.tag -match '^[0-9a-fA-F]{16}$' }).Count -gt 0) {
@@ -314,7 +372,13 @@ function Get-DeployBinAudit {
 
     $manifestMissing = ($null -eq $buildManifestJson)
     $mismatchCount = @($binAudits | Where-Object { $_.isMatch -eq $false }).Count
-    if ($manifestMissing -and $RequireManifest) {
+    if ($audit.policy_violations.Count -gt 0) {
+        # Not advisory: a distributed binary must be keyless, so this fails the
+        # build (or the -AuditOnly exit code) before anything else is reported.
+        $audit.status = 'violation'
+        $audit.reason = 'a distributed binary must be stamped dspkg-key-id=none'
+    }
+    elseif ($manifestMissing -and $RequireManifest) {
         $audit.status = 'error'
         $audit.reason = 'build_manifest.json missing from addon bin directory (required for keyed/release build)'
     }
@@ -363,6 +427,16 @@ function Write-DeployBinAudit {
                 Write-Host ("    {0}" -f $name) -ForegroundColor Red
             }
         }
+        return
+    }
+
+    if ($Audit.status -eq 'violation') {
+        Write-Host ("[audit] {0}: KEY POLICY VIOLATION - distributed binaries must be keyless" -f $Audit.addon_dir) -ForegroundColor Red
+        foreach ($bin in @($Audit.policy_violations)) {
+            Write-Host ("  {0}: {1}" -f $bin.target, $bin.policy_reason) -ForegroundColor Red
+        }
+        Write-Host "  Every editor, template_debug and template_release binary ships keyless." -ForegroundColor Yellow
+        Write-Host "  A keyed binary is a source build and is not distributed; use a source build for a baked key." -ForegroundColor Yellow
         return
     }
 
@@ -436,7 +510,8 @@ function Invoke-DeployAudit {
         [Parameter(Mandatory = $true)]
         [string[]]$AddonDirs,
         [switch]$Json,
-        [switch]$RequireManifest
+        [switch]$RequireManifest,
+        [switch]$AllowBakedKey
     )
 
     $results = @()
@@ -450,10 +525,11 @@ function Invoke-DeployAudit {
         $dedupeKey = $resolved.ToLowerInvariant()
         if ($seen -contains $dedupeKey) { continue }
         $seen += $dedupeKey
-        $results += Get-DeployBinAudit -AddonDir $resolved -RequireManifest:$RequireManifest
+        $results += Get-DeployBinAudit -AddonDir $resolved -RequireManifest:$RequireManifest -AllowBakedKey:$AllowBakedKey
     }
 
-    $hasError = @($results | Where-Object { $_.status -in @('mismatch', 'error') }).Count -gt 0
+    $hasError = @($results | Where-Object { $_.status -in @('mismatch', 'error', 'violation') }).Count -gt 0
+    $hasPolicyViolation = @($results | Where-Object { $_.status -eq 'violation' }).Count -gt 0
 
     if ($Json) {
         [Console]::Out.WriteLine((ConvertTo-Json -InputObject @($results) -Depth 5))
@@ -464,7 +540,7 @@ function Invoke-DeployAudit {
         }
     }
 
-    return $hasError
+    return [pscustomobject]@{ HasError = $hasError; HasPolicyViolation = $hasPolicyViolation }
 }
 
 # Load configuration from .env file
@@ -486,17 +562,68 @@ if (-not $EnvFilePath) {
     Show-BuildFailure -Step "Configuration Error" -Message "Configuration file '.env' not found! Please copy '.env.example' to '.env' and configure REMOTE_HOST and REMOTE_DIR." -Code 1
 }
 
-# Parse .env file (preserve pre-existing process environment variables to enforce ambient > .env precedence, R8-06)
-Get-Content $EnvFilePath | ForEach-Object {
-    $line = $_.Trim()
+# Variables this script consumes. Anything here that arrives pre-set in the environment is
+# reported below when it disagrees with .env, or when .env does not declare it at all:
+# ambient > .env remains the rule (R8-06), but a *silent* override is how a stale IDE/CI
+# export turned every build into a keyed source build for days without anyone noticing.
+$TrackedEnvKeys = @(
+    "REMOTE_BUILD", "REMOTE_HOST", "REMOTE_HOST_FALLBACK", "REMOTE_DIR",
+    "ENABLE_POST_BUILD_ADDON_SYNC", "SYNC_ADDON_DIR", "SYNC_TEST_DIR",
+    "SYNC_ADDON_COPYABLE_DIR", "DSPKG_ENCRYPTION_KEY_FILE", "DSPKG_ENCRYPTION_KEY"
+)
+
+# Parse .env without touching the environment yet, so it can be compared with it.
+$EnvFileValues = @{}
+foreach ($rawLine in @(Get-Content -LiteralPath $EnvFilePath)) {
+    $line = $rawLine.Trim()
     if ($line -and -not $line.StartsWith("#")) {
         $key, $value = $line -split '=', 2
         if ($key -and $value) {
-            $k = $key.Trim()
-            if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($k, "Process"))) {
-                [Environment]::SetEnvironmentVariable($k, $value.Trim().Trim('"').Trim("'"), "Process")
-            }
+            $EnvFileValues[$key.Trim()] = $value.Trim().Trim('"').Trim("'")
         }
+    }
+}
+# Compare every key the file declares too, not just the ones this script reads directly.
+foreach ($fileKey in @($EnvFileValues.Keys)) {
+    if ($TrackedEnvKeys -notcontains $fileKey) { $TrackedEnvKeys += $fileKey }
+}
+
+# Snapshot the genuine process environment before the merge so an override can be detected.
+$AmbientEnvSnapshot = @{}
+foreach ($k in $TrackedEnvKeys) {
+    $AmbientEnvSnapshot[$k] = [Environment]::GetEnvironmentVariable($k, "Process")
+}
+
+# Apply the file, preserving pre-existing process variables (ambient > .env, R8-06).
+foreach ($k in @($EnvFileValues.Keys)) {
+    if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($k, "Process"))) {
+        [Environment]::SetEnvironmentVariable($k, $EnvFileValues[$k], "Process")
+    }
+}
+
+# Report each divergence once. Matching values stay silent, so a normal run prints nothing.
+$EnvOverrideNotes = @()
+if (-not $ResetKeyHeader) {
+    foreach ($k in $TrackedEnvKeys) {
+        $ambient = $AmbientEnvSnapshot[$k]
+        $fromFile = $EnvFileValues[$k]
+        if ($ambient -and $fromFile -and $ambient -ne $fromFile) {
+            $EnvOverrideNotes += ("[Config] {0}: environment value '{1}' overrides .env value '{2}'" -f $k, $ambient, $fromFile)
+        }
+        elseif ($ambient -and -not $fromFile) {
+            $EnvOverrideNotes += ("[Config] {0}: set in the environment ('{1}') but not declared in .env" -f $k, $ambient)
+        }
+    }
+}
+if ($EnvOverrideNotes.Count -gt 0) {
+    foreach ($note in $EnvOverrideNotes) {
+        Write-Status $note -ForegroundColor Yellow
+    }
+    if (@($EnvOverrideNotes | Where-Object { $_ -match "DSPKG_" }).Count -gt 0) {
+        Write-Status "[Config] A DSPKG_* value from the environment changes what this build produces (baked archive key). Expected only if you set it deliberately for this run; otherwise something injected it - unset it, or pass -ResetKeyHeader, and rebuild." -ForegroundColor Yellow
+    }
+    else {
+        Write-Status "[Config] The environment overrides .env for the value(s) above. Expected if you set them for this run; if not, an IDE, extension or CI job injected them." -ForegroundColor DarkYellow
     }
 }
 
@@ -611,6 +738,8 @@ if ($AuditOnly) {
 
     # Audit must not depend on key material: key resolution runs only after this block (R10-09), so the
     # manifest requirement comes from the explicit switch plus per-directory keyed-tag inference (R8-13).
+    # A keyed tag is reported as a policy violation without a key file: distributed binaries must be
+    # keyless, and audit mode has no way to declare the deployment a source build.
     if ($EncryptionKeyFile -or $EncryptionKey) {
         Write-Status "[AuditOnly] Key arguments are ignored in audit mode; pass -RequireManifest to require build_manifest.json." -ForegroundColor Yellow
     }
@@ -622,8 +751,8 @@ if ($AuditOnly) {
         $AuditTargets = @($DefaultAddonDir) + @(Get-ConfiguredAddonDir)
     }
     $auditExpectsManifest = [bool]$RequireManifest
-    $hasError = Invoke-DeployAudit -AddonDirs $AuditTargets -Json:$Json -RequireManifest:$auditExpectsManifest
-    if ($hasError) { exit 1 } else { exit 0 }
+    $auditResult = Invoke-DeployAudit -AddonDirs $AuditTargets -Json:$Json -RequireManifest:$auditExpectsManifest
+    if ($auditResult.HasError) { exit 1 } else { exit 0 }
 }
 
 # --- Build concurrency guard -------------------------------------------------
@@ -701,6 +830,8 @@ elseif ($null -eq $BuildGuard.Owned) {
 $ResolvedKeyFile = ""
 $KeyFileRelWin = ""
 $EffectiveKey = ""
+# Human-readable provenance of the resolved key, filled in below and printed by the legacy warning.
+$KeyInputSource = ""
 if ($ResetKeyHeader) {
     # Strip ambient key variables from child build environments so child processes cannot re-key (R7-13)
     Remove-Item Env:DSPKG_ENCRYPTION_KEY -ErrorAction SilentlyContinue
@@ -737,6 +868,19 @@ else {
         }
         $EffectiveKey = $rawFileContent
 
+        # Provenance for the legacy warning: three inputs can reach this point, and after the
+        # .env merge the last two are identical in $env:DSPKG_ENCRYPTION_KEY_FILE. The
+        # pre-merge snapshot is what tells "your shell/IDE exported it" apart from ".env".
+        if ($isCliKeyFile) {
+            $KeyInputSource = "-EncryptionKeyFile '$ResolvedKeyFile'"
+        }
+        elseif ($AmbientKeyFileSnapshot) {
+            $KeyInputSource = "DSPKG_ENCRYPTION_KEY_FILE='$CandidateKeyFile' inherited from the process environment (it is exported in the shell or IDE that launched this build, not read from .env)"
+        }
+        else {
+            $KeyInputSource = "DSPKG_ENCRYPTION_KEY_FILE='$CandidateKeyFile' declared in .env"
+        }
+
         # Strip ambient key file variable when CLI key is provided to ensure SCons cannot invert precedence (R7-01)
         if ($isCliKeyFile) {
             Remove-Item Env:DSPKG_ENCRYPTION_KEY_FILE -ErrorAction SilentlyContinue
@@ -755,23 +899,38 @@ else {
             Show-BuildFailure -Step "Validation" -Message "EncryptionKey must be a 64-character hexadecimal string." -Code 1
         }
         $EffectiveKey = $trimmedKey
+        $KeyInputSource = "-EncryptionKey (raw hex on the command line)"
         Remove-Item Env:DSPKG_ENCRYPTION_KEY_FILE -ErrorAction SilentlyContinue
     }
 }
 
-# Guard against a genuinely exported DSPKG_ENCRYPTION_KEY leaking into the export plugin without key arguments
-# (R7-14, R8-01, R8-02). Evaluated strictly AFTER $CandidateKeyFile / $EffectiveKey resolution (R8-01), strictly for
-# compiling builds (R8-02), and strictly on the pre-.env snapshot (R9-02) so a key declared only in .env - which the
-# Godot editor never reads - does not abort the build.
+if ($EffectiveKey) {
+    # Deprecated shape. The supported model generates a random archive key per
+    # export and delivers it inside the encrypted PCK, so nothing about the key
+    # belongs in the binary. This warning reaches two audiences - a contributor
+    # building the addon's release binaries and a user building the DLL for their
+    # own game - so it states the consequence instead of assuming who ships what.
+    # Warn once, before the compile, while the user can still abort;
+    # DSPKG_BAKE_KEY_WARNED stops a local SCons run repeating it.
+    $LegacyKeySource = if ($KeyInputSource) { $KeyInputSource } else { "unknown (no key input recorded)" }
+    Write-Status ("[Legacy] DEPRECATED BUILD SHAPE: a fixed archive key is baked into the DLL. The supported path generates a random archive key per export and delivers it inside the encrypted PCK. Whatever you ship from this build carries the key, so rebuild without a key input before releasing. Key input: {0}." -f $LegacyKeySource) -ForegroundColor Yellow
+    $env:DSPKG_BAKE_KEY_WARNED = "1"
+}
+
+# Guard against a stale exported DSPKG_ENCRYPTION_KEY: no component reads that variable any more, so a build
+# that accepted it would misreport where its key came from (R7-14, R8-01, R8-02). Evaluated strictly AFTER
+# $CandidateKeyFile / $EffectiveKey resolution (R8-01), strictly for compiling builds (R8-02), and strictly on
+# the pre-.env snapshot (R9-02) so a key declared only in .env - which the Godot editor never reads - does not
+# abort the build.
 if (-not $AuditOnly -and $AmbientKeySnapshot -and -not $EffectiveKey -and -not $ResetKeyHeader) {
-    Show-BuildFailure -Step "Validation" -Message "DSPKG_ENCRYPTION_KEY is exported in the process environment, but builds require -EncryptionKeyFile, -EncryptionKey, or DSPKG_ENCRYPTION_KEY_FILE. Building a keyless DLL while the export plugin uses this exported key would cause runtime decryption failure. Unset DSPKG_ENCRYPTION_KEY (or move it to .env, where only build scripts read it), supply -EncryptionKeyFile, or pass -ResetKeyHeader." -Code 1
+    Show-BuildFailure -Step "Validation" -Message "DSPKG_ENCRYPTION_KEY is exported in the process environment, but no component reads it any more: the export plugin generates a random archive key per export and delivers it inside the encrypted PCK. A legacy source build bakes a key only via -EncryptionKeyFile, -EncryptionKey, or DSPKG_ENCRYPTION_KEY_FILE. Unset DSPKG_ENCRYPTION_KEY (or move it to .env, where only build scripts read it), supply -EncryptionKeyFile, or pass -ResetKeyHeader." -Code 1
 }
 
 # A DSPKG_ENCRYPTION_KEY that came from .env (i.e. is not in the pre-.env snapshot) is invisible to the
 # Godot editor and useless for the build, but would still be inherited by SCons and trip its own gate.
 # Drop it from the child environment with a warning so both entry points agree (R9-02).
 if ($env:DSPKG_ENCRYPTION_KEY -and -not $AmbientKeySnapshot) {
-    Write-Status "[Config] Ignoring DSPKG_ENCRYPTION_KEY declared in .env: the Godot editor cannot read .env. Export it in your shell if the export plugin needs it." -ForegroundColor Yellow
+    Write-Status "[Config] Ignoring DSPKG_ENCRYPTION_KEY declared in .env: the Godot editor cannot read .env, and no component reads this variable any more. This build bakes no key; pass -EncryptionKeyFile for a legacy source build." -ForegroundColor Yellow
     Remove-Item Env:DSPKG_ENCRYPTION_KEY -ErrorAction SilentlyContinue
 }
 
@@ -966,7 +1125,7 @@ try {
 # (so D:/ssh-tunnel/... parses /ssh-tunnel as a flag), while tar/scp
 # expect forward slashes. Use the Win variant for cmd builtins
 # (mkdir/cd/del/echo) and the Tar variant for tar -C / scp paths.
-# NOTE: use .Replace() (literal) — -replace is regex and a lone '\' throws
+# NOTE: use .Replace() (literal); -replace is regex and a lone '\' throws
 # "InvalidRegularExpression", leaving the variable empty and breaking tar -C.
 $RemoteDirWin = $RemoteDir.Replace('/', '\')
 $RemoteDirTar = $RemoteDir.Replace('\', '/')
@@ -984,11 +1143,101 @@ $AddonBinaryStem = "dsgd"
 # Every tar-exclude / pull / verify test-library pattern below derives from this.
 $TestLibraryName = "libdsgd_tests"
 
+# Remote artifact hashes (verify_remote.ps1 -Artifacts), fetched at most once per
+# run: the [5/6] pull needs them to decide whether a locked file is already in
+# sync, and [5b/6] needs the same map, so caching removes a duplicate SSH
+# handshake. A failed SSH yields no "ARTIFACT:" lines, which is exactly the
+# empty-map condition [5b/6] already reports on.
+$script:RemoteArtifactHashCache = $null
+$script:RemoteArtifactRawOutput = @()
+
+function Get-RemoteArtifactHashMap {
+    if ($null -ne $script:RemoteArtifactHashCache) {
+        return $script:RemoteArtifactHashCache
+    }
+    $artOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -Artifacts 2>&1
+    $script:RemoteArtifactRawOutput = @($artOut | ForEach-Object { $_.ToString() })
+    $hashes = @{}
+    foreach ($artText in $script:RemoteArtifactRawOutput) {
+        if ($artText.StartsWith("ARTIFACT:")) {
+            $artRest = $artText.Substring(9)
+            $artSep = $artRest.IndexOf("|")
+            if ($artSep -gt 0) {
+                $hashes[$artRest.Substring(0, $artSep)] = $artRest.Substring($artSep + 1)
+            }
+        }
+    }
+    $script:RemoteArtifactHashCache = $hashes
+    return $hashes
+}
+
+# Returns "<name> (PID <n>)" of the process mapping $Path, or $null when the file
+# can be opened for exclusive write. Only called on a pull failure, so the cost of
+# walking process modules (~ms per live process, wrapped against access denied)
+# never lands on the success path.
+function Get-FileLockingProcess {
+    param([string]$Path)
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $stream.Close()
+        return $null
+    }
+    catch {
+        $null = $_
+    }
+    $resolved = $Path
+    try {
+        $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+    }
+    catch {
+        $null = $_
+    }
+    foreach ($proc in @(Get-Process -ErrorAction SilentlyContinue)) {
+        try {
+            foreach ($module in $proc.Modules) {
+                if ($module.FileName -and [string]::Equals($module.FileName, $resolved, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return ("{0} (PID {1})" -f $proc.ProcessName, $proc.Id)
+                }
+            }
+        }
+        catch {
+            $null = $_
+        }
+    }
+    return "an unidentified process"
+}
+
+# Human-readable lock report for a failed pull, or "" when nothing is locked.
+# Without this the failure reads as a Device B copy error: OpenSSH reports a
+# local sharing violation as a truncated "open local ...: Broken pipe", because
+# a running Godot maps dstorage.dll / dstoragecore.dll from the addon bin dir
+# (those are plain LoadLibrary dependencies; only the GDExtension DLLs get the
+# hot-reload "~" rename that frees the real filename).
+function Get-LockedArtifactReport {
+    param(
+        [string]$Directory,
+        [string]$Pattern
+    )
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($file in @(Get-ChildItem -LiteralPath $Directory -Filter $Pattern -File -ErrorAction SilentlyContinue)) {
+        $holder = Get-FileLockingProcess -Path $file.FullName
+        if ($holder) {
+            $lines.Add(("  {0} is locked by {1}" -f $file.Name, $holder))
+        }
+    }
+    if ($lines.Count -eq 0) {
+        return ""
+    }
+    return ("`n Locked local artifact(s) - scp cannot replace a mapped file:" + "`n" + ($lines -join "`n") + "`n  Close the holding process (normally the Godot editor, or a running game instance that initialized the DirectStorage backend) and rerun.")
+}
+
 function Invoke-ScpArtifactWithRetry {
     param(
         [string]$RemotePath,
         [string]$LocalDest,
-        [int]$MaxRetries = 3
+        [int]$MaxRetries = 3,
+        [string]$LocalPattern,
+        [switch]$AcceptAlreadyInSync
     )
     for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
         & scp -4 -C -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$RemotePath" $LocalDest
@@ -1000,7 +1249,43 @@ function Invoke-ScpArtifactWithRetry {
             Start-Sleep -Seconds 2
         }
     }
-    return $false
+
+    if (-not $AcceptAlreadyInSync -or -not $LocalPattern) {
+        return $false
+    }
+
+    # Opt-in only, and only for the vendored runtime DLLs: those are shipped FROM
+    # Device A in step [3/6], so pulling them back is a content no-op and a lock
+    # on them cannot lose build output. The pull counts as satisfied only when
+    # EVERY artifact the glob covers already exists locally with Device B's exact
+    # bytes - a missing file, a stale file, or an unreachable verifier still
+    # fails. Build products never pass this switch: a locked dsgd_64.dll means
+    # the DLL on disk is not the one just compiled.
+    $remoteHashes = Get-RemoteArtifactHashMap
+    $remoteNames = @($remoteHashes.Keys | Where-Object { $_ -like $LocalPattern })
+    if ($remoteNames.Count -eq 0) {
+        return $false
+    }
+    $lockedNames = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $remoteNames) {
+        $localFile = Join-Path $LocalDest $name
+        if (-not (Test-Path -LiteralPath $localFile)) {
+            return $false
+        }
+        $localHash = (Get-FileHash -LiteralPath $localFile -Algorithm SHA256).Hash
+        if ($localHash -ne $remoteHashes[$name]) {
+            return $false
+        }
+        $holder = Get-FileLockingProcess -Path $localFile
+        if ($holder) {
+            $lockedNames.Add(("{0} held by {1}" -f $name, $holder))
+        }
+    }
+    Write-Status ("  [warn] {0}: pull failed but the local copy is already byte-identical to Device B; not replacing it." -f $LocalPattern) -ForegroundColor Yellow
+    if ($lockedNames.Count -gt 0) {
+        Write-Status ("         " + ($lockedNames -join "; ")) -ForegroundColor DarkGray
+    }
+    return $true
 }
 
 # 0. Check local disk space on Device A
@@ -1167,7 +1452,18 @@ $tarExcludesList = @(
     "--exclude=./.projectmem/*",
     "--exclude=./logs/*",
     "--exclude=./compile_commands.json",
-    "--exclude=./test-results.xml"
+    "--exclude=./test-results.xml",
+    # --- Local test/export output, regenerated on Device A: both trees are gitignored
+    # and Device B never reads them (it only compiles), but tar does not read
+    # .gitignore. Measured 2026-10-28: leaving them in shipped 1.35 GB and cost 130.6 s
+    # in step [3/6] -- one export-contract gate run (1152 MB, 1348 files) plus the local
+    # export output (200 MB, 8 files). With both excluded the same archive is 5.4 MB
+    # and the transfer takes 0.8 s. out/ also holds per-case project copies that
+    # duplicate the addon's GDScript UIDs, which has no business travelling to B.
+    # Root-anchored with ./ like ./build/* above; a bare "out" pattern would strip
+    # every directory component named out.
+    "--exclude=./project/exports/*",
+    "--exclude=./project/headless_tests/export_contract/out/*"
 )
 if ($KeyFileRelWin) {
     $tarExcludesList += ("--exclude=" + $KeyFileRelWin.Replace('\', '/'))
@@ -1247,9 +1543,18 @@ if (-not $SkipVerify) {
 # writes a CORRUPT archive when compressing to stdout: `tar --zstd -cf -`
 # reproduces "Truncated tar archive detected while reading data" on extraction
 # (verified with a two-file tree), while `--zstd -cf <file>` works fine -- and
-# the SSH stream cannot use a file. After the excludes above the payload is
-# ~10 MB, so gzip costs well under a second anyway.
-$tarCmd = "tar -czf - $tarExcludes . | ssh -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost ""tar -xzf - -C $RemoteDirTar"""
+# the SSH stream cannot use a file. The payload the excludes leave behind is now
+# reported in MB by the [3/6] line below, so a regression shows up as a number
+# instead of a hardcoded guess (this comment used to claim ~10 MB, and the real
+# payload had grown to 1.35 GB once generated trees escaped the excludes).
+#
+# Size reporting: bsdtar has no --totals, and the archive goes straight to stdout, so
+# the only exact counter available is OpenSSH's own verbose summary ("Transferred:
+# sent N, received M bytes"). -v writes it to a temp log that is parsed and deleted
+# here: no second payload pass, no temp archive, no extra SSH connection.
+$syncSshLog = Join-Path ([System.IO.Path]::GetTempPath()) ("dsgd_sync_ssh_{0}.log" -f $PID)
+Remove-Item -LiteralPath $syncSshLog -Force -ErrorAction SilentlyContinue
+$tarCmd = "tar -czf - $tarExcludes . | ssh -v -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost ""tar -xzf - -C $RemoteDirTar"" 2> ""$syncSshLog"""
 $syncTimer = [System.Diagnostics.Stopwatch]::StartNew()
 $syncSuccess = $false
 for ($syncAttempt = 1; $syncAttempt -le 2; $syncAttempt++) {
@@ -1264,15 +1569,43 @@ for ($syncAttempt = 1; $syncAttempt -le 2; $syncAttempt++) {
     }
 }
 $syncTimer.Stop()
+# Parse the size before anything can exit on failure. The log is kept until after
+# the success check: with stderr now redirected, ssh/tar diagnostics would otherwise
+# vanish, so a failed sync quotes the tail instead of just "it failed".
+$syncSentMb = $null
+$syncSshTail = @()
+if (Test-Path -LiteralPath $syncSshLog) {
+    $syncSshLogLines = @(Get-Content -LiteralPath $syncSshLog -ErrorAction SilentlyContinue)
+    $transferredLine = $syncSshLogLines | Select-String -Pattern 'Transferred: sent (\d+), received (\d+) bytes' | Select-Object -Last 1
+    if ($transferredLine) {
+        $syncSentMb = [math]::Round(([double]$transferredLine.Matches[0].Groups[1].Value) / 1MB, 2)
+    }
+    $syncSshTail = @($syncSshLogLines | Where-Object { $_ -match '\S' -and $_ -notmatch '^debug1:' } | Select-Object -Last 6)
+    if ($syncSshTail.Count -eq 0) {
+        $syncSshTail = @($syncSshLogLines | Where-Object { $_ -match '\S' } | Select-Object -Last 6)
+    }
+}
 # The manifest existed only to ride this stream (see [3b/6 prep] above). Delete
 # it before any exit path so a failed or interrupted build leaves no stray file
 # in the repo root.
 Remove-Item "sync_manifest.tmp" -Force -ErrorAction SilentlyContinue
 
 if (-not $syncSuccess) {
-    Show-BuildFailure -Step "Step [3/6] Source Sync" -Message "Failed to sync source files to Device B ($ActiveHost)." -Code 1
+    $syncFailureDetail = if ($syncSshTail.Count -gt 0) { "`nssh/tar diagnostics (last $(@($syncSshTail).Count) line(s)):`n" + ($syncSshTail -join "`n") } else { "" }
+    Remove-Item -LiteralPath $syncSshLog -Force -ErrorAction SilentlyContinue
+    Show-BuildFailure -Step "Step [3/6] Source Sync" -Message ("Failed to sync source files to Device B ($ActiveHost).$syncFailureDetail") -Code 1
 }
-Write-Status ("    [3/6 Sync] archive+transfer: {0:F1}s (gzip)" -f $syncTimer.Elapsed.TotalSeconds) -ForegroundColor DarkCyan
+Remove-Item -LiteralPath $syncSshLog -Force -ErrorAction SilentlyContinue
+$SyncSizeText = if ($null -eq $syncSentMb) {
+    "size not reported (ssh -v summary missing from the temp log)"
+}
+elseif ($syncSentMb -lt 1) {
+    "{0:N0} KB sent to Device B" -f ($syncSentMb * 1024)
+}
+else {
+    "{0:N2} MB sent to Device B" -f $syncSentMb
+}
+Write-Status ("    [3/6 Sync] archive+transfer: {0:F1}s (gzip), {1}" -f $syncTimer.Elapsed.TotalSeconds, $SyncSizeText) -ForegroundColor DarkCyan
 
 # [3b/6] Verify the sync end-to-end. The manifest hashed on Device A before the
 # tar ran (see [3b/6 prep] above) travelled inside the archive; here it is
@@ -1390,7 +1723,7 @@ if (-not $SkipVerify) {
 
 # 4. Prep + SCons build on Device B. Prep (orphan cleanup + marker reset) runs
 # FIRST in a single SSH round-trip, and [4/6] Compiling prints only after prep
-# finishes — so a slow cleanup is never mistaken for a slow compile.
+# finishes, so a slow cleanup is never mistaken for a slow compile.
 $TestsFlag = if ($IncludeTests) { " tests=true" } else { "" }
 $RemoteMarkerWin = "$RemoteDirWin\gdextest_scons.ok"
 
@@ -1523,10 +1856,19 @@ if (!(Test-Path $ArtifactLocalDir)) {
 
 # Pull runtime DLLs and manifest with on-the-fly compression (-C) and bounded retries
 if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$ArtifactRemoteDir/$AddonBinaryStem*.dll" -LocalDest "$ArtifactLocalDir/")) {
-    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy compiled $AddonBinaryStem*.dll from Device B ($ActiveHost)." -Code 1
+    $addonLockReport = Get-LockedArtifactReport -Directory $ArtifactLocalDir -Pattern "$AddonBinaryStem*.dll"
+    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy compiled $AddonBinaryStem*.dll from Device B ($ActiveHost).$addonLockReport" -Code 1
 }
-if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$ArtifactRemoteDir/dstorage*.dll" -LocalDest "$ArtifactLocalDir/")) {
-    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy dstorage*.dll from Device B ($ActiveHost)." -Code 1
+# The DirectStorage redistributables are vendored in the repo and shipped TO
+# Device B by the tar sync, so pulling them back is a content no-op. A running
+# Godot maps them for the life of the process (plain LoadLibrary dependencies get
+# no hot-reload "~" rename, unlike the GDExtension DLLs), which is why this line
+# used to abort every build on a machine with the editor open. -AcceptAlreadyInSync
+# suppresses that only when the local bytes already equal Device B's; a stale,
+# missing, or unverifiable file still fails here or in [5b/6].
+if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$ArtifactRemoteDir/dstorage*.dll" -LocalDest "$ArtifactLocalDir/" -LocalPattern "dstorage*.dll" -AcceptAlreadyInSync)) {
+    $runtimeLockReport = Get-LockedArtifactReport -Directory $ArtifactLocalDir -Pattern "dstorage*.dll"
+    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to copy dstorage*.dll from Device B ($ActiveHost).$runtimeLockReport" -Code 1
 }
 if ($IncludeTests) {
     if (!(Test-Path "./bin")) {
@@ -1543,7 +1885,8 @@ if ($IncludeTests) {
     # template_debug one), so removing every variant is safe.
     Get-ChildItem -Path "./bin" -Filter "$TestLibraryName*.dll" -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     if (-not (Invoke-ScpArtifactWithRetry -RemotePath "$RemoteDirTar/bin/$targetTestPattern" -LocalDest "./bin/")) {
-        Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll ($targetTestPattern) from Device B ($ActiveHost). The remote test build likely failed." -Code 1
+        $testLockReport = Get-LockedArtifactReport -Directory "./bin" -Pattern "$TestLibraryName*.dll"
+        Show-BuildFailure -Step "Step [5/6] Pull Test Artifacts" -Message "Failed to copy test .dll ($targetTestPattern) from Device B ($ActiveHost). The remote test build likely failed.$testLockReport" -Code 1
     }
     # Exactly one test library must exist after the pull. More than one means a
     # leftover variant survived a previous build and can be picked up by a
@@ -1555,6 +1898,13 @@ if ($IncludeTests) {
     }
 }
 & scp -C -o BatchMode=yes -o ConnectTimeout=5 "$ActiveHost`:$ArtifactRemoteDir/build_manifest.json" "$ArtifactLocalDir/" 2>$null
+# Provenance record: reported, never swallowed. A failed pull leaves the previous
+# manifest next to the freshly built DLLs, so build_freshness.ps1 and the
+# -RequireManifest audit would describe a build that is not the one on disk.
+if ($LASTEXITCODE -ne 0) {
+    $manifestLockReport = Get-LockedArtifactReport -Directory $ArtifactLocalDir -Pattern "build_manifest.json"
+    Show-BuildFailure -Step "Step [5/6] Pull Artifacts" -Message "Failed to pull build_manifest.json from Device B ($ActiveHost).$manifestLockReport" -Code 1
+}
 
 # [5b/6] Verify pulled artifacts equal the Device B files (transfer
 # integrity). A truncated scp must never pass as a fresh build.
@@ -1563,7 +1913,7 @@ if (-not $SkipVerify) {
     $PullChecks = @(
         @{ Pattern = "$AddonBinaryStem*.dll"; LocalDir = $ArtifactLocalDir; Required = $true },
         @{ Pattern = "dstorage*.dll"; LocalDir = $ArtifactLocalDir; Required = $true },
-        @{ Pattern = "build_manifest.json"; LocalDir = $ArtifactLocalDir; Required = [bool]($EffectiveKey -or $RequireManifest) }
+        @{ Pattern = "build_manifest.json"; LocalDir = $ArtifactLocalDir; Required = $true }   # provenance record: always pulled and hash-verified
     )
     if ($IncludeTests) {
         $targetForTestPattern = if ($IsMultiTarget) { "template_debug" } else { $Target }
@@ -1571,23 +1921,14 @@ if (-not $SkipVerify) {
         $PullChecks += @{ Pattern = $targetTestPattern; LocalDir = "./bin"; Required = $true }
     }
     # Remote hashes come from the verifier script (quoteless invocation, same
-    # as step [3b/6]) so no nested quoting is needed here either.
-    $ArtOut = & ssh -n -o BatchMode=yes -o ConnectTimeout=5 $ActiveHost powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteVerifyWin -RemoteDir $RemoteDirWin -Artifacts 2>&1
-    $RemoteArtifacts = @{}
-    foreach ($artLine in @($ArtOut)) {
-        $artText = $artLine.ToString()
-        if ($artText.StartsWith("ARTIFACT:")) {
-            $artRest = $artText.Substring(9)
-            $artSep = $artRest.IndexOf("|")
-            if ($artSep -gt 0) {
-                $RemoteArtifacts[$artRest.Substring(0, $artSep)] = $artRest.Substring($artSep + 1)
-            }
-        }
-    }
+    # as step [3b/6]) so no nested quoting is needed here either. The map is
+    # cached per run: the [5/6] pull may already have fetched it to decide
+    # whether a locked artifact was in sync.
+    $RemoteArtifacts = Get-RemoteArtifactHashMap
     foreach ($pullCheck in $PullChecks) {
         $matchedNames = @($RemoteArtifacts.Keys | Where-Object { $_ -like $pullCheck.Pattern })
         if ($matchedNames.Count -eq 0 -and $pullCheck.Required) {
-            $rawRemote = @($ArtOut | ForEach-Object { $_.ToString() } | Where-Object { $_.Trim() -ne "" } | Select-Object -First 10) -join "`n"
+            $rawRemote = @($script:RemoteArtifactRawOutput | Where-Object { $_.Trim() -ne "" } | Select-Object -First 10) -join "`n"
             Show-BuildFailure -Step "Step [5/6] Artifact Verification" -Message "No artifacts matched on Device B for pattern $($pullCheck.Pattern). Raw remote output:`n$rawRemote" -Code 1
         }
         foreach ($matchedName in $matchedNames) {
@@ -1810,13 +2151,31 @@ else {
     Write-VerboseHost "Post-build addon sync is disabled (ENABLE_POST_BUILD_ADDON_SYNC=0)." -ForegroundColor DarkGray
 }
 
-# Advisory deployment audit: reports files present in a deployed addon folder
+# Deployment audit: reports files present in a deployed addon folder
 # that its .gdextension does not declare (stale binaries from an older naming
 # scheme, hand copies, ...). Read-only - nothing is deleted or moved here.
+# The keyless rule is the one fatal condition: every editor, template_debug and
+# template_release binary must be stamped dspkg-key-id=none. Only explicit key
+# input makes this a source build, where a baked key is expected instead. The
+# script never exports a project, so it cannot relate a keyless DLL to an
+# archive's key: the boot sentinel and the pack scan own that pairing.
 Write-Status "[audit] Scanning deployed addon directories..." -ForegroundColor Cyan
+# The addon directory this run produced must carry its provenance record. SCons
+# writes build_manifest.json next to the DLLs and copies it to every sync target,
+# so a missing one means the build, the artifact pull or the sync dropped it - not
+# a legitimate state to ship from. Keyed builds used to imply this requirement;
+# now that keyless is the default it has to be explicit. Configured mirror
+# directories stay advisory: they can be stale, never synced this run, or absent.
+$DefaultManifestPath = Join-Path $DefaultAddonDir "bin\build_manifest.json"
+if (-not (Test-Path -LiteralPath $DefaultManifestPath -PathType Leaf)) {
+    Show-BuildFailure -Step "Audit" -Message ("build_manifest.json is missing from {0}\bin. It is the only record of the commit and key state behind these DLLs, and every compiling build writes it. Re-run the build; for a remote build, check that step [5/6] pulled it from Device B." -f $DefaultAddonDir) -Code 1
+}
 $DeployAuditTargets = @($DefaultAddonDir) + @(Get-ConfiguredAddonDir)
-$postBuildAuditError = Invoke-DeployAudit -AddonDirs $DeployAuditTargets -Json:$Json -RequireManifest:([bool]($EffectiveKey -or $RequireManifest))
-if ($postBuildAuditError -and ($EffectiveKey -or $RequireManifest)) {
+$postBuildAudit = Invoke-DeployAudit -AddonDirs $DeployAuditTargets -Json:$Json -RequireManifest:([bool]($EffectiveKey -or $RequireManifest)) -AllowBakedKey:([bool]$EffectiveKey)
+if ($postBuildAudit.HasPolicyViolation) {
+    Show-BuildFailure -Step "Audit" -Message "A deployed binary is not keyless. Every editor, template_debug and template_release binary must be stamped dspkg-key-id=none: distributed binaries must be keyless, so use a source build (-EncryptionKeyFile/-EncryptionKey) for a baked key." -Code 1
+}
+if ($postBuildAudit.HasError -and ($EffectiveKey -or $RequireManifest)) {
     Show-BuildFailure -Step "Audit" -Message "Keyed/release build deployment audit failed due to binary/manifest key-id mismatch or error." -Code 1
 }
 

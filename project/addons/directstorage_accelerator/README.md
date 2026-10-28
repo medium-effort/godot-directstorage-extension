@@ -60,21 +60,70 @@ Why that matters for DirectStorage settings:
 
 `directstorage/auto_tune_for_integrated_gpu` (default `true`) handles this automatically: when the extension detects an integrated/UMA adapter (queried directly via Direct3D 12 hardware UMA architecture, or under 1 GiB of dedicated VRAM reported by Windows), it quietly lowers the *effective* staging buffer to 64 MiB and the queue to 256 at startup, routes GPU prewarms to System RAM, and says so once in the log (`auto-tune clamped staging 128->64 MiB, queue 512->256`). It only ever lowers, never raises — if you already set smaller values, they pass through untouched, and your saved settings are never rewritten. Discrete-GPU PCs are completely unaffected. Turn it off (`false`) if you want full manual control, e.g. when benchmarking exact configured values.
 
-## Export Preset Options & TOC Encryption
+## Export Preset Options
 
-When configuring a Windows Desktop export preset (`Project -> Export... -> Windows Desktop -> Options`), the exporter supports bundling and encrypting texture archives:
+The exporter adds three options to every Windows Desktop preset, on the **Options** tab (`Project -> Export... -> Windows Desktop -> Options`):
 
 | Export Option | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `directstorage/bundle_textures_dspkg` | `bool` | `true` | Bundles exported textures into `textures.dspkg` for unbuffered DirectStorage DMA loading. |
-| `directstorage/enforce_archive_pairing` | `bool` | `true` | Embeds matching fingerprint in PCK and archive to prevent stale/corrupt reads. |
+| `directstorage/enforce_archive_pairing` | `bool` | `true` | Publishes a random 64-bit archive id per export and compares it, in full, when the runtime opens the archive. Set to `false` only for local tooling: it publishes `0`, which skips the check in that build, and writes an archive carrying id `0` that any build expecting a real id rejects. |
 | `directstorage/steampipe_1mb_alignment` | `bool` | `false` | Aligns texture payloads to 1 MiB chunks for SteamPipe differential patching efficiency. |
-| `directstorage/encryption_enabled` | `bool` | `false` | Generates Version 4 archives with encrypted and authenticated table of contents (TOC). |
-| `directstorage/encryption_key` | `String` | `""` | 64-hex symmetric key for TOC encryption. Avoid storing secrets in committed presets. |
 
-### Encryption Architecture & Key Provisioning
-- **TOC Structure Obfuscation & Authentication**: Protects the entry table (names, dimensions, offsets) using authenticated AEAD encryption (BLAKE2b key-ID derivation, XChaCha20 encryption, and Poly1305 MAC via Monocypher).
-- **Zero-Copy DMA Payloads**: Payload blocks remain unencrypted on disk to enable direct zero-copy NVMe-to-GPU DirectStorage DMA transfers.
-- **Runtime Key Contract**: Games shipping with encrypted archives can provide their symmetric key at startup using `DSPkg.set_global_encryption_key("64_hex_chars...")` during initialization, or compile the key into the binary via `DSPKG_ENCRYPTION_KEY_FILE`.
+Encryption is not one of those options. It comes entirely from the same preset's **Encryption** tab (`Project -> Export... -> Windows Desktop -> Encryption`), next to Options. The add-on keeps no encryption toggle and no key field of its own, and caches nothing from the preset, because one plugin instance serves every preset of an "Export All" run.
+
+### What the Encryption tab contributes
+
+The exporter reads four controls from that tab, once, when the export starts:
+
+| Encryption tab control | Preset getter | Role |
+| :--- | :--- | :--- |
+| **Encrypt Exported PCK** | `get_encrypt_pck()` | Master switch. Off means a plaintext archive, whatever the key and filters say. |
+| **Encryption Key (256-bits as hexadecimal):** | `get_encryption_key()` | Tested for emptiness only. The archive key is never derived from it. |
+| **Filters to include files/folders** | `get_encryption_in_filter()` | Must match `res://.dspkg/toc.key`. |
+| **Filters to exclude files/folders** | `get_encryption_ex_filter()` | Must not match it. Exclude wins over include. |
+
+Both filter lists are comma-separated globs, matched against the full `res://` path and against the path without the prefix, so `res://.dspkg/toc.key` and `.dspkg/*` both work. The key itself lives in `.godot/export_credentials.cfg` (`script_encryption_key`), not in `export_presets.cfg`, so it does not travel with the repository.
+
+### Outcomes
+
+Those inputs, together with the bundling toggle, resolve to one outcome per export:
+
+| Preset state | Outcome | What ships | At startup |
+| :--- | :---: | :--- | :--- |
+| bundling off (`bundle_textures_dspkg = false`) | `disabled` | No archive. Every `.dstex` stays in the PCK. | Normal CPU decompression. |
+| bundling on, **Encrypt Exported PCK** off | `plaintext` | Archive written without a key; no key entry is injected. The TOC is readable by anyone. | Archive loads, no protection. |
+| bundling on, **Encrypt Exported PCK** on, key set, key path encrypted by the filters | `protected` | Archive written with a random 32-byte key for this export, then injected as a 48-byte PCK entry (16-byte derived magic + 32-byte key). | Archive loads after the key check. |
+| bundling on, **Encrypt Exported PCK** on, key empty or key path not encrypted | `failed` | No archive, no key entry, and every `.dstex` removed from the PCK. | Player fails with `DSPKG_BOOT status=fail reason=missing_archive`. |
+
+`failed` is the outcome that tends to surprise. The export itself still completes and reports through a `push_error` line in the export log rather than an error dialog, and the texture payloads have already been removed from the PCK, so the game hard-fails at startup instead of quietly falling back to CPU decompression. A project with no `.dstex` has nothing to remove and still boots on CPU. Fix the preset and re-export.
+
+The filters are mandatory because Godot decides encryption per file from the include and exclude globs, so **Encrypt Exported PCK** on its own encrypts nothing. An empty include filter would store the injected key in the clear, which is why that configuration is rejected as `failed` instead of shipped.
+
+### Engine controls that do not affect the archive
+
+Two more controls sit on that tab and are never read by the exporter:
+
+- **Encrypt Index (File Names and Info)** changes how the PCK index is stored, not how the archive is built.
+- **Initialization vector seed** only makes encrypted files byte-stable across exports: the AES-256-CFB IV is derived from the file content plus the seed instead of being random. It cannot make a DirectStorage build reproducible, because the archive key and the archive id are regenerated on every export.
+
+### Encryption architecture and key provisioning
+
+- **Prerequisite**: the Godot export templates must be built with the same PCK key. Stock Godot cannot mount a custom-key pack, so plan the template build with your PCK key before enabling encryption.
+- **TOC encryption and authentication**: the archive's table of contents (TOC: entry names, dimensions, offsets) is encrypted and authenticated with AEAD (BLAKE2b key-id derivation, XChaCha20, Poly1305 MAC via Monocypher).
+- **Payload blocks stay unencrypted** so DirectStorage can hand the compressed GDeflate streams straight to the GPU decompressor. The payload bytes are therefore not secret: they are recoverable from the archive without any key.
+- **Key delivery**: the archive key is random per export, is not compiled into published binaries, and reaches the game only as the `res://.dspkg/toc.key` entry inside the encrypted PCK. `DSPkg.open()` reads that entry, checks the 16-byte magic, and installs the key only after it reproduces the archive header's key id and decrypts the TOC. Shipped games do not need to call `DSPkg.set_global_encryption_key()`.
+- **Verification**: a build counts as protected only after the exported player prints one `DSPKG_BOOT status=ok mode=protected … key_id=<16 hex>` line and the add-on's pack scanner (`tools/dspkg_pack_scan.gd`, also available as **Project > Tools > Verify exported pack (DSPkg)**) reports `DSPKG_SCAN status=ok` on the shipped pack.
+  - Boot check: `<export-dir>\game.exe --headless -- --dspkg-validate=protected`. A normal successful boot prints nothing; the switch is what turns the line on. A failed boot prints `DSPKG_BOOT status=fail reason=<code>` every time, and `key_id=none` means no key was committed.
+  - Reference: [`docs/verifying-an-exported-build.md`](../../../docs/verifying-an-exported-build.md) covers the fields, the five failure reasons and the CI shape. That file lives in this repository next to the add-on; a project that only copied `addons/` does not have it, and the editor scan above needs nothing else.
+
+### Legacy: baking the key into the DLL
+
+A source build can compile the archive key into the extension binary (`DSPKG_ENCRYPTION_KEY_FILE`). This is not the delivery path described above and is not used by published builds; it exists for experiments and for source builds that have no encrypted PCK to carry a key.
+
+- **Weaker**: the key ships inside the binary, so anyone holding the DLL holds the key, and every copy of the game shares one archive key. A PCK-delivered key is unique per export.
+- **Precedence**: a valid `res://.dspkg/toc.key` wins; the baked key is used only when no readable key entry exists.
+- **Distribution**: published binaries carry no key in the DLL (`dspkg-key-id=none`); the build audit treats a binary that carries a key, or one with no tag, as a violation for distributed targets.
+
 
 

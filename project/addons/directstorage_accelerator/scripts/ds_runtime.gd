@@ -21,6 +21,27 @@ extends Node
 ##   in the background, they just emit no progress signals.
 ## - When the extension is missing or uninitialized, `_process` does nothing,
 ##   so regular `ResourceLoader.load()` calls keep working untouched.
+## - Exported builds print one `DSPKG_BOOT` verdict line: a failure line on
+##   every boot, the success line only when the boot was asked to validate or
+##   to be verbose. The release gate reads that line instead of the exit code.
+
+## Machine-readable boot verdict. A failure prints on every boot; the success
+## line prints only in validate/verbose mode so a normal boot stays silent.
+const BOOT_SENTINEL: String = "DSPKG_BOOT"
+## Command-line switch that turns on the success line and pins the expected
+## archive mode. It only changes verbosity and the reported mode: the normal
+## boot path runs unchanged.
+const BOOT_VALIDATE_ARG: String = "--dspkg-validate="
+const BOOT_MODE_PROTECTED: String = "protected"
+const BOOT_MODE_UNPROTECTED: String = "unprotected"
+## Static bridge to the native key bindings. Loaded through `load()` only after
+## `ClassDB` reports the class, so this script parses without the native binary.
+const DSPKG_STATIC_PATH: String = "res://addons/directstorage_accelerator/scripts/ds_dspkg_static.gd"
+
+## Guards the success line so it is printed at most once per process. CI treats
+## a duplicate `status=ok` line as a failure, so a second boot hook must stay
+## silent rather than repeat the verdict.
+static var _boot_ok_reported: bool = false
 
 ## Per-tag prewarm progress: (tag: int, done: int, total: int).
 signal prewarm_progress(tag: int, done: int, total: int)
@@ -147,7 +168,7 @@ func _ready() -> void:
 	else:
 		push_error("[DirectStorage] GDExtension ClassDB entry 'DSContext' not found. Ensure GDExtension library is built and deployed.")
 		if not OS.has_feature("editor"):
-			_fatal_boot(
+			_fail_boot(
 				"missing_extension",
 				"A required game component is missing:\n" +
 				"'directstorage_accelerator' library was not found.\n\n" +
@@ -159,80 +180,175 @@ func _ready() -> void:
 	# Verification of bundled texture archive when exported with bundle_dspkg.
 	# Deliberately loader-independent (no C++ popup during resource loads):
 	# the autoload owns the player-facing missing-archive and decryption UX at startup.
-	if not OS.has_feature("editor") and bool(ProjectSettings.get_setting("directstorage/export/bundle_dspkg", false)):
-		var archive_name := String(ProjectSettings.get_setting("directstorage/archive_name", "textures.dspkg"))
-		if archive_name.is_empty():
-			archive_name = "textures.dspkg"
-		var exe_dir := OS.get_executable_path().get_base_dir()
-		var candidates: Array[String] = ["res://" + archive_name]
-		if archive_name != "textures.dspkg":
-			candidates.append("res://textures.dspkg")
-		if not exe_dir.is_empty():
-			candidates.append(exe_dir.path_join(archive_name))
+	var archive_entries: int = 0
+	if not OS.has_feature("editor"):
+		if bool(ProjectSettings.get_setting("directstorage/export/bundle_dspkg", false)):
+			var archive_name := String(ProjectSettings.get_setting("directstorage/archive_name", "textures.dspkg"))
+			if archive_name.is_empty():
+				archive_name = "textures.dspkg"
+			var exe_dir := OS.get_executable_path().get_base_dir()
+			var candidates: Array[String] = ["res://" + archive_name]
 			if archive_name != "textures.dspkg":
-				candidates.append(exe_dir.path_join("textures.dspkg"))
-		var glob_path := ProjectSettings.globalize_path("res://" + archive_name)
-		if not candidates.has(glob_path):
-			candidates.append(glob_path)
-		if archive_name != "textures.dspkg":
-			var glob_default := ProjectSettings.globalize_path("res://textures.dspkg")
-			if not candidates.has(glob_default):
-				candidates.append(glob_default)
+				candidates.append("res://textures.dspkg")
+			if not exe_dir.is_empty():
+				candidates.append(exe_dir.path_join(archive_name))
+				if archive_name != "textures.dspkg":
+					candidates.append(exe_dir.path_join("textures.dspkg"))
+			var glob_path := ProjectSettings.globalize_path("res://" + archive_name)
+			if not candidates.has(glob_path):
+				candidates.append(glob_path)
+			if archive_name != "textures.dspkg":
+				var glob_default := ProjectSettings.globalize_path("res://textures.dspkg")
+				if not candidates.has(glob_default):
+					candidates.append(glob_default)
 
-		var candidate_found := false
-		var candidate_path := ""
-		for candidate in candidates:
-			if not candidate.is_empty() and FileAccess.file_exists(candidate):
-				candidate_found = true
-				candidate_path = candidate
-				break
+			var candidate_found := false
+			var candidate_path := ""
+			for candidate in candidates:
+				if not candidate.is_empty() and FileAccess.file_exists(candidate):
+					candidate_found = true
+					candidate_path = candidate
+					break
 
-		if not candidate_found:
-			var candidate_list := "'" + "', '".join(candidates) + "'"
-			print("[DirectStorage] Archive '", archive_name, "' not found. Searched candidates: ", candidate_list, ".")
-			var err_msg := "Missing required game asset archive: '" + archive_name + "'.\n\nPlease verify game file integrity or reinstall the game."
-			push_error("[DirectStorage] FATAL: " + err_msg)
-			if not OS.has_feature("editor"):
-				_fatal_boot("missing_archive", err_msg, "Missing Game Files")
+			if not candidate_found:
+				var candidate_list := "'" + "', '".join(candidates) + "'"
+				print("[DirectStorage] Archive '", archive_name, "' not found. Searched candidates: ", candidate_list, ".")
+				var err_msg := "Missing required game asset archive: '" + archive_name + "'.\n\nPlease verify game file integrity or reinstall the game."
+				push_error("[DirectStorage] FATAL: " + err_msg)
+				_fail_boot("missing_archive", err_msg, "Missing Game Files")
 				return
-		elif ClassDB.class_exists("DSPkg"):
-			var probe: RefCounted = ClassDB.instantiate("DSPkg")
-			if probe != null and probe.has_method("open"):
-				var expected_fingerprint: int = int(ProjectSettings.get_setting("directstorage/expected_archive_fingerprint", 0))
-				var open_err: Error = probe.call("open", candidate_path, expected_fingerprint)
-				if open_err != OK:
-					var reason := "archive_unreadable"
-					var title := "Corrupt Game Files"
-					var open_msg := "Failed to open game asset archive: '" + archive_name + "' (" + error_string(open_err) + ").\n\nPlease verify game file integrity or reinstall the game."
-					if open_err == ERR_UNAUTHORIZED:
-						reason = "archive_unauthorized"
-						title = "Decryption Error"
-						open_msg = "Failed to decrypt game asset archive: '" + archive_name + "'.\n\nNo valid decryption key was found. Please verify game file integrity or reinstall the game."
-					elif open_err == ERR_FILE_UNRECOGNIZED:
-						reason = "archive_pairing_mismatch"
-						title = "Mismatched Game Files"
-						open_msg = "Game asset archive does not match this build: '" + archive_name + "'.\n\nThe archive and the game files come from different exports. Reinstall the game or re-export it."
-					push_error("[DirectStorage] FATAL: " + open_msg)
-					if not OS.has_feature("editor"):
-						_fatal_boot(reason, open_msg, title)
+			if ClassDB.class_exists("DSPkg"):
+				var probe: RefCounted = ClassDB.instantiate("DSPkg")
+				if probe != null and probe.has_method("open"):
+					# The native open() acquires the key from res://.dspkg/toc.key
+					# itself; the runtime never supplies one. The archive id comes
+					# from the export contract and rejects a mixed-export pairing.
+					var archive_id: int = int(ProjectSettings.get_setting("directstorage/export/archive_id", 0))
+					var open_err: Error = probe.call("open", candidate_path, archive_id)
+					if open_err != OK:
+						var reason := "archive_unreadable"
+						var title := "Corrupt Game Files"
+						var open_msg := "Failed to open game asset archive: '" + archive_name + "' (" + error_string(open_err) + ").\n\nPlease verify game file integrity or reinstall the game."
+						if open_err == ERR_UNAUTHORIZED:
+							reason = "archive_unauthorized"
+							title = "Decryption Error"
+							open_msg = "Failed to decrypt game asset archive: '" + archive_name + "'.\n\nNo valid decryption key was found. Please verify game file integrity or reinstall the game."
+						elif open_err == ERR_FILE_UNRECOGNIZED:
+							reason = "archive_pairing_mismatch"
+							title = "Mismatched Game Files"
+							open_msg = "Game asset archive does not match this build: '" + archive_name + "'.\n\nThe archive and the game files come from different exports. Reinstall the game or re-export it."
+						push_error("[DirectStorage] FATAL: " + open_msg)
+						_fail_boot(reason, open_msg, title)
 						return
-	elif not OS.has_feature("editor"):
-		print("[DirectStorage] Textures are packaged in PCK (bundle_dspkg disabled); operating in CPU decompression mode.")
+					if probe.has_method("get_entry_count"):
+						archive_entries = int(probe.call("get_entry_count"))
+		else:
+			print("[DirectStorage] Textures are packaged in PCK (bundle_dspkg disabled); operating in CPU decompression mode.")
+		_report_boot_ok(archive_entries)
+
+
+## Prints the machine-readable success verdict when the boot was asked to
+## validate (`--dspkg-validate=<mode>` or `DSPKG_VALIDATE`) or to be verbose
+## (`DSPKG_BOOT_VERBOSE=1`). A plain successful boot stays silent.
+##
+## Only exported players report: the editor has no bundled archive to verify,
+## and an `ok` line there would describe a boot the release gate never ran.
+## The static guard keeps the verdict to one line per process because CI
+## treats a duplicate `status=ok` as a failure.
+func _report_boot_ok(p_entry_count: int) -> void:
+	if _requested_validate_mode().is_empty() and OS.get_environment("DSPKG_BOOT_VERBOSE") != "1":
+		return
+	if _boot_ok_reported:
+		return
+	_boot_ok_reported = true
+	_emit_boot_line(
+		"%s status=ok mode=%s entries=%d key_id=%s"
+		% [BOOT_SENTINEL, _boot_mode(), p_entry_count, _boot_key_id()]
+	)
+
+
+## Returns the validate mode requested by the caller, or an empty string when
+## the boot was not asked to validate. Only user arguments are scanned:
+## `OS.get_cmdline_args()` is empty in an exported player, so the switch would
+## never be seen there. `DSPKG_VALIDATE` is the environment fallback.
+func _requested_validate_mode() -> String:
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with(BOOT_VALIDATE_ARG):
+			var arg_mode := arg.substr(BOOT_VALIDATE_ARG.length()).strip_edges()
+			if _is_validate_mode(arg_mode):
+				return arg_mode
+	var env_mode := OS.get_environment("DSPKG_VALIDATE").strip_edges()
+	if _is_validate_mode(env_mode):
+		return env_mode
+	return ""
+
+
+## True for the two archive modes the sentinel can report.
+func _is_validate_mode(mode: String) -> bool:
+	return mode == BOOT_MODE_PROTECTED or mode == BOOT_MODE_UNPROTECTED
+
+
+## Archive mode reported by the sentinel: the validate argument when present
+## (the gate states the mode it expects), otherwise what the export published
+## through `directstorage/export/protected`.
+func _boot_mode() -> String:
+	var requested := _requested_validate_mode()
+	if not requested.is_empty():
+		return requested
+	if bool(ProjectSettings.get_setting("directstorage/export/protected", false)):
+		return BOOT_MODE_PROTECTED
+	return BOOT_MODE_UNPROTECTED
+
+
+## Key id of the key committed while the archive was opened, or `none` for a
+## plaintext archive (no key is involved, and a source build's baked key is not
+## part of the shipped contract).
+func _boot_key_id() -> String:
+	if not bool(ProjectSettings.get_setting("directstorage/export/protected", false)):
+		return "none"
+	if not ClassDB.class_exists("DSPkg"):
+		return "none"
+	var bridge := load(DSPKG_STATIC_PATH) as GDScript
+	if bridge == null:
+		return "none"
+	var key_id := String(bridge.call("get_global_key_id"))
+	return "none" if key_id.is_empty() else key_id
+
+
+## Writes one sentinel line to stdout and, when `DSPKG_VALIDATE_OUT` is set, to
+## that file as well. The line is emitted before any alert so a headless gate
+## reads the verdict even when a dialog is about to block or the process quits.
+func _emit_boot_line(line: String) -> void:
+	print(line)
+	var sink := OS.get_environment("DSPKG_VALIDATE_OUT").strip_edges()
+	if sink.is_empty():
+		return
+	var file := FileAccess.open(sink, FileAccess.READ_WRITE)
+	if file == null:
+		file = FileAccess.open(sink, FileAccess.WRITE)
+	if file == null:
+		push_warning("[DirectStorage] Cannot append the boot sentinel to DSPKG_VALIDATE_OUT: " + sink)
+		return
+	file.seek_end()
+	file.store_line(line)
+	file.close()
 
 
 ## Reports an unrecoverable startup failure and exits.
 ##
-## Headless runs must never call `OS.alert()`: it blocks until a human
-## dismisses the dialog (Godot quirk Q64), so CI and `--headless` runs would
-## hang until an external timeout kills them. In those runs the failure is
-## reported as a machine-readable `DSPKG_BOOT_FAIL` line and the process exits
-## non-zero instead. `DSPKG_NO_ALERT=1` forces the non-interactive path even
-## when a display is present.
-func _fatal_boot(reason: String, message: String, title: String, code: int = 1) -> void:
-	if _is_non_interactive():
-		printerr("[DirectStorage] DSPKG_BOOT_FAIL reason=", reason)
-		printerr("[DirectStorage] ", message.replace("\n", " "))
-	else:
+## The sentinel line and the `DSPKG_VALIDATE_OUT` entry are written before any
+## alert: CI reads them, and a dialog would only block. Headless runs must never
+## call `OS.alert()`: it waits for a human to dismiss it (Godot quirk Q64), so
+## CI and `--headless` runs would hang until an external timeout kills them.
+## `DSPKG_NO_ALERT=1` forces that path even when a display is present.
+##
+## The verdict is diagnostic: this only quits with the code, it never pauses the
+## tree or frees siblings, so later autoloads and the main scene still run and a
+## later `quit(0)` can override the exit code.
+func _fail_boot(reason: String, message: String, title: String, code: int = 1) -> void:
+	_emit_boot_line("%s status=fail reason=%s mode=%s" % [BOOT_SENTINEL, reason, _boot_mode()])
+	printerr("[DirectStorage] ", message.replace("\n", " "))
+	if not _is_non_interactive():
 		if get_tree() and get_tree().root:
 			get_tree().root.hide()
 		OS.alert(message, title)
@@ -241,8 +357,14 @@ func _fatal_boot(reason: String, message: String, title: String, code: int = 1) 
 
 
 ## True when no human is available to dismiss an `OS.alert()` dialog.
+##
+## A validation run is machine-driven by definition, so `--dspkg-validate=*`
+## (or `DSPKG_VALIDATE`) counts as non-interactive even when a display server
+## is present: the gate would otherwise block on a modal nobody dismisses.
 func _is_non_interactive() -> bool:
 	if OS.get_environment("DSPKG_NO_ALERT") == "1":
+		return true
+	if not _requested_validate_mode().is_empty():
 		return true
 	return DisplayServer.get_name() == "headless"
 

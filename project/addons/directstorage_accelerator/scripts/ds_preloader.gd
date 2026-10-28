@@ -140,8 +140,8 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 	if not extra_scan_dirs.is_empty() and not pkg_path.is_empty() and ClassDB.class_exists("DSPkg"):
 		var dspkg: RefCounted = ClassDB.instantiate("DSPkg")
 		if dspkg != null and dspkg.has_method("open") and dspkg.has_method("get_entries"):
-			var expected_fingerprint: int = int(ProjectSettings.get_setting("directstorage/expected_archive_fingerprint", 0))
-			if dspkg.call("open", pkg_path, expected_fingerprint) == OK:
+			var archive_id: int = int(ProjectSettings.get_setting("directstorage/export/archive_id", 0))
+			if dspkg.call("open", pkg_path, archive_id) == OK:
 				var pkg_entries: Array = dspkg.call("get_entries")
 				for entry in pkg_entries:
 					var entry_str := String(entry)
@@ -181,7 +181,8 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 	if not pkg_path.is_empty() and ClassDB.class_exists("DSPkg"):
 		var dspkg: RefCounted = ClassDB.instantiate("DSPkg")
 		if dspkg != null and dspkg.has_method("open") and dspkg.has_method("get_entries"):
-			if dspkg.call("open", pkg_path) == OK:
+			var archive_id: int = int(ProjectSettings.get_setting("directstorage/export/archive_id", 0))
+			if dspkg.call("open", pkg_path, archive_id) == OK:
 				var pkg_entries: Array = dspkg.call("get_entries")
 				for entry in pkg_entries:
 					var entry_str := String(entry)

@@ -1,0 +1,23 @@
+; Export-contract fixture project.
+;
+; Never edited in place: run_export_contract.ps1 copies this directory into a
+; work tree, adds the live addon, decodes the .dstex fixtures and writes one
+; export preset per contract case.
+
+config_version=5
+
+[application]
+
+config/name="Export Contract Fixture"
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.7", "Forward Plus")
+
+[autoload]
+
+DSRuntime="*res://addons/directstorage_accelerator/scripts/ds_runtime.gd"
+
+[editor_plugins]
+
+; Registration order matters: the contract injector's `_export_end` must run
+; before the add-on plugin's, which is where finalize() happens.
+enabled=PackedStringArray("res://addons/contract_injector/plugin.cfg", "res://addons/directstorage_accelerator/plugin.cfg")

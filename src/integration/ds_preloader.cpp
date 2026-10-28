@@ -165,10 +165,12 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 		} else {
 			Ref<DSPkg> fresh;
 			fresh.instantiate();
+			// 0 means the archive is unpaired; pairing is the random archive id,
+			// compared in full 64-bit width when the expected value is non-zero.
 			uint64_t expected_fingerprint = 0;
 			ProjectSettings *ps = ProjectSettings::get_singleton();
-			if (ps && ps->has_setting("directstorage/expected_archive_fingerprint")) {
-				expected_fingerprint = static_cast<uint64_t>(ps->get_setting("directstorage/expected_archive_fingerprint"));
+			if (ps && ps->has_setting("directstorage/export/archive_id")) {
+				expected_fingerprint = static_cast<uint64_t>(ps->get_setting("directstorage/export/archive_id"));
 			}
 			Error open_err = fresh->open(archive_path, expected_fingerprint);
 			if (open_err != OK) {
@@ -176,7 +178,7 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 					static String s_last_reported_preloader_unauth;
 					if (s_last_reported_preloader_unauth != archive_path) {
 						s_last_reported_preloader_unauth = archive_path;
-						UtilityFunctions::push_error("DirectStorage Preloader: Decryption failed for package '" + archive_path + "'. Ensure valid encryption key is configured via DSPkg::set_global_encryption_key().");
+						UtilityFunctions::push_error("DirectStorage Preloader: Decryption unauthorized or key mismatch for package '" + archive_path + "'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.");
 					}
 				} else {
 					UtilityFunctions::push_error("DirectStorage Preloader: Failed to open DirectStorage package '" + archive_path + "': " + UtilityFunctions::error_string(open_err));

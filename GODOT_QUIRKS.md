@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 27 October 2026
+Last updated: 28 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1556,4 +1556,238 @@ In the measured 4.7.2 release player, `OS.get_cmdline_args()` returned an empty 
 Read user flags from `OS.get_cmdline_user_args()` after `--`; never rely on `OS.get_cmdline_args()` in an exported player.
 
 Parse `get_cmdline_user_args()` for user flags and keep engine arguments separate. Related: Q63, Q64.
+
+## 66. A Main-Scene Load Failure Exits Before Autoload `_ready`
+
+### The Engine Reality
+`Main::start()` loads the main scene at `main/main.cpp:4767`; when that load fails, startup returns before the first main-loop iteration, so an autoload's `_ready()` never runs. The failure is reported by the resource layer, not by the game.
+
+### The Trap / Symptom
+A player whose main scene loads an archived `.dstex`, booted with `textures.dspkg` removed, printed:
+
+```
+ERROR: Failed loading resource: res://assets/used.dstex.
+ERROR: Failed loading scene: res://dependent.tscn.
+   at: Main::start (main\main.cpp:4767)
+```
+
+and produced zero `DSPKG_BOOT` lines plus no `[DirectStorage] Autoload initialized` line — the entire startup diagnostic gate was silent. Reproduced windowed and headless; exit 1. A main scene that does not touch archived payloads prints the sentinel normally.
+
+### The Rule
+Never diagnose a missing startup resource only from an autoload `_ready()`; if the main scene fails to load, Godot exits before autoloads report.
+
+Either keep the boot scene free of archived payloads and load them after startup, or emit the verdict from a resource loader / SceneTree hook. Verify any startup diagnostic by booting with the archive removed. Related: Q63, Q55, Q34.
+
+## 67. `encrypt_pck=true` Encrypts Nothing Without an Include Filter
+
+### The Engine Reality
+`encrypt_pck` only enables the per-file decision. `EditorExportPlatform::_encrypt_and_store_data()` (`editor_export_platform.cpp:377-391`) encrypts a file only when its path matches an entry in `encryption_include_filters` and matches no entry in `encryption_exclude_filters`. Filters are comma-separated globs tested with `String::matchn` against both the `res://` path and the path without the prefix. Files added with `add_file()` go through the same filters (`:1429`).
+
+### The Trap / Symptom
+A preset with PCK encryption enabled and an empty include filter writes a perfectly valid pack in which every file is plaintext — including an injected key file. An exclude filter also beats a `*` include. Measured by byte scan on 4.7.2, not inferred from source.
+
+### The Rule
+Always set `encryption_include_filters`; `encrypt_pck` only enables the per-file decision.
+
+Keep the protected path out of the exclude filter and verify the produced pack rather than trusting the checkbox. Related: Q57, Q58, Q21.
+
+## 68. `add_file()` from `_export_end` Is Too Late
+
+### The Engine Reality
+Extra files registered by export plugins are written inside `save_pack()` (`editor_export_platform.cpp:1475` and `:1759`). `_export_end` runs from `~ExportNotifier` (`:820-831`), i.e. when the export function's notifier is destroyed, after the pack is sealed.
+
+### The Trap / Symptom
+Calling `add_file()` from `_export_end` compiles, runs, logs nothing, and the file never appears in the pack. This looks like a filter problem and wastes time chasing the include/exclude configuration.
+
+### The Rule
+Add extra files from `_export_begin`, never from `_export_end`; the pack has already flushed its extras.
+
+Use `add_file(path, bytes, false)`; `remap` is ignored outside `_export_file` and the file is not imported. Treat `_export_end` as reporting-only. Related: Q60, Q61.
+
+## 69. `--main-pack` Still Honors a Project Working Directory
+
+### The Engine Reality
+Mounting a pack with `--main-pack` does not replace an already-resolved project. When the process working directory is itself a Godot project, `res://` still resolves against that project, so the pack's contents are shadowed for path lookups.
+
+### The Trap / Symptom
+A pack probe run from the repository root (which contains `project.godot` at a parent path or in the CWD) reported the local project's settings and files, not the mounted pack's. The same probe run from a neutral temp directory read the pack correctly. Measured in the export-contract gate.
+
+### The Rule
+Run `--main-pack` probes from a neutral directory; a project CWD overrides the pack for `res://`.
+
+Assert a marker that only the pack contains. Related: Q56, Q65.
+
+## 70. A Plugin `Window` Has No `panel` Theme Item
+
+### The Engine Reality
+`Window` binds exactly two styleboxes from its theme: `embedded_border` and `embedded_unfocused_border` (`scene/main/window.cpp:3688`). There is no `panel` item for the window body. The editor themes only define `panel` for `AcceptDialog` and `PopupPanel` (`editor/themes/theme_classic.cpp:1040`, `editor/themes/theme_modern.cpp:1026`). `AcceptDialog` gets a body by creating an internal `Panel` and overriding `panel` with its own `theme_cache.panel_style` (`scene/gui/dialogs.cpp:98`).
+
+So a bare `Window` in an editor plugin has no editor-themed item to fall back on for its background, while every `Control` inside it does have one. The result is a dialog that is half editor-themed.
+
+### The Trap / Symptom
+The pack scan dialog showed editor-styled buttons and labels on a default-grey body, in both dark and light editor themes. Assigning the theme looked correct and verifiably round-tripped:
+
+```text
+[DSPkg] pack scan dialog theme: hint=true theme_null=false roundtrip=true panel=true scale=1.00
+```
+
+Three fix rounds were spent on wiring before the theme definition was read: explicit `theme` on the `Window`, `theme` on the root `VBoxContainer`, `EditorFileDialog` (refuses to instantiate outside the editor), `wrap_controls` (does not resize an unshown window), and parenting to `EditorInterface.get_base_control()` instead of `EditorInterface.popup_dialog_centered()` (the helper parents to `EditorNode`, a plain `Node`, and theme chains break at non-`Control`/non-`Window` nodes — `scene/theme/theme_owner.cpp:135`).
+
+None of those addressed the missing item.
+
+### The Rule
+Always place a full-rect `Panel` behind a plugin `Window`'s content and override its `panel` with `AcceptDialog/panel`; assigning `theme` to the window cannot style its body.
+
+Keep the layout margins from that same stylebox so content sits where the editor's dialogs put it. Our implementation: `project/addons/directstorage_accelerator/tools/dspkg_pack_scan_dialog.gd` `_apply_editor_theme()`.
+
+```gdscript
+var dialog_style: StyleBox = EditorInterface.get_editor_theme().get_stylebox("panel", "AcceptDialog")
+if dialog_style != null:
+    _background.add_theme_stylebox_override("panel", dialog_style)
+    _layout.offset_left = dialog_style.get_margin(SIDE_LEFT)
+    # ... all four sides
+```
+
+The `Panel` must be a full-rect child placed before the content so it stays behind it. Related: Q66 for editor-run lifecycle ordering.
+
+## 71. An Imported Source Is Never Packed
+
+### The Engine Reality
+A file with an `.import` companion is not shipped as itself. The exporter walks the project, and any path that has a valid import is replaced by its imported artifact plus a `.remap` entry, so `res://x.glb` resolves to `.godot/imported/x.glb-<hash>.scn` inside the pack. `include_filter` does add matching files from disk (`editor_export_platform.cpp:1370` → `_edit_filter_list` → `_edit_files_with_filter`), but the substitution happens afterwards, so the filter loses. There is no "keep the source" option on the scene importer.
+
+### The Trap / Symptom
+The 3D benchmark failed in every exported build with:
+
+```text
+[DS 3D Benchmark] ERROR: Model file not found: res://test_assets/steampunk_underwater_explorer.glb
+```
+
+Measured on a plaintext export mounted in a neutral project:
+
+```text
+RES res://test_assets/steampunk_underwater_explorer.glb  file=false  loader_exists=true  load=true
+```
+
+`include_filter="README.txt,*.glb"` had been in the preset the whole time and never shipped the file. The size arithmetic proves it independently: an 80 MB pack cannot contain a 50 MB source plus everything else.
+
+The first probe missed this because it ran with `--path project`, so `res://` fell through to the live project and reported `file=true` — see Q69.
+
+### The Rule
+Never rely on `include_filter` to ship an imported source (`.glb`, `.png`); Godot substitutes the imported artifact plus a `.remap`, so raw bytes need a non-imported extension or `add_file()`.
+
+For a reader that needs raw bytes, give the asset a non-imported name and match that in the include filter:
+
+```text
+res://test_assets/raw/steampunk_underwater_explorer.glb.bin   # not imported
+include_filter="README.txt,*.bin"
+```
+
+Or inject the file with `add_file()` from `_export_begin` (Q68). Note that `include_filter="*.glb"` is a silent no-op — worth deleting from presets because it reads like it works.
+
+## 72. `add_autoload_singleton()` Marks the Editor Unsaved
+
+### The Engine Reality
+`EditorPlugin::add_autoload_singleton()`/`remove_autoload_singleton()` do not write a project setting directly; they hand off to `EditorAutoloadSettings::autoload_add()`/`autoload_remove()` (`editor/settings/editor_autoload_settings.cpp:762`, `:806` in 4.7.2), and both wrap the change in an `EditorUndoRedoManager` action:
+
+```cpp
+EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+undo_redo->create_action(TTR("Remove Autoload"));   // no history id -> GLOBAL_HISTORY
+...
+undo_redo->commit_action();
+```
+
+`EditorNode::_update_unsaved_cache()` ORs `is_history_unsaved(GLOBAL_HISTORY)` into the title star (`editor_node.cpp:386-388`), the quit flow gates "Save modified resources before closing?" on the same flag (`:3779`), and committing sets `saved_version = UNSAVED_VERSION` (`editor_undo_redo_manager.cpp:390-394`), which `is_history_unsaved()` treats as permanently dirty. Only a save path calls `set_history_as_saved(GLOBAL_HISTORY)` (`editor_node.cpp:2426`), and that method is not exposed to GDScript, so a plugin cannot clear it.
+
+### The Trap / Symptom
+Disabling an addon that manages its own autoload left the editor showing a modified project, with no scene touched:
+
+```text
+(*) test_3d_steampunk_benchmark.tscn - DirectStorage Accelerator Demo - Godot Engine
+```
+
+Quitting then asked to save modified resources, and undo did nothing because the action lives in the global history rather than the scene's. The mark is easy to misread as "the scene has unsaved edits", which sends you looking at whatever was edited last — and because `project.godot` may not be written yet, the autoload state on disk can disagree with the editor while the star is showing.
+
+### The Rule
+Never call `add_autoload_singleton()`/`remove_autoload_singleton()` from a plugin's enable/disable path; write the `autoload/<name>` entry with `ProjectSettings.set_setting()`/`clear()` + `save()` instead.
+
+```gdscript
+func _sync_autoload(p_name: String, p_path: String) -> void:
+    var key := "autoload/" + p_name
+    if p_path.is_empty():
+        if not ProjectSettings.has_setting(key):
+            return
+        ProjectSettings.clear(key)
+    elif ProjectSettings.has_setting(key):
+        return                      # already registered; keep its *uid:// form
+    else:
+        ProjectSettings.set_setting(key, "*" + p_path)
+        ProjectSettings.set_as_basic(key, true)
+    ProjectSettings.save()
+```
+
+Our implementation: `project/addons/directstorage_accelerator/scripts/ds_plugin.gd` `_sync_autoload()`, called from `_enter_tree()` (legacy purge + register) and `_exit_tree()` (unregister). Edits made through the Project Settings -> Autoload UI still take the undoable path; only the plugin's own enable/disable writes bypass it, which is the intent.
+
+Two accepted costs: the Project Settings -> Autoload list does not refresh until it is reopened, and the live autoload node stays in the editor tree until restart. Also note that editor plugin scripts are not hot-reloaded from disk (there is no reload hook in `editor_node.cpp`), so restart the editor before judging a change to plugin startup code — otherwise you are testing the old script.
+
+## 73. A Runtime-Assigned Editor Theme Is Serialized Into the Scene
+
+### The Engine Reality
+Saving a scene runs `PackedScene::pack()`, which walks every node property and stores any `Resource` reference that differs from the class default. The editor theme is built at runtime by `EditorThemeManager` and has no `resource_path`, so it cannot become an `[ext_resource]`; it is inlined as a `[sub_resource]` together with its whole dependency graph. `Node::NOTIFICATION_EDITOR_PRE_SAVE` (9001) and `NOTIFICATION_EDITOR_POST_SAVE` (9002) fire immediately before and after that write, in the editor only.
+
+### The Trap / Symptom
+A dialog scene that was ~100 lines on disk became 6,826,613 bytes / 22,550 lines, with Godot warning that the text scene is large:
+
+| sub-resource | count | bytes |
+| --- | --- | --- |
+| `FontFile` (embedded TTFs: Noto/Vazirmatn/Inter/JetBrains Mono) | 29 | 4,158,429 |
+| `Image` (256x256 `LumAlpha8` MSDF atlases) | 10 | 1,749,190 |
+| `DPITexture` (inline SVG icon sources) | 1,045 | 680,751 |
+| `EditorTheme` (320 colors / 428 styles / 1,200 icons) | 1 | 149,312 |
+
+The fingerprints pointed at the script rather than an import: `theme = SubResource("EditorTheme_...")` sat on exactly the three nodes `_apply_editor_theme()` assigns it to, `theme_override_styles/panel` was the `AcceptDialog` panel StyleBox, and the four layout offsets equaled that StyleBox's margins. The editor was faithfully recording the live tree, so the file looked corrupt while the saved text had never contained those resources.
+
+### The Rule
+Never leave `EditorInterface.get_editor_theme()` (or a StyleBox taken from it) assigned to a node property in a scene the editor can save; clear it in `NOTIFICATION_EDITOR_PRE_SAVE` (9001) and restore it in `NOTIFICATION_EDITOR_POST_SAVE` (9002).
+
+```gdscript
+func _notification(what: int) -> void:
+    if not Engine.is_editor_hint() or not is_node_ready():
+        return
+    if what == NOTIFICATION_EDITOR_PRE_SAVE:
+        theme = null
+        _layout.theme = null
+        _file_dialog.theme = null
+        _background.remove_theme_stylebox_override("panel")
+    elif what == NOTIFICATION_EDITOR_POST_SAVE:
+        _apply_editor_theme_look()      # theme half only, never the UI-scale resize
+```
+
+Deleting the baked block without the guard does not stick: opening the scene re-runs `_ready()`, so the next save re-adds ~6.4 MB. Saving the scene as `.scn` only hides the diff. Related: Q70 (the window panel that needs the theme in the first place), Q72.
+
+The same leak applies to any state a `@tool` script computes at load time — `content_scale_factor`/`size`/`min_size` multiplied by `EditorInterface.get_editor_scale()` are node properties too, so saving from a non-1.0 editor scale bakes the multiplied values and they compound on the next open.
+
+## 74. `slices.size() < 7` Is a Filesystem-Cache Parse, Not a Scene Fault
+
+### The Engine Reality
+`EditorFileSystem::_scan_filesystem()` (`editor/file_system/editor_file_system.cpp:409` in 4.7.2) first loads the on-disk scan cache at `:425-488`. Line 1 is the import-settings hash, `::<dir>::<uid>` lines are directory headers, and every other line is one file:
+
+```text
+name::type::uid::mtime::import_mtime::import_valid::group::<name<>extends<>icon<>abstract<>tool<>import_md5<>dest_paths>::deps
+```
+
+Field 7 must split into 7 `<>` slices; `:476` is `ERR_CONTINUE(slices.size() < 7)`, so a malformed record is skipped and its file rescanned. `_save_filesystem_cache()` always writes 7, and the format is identical from 4.5 through 4.7.3, so a version difference is not a plausible cause — a truncated or interleaved write is.
+
+### The Trap / Symptom
+Right after an unrelated edit, the editor printed one of these per bad record at startup:
+
+```text
+ERROR: (233) editor/file_system/editor_file_system.cpp:476 - Condition "slices.size() < 7" is true. Continuing.
+```
+
+The obvious reading — "the scene I just changed corrupted the project" — is wrong, and timestamps settled it here: the scene was written at 20:03:54, the editor started at 20:07:35 and rewrote a clean cache 5 s later, while the malformed cache had been written by the previous session before 19:53. Scene size or content never enters that file; a record holds only name, type, uid, timestamps, import flags and dependency paths, so a 6.5 MB -> 3.4 KB scene rewrite cannot move the needle.
+
+### The Rule
+Never debug scene or resource content for `editor_file_system.cpp:476 Condition "slices.size() < 7"`; it is a malformed record in `.godot/editor/filesystem_cache10`, so rescan or delete the cache instead.
+
+`ERR_CONTINUE` makes the damage cosmetic: one error per bad record, only on a full scan, and the scan that follows rewrites the file. Confirm by parsing the current cache (`.agents/scratch/analyze_fs_cache.ps1` — 233 records, 0 malformed in our case), or delete `.godot/editor/filesystem_cache10` to force a clean rebuild. Related: Q56 (another stale editor-cache trap), Q47.
 

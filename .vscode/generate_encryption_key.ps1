@@ -123,10 +123,11 @@ if ($copiedToClipboard) {
     Write-Host "  [!] Please select and copy the 64-hex key above to your clipboard." -ForegroundColor Yellow
 }
 Write-Host ""
-Write-Host "  Where to use this key:" -ForegroundColor Gray
-Write-Host "    * Export Preset : directstorage/encryption_key in export_presets.cfg" -ForegroundColor White
+Write-Host "  Where to use this key (legacy source build and local tooling only):" -ForegroundColor Gray
 Write-Host "    * SCons (.env)  : DSPKG_ENCRYPTION_KEY_FILE=$displayRelPath" -ForegroundColor White
 Write-Host "    * GDScript      : DSPkg.set_global_encryption_key(`"$keyHex`")" -ForegroundColor White
+Write-Host "  Shipped games do not use a fixed key: every export generates a random archive key" -ForegroundColor Gray
+Write-Host "  and delivers it inside the encrypted PCK." -ForegroundColor Gray
 Write-Host ""
 Write-Host "  Security Reminder:" -ForegroundColor Gray
 Write-Host "    Never commit this key file to public source control (ignored by .gitignore)." -ForegroundColor DarkGray

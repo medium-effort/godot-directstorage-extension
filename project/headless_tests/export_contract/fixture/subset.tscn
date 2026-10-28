@@ -1,0 +1,8 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Texture2D" path="res://assets/used.dstex" id="1_used"]
+
+[node name="Subset" type="Node"]
+
+[node name="Sprite" type="Sprite2D" parent="."]
+texture = ExtResource("1_used")
