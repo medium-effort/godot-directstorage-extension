@@ -6,6 +6,8 @@ This addon exposes DirectStorage-backed texture streaming and asynchronous I/O r
 
 Enable the `DirectStorage Accelerator` plugin. It registers the `DSRuntime` autoload, the `DirectStorage Texture` importer, and the `DirectStorageExporter` export plugin.
 
+The autoload entry is written to `project.godot` when the plugin is enabled and removed only when you disable the plugin again — commit it with the rest of your project settings. Closing the editor keeps it, because standalone and exported builds need that node to drive the asynchronous prewarm queue.
+
 The importer converts `.png`, `.jpg`, `.jpeg`, and `.webp` sources into `.dstex` (version 2) resources with D3D12-aligned footprints (256-byte row pitch alignment and 512-byte mip placement alignment) for direct hardware decompression. Its Import dock options control source compression mode (S3TC vs uncompressed), source color space, and GDeflate compression level.
 
 During export, imported `.dstex` files are bundled into `res://textures.dspkg` (version 3 or version 4 with encrypted TOC) along with per-entry GPU mip metadata and entry flags. The runtime resource loader resolves texture paths directly from that archive without requiring individual `.dstex` files in the exported PCK.
@@ -27,6 +29,29 @@ The native classes are documented in Godot's Editor Help and support Ctrl-click 
 - `DSErrorHandler` and `DSProfiler`: monitor asynchronous DirectStorage kernel errors, measure physical storage throughput, and inspect logical decompression metrics.
 
 The extension registers `DSContext`, `DSErrorHandler`, `DSProfiler`, and `DSTextureCache` as Engine singletons. Access them via `Engine.get_singleton("DSContext")` or the corresponding singleton name.
+
+## Async Prewarm: Who Owns What
+
+`DSPreloader` drives the streaming queue and reports its state; it deliberately does not make policy decisions for the game.
+
+- **Residency is intentional.** `DSTextureCache` keeps prewarmed textures resident after a scene swap, so memory staying high (roughly one level's worth of textures) is the cache working, not a leak. Resident entries load again with no disk read.
+- **Releasing a level's GPU resources is the game's job.** Drop the references the scene held, then call `DSTextureCache.clear_unused()`; entries that still have a live reference are kept. Judge the result by whether you are still hitting your session's own best throughput, not by a fixed millisecond budget — the same byte count is cheap with memory headroom and slow when the system is paging.
+- **The addon will not warn you about scene teardown.** A slow quit is the engine freeing the scene graph plus the driver releasing memory; `DSPreloader` does not watch for it and emits nothing. Do not wait for a warning that will never come.
+- **Eviction granularity is per call, not per microsecond.** There is no `clear_unused_budget()`, and none is planned: the call itself is not where the time goes. To spread the cost, release references in stages and call `clear_unused()` after each stage.
+
+Diagnostics, so a wedged load is one call instead of three pollers:
+
+```gdscript
+# Returns false (and cancels the tag) instead of polling forever.
+var ok: bool = await DSPreloader.await_prewarm_finished(tag, on_progress, 8000, on_stall)
+if not ok:
+    # {"progress": Vector2i, "complete": bool, "pending": int, "unbuilt": int,
+    #  "unbuilt_cpu": int, "unbuilt_gpu": int}
+    push_warning("prewarm wedged: %s" % DSPreloader.get_prewarm_state(tag))
+    # fall back to the synchronous load path here
+```
+
+`stall_timeout_msec = 0` keeps the historical "poll until done" behaviour, so existing callers need no change. The stall check watches progress *and* the pending/unbuilt counters, because a batch can finish every request and still be building textures.
 
 ## Project Settings
 

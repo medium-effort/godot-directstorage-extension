@@ -5,15 +5,19 @@
 	</brief_description>
 	<description>
 		[DSPreloader] provides a high-level static GDScript API over DirectStorage streaming and GPU decompression. It walks scene dependencies to discover texture paths, issues stream prewarm requests through [DSTextureCache], and coordinates with the [code]DSRuntime[/code] autoload for non-blocking scene loading.
+		[b]Residency ownership:[/b] the texture cache pins prewarmed textures on purpose, so memory staying high after a scene swap is the expected design, not a leak. Releasing a scene's GPU resources is the game's job (drop the references, then call [code]DSTextureCache.clear_unused()[/code]); measure that release in bytes per second against the session's own best rate rather than a fixed millisecond budget. [DSPreloader] does not watch scene teardown and emits no warnings about it - do not wait for one.
 	</description>
 	<tutorials>
 	</tutorials>
 	<methods>
 		<method name="await_prewarm_finished" qualifiers="static">
-			<return type="void" />
+			<return type="bool" />
 			<param index="0" name="tag" type="int" />
 			<param index="1" name="on_progress" type="Callable" default="Callable()" />
-			<description>Awaits completion of prewarm batch [param tag] across frame updates without blocking the main thread, optionally invoking [param on_progress] with [code](done, total)[/code] each frame.</description>
+			<param index="2" name="stall_timeout_msec" type="int" default="0" />
+			<param index="3" name="on_stall" type="Callable" default="Callable()" />
+			<description>Awaits completion of prewarm batch [param tag] across frame updates without blocking the main thread, optionally invoking [param on_progress] with [code](done, total)[/code] each frame. Returns [code]true[/code] when the batch completed, [code]false[/code] when the main loop is not a [SceneTree] or when the batch was declared stalled.
+			[param stall_timeout_msec] is opt-in and defaults to [code]0[/code], which polls until completion with no timeout (the historical behaviour). When greater than zero it tracks a liveness fingerprint (progress plus the pending/unbuilt texture counters, because a batch can finish every request and still be building textures); after that many milliseconds without any change it emits one warning with a state dump, calls [method cancel_prewarm], invokes [param on_stall] with [code](tag, done, total)[/code] when valid, and returns [code]false[/code]. The cancelled tag reaches its terminal state on the next completion harvest, so a pump tick is still needed afterwards. Callers that ignore the return value keep working unchanged.</description>
 		</method>
 		<method name="cancel_prewarm" qualifiers="static">
 			<return type="void" />
@@ -31,6 +35,11 @@
 			<param index="0" name="tag" type="int" />
 			<description>Returns [code]Vector2i(completed, total)[/code] items processed for prewarm batch [param tag].</description>
 		</method>
+		<method name="get_prewarm_state" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="tag" type="int" />
+			<description>Returns a one-call diagnostic snapshot of prewarm batch [param tag]: [code]progress[/code] ([Vector2i] done/total), [code]complete[/code] ([bool]), and the per-tag texture counters [code]pending[/code], [code]unbuilt[/code], [code]unbuilt_cpu[/code], [code]unbuilt_gpu[/code] ([int]), so a caller can log why a load did not finish without assembling several pollers. Every counter is probed with [method @GlobalScope.has_method] and reports [code]0[/code] on older native builds. An unknown tag reports [code]complete = true[/code], [code]progress = (0, 0)[/code] and zero counters, matching [method is_prewarm_complete].</description>
+		</method>
 		<method name="is_gpu_prewarm_available" qualifiers="static">
 			<return type="bool" />
 			<description>Returns [code]true[/code] if Direct3D 12 hardware GPU decompression prewarm directly into VRAM is supported and active.</description>
@@ -42,7 +51,7 @@
 		</method>
 		<method name="is_stream_prewarm_available" qualifiers="static">
 			<return type="bool" />
-			<description>Returns [code]true[/code] if the native DirectStorage streaming pipeline singletons are active and available.</description>
+			<description>Returns [code]true[/code] if the native DirectStorage streaming pipeline singletons are active AND a stream driver node is in the scene tree ([code]/root/DSRuntime[/code], or the legacy [code]/root/DSBatchManager[/code]). Both halves are required: the driver's [code]_process()[/code] is what submits and harvests the queue, so capability flags alone would let callers wait forever on requests nobody services.</description>
 		</method>
 		<method name="load_scene_with_loading_screen" qualifiers="static">
 			<return type="Node" />
@@ -58,14 +67,14 @@
 		<method name="prewarm_async" qualifiers="static">
 			<return type="int" />
 			<param index="0" name="paths" type="PackedStringArray" />
-			<description>Enqueues texture [param paths] for asynchronous CPU memory streaming prewarm and returns the assigned batch tag.</description>
+			<description>Enqueues texture [param paths] for asynchronous CPU memory streaming prewarm and returns the assigned batch tag. Returns [code]0[/code] when the native singletons or the stream driver autoload ([code]DSRuntime[/code]) are unavailable; a tag issued without that driver would never complete.</description>
 		</method>
 		<method name="prewarm_gpu_async" qualifiers="static">
 			<return type="int" />
 			<param index="0" name="paths" type="PackedStringArray" />
 			<param index="1" name="chunk_size" type="int" default="16" />
 			<param index="2" name="prefer_gpu" type="bool" default="true" />
-			<description>Enqueues texture [param paths] for direct-to-GPU VRAM DMA streaming prewarm in chunks of [param chunk_size] and returns the batch tag.</description>
+			<description>Enqueues texture [param paths] for direct-to-GPU VRAM DMA streaming prewarm in chunks of [param chunk_size] and returns the batch tag. Returns [code]0[/code] when the native singletons or the stream driver autoload ([code]DSRuntime[/code]) are unavailable.</description>
 		</method>
 	</methods>
 	<constants>

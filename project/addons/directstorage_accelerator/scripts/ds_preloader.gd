@@ -48,6 +48,54 @@ const TRAVERSABLE_EXTENSIONS: PackedStringArray = ["tscn", "scn", "tres", "res",
 ## headroom for 60 FPS loading-screen rendering.
 const FALLBACK_FRAME_BUDGET_USEC: int = 8000
 
+## Name of the autoload that drives the async stream queue, and the legacy
+## autoload older addon versions installed. One of them must exist in the tree
+## or nothing ever calls [code]flush_stream_async()[/code] /
+## [code]poll_completed()[/code].
+const STREAM_PUMP_AUTOLOAD: String = "DSRuntime"
+const STREAM_PUMP_LEGACY_AUTOLOAD: String = "DSBatchManager"
+
+## One-shot guard for the "requests enqueued but no driver" diagnostic, so a
+## loading screen that asks every frame logs the cause once instead of flooding.
+static var _missing_pump_warned: bool = false
+
+
+## Returns the per-frame stream driver node ([code]/root/DSRuntime[/code], or
+## the legacy [code]/root/DSBatchManager[/code]), or [code]null[/code] when
+## neither is in the tree or there is no [SceneTree] main loop.
+static func _get_stream_pump() -> Node:
+	var loop: MainLoop = Engine.get_main_loop()
+	if not (loop is SceneTree):
+		return null
+	var root_node: Window = (loop as SceneTree).root
+	if root_node == null:
+		return null
+	var pump: Node = root_node.get_node_or_null(STREAM_PUMP_AUTOLOAD)
+	if pump == null:
+		pump = root_node.get_node_or_null(STREAM_PUMP_LEGACY_AUTOLOAD)
+	return pump
+
+
+## True when a stream driver node is in the tree. The queue is only submitted
+## and harvested from [code]_process()[/code] of that node, so the native
+## capability flags alone do not make async prewarm usable.
+static func _has_stream_pump() -> bool:
+	return _get_stream_pump() != null
+
+
+## One loud, once-per-process diagnostic for the state that used to look like a
+## silent hang: the native pipeline reports itself available, but no autoload
+## submits or harvests the stream queue. Callers see
+## [method is_stream_prewarm_available] return [code]false[/code] and
+## [method prewarm_async] / [method prewarm_gpu_async] return [code]0[/code].
+static func _warn_missing_stream_pump() -> void:
+	if _missing_pump_warned:
+		return
+	_missing_pump_warned = true
+	push_error(
+		"[DirectStorage] DSPreloader: async prewarm unavailable - neither /root/%s nor /root/%s exists, so nothing submits or harvests the stream queue (requests would sit there forever). Enable the DirectStorage Accelerator plugin in Project Settings > Plugins so it registers the autoload, or add '%s' to autoload manually." % [STREAM_PUMP_AUTOLOAD, STREAM_PUMP_LEGACY_AUTOLOAD, STREAM_PUMP_AUTOLOAD]
+	)
+
 
 ## Normalizes a raw dependency entry returned by [code]ResourceLoader.get_dependencies()[/code]
 ## into a clean [code]res://[/code] or [code]user://[/code] engine path.
@@ -197,12 +245,18 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 	return out
 
 
-## Returns [code]true[/code] when async stream prewarm is available
-## ([code]flush_stream_async/has_stream_pending[/code] on [code]DSContext[/code]
-## plus [code]prewarm_async[/code] on [code]DSTextureCache[/code]). When
-## [code]false[/code], callers must use the frame-budgeted sync fallback in
+## Returns [code]true[/code] when async stream prewarm is available:
+## [code]flush_stream_async/has_stream_pending[/code] on [code]DSContext[/code],
+## [code]prewarm_async[/code] on [code]DSTextureCache[/code], and a stream
+## driver node ([code]/root/DSRuntime[/code] or the legacy
+## [code]/root/DSBatchManager[/code]) in the tree. When [code]false[/code],
+## callers must use the frame-budgeted sync fallback in
 ## [method load_scene_with_loading_screen]; regular
 ## [code]ResourceLoader.load()[/code] calls keep working untouched.
+##
+## The driver check is the important half: without it this reported
+## [code]true[/code] for a project whose autoload was missing, so callers chose
+## the async path and then waited forever on a queue nobody submitted.
 static func is_stream_prewarm_available() -> bool:
 	if not ClassDB.class_exists("DSContext"):
 		return false
@@ -212,7 +266,12 @@ static func is_stream_prewarm_available() -> bool:
 	var cache: Object = Engine.get_singleton("DSTextureCache")
 	if ctx == null or cache == null:
 		return false
-	return ctx.has_method("flush_stream_async") and ctx.has_method("has_stream_pending") and cache.has_method("prewarm_async")
+	if not (ctx.has_method("flush_stream_async") and ctx.has_method("has_stream_pending") and cache.has_method("prewarm_async")):
+		return false
+	if not _has_stream_pump():
+		_warn_missing_stream_pump()
+		return false
+	return true
 
 
 ## Enqueues [param paths] (engine texture paths) for async prewarm and returns
@@ -222,7 +281,8 @@ static func is_stream_prewarm_available() -> bool:
 ## coordinator, so this also calls [code]track_prewarm(tag)[/code] immediately —
 ## without it the tag still flows through flush/collect but emits no
 ## [code]prewarm_progress[/code] / [code]prewarm_finished[/code] signals.
-## Returns 0 when the native singletons are unavailable.
+## Returns 0 when the native singletons or the stream driver are unavailable;
+## a tag returned without a driver would never complete.
 static func prewarm_async(paths: PackedStringArray) -> int:
 	if not ClassDB.class_exists("DSTextureCache"):
 		push_warning("[DirectStorage] DSPreloader: DSTextureCache class unavailable; prewarm_async aborted.")
@@ -230,6 +290,9 @@ static func prewarm_async(paths: PackedStringArray) -> int:
 	var cache: Object = Engine.get_singleton("DSTextureCache")
 	if cache == null or not cache.has_method("prewarm_async"):
 		push_warning("[DirectStorage] DSPreloader: DSTextureCache singleton unavailable; prewarm_async aborted.")
+		return 0
+	if not _has_stream_pump():
+		_warn_missing_stream_pump()
 		return 0
 	var tag: int = int(cache.call("prewarm_async", paths))
 	_track_batch_manager_tag(tag)
@@ -252,7 +315,7 @@ static func is_gpu_prewarm_available() -> bool:
 ## and filled via DirectStorage DMA decompression straight into VRAM. Ineligible textures or
 ## non-D3D12 platforms automatically fall back to the CPU [ImageTexture] memory stream path.
 ## Textures are allocated in render-thread chunks of [param chunk_size] to bound frame time.
-## Returns 0 when native singletons are unavailable.
+## Returns 0 when native singletons or the stream driver are unavailable.
 static func prewarm_gpu_async(paths: PackedStringArray, chunk_size: int = 16, prefer_gpu: bool = true) -> int:
 	if not ClassDB.class_exists("DSTextureCache"):
 		push_warning("[DirectStorage] DSPreloader: DSTextureCache class unavailable; prewarm_gpu_async aborted.")
@@ -260,6 +323,9 @@ static func prewarm_gpu_async(paths: PackedStringArray, chunk_size: int = 16, pr
 	var cache: Object = Engine.get_singleton("DSTextureCache")
 	if cache == null:
 		push_warning("[DirectStorage] DSPreloader: DSTextureCache singleton unavailable; prewarm_gpu_async aborted.")
+		return 0
+	if not _has_stream_pump():
+		_warn_missing_stream_pump()
 		return 0
 	var tag: int = 0
 	if cache.has_method("prewarm_gpu_async"):
@@ -299,9 +365,11 @@ static func is_prewarm_complete(tag: int) -> bool:
 	return complete
 
 
-## Cancels the prewarm for [param tag]: queued requests fail with a
-## "cancelled" message so [method is_prewarm_complete] returns [code]true[/code].
-## Does nothing when the context is unavailable.
+## Cancels the prewarm for [param tag]: queued requests are marked failed and
+## requests already submitted to the backend are cancelled there. The tag reports
+## complete once the next completion harvest observes those terminal states, so a
+## pump tick is still needed after this call. Does nothing when the context is
+## unavailable.
 static func cancel_prewarm(tag: int) -> void:
 	if not ClassDB.class_exists("DSContext"):
 		return
@@ -310,28 +378,113 @@ static func cancel_prewarm(tag: int) -> void:
 		ctx.call("cancel_prewarm", tag)
 
 
+## One-call snapshot of prewarm batch [param tag], so a caller does not have to
+## assemble three pollers itself just to log what happened.
+##
+## Keys: [code]progress[/code] ([Vector2i] done/total), [code]complete[/code]
+## ([bool]), and the per-tag texture counters [code]pending[/code],
+## [code]unbuilt[/code], [code]unbuilt_cpu[/code], [code]unbuilt_gpu[/code]
+## ([int]). Every counter is [code]has_method[/code]-guarded, so an older native
+## binary reports [code]0[/code] instead of erroring.
+##
+## An unknown tag reports [code]complete = true[/code], [code]progress = (0, 0)[/code]
+## and zero counters, matching [method is_prewarm_complete], which treats a tag
+## that was never issued (or was already retired) as "nothing pending" rather
+## than "wedged".
+static func get_prewarm_state(tag: int) -> Dictionary:
+	var state: Dictionary = {
+		"progress": get_prewarm_progress(tag),
+		"complete": is_prewarm_complete(tag),
+		"pending": 0,
+		"unbuilt": 0,
+		"unbuilt_cpu": 0,
+		"unbuilt_gpu": 0,
+	}
+	if not ClassDB.class_exists("DSTextureCache"):
+		return state
+	var cache: Object = Engine.get_singleton("DSTextureCache")
+	if cache == null:
+		return state
+	var counters: Dictionary = {
+		"pending": "get_pending_prewarm_count",
+		"unbuilt": "get_unbuilt_prewarm_count",
+		"unbuilt_cpu": "get_unbuilt_cpu_prewarm_count",
+		"unbuilt_gpu": "get_unbuilt_gpu_prewarm_count",
+	}
+	for key in counters:
+		var method: String = counters[key]
+		if cache.has_method(method):
+			state[key] = int(cache.call(method, tag))
+	return state
+
+
+## Compact liveness fingerprint for [param tag]: request progress plus the
+## pending/unbuilt texture counters. Progress alone is not enough, because
+## [method is_prewarm_complete] also waits for the build queue, so a batch can
+## legitimately sit at [code]done == total[/code] for a while with textures
+## still being built - that must not read as a stall.
+static func _prewarm_liveness(tag: int) -> Vector4i:
+	var state: Dictionary = get_prewarm_state(tag)
+	var progress: Vector2i = state["progress"]
+	return Vector4i(progress.x, progress.y, int(state["pending"]), int(state["unbuilt"]))
+
+
+## Emits the stall diagnostic: one line with the full prewarm state plus the
+## most likely cause, so the caller only has to decide policy (fall back, retry,
+## report). The batch is cancelled by the caller right after this.
+static func _warn_prewarm_stall(tag: int, progress: Vector2i, stall_timeout_msec: int) -> void:
+	var state: Dictionary = get_prewarm_state(tag)
+	var cause := "the stream driver is still in the tree, so the queue is not making progress; check DSErrorHandler for a device-lost or queue error"
+	if not _has_stream_pump():
+		cause = "no /root/%s or /root/%s in the scene tree, so nothing submits the stream queue; enable the DirectStorage Accelerator plugin so it registers the autoload" % [STREAM_PUMP_AUTOLOAD, STREAM_PUMP_LEGACY_AUTOLOAD]
+	push_warning(
+		"[DirectStorage] DSPreloader: prewarm tag %d stalled - no progress for %d ms, cancelling it so the caller can fall back. state: progress=(%d, %d) complete=%s pending=%d unbuilt=%d (cpu=%d gpu=%d). cause: %s"
+		% [
+			tag,
+			stall_timeout_msec,
+			progress.x,
+			progress.y,
+			str(bool(state["complete"])),
+			int(state["pending"]),
+			int(state["unbuilt"]),
+			int(state["unbuilt_cpu"]),
+			int(state["unbuilt_gpu"]),
+			cause,
+		]
+	)
+
+
 ## Awaits prewarm completion without blocking: yields one
 ## [code]process_frame[/code] per iteration and invokes
 ## [param on_progress] as [code]on_progress.call(done, total)[/code] for bar
-## updates. Prefer awaiting the batch manager's
-## [code]prewarm_finished[/code] signal when the autoload is present; use
-## this poll when driving progress from a static context.
-static func await_prewarm_finished(tag: int, on_progress: Callable = Callable()) -> void:
+## updates. Returns [code]true[/code] when the batch completed, [code]false[/code]
+## when the main loop is not a [SceneTree] or when the batch was declared
+## stalled and cancelled.
+##
+## [param stall_timeout_msec] is opt-in and defaults to [code]0[/code], which
+## keeps the historical behaviour exactly: poll until complete, no timeout.
+## When greater than zero, the call tracks a liveness fingerprint (progress plus
+## the pending/unbuilt counters) and, after that many milliseconds without any
+## change, emits one warning with a state dump, calls [method cancel_prewarm] so
+## the tag terminates on the next completion harvest, invokes [param on_stall] as
+## [code]on_stall.call(tag, done, total)[/code] when valid, and returns
+## [code]false[/code]. Callers that ignore the return value keep working.
+##
+## Prefer awaiting the batch manager's [code]prewarm_finished[/code] signal when
+## the autoload is present; use this poll when driving progress from a static
+## context.
+static func await_prewarm_finished(tag: int, on_progress: Callable = Callable(), stall_timeout_msec: int = 0, on_stall: Callable = Callable()) -> bool:
 	if on_progress.is_valid():
 		var initial: Vector2i = get_prewarm_progress(tag)
 		on_progress.call(initial.x, initial.y)
 	var loop: MainLoop = Engine.get_main_loop()
+	var last_alive_msec: int = Time.get_ticks_msec()
+	var last_alive: Vector4i = _prewarm_liveness(tag)
 	while not is_prewarm_complete(tag):
-		if loop is SceneTree:
-			await (loop as SceneTree).process_frame
-		else:
-			return
-		var manager: Node = null
-		if loop is SceneTree:
-			var root_node: Window = (loop as SceneTree).root
-			manager = root_node.get_node_or_null("DSRuntime")
-			if manager == null:
-				manager = root_node.get_node_or_null("DSBatchManager")
+		if not (loop is SceneTree):
+			return false
+		await (loop as SceneTree).process_frame
+		var manager: Node = _get_stream_pump()
 		if manager == null and ClassDB.class_exists("DSTextureCache"):
 			var cache: Object = Engine.get_singleton("DSTextureCache")
 			if cache != null:
@@ -339,12 +492,28 @@ static func await_prewarm_finished(tag: int, on_progress: Callable = Callable())
 					cache.call("pump_gpu_prewarm")
 				if cache.has_method("poll_completed"):
 					cache.call("poll_completed", tag, 0, 2000)
+		var progress: Vector2i = get_prewarm_progress(tag)
 		if on_progress.is_valid():
-			var progress: Vector2i = get_prewarm_progress(tag)
 			on_progress.call(progress.x, progress.y)
+		if stall_timeout_msec <= 0:
+			continue
+		var now: int = Time.get_ticks_msec()
+		var liveness: Vector4i = _prewarm_liveness(tag)
+		if liveness != last_alive:
+			last_alive = liveness
+			last_alive_msec = now
+			continue
+		if now - last_alive_msec < stall_timeout_msec:
+			continue
+		_warn_prewarm_stall(tag, progress, stall_timeout_msec)
+		cancel_prewarm(tag)
+		if on_stall.is_valid():
+			on_stall.call(tag, progress.x, progress.y)
+		return false
 	if on_progress.is_valid():
 		var final_progress: Vector2i = get_prewarm_progress(tag)
 		on_progress.call(final_progress.x, final_progress.y)
+	return true
 
 
 ## Full loading-screen sample: prewarm -> cached scene bind -> instantiate ->
@@ -402,13 +571,7 @@ static func load_scene_with_loading_screen(tree: SceneTree, scene_path: String, 
 static func _track_batch_manager_tag(tag: int) -> void:
 	if tag <= 0:
 		return
-	var loop: MainLoop = Engine.get_main_loop()
-	if not (loop is SceneTree):
-		return
-	var root_node: Window = (loop as SceneTree).root
-	var manager: Node = root_node.get_node_or_null("DSRuntime")
-	if manager == null:
-		manager = root_node.get_node_or_null("DSBatchManager")
+	var manager: Node = _get_stream_pump()
 	if manager != null and manager.has_method("track_prewarm"):
 		manager.call("track_prewarm", tag)
 

@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 28 October 2026
+Last updated: 29 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1725,7 +1725,7 @@ func _sync_autoload(p_name: String, p_path: String) -> void:
     ProjectSettings.save()
 ```
 
-Our implementation: `project/addons/directstorage_accelerator/scripts/ds_plugin.gd` `_sync_autoload()`, called from `_enter_tree()` (legacy purge + register) and `_exit_tree()` (unregister). Edits made through the Project Settings -> Autoload UI still take the undoable path; only the plugin's own enable/disable writes bypass it, which is the intent.
+Our implementation: `project/addons/directstorage_accelerator/scripts/ds_plugin.gd` `_sync_autoload()`, called from `_enter_tree()` (legacy purge + register) and from `_disable_plugin()` (unregister). Never from `_exit_tree()`: that runs on a normal editor shutdown too, and unregistering there deletes the `autoload/<name>` entry from `project.godot` whenever the editor closes, so the next standalone or exported run has no autoload node at all. `_disable_plugin()` is the only callback the engine fires exclusively for a user-initiated disable (`EditorNode::set_addon_plugin_enabled()` calls `disable_plugin()` before `remove_child()` only when `p_config_changed` is true; `EditorNode::unload_editor_addons()` on quit passes `false`). Edits made through the Project Settings -> Autoload UI still take the undoable path; only the plugin's own enable/disable writes bypass it, which is the intent.
 
 Two accepted costs: the Project Settings -> Autoload list does not refresh until it is reopened, and the live autoload node stays in the editor tree until restart. Also note that editor plugin scripts are not hot-reloaded from disk (there is no reload hook in `editor_node.cpp`), so restart the editor before judging a change to plugin startup code — otherwise you are testing the old script.
 
@@ -1790,4 +1790,26 @@ The obvious reading — "the scene I just changed corrupted the project" — is 
 Never debug scene or resource content for `editor_file_system.cpp:476 Condition "slices.size() < 7"`; it is a malformed record in `.godot/editor/filesystem_cache10`, so rescan or delete the cache instead.
 
 `ERR_CONTINUE` makes the damage cosmetic: one error per bad record, only on a full scan, and the scan that follows rewrites the file. Confirm by parsing the current cache (`.agents/scratch/analyze_fs_cache.ps1` — 233 records, 0 malformed in our case), or delete `.godot/editor/filesystem_cache10` to force a clean rebuild. Related: Q56 (another stale editor-cache trap), Q47.
+
+## 75. Slow Quit Is Scene Teardown Under Memory Pressure, Not Eviction
+
+### The Engine Reality
+`SceneTree::_flush_delete_queue()` destroys every node queued for deletion in one frame, so a level swap pays `Object` destruction plus the RenderingServer release of everything those objects owned, on the main thread, in the same frame before the draw. Measured on the demo side (Godot 4.7.2, D3D12, GTX 1050 Ti sharing the desktop with the editor), that single flush is where the exit time goes - not the texture cache, not eviction, and not the editor plugin's autoload bookkeeping.
+
+### The Trap / Symptom
+The same ~976 MiB level produced wildly different exit times with an unchanged byte count:
+
+| condition | tree flush |
+| :--- | :--- |
+| RAM headroom | 16.7-17.6 ms |
+| commit charge >= RAM, pagefile on an almost-full drive | 6.9 s and 13.4 s (two separate runs) |
+
+The draw that follows stayed in the tens of milliseconds in every run, so the whole variance sits in the flush. For scale, the addon's eviction path on the same machine released 118 textures via `DSTextureCache.clear_unused()` in 859 us on the main thread plus one ~24 ms render-thread drain frame. Because it also releases level textures, it took the blame for the multi-second quit for a while - three orders of magnitude apart, and the byte count never changed.
+
+### The Rule
+Never diagnose a slow quit from the texture cache, eviction count, or plugin state; measure the tree flush separately from the draw and compare the freed byte count between runs.
+
+Split the exit frame with `RenderingServer.frame_pre_draw` (or log around the flush) and correlate with `RENDER_VIDEO_MEM_USED` / `OS.get_static_memory_usage()` deltas. Identical bytes with wildly different wall time is the environment: check commit charge and where the pagefile lives before touching code. To amortize a genuinely large teardown, detach the level immediately and free a bounded number of nodes per frame instead of `remove_child()` + `queue_free()` on the whole subtree in one frame.
+
+The addon deliberately does not observe scene teardown and emits no warnings about it (documented in the addon README under "Async Prewarm: Who Owns What"), so a game that wants the cost spread must drive that itself. Related: Q43 (eviction semantics), Q63 (exit ordering with an autoload `quit()`).
 

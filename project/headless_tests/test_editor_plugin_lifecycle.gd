@@ -34,8 +34,16 @@ func _init() -> void:
 		return
 
 	var source_code: String = script_resource.source_code
-	if not "remove_autoload_singleton" in source_code:
-		push_error("[Test Lifecycle] FAIL: ds_plugin.gd does not contain remove_autoload_singleton call in _exit_tree")
+	# The autoload is project data: it must be removed when the user disables the
+	# addon, and only then. Removing it from _exit_tree() also erased it on a
+	# normal editor shutdown, which left standalone and exported runs with no
+	# DSRuntime node to submit the stream queue (async prewarm stalled at 0/N).
+	if not "func _disable_plugin" in source_code:
+		push_error("[Test Lifecycle] FAIL: ds_plugin.gd has no _disable_plugin hook; nothing unregisters the autoload on an explicit disable")
+		quit(1)
+		return
+	if "_sync_autoload(AUTOLOAD_NAME, \"\")" in _function_body(source_code, "_exit_tree"):
+		push_error("[Test Lifecycle] FAIL: ds_plugin.gd unregisters the autoload from _exit_tree(); a normal editor shutdown would strip it from project.godot again")
 		quit(1)
 		return
 
@@ -77,31 +85,61 @@ func _init() -> void:
 
 		print("[Test Lifecycle] SUCCESS: EditorInterface enable/disable/re-enable verified successfully.")
 	else:
-		print("[Test Lifecycle] Running in standalone headless mode. Verifying ProjectSettings autoload removal logic...")
+		print("[Test Lifecycle] Running in standalone headless mode. Verifying ProjectSettings autoload lifecycle contract...")
+
+		var key := "autoload/" + AUTOLOAD_NAME
+		var registered_path := "*res://addons/directstorage_accelerator/scripts/ds_runtime.gd"
+		var original_present := ProjectSettings.has_setting(key)
+		var original_value = ProjectSettings.get_setting(key) if original_present else null
 
 		# Simulate enable: add setting
-		ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, "*res://addons/directstorage_accelerator/scripts/ds_runtime.gd")
-		if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
+		ProjectSettings.set_setting(key, registered_path)
+		if not ProjectSettings.has_setting(key):
 			push_error("[Test Lifecycle] FAIL: Unable to set autoload in ProjectSettings")
 			quit(1)
 			return
 
-		# Simulate disable: remove setting
-		ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, null)
-		if ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
+		# The source check above proves _exit_tree() does not unregister it: the
+		# plugin node itself cannot be instantiated outside the editor
+		# ("Class 'EditorPlugin' can only be instantiated by editor"), so the
+		# editor-shutdown branch is asserted statically and exercised live by the
+		# EditorInterface branch above.
+
+		# Simulate an explicit disable (the disable hook owns the removal).
+		ProjectSettings.set_setting(key, null)
+		if ProjectSettings.has_setting(key):
 			push_error("[Test Lifecycle] FAIL: Unable to clear autoload from ProjectSettings")
 			quit(1)
 			return
 
 		# Simulate re-enable: add setting
-		ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, "*res://addons/directstorage_accelerator/scripts/ds_runtime.gd")
-		if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
+		ProjectSettings.set_setting(key, registered_path)
+		if not ProjectSettings.has_setting(key):
 			push_error("[Test Lifecycle] FAIL: Unable to re-set autoload in ProjectSettings")
 			quit(1)
 			return
 
-		# Cleanup
-		ProjectSettings.set_setting("autoload/" + AUTOLOAD_NAME, null)
+		# Cleanup: restore whatever project.godot declared on entry (never saved).
+		if original_present:
+			ProjectSettings.set_setting(key, original_value)
+		else:
+			ProjectSettings.set_setting(key, null)
 		print("[Test Lifecycle] SUCCESS: Static code inspection & ProjectSettings lifecycle contract verified.")
 
 	quit(0)
+
+
+## Returns the body of [param func_name] up to the next top-level function
+## declaration, or an empty string when the function is absent. Needed to assert
+## WHERE a call site lives: an EditorPlugin cannot be instantiated outside the
+## editor, so the shutdown/disable split is checked on the source text.
+static func _function_body(source: String, func_name: String) -> String:
+	var marker := "\nfunc " + func_name
+	var start := source.find(marker)
+	if start < 0:
+		return ""
+	var rest := source.substr(start + 1)
+	var next_func := rest.find("\nfunc ", 1)
+	if next_func < 0:
+		return rest
+	return rest.substr(0, next_func)

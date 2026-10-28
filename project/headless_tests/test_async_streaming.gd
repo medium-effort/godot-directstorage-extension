@@ -169,11 +169,80 @@ func _run() -> void:
 		if ctx.is_batch_complete() and ctx.has_pending_results():
 			ctx.collect_completed_results()
 		cache.poll_completed()
-	await PreloaderScript.await_prewarm_finished(tag_cb, cb)
-	_check(ctx.is_prewarm_complete(tag_cb), "await_prewarm_finished returns on completion")
+	var completed_ok: bool = await PreloaderScript.await_prewarm_finished(tag_cb, cb)
+	_check(completed_ok and ctx.is_prewarm_complete(tag_cb),
+		"await_prewarm_finished returns true on completion")
 	_check(not seen.is_empty() and seen[seen.size() - 1] == Vector2i(2, 2),
 		"progress callback reaches (2, 2)")
 	_verify_set(ctx, cache, set_cb, tag_cb, gpu, "callback")
+
+	# --- Phase 4b: stall guard + get_prewarm_state.
+	_log("--- Phase 4b: stall guard / get_prewarm_state ---")
+	var unknown_state: Dictionary = PreloaderScript.get_prewarm_state(999999999)
+	_check(bool(unknown_state.get("complete", false)), "get_prewarm_state: unknown tag is complete")
+	_check(unknown_state.get("progress", Vector2i(-1, -1)) == Vector2i(0, 0),
+		"get_prewarm_state: unknown tag progress is (0, 0)")
+	_check(int(unknown_state.get("pending", -1)) == 0 and int(unknown_state.get("unbuilt", -1)) == 0,
+		"get_prewarm_state: unknown tag counters are zero")
+	var live_state: Dictionary = PreloaderScript.get_prewarm_state(tag_cb)
+	_check(live_state.get("progress") is Vector2i and live_state.get("complete") is bool,
+		"get_prewarm_state: progress/complete have the documented types")
+	_check(live_state.get("pending") is int and live_state.get("unbuilt") is int
+		and live_state.get("unbuilt_cpu") is int and live_state.get("unbuilt_gpu") is int,
+		"get_prewarm_state: counters are ints")
+
+	# A tag that cannot finish: DSPreloader::prewarm_async submits its own request
+	# batch (C++ calls flush_stream_async at the end), but only the driver's
+	# _process() harvests completions. Freezing the driver therefore leaves the
+	# requests submitted-but-never-harvested, so progress never advances - the same
+	# shape as the standalone tps-demo stall, without breaking the backend.
+	var set_stall: Array[String] = []
+	for i in 2:
+		var dstex_st := PROBE_DIR + "st_t%02d.dstex" % i
+		var png_st := PROBE_DIR + "st_t%02d.png" % i
+		_write_dstex(dstex_st, payload)
+		_write_import(png_st, dstex_st)
+		set_stall.append(png_st)
+	var tag_stall: int = PreloaderScript.prewarm_async(PackedStringArray(set_stall))
+	_check(tag_stall > 0, "stall fixture issues a tag (%d)" % tag_stall)
+	var pump: Node = root.get_node_or_null("DSRuntime")
+	var alias: Node = root.get_node_or_null("DSBatchManager")
+	# Freeze the driver instead of deleting it: both nodes call
+	# DSContext.shutdown_ds() in NOTIFICATION_PREDELETE (ds_runtime.gd:569-577),
+	# which would poison every later phase of this probe. Stopping _process() is
+	# enough - it is the only caller of flush_stream_async().
+	if pump != null:
+		pump.set_process(false)
+	if alias != null:
+		alias.set_process(false)
+	var stall_events: Array = []
+	var on_stall := func(stag: int, sdone: int, stotal: int) -> void:
+		stall_events.append(Vector3i(stag, sdone, stotal))
+	var stalled_done: bool = await PreloaderScript.await_prewarm_finished(tag_stall, Callable(), 250, on_stall)
+	_check(not stalled_done, "stall guard returns false instead of polling forever")
+	_check(stall_events.size() == 1 and stall_events[0].x == tag_stall,
+		"on_stall fires exactly once for the wedged tag")
+	_check(PreloaderScript.get_prewarm_progress(tag_stall).y == set_stall.size(),
+		"stalled tag still reports its full total")
+	# Put the driver back (a real caller keeps it) and harvest the cancelled
+	# requests to their terminal state: cancellation of already-submitted
+	# requests is accounted by the completion harvest, so it needs a pump tick.
+	if pump != null:
+		pump.set_process(true)
+	if alias != null:
+		alias.set_process(true)
+	var drained := 0
+	while (not ctx.is_prewarm_complete(tag_stall) or ctx.has_stream_pending()) and drained < MAX_PUMP_FRAMES:
+		if ctx.is_batch_complete() and ctx.has_pending_results():
+			ctx.collect_completed_results()
+		if ctx.has_stream_pending():
+			ctx.flush_stream_async()
+		cache.poll_completed()
+		drained += 1
+		await process_frame
+	_check(drained < MAX_PUMP_FRAMES, "cancelled tag drains once the driver returns")
+	_check(ctx.is_prewarm_complete(tag_stall), "stalled tag terminates once the driver harvests it")
+	_check(PreloaderScript.is_stream_prewarm_available(), "driver restored -> prewarm available again")
 
 	# --- Phase 5: cancel semantics.
 	_log("--- Phase 5: cancel ---")
@@ -185,6 +254,9 @@ func _run() -> void:
 		_write_import(png, dstex)
 		set_cancel.append(png)
 	var tag_cx: int = PreloaderScript.prewarm_async(PackedStringArray(set_cancel))
+	_check(tag_cx > 0 and tag_cx != tag_stall, "cancel fixture issues a fresh tag (%d)" % tag_cx)
+	_check(PreloaderScript.get_prewarm_progress(tag_cx).y == set_cancel.size(),
+		"cancel fixture enqueues every request")
 	ctx.cancel_prewarm(tag_cx)
 	_check(await _pump_until(ctx, cache, tag_cx), "cancelled tag converges without hanging")
 	ctx.cancel_prewarm(999999999)

@@ -23,10 +23,22 @@ var _verify_dialog: Window = null
 
 ## Registers the autoload, import plugin, export plugin, and DirectStorage
 ## runtime when the addon is enabled.
+##
+## The autoload is installed here rather than in `_enable_plugin()`:
+## `EditorNode::init_plugins()` enables addons with `p_config_changed = false`,
+## so the engine only calls `_enable_plugin()` on a runtime toggle, never when
+## the editor starts with the addon already enabled. `_enter_tree()` runs on
+## both paths. Unregistration lives in `_disable_plugin()`, the one callback
+## the engine fires for a user-initiated disable alone (see `_exit_tree()`).
 func _enter_tree() -> void:
 	# Purge legacy autoload if present from older addon versions
 	_sync_autoload(LEGACY_AUTOLOAD_NAME, "")
 	_sync_autoload(AUTOLOAD_NAME, AUTOLOAD_PATH)
+
+	if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
+		push_error(
+			"[DirectStorage] Failed to register the %s autoload in project.godot. Async texture prewarm needs that node to drive the stream queue and will stay unavailable until 'autoload/%s' exists in Project Settings." % [AUTOLOAD_NAME, AUTOLOAD_NAME]
+		)
 
 	print(
 		"[DirectStorage] Plugin enabled by MediumEffort. Autoload, Importer, and Exporter registered."
@@ -66,7 +78,17 @@ func _enter_tree() -> void:
 		ds_context.initialize_ds()
 
 
-## Unregisters the autoload, import plugin, and export plugin when disabled.
+## Unregisters the import plugin, export plugin, and tool menu item when the
+## editor stops this plugin: a normal editor shutdown and a user-initiated
+## disable both land here.
+##
+## The autoload is deliberately NOT touched. It is project data, not editor
+## session state: erasing it on shutdown also erased it from project.godot, so
+## the next standalone or exported run had no `DSRuntime` node - nothing
+## submitted or harvested the async stream queue, and prewarm stalled at
+## 0/<total> with no diagnostic because the backend still initialised lazily.
+## Only `_disable_plugin()`, which the engine calls for a user-initiated
+## disable alone, unregisters the autoload.
 func _exit_tree() -> void:
 	if _importer != null:
 		remove_import_plugin(_importer)
@@ -89,6 +111,17 @@ func _exit_tree() -> void:
 		scene_closed.disconnect(_on_scene_closed)
 	_checked_scenes.clear()
 
+	print(
+		"[DirectStorage] Plugin stopped (addon still enabled); %s autoload kept in project.godot."
+		% AUTOLOAD_NAME
+	)
+
+
+## Called by the engine only when the user disables the addon in the Plugin tab
+## of the project settings (the editor never calls it while quitting). This is
+## the single place that unregisters the autoload, so a plain editor shutdown
+## cannot strip it from project.godot again.
+func _disable_plugin() -> void:
 	_sync_autoload(AUTOLOAD_NAME, "")
 
 	print("[DirectStorage] Plugin disabled. Autoload, Importer, and Exporter unregistered.")

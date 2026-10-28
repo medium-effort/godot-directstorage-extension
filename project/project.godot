@@ -17,6 +17,10 @@ config/features=PackedStringArray("4.7")
 config/icon="res://addons/directstorage_accelerator/icons/DirectStorage.svg"
 config/author="MediumEffort"
 
+[autoload]
+
+DSRuntime="*res://addons/directstorage_accelerator/scripts/ds_runtime.gd"
+
 [editor_plugins]
 
 enabled=PackedStringArray("res://addons/directstorage_accelerator/plugin.cfg")
