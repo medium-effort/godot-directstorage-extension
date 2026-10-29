@@ -205,6 +205,14 @@ public:
 	// Bounded fallback timeout (default 5.0s) protects against GPU hangs / TDR.
 	static bool is_terminal(const Ref<DSRequest> &p_request, uint64_t p_timeout_usec = 5000000ULL);
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only: hands the native suite the tracked GPU prewarm's destination RID
+	// and its parent request, so the in-flight window can be asserted directly.
+	// Never bound in _bind_methods(): the GDScript surface is unchanged.
+	static RID _get_gpu_prewarm_rid_for_testing(uint64_t p_tag);
+	static Ref<DSRequest> _get_gpu_prewarm_request_for_testing(uint64_t p_tag);
+#endif
+
 	friend struct PreloaderUnpackTest;
 
 private:

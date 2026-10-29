@@ -908,9 +908,16 @@ void DSPreloader::free_gpu_orphans_on_render_thread() {
 	if (rd == nullptr) {
 		return;
 	}
+	// Never free inline. A cancelled GPU prewarm is exactly the case where the
+	// destination texture may still be under live DMA: cancel_prewarm() cannot stop
+	// a copy the hardware already started, and the parent request only stops
+	// reporting is_gpu_in_flight() once its fence retires. release_owned_rid()
+	// applies the shared discipline instead - free now on the render thread, or
+	// defer to the evict queue and retry on a later frame while
+	// DSContext::is_resource_in_flight() still reports the RID in use.
 	for (size_t i = 0; i < orphans.size(); ++i) {
 		if (orphans[i].is_valid()) {
-			rd->free_rid(orphans[i]);
+			DSTextureCache::release_owned_rid(orphans[i]);
 		}
 	}
 }
@@ -1393,6 +1400,35 @@ bool DSPreloader::is_terminal(const Ref<DSRequest> &p_request, uint64_t p_timeou
 	}
 	return false;
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+RID DSPreloader::_get_gpu_prewarm_rid_for_testing(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	State &s = state();
+	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+		if (it->second.tag == p_tag && it->second.is_gpu && it->second.gpu_tex_rid.is_valid()) {
+			return it->second.gpu_tex_rid;
+		}
+	}
+	return RID();
+}
+
+Ref<DSRequest> DSPreloader::_get_gpu_prewarm_request_for_testing(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	State &s = state();
+	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+		if (it->second.tag != p_tag || !it->second.is_gpu || it->second.requests.is_empty()) {
+			continue;
+		}
+		for (int r = 0; r < it->second.requests.size(); ++r) {
+			if (it->second.requests[r].is_valid()) {
+				return it->second.requests[r];
+			}
+		}
+	}
+	return Ref<DSRequest>();
+}
+#endif
 
 Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vector<PackedByteArray> &p_buffers) {
 	if (p_meta.width == 0 || p_meta.height == 0 || p_meta.mip_count == 0 || p_buffers.empty()) {

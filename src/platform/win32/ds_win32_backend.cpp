@@ -675,16 +675,30 @@ static void complete_chunked_requests() {
 			}
 		}
 
+		// The parent status above is already final, but the batch may still be
+		// writing: cancel_requests_with_tag() marks children FAILED while their
+		// gpu_in_flight flag stays set until the fence retires (it keeps them in the
+		// slot for exactly that). Erasing the entry now would leave nothing to clear
+		// the parent flag, and DSPreloader::is_terminal() would then free the
+		// destination RID under live DMA. Wait for retirement instead.
 		bool any_child_gpu_in_flight = false;
 		for (int i = 0; i < state.children.size(); i++) {
+			if (state.children[i].is_valid() && state.children[i]->is_gpu_in_flight()) {
+				any_child_gpu_in_flight = true;
+				break;
+			}
+		}
+		if (any_child_gpu_in_flight) {
+			++it;
+			continue;
+		}
+
+		for (int i = 0; i < state.children.size(); i++) {
 			if (state.children[i].is_valid()) {
-				if (state.children[i]->is_gpu_in_flight()) {
-					any_child_gpu_in_flight = true;
-				}
 				s_chunk_parents.erase(state.children[i].ptr());
 			}
 		}
-		if (!any_child_gpu_in_flight && state.parent.is_valid()) {
+		if (state.parent.is_valid()) {
 			state.parent->set_gpu_in_flight(false);
 		}
 		it = s_chunked_requests.erase(it);
@@ -3154,6 +3168,11 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			s_chunk_parents[staged_children[c].ptr()] = p_request.ptr();
 		}
 		s_chunked_requests[p_request.ptr()] = state;
+		// The parent is what callers (and DSPreloader) hold and poll, so it must
+		// report the hardware window, not just the children. Without this the
+		// preloader sees a cancelled parent as terminal while its per-mip children
+		// are still DMA-writing the destination texture.
+		p_request->set_gpu_in_flight(true);
 		p_request->set_status(DSRequest::STATUS_SUBMITTED);
 		return true;
 	}
@@ -3203,6 +3222,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		state.destination_offsets.push_back(0);
 		s_chunk_parents[child.ptr()] = p_request.ptr();
 		s_chunked_requests[p_request.ptr()] = state;
+		// Same contract as the multi-mip branch above: the parent carries the
+		// in-flight flag so cancellation cannot look terminal before the fence
+		// retires.
+		p_request->set_gpu_in_flight(true);
 		p_request->set_status(DSRequest::STATUS_SUBMITTED);
 		return true;
 	}

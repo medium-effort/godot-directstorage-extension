@@ -41,6 +41,7 @@
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/resource_format_loader.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
@@ -93,14 +94,15 @@ void test_render_cb_body() {
 // p_virtual_path and p_control_path, and publishes the archive at
 // res://textures.dspkg. Does NOT register teardowns: the caller owns
 // cleanup ordering.
-bool stage_gpu_dspkg(const char *p_dstex_path, const char *p_dspkg_path, const char *p_virtual_path, const char *p_control_path) {
+bool stage_gpu_dspkg_impl(const char *p_dstex_path, const char *p_dspkg_path, const char *p_virtual_path, const char *p_control_path,
+        const godot::PackedByteArray &p_raw, int p_width, int p_height, int p_mip_count) {
     godot::Ref<godot::DSTex> dstex;
     dstex.instantiate();
     if (dstex.is_null()) {
         return false;
     }
-    if (dstex->write_to_file(godot::String(p_dstex_path), make_gpu_raw(),
-                kGpuTexWidth, kGpuTexHeight, godot::Image::FORMAT_RGBA8, kGpuMipCount, 1) != godot::OK) {
+    if (dstex->write_to_file(godot::String(p_dstex_path), p_raw,
+                p_width, p_height, godot::Image::FORMAT_RGBA8, p_mip_count, 1) != godot::OK) {
         return false;
     }
     godot::Ref<godot::DSPkg> builder;
@@ -145,6 +147,30 @@ bool stage_gpu_dspkg(const char *p_dstex_path, const char *p_dspkg_path, const c
     }
     fprintf(stderr, "[gpu_prewarm] stage self-verify failed for %s + %s\n", p_virtual_path, p_control_path);
     return false;
+}
+
+bool stage_gpu_dspkg(const char *p_dstex_path, const char *p_dspkg_path, const char *p_virtual_path, const char *p_control_path) {
+    return stage_gpu_dspkg_impl(p_dstex_path, p_dspkg_path, p_virtual_path, p_control_path,
+            make_gpu_raw(), kGpuTexWidth, kGpuTexHeight, kGpuMipCount);
+}
+
+// Same staging, but with a payload large enough that the GPU copy is still
+// running when the test cancels. kGpuTexWidth (64) retires in microseconds, so
+// an in-flight assertion against it would be a coin flip; 2048^2 incompressible
+// RGBA8 keeps the DMA + GDeflate decode window at tens of milliseconds (the
+// shape gpu_drain_tests.cpp already relies on).
+bool stage_large_gpu_dspkg(const char *p_dstex_path, const char *p_dspkg_path, const char *p_virtual_path, const char *p_control_path) {
+    constexpr int kLargeSize = 2048;
+    godot::PackedByteArray raw;
+    raw.resize(static_cast<int64_t>(kLargeSize) * static_cast<int64_t>(kLargeSize) * 4);
+    uint8_t *writer = raw.ptrw();
+    uint32_t state = 0x9E3779B9u;
+    for (int64_t i = 0; i < raw.size(); ++i) {
+        state = state * 1664525u + 1013904223u;
+        writer[i] = static_cast<uint8_t>(state >> 24);
+    }
+    return stage_gpu_dspkg_impl(p_dstex_path, p_dspkg_path, p_virtual_path, p_control_path,
+            raw, kLargeSize, kLargeSize, 1);
 }
 
 void remove_abs(const char *p_path) {
@@ -611,9 +637,14 @@ GDEX_TEST_T(gpu_prewarm, cancellation_while_gpu_in_flight_retires_safely, TAG_IN
     // Immediately cancel the in-flight GPU prewarm
     ds->cancel_prewarm(tag);
 
-    // Drive frames to pump completion and orphan collection
+    // Drive frames to pump completion and orphan collection. The context pump is
+    // part of it: a cancelled GPU prewarm keeps its parent request in flight until
+    // the batch fence retires, so the per-tag report is finalized by the next
+    // collect_completed_results() (DSRuntime does this every frame) rather than by
+    // cancel_prewarm() alone.
     const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() + 10000;
     while (godot::Time::get_singleton()->get_ticks_msec() < deadline) {
+        ds->collect_completed_results();
         cache->poll_completed(tag, 16, 4000);
         if (ds->is_prewarm_complete(tag) && godot::DSPreloader::get_unbuilt_prewarm_count(tag) == 0) {
             break;
@@ -624,5 +655,122 @@ GDEX_TEST_T(gpu_prewarm, cancellation_while_gpu_in_flight_retires_safely, TAG_IN
     // Must have settled without leaking pending entries or hanging
     GDEX_EXPECT_TRUE(ds->is_prewarm_complete(tag));
     GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(tag), 0);
+}
+
+GDEX_TEST_T(gpu_prewarm, cancel_in_flight_keeps_parent_and_rid_owned, TAG_INTEGRATION | TAG_SLOW) {
+#if !defined(DEBUG_ENABLED) && !defined(DEV_ENABLED)
+    (void)ctx;
+    GDEX_SKIP("The prewarm tracking seam is compiled out of release builds.");
+#else
+    // A20261029-CRIT-01: cancelling an in-flight GPU prewarm must not let the
+    // destination RID be freed while DirectStorage is still writing into it.
+    // The preloader decides that from the PARENT request's is_gpu_in_flight(), so
+    // the parent flag and the chunked-state lifetime are the things under test.
+    if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
+        GDEX_SKIP("DSContext/DSTextureCache classes unavailable");
+    }
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    godot::DSContext *ds = require_singleton_context(ctx);
+    if (!ds->initialize_ds() || !ds->is_initialized()) {
+        GDEX_SKIP("DSContext backend unavailable (initialize_ds failed)");
+    }
+    if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+        GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver)");
+    }
+    godot::DSTextureCache *cache = new_test_cache(ctx);
+    godot::DSPreloader::shutdown();
+
+    const char *dstex_path = "user://gdextest_crit01_cancel_inflight.dstex";
+    const char *dspkg_path = "user://gdextest_crit01_cancel_inflight.dspkg";
+    const char *virtual_path = "res://gdextest_crit01_cancel_inflight.png";
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps) {
+        ps->set_setting("directstorage/force_archive_resolution", true);
+    }
+    ctx.add_teardown([ds, ps]() {
+        if (ps) {
+            ps->set_setting("directstorage/force_archive_resolution", false);
+        }
+        ds->shutdown_ds();
+        remove_abs("res://textures.dspkg");
+        remove_abs("user://gdextest_crit01_cancel_inflight.dstex");
+        remove_abs("user://gdextest_crit01_cancel_inflight.dspkg");
+        godot::DSPreloader::shutdown();
+    });
+    if (!stage_large_gpu_dspkg(dstex_path, dspkg_path, virtual_path, "res://gdextest_crit01_cancel_ctl.png")) {
+        GDEX_ABORT_TEST("textures.dspkg staging failed");
+    }
+
+    godot::PackedStringArray paths;
+    paths.push_back(godot::String(virtual_path));
+    const uint64_t tag = cache->prewarm_gpu_async(paths, 16, true);
+    GDEX_ASSERT_TRUE(tag != 0);
+
+    // Drive until the tracked entry exists and its parent request is live.
+    godot::RID rid;
+    godot::Ref<godot::DSRequest> parent;
+    const uint64_t observe_deadline = godot::Time::get_singleton()->get_ticks_msec() + 15000;
+    while (godot::Time::get_singleton()->get_ticks_msec() < observe_deadline) {
+        godot::DSPreloader::pump_gpu_prewarm();
+        ds->flush_stream_async();
+        rid = godot::DSPreloader::_get_gpu_prewarm_rid_for_testing(tag);
+        parent = godot::DSPreloader::_get_gpu_prewarm_request_for_testing(tag);
+        if (rid.is_valid() && parent.is_valid()) {
+            break;
+        }
+        ds->wait_for_completion(50);
+        godot::OS::get_singleton()->delay_usec(2000);
+    }
+    GDEX_ASSERT_TRUE(rid.is_valid());
+    GDEX_ASSERT_TRUE(parent.is_valid());
+
+    // 1) A GPU-texture chunked parent must report the hardware window. Before the
+    //    fix the parent was never marked, so the preloader believed a cancel had
+    //    already retired a batch that was still writing.
+    GDEX_ASSERT_TRUE(parent->is_gpu_in_flight());
+
+    // 2) Cancellation cannot make it look terminal while the fence is unsignaled.
+    ds->cancel_prewarm(tag);
+    GDEX_EXPECT_TRUE(parent->is_gpu_in_flight());
+    GDEX_EXPECT_FALSE(godot::DSPreloader::is_terminal(parent));
+
+    // 3) ... which is what keeps the tracked entry alive. A pre-fix build consumes
+    //    it here (get_unbuilt_prewarm_count drops to 0) and hands the destination
+    //    RID to the orphan free path.
+    cache->poll_completed(tag, 16, 4000);
+    GDEX_EXPECT_TRUE(godot::DSPreloader::get_unbuilt_prewarm_count(tag) > 0);
+
+    // The RID may only disappear once the hardware is done with it.
+    GDEX_EXPECT_TRUE(rd->texture_is_valid(rid) || !ds->is_resource_in_flight(rid));
+
+    // 4) Retirement must still finish: no permanently stuck in-flight flag.
+    const uint64_t retire_deadline = godot::Time::get_singleton()->get_ticks_msec() + 15000;
+    while (godot::Time::get_singleton()->get_ticks_msec() < retire_deadline) {
+        cache->poll_completed(tag, 16, 4000);
+        godot::DSPreloader::pump_gpu_prewarm();
+        ds->collect_completed_results();
+        if (!ds->is_resource_in_flight(rid) && !parent->is_gpu_in_flight()) {
+            break;
+        }
+        ds->wait_for_completion(20);
+        godot::OS::get_singleton()->delay_usec(2000);
+    }
+    GDEX_EXPECT_FALSE(parent->is_gpu_in_flight());
+    GDEX_EXPECT_TRUE(godot::DSPreloader::is_terminal(parent));
+
+    // Deliberate leak guard: never free under live DMA, but do not leave the RID
+    // behind either.
+    if (rd->texture_is_valid(rid)) {
+        if (ds->is_resource_in_flight(rid)) {
+            GDEX_FAIL("destination RID stayed in flight past the retirement deadline");
+        } else {
+            rd->free_rid(rid);
+        }
+    }
+#endif
 }
 
