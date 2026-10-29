@@ -13,6 +13,7 @@
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/resource_format_loader.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
+#include <godot_cpp/classes/texture2drd.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
 #include <godot_cpp/variant/string.hpp>
@@ -241,7 +242,7 @@ GDEX_TEST_T(loader, load_loose_dstex_ignore_returns_valid_texture, TAG_INTEGRATI
 	remove_user_file(dstex_path);
 }
 
-// --- Load: partial mip chain falls back to base without mipmaps (#0039) ------
+// --- Load: partial mip chain keeps the base without inventing mipmaps (#0039) --
 
 GDEX_TEST_T(loader, load_partial_mip_chain_returns_base_without_mipmaps, TAG_INTEGRATION) {
 	const char *dstex_path = "user://gdextest_loader_partial_chain.dstex";
@@ -269,12 +270,24 @@ GDEX_TEST_T(loader, load_partial_mip_chain_returns_base_without_mipmaps, TAG_INT
 	GDEX_ASSERT_TRUE(tex.is_valid());
 	GDEX_EXPECT_EQ(tex->get_width(), 64);
 	GDEX_EXPECT_EQ(tex->get_height(), 64);
+
+	// Two outcomes are legitimate for a partial (2-of-7) chain, and which one
+	// applies depends on the load environment, not on the payload:
+	//  - GPU path (v2 payload, D3D12 render thread, sub-threads off): a
+	//    Texture2DRD holding exactly the two authored mips.
+	//  - CPU path (headless, non-D3D12, or a worker-thread load): an
+	//    ImageTexture with the base mip only - never a partial mip chain.
 	godot::Ref<godot::ImageTexture> img_tex = tex;
-	GDEX_ASSERT_TRUE(img_tex.is_valid());
-	godot::Ref<godot::Image> img = img_tex->get_image();
-	GDEX_ASSERT_TRUE(img.is_valid());
-	GDEX_EXPECT_FALSE(img->has_mipmaps());
-	GDEX_EXPECT_EQ(img->get_data().size(), 16384);
+	if (img_tex.is_valid()) {
+		godot::Ref<godot::Image> img = img_tex->get_image();
+		GDEX_ASSERT_TRUE(img.is_valid());
+		GDEX_EXPECT_FALSE(img->has_mipmaps());
+		GDEX_EXPECT_EQ(img->get_data().size(), 16384);
+	} else {
+		godot::Ref<godot::Texture2DRD> rd_tex = tex;
+		GDEX_ASSERT_TRUE(rd_tex.is_valid());
+		GDEX_EXPECT_TRUE(rd_tex->get_texture_rd_rid().is_valid());
+	}
 
 	remove_user_file(dstex_path);
 }
