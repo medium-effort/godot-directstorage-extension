@@ -646,12 +646,18 @@ GDEX_TEST_T(context_lifecycle, gpu_adapter_info_schema_and_uma_invariants, TAG_I
 GDEX_TEST_T(context_lifecycle, repeated_initialize_shutdown_has_no_lost_wakeup,
         TAG_INTEGRATION) {
     godot::Object *ds = require_singleton(ctx, "DSContext");
+    // Read the backend while a context is live: a cycle is cheap only on the
+    // software fallback (worker thread spawn + join, ~0.2 ms). On
+    // Win32DirectStorage every cycle rebuilds the whole hardware stack -
+    // factory, render-thread D3D12 device acquisition, queues, the 128 MiB
+    // staging buffer, then a drain-then-join shutdown - measured at 86-199 ms
+    // per cycle. Thousands of iterations only make sense for the cheap one.
+    ds->call(godot::StringName("initialize_ds"));
+    const godot::String backend = static_cast<godot::String>(
+        ds->call(godot::StringName("get_active_backend_name")));
     ds->call(godot::StringName("shutdown_ds"));
 
-    // Each cycle costs one thread spawn + join (~0.1 ms), so 1000 cycles is a
-    // fraction of a second while exercising the start/stop race thousands of
-    // times per run instead of once per suite.
-    constexpr int kCycles = 1000;
+    const int kCycles = backend == godot::String("SoftwareFallback") ? 1000 : 50;
     for (int i = 0; i < kCycles; ++i) {
         GDEX_ASSERT_TRUE(static_cast<bool>(ds->call(godot::StringName("initialize_ds"))));
         ds->call(godot::StringName("shutdown_ds"));
