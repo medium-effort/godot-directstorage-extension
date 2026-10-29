@@ -5,6 +5,10 @@
 #include "../../formats/dstex_format.h"
 #include "../../formats/dspkg_format.h"
 
+#ifdef _WIN32
+#include "TileStream.h"
+#endif
+
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
@@ -118,6 +122,54 @@ bool Win32Backend::validate_dstex_chunk_range(uint64_t p_source_offset, uint64_t
 	}
 	return false;
 }
+
+// Validates the 8-byte GDeflate tile-stream header against the uncompressed
+// size the request declared (issue #0181). The declared size is what sizes a
+// memory/buffer destination, while DirectStorage decodes the tiles the stream
+// header itself declares - a mismatch therefore writes past the destination
+// and still reports success with no error record. The CPU fallback applies the
+// same rule in GDeflateDecompressor::validate_stream.
+#ifdef _WIN32
+static bool validate_gdeflate_stream_size(const String &p_path, uint64_t p_source_offset, uint64_t p_declared_size, String &r_error) {
+	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		r_error = "Win32Backend: Failed to open '" + p_path + "' to validate its GDeflate stream header.";
+		return false;
+	}
+	file->seek(static_cast<int64_t>(p_source_offset));
+	if (file->get_position() != p_source_offset) {
+		r_error = "Win32Backend: Cannot seek to GDeflate payload offset " + String::num_uint64(p_source_offset) + " in '" + p_path + "'.";
+		return false;
+	}
+	PackedByteArray raw_header = file->get_buffer(static_cast<int64_t>(sizeof(GDeflate::TileStream)));
+	file->close();
+	if (raw_header.size() != static_cast<int64_t>(sizeof(GDeflate::TileStream))) {
+		r_error = "Win32Backend: GDeflate payload at offset " + String::num_uint64(p_source_offset) + " in '" + p_path + "' is shorter than a tile-stream header.";
+		return false;
+	}
+
+	// TileStream has no default constructor; copy the packed 8 bytes into an
+	// aligned buffer instead of constructing or reading through a potentially
+	// unaligned pointer.
+	alignas(8) uint8_t header_bytes[sizeof(GDeflate::TileStream)] = {};
+	std::memcpy(header_bytes, raw_header.ptr(), sizeof(GDeflate::TileStream));
+	const GDeflate::TileStream *header = reinterpret_cast<const GDeflate::TileStream *>(header_bytes);
+	if (!header->IsValid() || header->id != GDeflate::kGDeflateId || header->tileSizeIdx != 1 ||
+			header->numTiles == 0 || header->lastTileSize > GDeflate::kDefaultTileSize) {
+		r_error = "Win32Backend: Invalid GDeflate tile-stream header at offset " + String::num_uint64(p_source_offset) + " in '" + p_path + "'.";
+		return false;
+	}
+
+	const uint64_t stream_size = static_cast<uint64_t>(header->GetUncompressedSize());
+	if (stream_size != p_declared_size) {
+		r_error = "Win32Backend: GDeflate stream declares " + String::num_uint64(stream_size) +
+				" uncompressed bytes but the request declared " + String::num_uint64(p_declared_size) +
+				"; refusing to decompress into a destination sized by the declared value.";
+		return false;
+	}
+	return true;
+}
+#endif // _WIN32
 
 static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t p_capacity, Vector<DSChunkBoundary> &r_chunks) {
 	if (p_path.get_extension().to_lower() != "dstex") {
@@ -2685,6 +2737,28 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("Win32Backend: Invalid size parameters (src_size=" + String::num_uint64(src_size) + ", uncompressed_size=" + String::num_uint64(uncompressed_size) + ").");
 		return false;
+	}
+
+	// GDeflate size contract (issue #0181). The declared uncompressed size is
+	// what sizes a memory/buffer destination, but DirectStorage decompresses the
+	// tiles the stream header itself declares and reports no error when the two
+	// disagree - the write simply runs past the destination. Reject the request
+	// before anything is sized from the declaration. Texture ranges carry one
+	// stream per subresource and are covered by the dstex/dspkg footprint
+	// metadata instead.
+	if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE &&
+			(p_request->get_destination_type() == DSRequest::DESTINATION_MEMORY ||
+					p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER)) {
+		String stream_error;
+		if (!validate_gdeflate_stream_size(p_request->get_file_path(), p_request->get_offset(), uncompressed_size, stream_error)) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message(stream_error);
+			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+			if (err_handler) {
+				err_handler->report_error(stream_error);
+			}
+			return false;
+		}
 	}
 
 	Vector<DSTexMipEntryV2> texture_mip_entries;

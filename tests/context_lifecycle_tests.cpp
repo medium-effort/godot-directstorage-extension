@@ -320,11 +320,15 @@ GDEX_TEST_T(context_lifecycle, fallback_gdeflate_size_mismatch_fails_gracefully,
     req->call(godot::StringName("set_compression_format"), COMPRESSION_GDEFLATE);
     req->call(godot::StringName("set_destination_type"), DESTINATION_MEMORY);
 
+    // Rejection may land at enqueue (Win32 validates the GDeflate stream header
+    // against the declared size before submission) or at completion (software
+    // fallback decodes and fails); both are graceful failures.
     const bool enqueued = static_cast<bool>(ds->call(
         godot::StringName("enqueue_request"), godot::Variant(req)));
-    GDEX_EXPECT_TRUE(enqueued);
-    ds->call(godot::StringName("flush_batch"));
-    ds->call(godot::StringName("wait_for_completion"), 5000);
+    if (enqueued) {
+        ds->call(godot::StringName("flush_batch"));
+        ds->call(godot::StringName("wait_for_completion"), 5000);
+    }
 
     const int64_t status = static_cast<int64_t>(req->call(godot::StringName("get_status")));
     GDEX_EXPECT_EQ(status, REQUEST_STATUS_FAILED);
@@ -336,6 +340,80 @@ GDEX_TEST_T(context_lifecycle, fallback_gdeflate_size_mismatch_fails_gracefully,
     if (backend == godot::String("SoftwareFallback")) {
         GDEX_EXPECT_STR_CONTAINS(err, "CPU GDeflate decompression failed");
     }
+}
+
+// Sentinel proof for the GDeflate size contract. The declared uncompressed size
+// is what sizes the destination, so decompression must never write past it. The
+// CPU fallback enforces that in GDeflateDecompressor::validate_stream; the
+// hardware path must reject the request before submission instead of letting
+// DirectStorage decode the tiles the stream itself declares.
+GDEX_TEST_T(context_lifecycle, fallback_gdeflate_size_mismatch_never_overruns_destination,
+        TAG_INTEGRATION) {
+    godot::Object *ds = require_singleton(ctx, "DSContext");
+    godot::PackedByteArray original = create_pattern(4096);
+    godot::PackedByteArray compressed = compress_data(ctx, original);
+    GDEX_ASSERT_TRUE(compressed.size() > 0);
+
+    const godot::String file_path = "user://__gdextest_size_mismatch_canary.bin";
+    godot::Ref<godot::FileAccess> f = godot::FileAccess::open(file_path, godot::FileAccess::WRITE);
+    GDEX_ASSERT_TRUE(f.is_valid());
+    f->store_buffer(compressed);
+    f->close();
+
+    ctx.add_teardown([ds, file_path]() {
+        ds->call(godot::StringName("flush_batch"));
+        godot::DirAccess::remove_absolute(file_path);
+    });
+
+    // 4096-byte destination with a 2048-byte declared size: bytes
+    // [2048, 4096) are the canary and must survive any completion. A driver
+    // that decodes the 4096-byte stream regardless of the declaration
+    // overwrites them - with a destination sized from the declaration that is
+    // a heap overflow.
+    godot::PackedByteArray canary;
+    canary.resize(4096);
+    for (int64_t i = 0; i < 4096; ++i) {
+        canary[i] = 0xAA;
+    }
+
+    godot::Ref<godot::RefCounted> req = make_request(ctx);
+    req->call(godot::StringName("set_file_path"), file_path);
+    req->call(godot::StringName("set_size"), compressed.size());
+    req->call(godot::StringName("set_uncompressed_size"), 2048);
+    req->call(godot::StringName("set_compression_format"), COMPRESSION_GDEFLATE);
+    req->call(godot::StringName("set_destination_type"), DESTINATION_MEMORY);
+    req->call(godot::StringName("set_destination_buffer"), canary);
+
+    const bool enqueued = static_cast<bool>(ds->call(
+        godot::StringName("enqueue_request"), godot::Variant(req)));
+    if (enqueued) {
+        ds->call(godot::StringName("flush_batch"));
+        ds->call(godot::StringName("wait_for_completion"), 5000);
+    }
+
+    const int64_t status = static_cast<int64_t>(req->call(godot::StringName("get_status")));
+    godot::PackedByteArray result = static_cast<godot::PackedByteArray>(
+            req->call(godot::StringName("get_destination_buffer")));
+
+    // The software fallback resizes the destination to the declared size before
+    // decoding, so the canary can only be observed on a path that never wrote
+    // (the hardware rejection); scan whatever is left.
+    int64_t first_overrun = -1;
+    for (int64_t i = 2048; i < result.size(); ++i) {
+        if (result[i] != 0xAA) {
+            first_overrun = i;
+            break;
+        }
+    }
+    if (first_overrun >= 0) {
+        GDEX_FAIL("destination overrun: canary byte " + std::to_string(first_overrun) +
+                " changed although only 2048 uncompressed bytes were declared (status=" +
+                std::to_string(status) + ")");
+    }
+
+    GDEX_EXPECT_EQ(status, REQUEST_STATUS_FAILED);
+    const godot::String err = static_cast<godot::String>(req->call(godot::StringName("get_error_message")));
+    GDEX_EXPECT_FALSE(err.is_empty());
 }
 
 GDEX_TEST_T(context_lifecycle, fallback_gdeflate_truncated_header_fails_gracefully,
@@ -366,11 +444,15 @@ GDEX_TEST_T(context_lifecycle, fallback_gdeflate_truncated_header_fails_graceful
     req->call(godot::StringName("set_compression_format"), COMPRESSION_GDEFLATE);
     req->call(godot::StringName("set_destination_type"), DESTINATION_MEMORY);
 
+    // Rejection may land at enqueue (Win32 rejects a payload shorter than a
+    // tile-stream header) or at completion (software fallback); both are
+    // graceful failures.
     const bool enqueued = static_cast<bool>(ds->call(
         godot::StringName("enqueue_request"), godot::Variant(req)));
-    GDEX_EXPECT_TRUE(enqueued);
-    ds->call(godot::StringName("flush_batch"));
-    ds->call(godot::StringName("wait_for_completion"), 5000);
+    if (enqueued) {
+        ds->call(godot::StringName("flush_batch"));
+        ds->call(godot::StringName("wait_for_completion"), 5000);
+    }
 
     const int64_t status = static_cast<int64_t>(req->call(godot::StringName("get_status")));
     GDEX_EXPECT_EQ(status, REQUEST_STATUS_FAILED);
