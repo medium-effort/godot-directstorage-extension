@@ -210,6 +210,14 @@ public:
 	bool wait_for_completion(uint64_t p_fence_value, uint32_t p_timeout_msec);
 	bool is_resource_in_flight(const RID &p_rid) const override;
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only seam: reproduces the synchronous-flush timeout state (active slot
+	// moved into zombie_slots, fence intact) so the in-flight predicates can be
+	// asserted deterministically; the real branch needs a >500 ms DMA stall.
+	// Never bound in _bind_methods().
+	void _debug_zombify_active_batch_for_testing();
+#endif
+
 	static bool is_path_valid(const String &p_path);
 	static Dictionary get_drive_info_for_path(const String &p_path);
 	static bool validate_dstex_chunk_range(uint64_t p_source_offset, uint64_t p_source_size, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t &r_resolved_offset);

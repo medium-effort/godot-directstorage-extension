@@ -27,9 +27,15 @@
 
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/image.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/rd_texture_format.hpp>
+#include <godot_cpp/classes/rd_texture_view.hpp>
+#include <godot_cpp/classes/rendering_device.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/string.hpp>
+#include <godot_cpp/variant/typed_array.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -74,6 +80,102 @@ void remove_temp_file(const char *p_path) {
     if (dir.is_valid()) {
         dir->remove(godot::String(p_path));
     }
+}
+
+// HIGH-01 fixtures: a 2048^2 incompressible RGBA8 payload keeps the DMA +
+// GDeflate decode window at tens of milliseconds (the shape gpu_drain_tests.cpp
+// already relies on), so "still in flight" is observable instead of a
+// theoretical race.
+constexpr int kInFlightTextureSize = 2048;
+
+godot::PackedByteArray make_incompressible_rgba8(int p_size) {
+    godot::PackedByteArray data;
+    data.resize(static_cast<int64_t>(p_size) * static_cast<int64_t>(p_size) * 4);
+    uint8_t *writer = data.ptrw();
+    uint32_t state = 0x9E3779B9u;
+    for (int64_t i = 0; i < data.size(); ++i) {
+        state = state * 1664525u + 1013904223u;
+        writer[i] = static_cast<uint8_t>(state >> 24);
+    }
+    return data;
+}
+
+bool write_gpu_texture_fixture(const godot::String &p_path) {
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    if (dstex.is_null()) {
+        return false;
+    }
+    const godot::PackedByteArray raw = make_incompressible_rgba8(kInFlightTextureSize);
+    const godot::Error err = dstex->write_to_file(p_path, raw, kInFlightTextureSize,
+            kInFlightTextureSize, godot::Image::FORMAT_RGBA8, 1, 1);
+    return err == godot::OK;
+}
+
+// Builds a GPU-texture request spanning the whole single-mip payload.
+// texture_format stays 0 so the backend skips the driver-format equality check
+// (the contract the preloader and gpu_drain_tests.cpp already rely on); the
+// in-flight admission check in enqueue_one() still applies in that case.
+bool build_gpu_texture_request(const godot::String &p_path, uint64_t p_tag, godot::Ref<godot::DSRequest> &r_request) {
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    if (dstex.is_null()) {
+        return false;
+    }
+    const godot::Dictionary header = dstex->read_header(p_path);
+    if (header.is_empty()) {
+        return false;
+    }
+    const int mip_count = header["mip_count"];
+    const godot::PackedInt64Array mip_offsets = header["mip_offsets"];
+    const godot::PackedInt32Array mip_sizes = header["mip_sizes"];
+    if (mip_count < 1 || mip_offsets.size() < mip_count || mip_sizes.size() < mip_count) {
+        return false;
+    }
+    const uint64_t start = static_cast<uint64_t>(mip_offsets[0]);
+    const uint64_t end = static_cast<uint64_t>(mip_offsets[mip_count - 1]) + static_cast<uint64_t>(mip_sizes[mip_count - 1]);
+    r_request.instantiate();
+    r_request->set_file_path(p_path);
+    r_request->set_offset(start);
+    r_request->set_size(static_cast<uint32_t>(end - start));
+    r_request->set_uncompressed_size(static_cast<uint32_t>(header["original_size"]));
+    r_request->set_compression_format(godot::DSRequest::COMPRESSION_GDEFLATE);
+    r_request->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    r_request->set_first_subresource(0);
+    r_request->set_subresource_count(static_cast<uint32_t>(mip_count));
+    r_request->set_texture_format(0);
+    r_request->set_cancellation_tag(p_tag);
+    return true;
+}
+
+godot::RID create_destination_texture(godot::RenderingDevice *p_rd, int p_mip_count) {
+    godot::Ref<godot::RDTextureFormat> format;
+    format.instantiate();
+    format->set_width(kInFlightTextureSize);
+    format->set_height(kInFlightTextureSize);
+    format->set_format(godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+    format->set_mipmaps(p_mip_count);
+    format->set_texture_type(godot::RenderingDevice::TEXTURE_TYPE_2D);
+    format->set_usage_bits(godot::RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+            godot::RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
+            godot::RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
+    godot::Ref<godot::RDTextureView> view;
+    view.instantiate();
+    return p_rd->texture_create(format, view, godot::TypedArray<godot::PackedByteArray>());
+}
+
+// Bounded wait for the backend to stop reporting the RID as in flight. The
+// backend's own completion thread retires the fence; poll_batch_status() is what
+// clears the flags and drains zombie slots.
+bool wait_until_released(godot::Win32Backend *p_backend, const godot::RID &p_rid, int p_attempts = 400) {
+    for (int i = 0; i < p_attempts; ++i) {
+        p_backend->poll_batch_status();
+        if (!p_backend->is_resource_in_flight(p_rid)) {
+            return true;
+        }
+        godot::OS::get_singleton()->delay_usec(5000);
+    }
+    return false;
 }
 #endif
 
@@ -643,6 +745,154 @@ GDEX_TEST_T(win32_remediation, med08_single_mip_parsed_values_preserved, TAG_INT
     GDEX_EXPECT_EQ(parent->get_size(), 100u);
     GDEX_EXPECT_EQ(parent->get_uncompressed_size(), 200u);
     GDEX_EXPECT_EQ(parent->get_cancellation_tag(), 999u);
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, staged_request_reports_resource_in_flight, TAG_INTEGRATION) {
+#ifdef _WIN32
+    // is_resource_in_flight() must answer "yes" for a request the backend
+    // has accepted but nobody has flushed yet. That staged batch DMA-writes the
+    // destination on the next flush, so a release that reads "no" here frees VRAM
+    // the hardware is still going to write.
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        memdelete(backend); // shutdown() drains anything still in flight
+        remove_temp_file("user://high01_staged_in_flight.dstex");
+    });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    const godot::String fixture("user://high01_staged_in_flight.dstex");
+    remove_temp_file("user://high01_staged_in_flight.dstex");
+    GDEX_ASSERT_TRUE(write_gpu_texture_fixture(fixture));
+
+    godot::Ref<godot::DSRequest> request;
+    GDEX_ASSERT_TRUE(build_gpu_texture_request(fixture, 5101, request));
+    const godot::RID rid = create_destination_texture(rd, static_cast<int>(request->get_subresource_count()));
+    GDEX_ASSERT_TRUE(rid.is_valid());
+    request->set_destination_resource(rid);
+
+    GDEX_ASSERT_TRUE(backend->enqueue_request(request));
+
+    // The core assertion: nothing is submitted yet, but the backend owns a request
+    // that will write this RID as soon as it is flushed.
+    GDEX_EXPECT_TRUE(backend->is_resource_in_flight(rid));
+
+    backend->submit_async();
+    const uint64_t fence = backend->get_completion_fence();
+    GDEX_ASSERT_TRUE(fence > 0);
+    GDEX_EXPECT_TRUE(backend->is_resource_in_flight(rid));
+
+    // ... and the flag must not stay stuck once the fence retires.
+    backend->wait_for_completion(fence, 5000);
+    GDEX_EXPECT_TRUE(wait_until_released(backend, rid));
+
+    if (rd->texture_is_valid(rid)) {
+        rd->free_rid(rid);
+    }
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, zombie_slot_reports_resource_in_flight, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // HIGH-01: when a synchronous flush times out, the batch's requests leave the
+    // slot for zombie_slots while the hardware keeps writing. Both in-flight queries
+    // must still see them - otherwise a release frees the destination under live DMA
+    // and a second enqueue is admitted against a resource nobody can barrier.
+    // The state is produced through the DEBUG-only seam because the real branch needs
+    // a >500 ms DMA stall (sync_flush_timeout_ms is clamped to [500, 10000]).
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        memdelete(backend); // shutdown() drains anything still in flight
+        remove_temp_file("user://high01_zombie_in_flight.dstex");
+    });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    const godot::String fixture("user://high01_zombie_in_flight.dstex");
+    remove_temp_file("user://high01_zombie_in_flight.dstex");
+    GDEX_ASSERT_TRUE(write_gpu_texture_fixture(fixture));
+
+    bool proven = false;
+    for (int attempt = 0; attempt < 3 && !proven; ++attempt) {
+        godot::Ref<godot::DSRequest> request;
+        GDEX_ASSERT_TRUE(build_gpu_texture_request(fixture, 5201, request));
+        const godot::RID rid = create_destination_texture(rd, static_cast<int>(request->get_subresource_count()));
+        GDEX_ASSERT_TRUE(rid.is_valid());
+        request->set_destination_resource(rid);
+
+        GDEX_ASSERT_TRUE(backend->enqueue_request(request));
+        backend->submit_async();
+        const uint64_t fence = backend->get_completion_fence();
+        if (fence == 0 || !backend->is_resource_in_flight(rid)) {
+            // Lost the race: the fence retired before we could zombify. Retry with a
+            // fresh texture instead of failing on scheduler jitter.
+            if (rd->texture_is_valid(rid)) {
+                rd->free_rid(rid);
+            }
+            continue;
+        }
+
+        backend->_debug_zombify_active_batch_for_testing();
+
+        // (1) The moved request still owns the RID.
+        GDEX_EXPECT_TRUE(backend->is_resource_in_flight(rid));
+
+        // (2) The admission gate must refuse a second write into it.
+        godot::Ref<godot::DSRequest> conflicting;
+        GDEX_ASSERT_TRUE(build_gpu_texture_request(fixture, 5202, conflicting));
+        conflicting->set_destination_resource(rid);
+        GDEX_EXPECT_FALSE(backend->enqueue_request(conflicting));
+        GDEX_EXPECT_TRUE(conflicting->get_error_message().contains("in-flight DirectStorage batch"));
+
+        // (3) Retirement drains the zombie and releases the RID.
+        backend->wait_for_completion(fence, 5000);
+        GDEX_EXPECT_TRUE(wait_until_released(backend, rid));
+
+        // (4) The RID is reusable once the fence has retired.
+        godot::Ref<godot::DSRequest> reusable;
+        GDEX_ASSERT_TRUE(build_gpu_texture_request(fixture, 5203, reusable));
+        reusable->set_destination_resource(rid);
+        GDEX_EXPECT_TRUE(backend->enqueue_request(reusable));
+        backend->cancel_requests_with_tag(5203); // purge the staged request before free
+
+        if (rd->texture_is_valid(rid)) {
+            rd->free_rid(rid);
+        }
+        proven = true;
+    }
+    GDEX_ASSERT_TRUE(proven);
+#else
+    (void)ctx;
+    GDEX_SKIP("The zombie seam is compiled out of release builds.");
+#endif
 #else
     (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");

@@ -2811,6 +2811,14 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	//   again; batch_completed / wait_for_completion remains the sanctioned gate for
 	//   sampling. Must be called with batch_mutex held (enqueue_request holds it
 	//   here; every site flipping submitted/completion_ready holds it too).
+	// - A slot that stopped being submitted but has not completed is NOT exempt:
+	//   both the closing window (closing=true, submitted=false, spanning
+	//   execute_transitions() and EnqueueRequests() outside batch_mutex) and
+	//   zombie_slots (a synchronous flush that timed out, DMA still running) end in
+	//   DMA against the resource. Skipping them would admit a second, barrier-less
+	//   write into a destination DirectStorage has not finished with. Only the slot
+	//   being filled right now stays exempt, because multi-mip splitting
+	//   legitimately puts several children of one texture in it (bullet above).
 	auto gpu_destination_in_flight = [&](ID3D12Resource *p_resource) -> bool {
 		if (!p_resource) {
 			return false;
@@ -2819,7 +2827,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			const QueueState &check_state = priority_queues[check_queue];
 			for (int check_slot = 0; check_slot < BATCH_SLOT_COUNT; check_slot++) {
 				const BatchSlot &check = check_state.batch_slots[check_slot];
-				if (!check.submitted || check.completion_ready) {
+				if (&check == &slot || check.completion_ready) {
 					continue;
 				}
 				for (int check_request = 0; check_request < check.requests.size(); check_request++) {
@@ -2830,6 +2838,20 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 					if (guard_it != s_resource_guards.end() && guard_it->second == p_resource) {
 						return true;
 					}
+				}
+			}
+		}
+		// Zombie batches keep their request guards (released only when the fence
+		// retires in poll_batch_status), so the same guard lookup applies.
+		for (size_t check_zombie = 0; check_zombie < zombie_slots.size(); check_zombie++) {
+			const ZombieBatchSlot &zombie = zombie_slots[check_zombie];
+			for (int check_request = 0; check_request < zombie.requests.size(); check_request++) {
+				if (zombie.requests[check_request].is_null()) {
+					continue;
+				}
+				std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard_it = s_resource_guards.find(zombie.requests[check_request].ptr());
+				if (guard_it != s_resource_guards.end() && guard_it->second == p_resource) {
+					return true;
 				}
 			}
 		}
@@ -3911,11 +3933,23 @@ bool Win32Backend::is_resource_in_flight(const RID &p_rid) const {
 		return false;
 	}
 	std::lock_guard<std::mutex> lock(batch_mutex);
+	// A slot is done with a destination once completion_ready is set: that flag is
+	// only set after the governing fence retired (poll_batch_status() checks it
+	// first). Every earlier state still leads to DMA against the same resource, so
+	// it must be reported as in flight:
+	//   - staged    : enqueue_request() accepted the request, it will be flushed
+	//                 later - freeing now lets that flush write into freed VRAM;
+	//   - closing   : submit_async()/submit_batch() set closing=true, dropped the
+	//                 lock for execute_transitions() + EnqueueRequests(), and have
+	//                 not set submitted=true yet;
+	//   - submitted : the historical case, DMA is on the hardware queue.
+	// Zombie batches (synchronous flush timed out, hardware still running) are not
+	// in any slot at all, so they are scanned separately below.
 	for (int q = 0; q < QUEUE_COUNT; q++) {
 		const QueueState &queue = priority_queues[q];
 		for (int s = 0; s < BATCH_SLOT_COUNT; s++) {
 			const BatchSlot &slot = queue.batch_slots[s];
-			if (!slot.submitted || slot.completion_ready) {
+			if (slot.completion_ready) {
 				continue;
 			}
 			for (int r = 0; r < slot.requests.size(); r++) {
@@ -3926,10 +3960,72 @@ bool Win32Backend::is_resource_in_flight(const RID &p_rid) const {
 			}
 		}
 	}
+	for (size_t z = 0; z < zombie_slots.size(); z++) {
+		const ZombieBatchSlot &zombie = zombie_slots[z];
+		for (int r = 0; r < zombie.requests.size(); r++) {
+			const Ref<DSRequest> &req = zombie.requests[r];
+			if (req.is_valid() && req->get_destination_resource() == p_rid && req->is_gpu_in_flight()) {
+				return true;
+			}
+		}
+	}
 	return false;
 #else
 	return false;
 #endif
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+void Win32Backend::_debug_zombify_active_batch_for_testing() {
+#ifdef _WIN32
+	// Test-only seam. Reproduces the state submit_batch() enters when its
+	// synchronous completion wait times out (see the zombie_slots move in
+	// submit_batch()): the active slot's in-flight requests are moved out of the
+	// slot into zombie_slots with their fence value intact, and the slot is reset.
+	// The real branch needs a DMA >500 ms stall, which
+	// directstorage/sync_flush_timeout_ms cannot produce on demand (it is clamped
+	// to [500, 10000]). Never bound in _bind_methods().
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
+		QueueState &queue = priority_queues[queue_index];
+		for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; slot_index++) {
+			BatchSlot &slot = queue.batch_slots[slot_index];
+			if (!slot.submitted || slot.requests.is_empty()) {
+				continue;
+			}
+			for (std::deque<BatchMetadata>::iterator it = completion_queue.begin(); it != completion_queue.end();) {
+				if (it->slot_index == slot_index && it->queue_index == queue_index) {
+					it = completion_queue.erase(it);
+				} else {
+					++it;
+				}
+			}
+			ZombieBatchSlot zombie;
+			zombie.queue_index = queue_index;
+			zombie.fence_value = slot.fence_value;
+			zombie.requests = slot.requests;
+			zombie.files = slot.files;
+			zombie.gpu_transitions = slot.gpu_transitions;
+			zombie_slots.push_back(zombie);
+
+			slot.is_sync_submission = false;
+			slot.requests.clear();
+			slot.files.clear();
+			slot.file_cache.clear();
+			slot.gpu_transitions.clear();
+			slot.fence_value = 0;
+			slot.completed_count = 0;
+			slot.error_code = -1;
+			slot.error_message = "Batch submission timed out.";
+			slot.closing = false;
+			slot.submitted = false;
+			slot.completion_ready = false;
+		}
+	}
+	batch_in_flight.store(has_in_flight_batches_locked());
+	update_profiler_queue_depth_locked();
+#endif
+}
+#endif
 
 } // namespace godot

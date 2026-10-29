@@ -1,5 +1,13 @@
 {
     "github-actions.workflows.pinned.workflows": [
         ".github/workflows/gdextest.yml"
-    ]
+    ],
+    "editor.formatOnSave": false,
+    "editor.formatOnType": false,
+    "[cpp]": {
+        "editor.formatOnSave": false
+    },
+    "[c]": {
+        "editor.formatOnSave": false
+    }
 }
