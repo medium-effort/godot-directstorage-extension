@@ -90,5 +90,11 @@
 		<constant name="FALLBACK_FRAME_BUDGET_USEC" value="8000">
 			Default per-frame processing budget in microseconds used during main-thread fallback loading.
 		</constant>
+		<constant name="STREAM_PUMP_AUTOLOAD" value="&quot;DSRuntime&quot;">
+			Name of the autoload node whose stream pump submits and harvests queued prewarm requests.
+		</constant>
+		<constant name="STREAM_PUMP_LEGACY_AUTOLOAD" value="&quot;DSBatchManager&quot;">
+			Legacy autoload node name accepted when the current stream pump autoload is absent.
+		</constant>
 	</constants>
 </class>
