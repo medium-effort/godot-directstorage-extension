@@ -7,9 +7,11 @@
 #include "formats/dstex_format.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/resource_format_loader.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
@@ -18,6 +20,7 @@
 #include <godot_cpp/variant/packed_string_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/string_name.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/variant/variant.hpp>
 
 #include <cstdint>
@@ -97,11 +100,34 @@ void remove_user_file(const char *p_path) {
 	}
 }
 
+// Releases the DirectStorage context so the Win32 backend drops its cached
+// IDStorageFile handles. The backend keeps every DMA source open for the life
+// of the context, and a file opened that way cannot be removed or replaced:
+// remove fails with a sharing violation and Godot's safe-save copy commit is
+// rolled back while still reporting success. Any test that stages over
+// res://textures.dspkg after a GPU load must release the handles first.
+void shutdown_ds_singleton() {
+	godot::Engine *engine = godot::Engine::get_singleton();
+	if (engine && engine->has_singleton(godot::StringName("DSContext"))) {
+		godot::Object *ds = engine->get_singleton(godot::StringName("DSContext"));
+		if (ds != nullptr) {
+			ds->call(godot::StringName("shutdown_ds"));
+		}
+	}
+}
+
 // Builds a single-entry .dspkg at p_dspkg_path indexing p_virtual_path and
 // copies it to the well-known res://textures.dspkg logical path (mirrors
 // test_dspkg_alignment.gd). Registers a teardown so the archive is removed
 // even when the body aborts. Returns false when any step fails.
+//
+// Staging is release + remove + copy + reopen-verify with one retry, never the
+// copy return code alone: a stale or locked res://textures.dspkg poisons every
+// later resolve, and the copy has reported success over live scan windows.
+// On failure the exact step is logged so a locked destination is
+// distinguishable from a corrupt one.
 bool stage_textures_dspkg(::gdextest::TestContext &ctx, const char *p_dstex_path, const char *p_dspkg_path, const char *p_virtual_path) {
+	shutdown_ds_singleton();
 	if (!write_loose_dstex(p_dstex_path)) {
 		return false;
 	}
@@ -119,14 +145,67 @@ bool stage_textures_dspkg(::gdextest::TestContext &ctx, const char *p_dstex_path
 	if (builder->finalize() != godot::OK) {
 		return false;
 	}
-	if (godot::DirAccess::copy_absolute(godot::String(p_dspkg_path), godot::String("res://textures.dspkg")) != godot::OK) {
-		return false;
+
+	int64_t built_len = -1;
+	{
+		godot::Ref<godot::FileAccess> built = godot::FileAccess::open(godot::String(p_dspkg_path), godot::FileAccess::READ);
+		if (built.is_valid()) {
+			built_len = built->get_length();
+			built->close();
+		}
 	}
-	ctx.add_teardown([]() {
-		godot::Error err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
-		(void)err;
-	});
-	return true;
+
+	for (int attempt = 0; attempt < 2; ++attempt) {
+		godot::Error remove_err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+		godot::Error copy_err = godot::DirAccess::copy_absolute(godot::String(p_dspkg_path), godot::String("res://textures.dspkg"));
+		bool exists = godot::FileAccess::file_exists(godot::String("res://textures.dspkg"));
+
+		int64_t staged_len = -1;
+		godot::Ref<godot::FileAccess> staged = godot::FileAccess::open(godot::String("res://textures.dspkg"), godot::FileAccess::READ);
+		if (staged.is_valid()) {
+			staged_len = staged->get_length();
+			staged->close();
+		}
+
+		godot::Error open_err = godot::ERR_CANT_OPEN;
+		int64_t entries = -1;
+		bool has_texture = false;
+		godot::Ref<godot::DSPkg> verify;
+		verify.instantiate();
+		if (verify.is_valid()) {
+			open_err = verify->open(godot::String("res://textures.dspkg"));
+			entries = verify->get_entry_count();
+			has_texture = verify->has_texture(godot::String(p_virtual_path));
+		}
+
+		if (exists && open_err == godot::OK && has_texture) {
+			ctx.add_teardown([]() {
+				shutdown_ds_singleton();
+				godot::Error err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+				(void)err;
+			});
+			return true;
+		}
+
+		godot::UtilityFunctions::push_warning(
+				"stage_textures_dspkg attempt ", attempt,
+				": remove=", static_cast<int64_t>(remove_err),
+				" copy=", static_cast<int64_t>(copy_err),
+				" exists=", exists,
+				" built_len=", built_len,
+				" staged_len=", staged_len,
+				" open=", static_cast<int64_t>(open_err),
+				" entries=", entries,
+				" has_texture=", has_texture);
+
+		if (attempt == 0) {
+			godot::OS *os = godot::OS::get_singleton();
+			if (os != nullptr) {
+				os->delay_msec(500);
+			}
+		}
+	}
+	return false;
 }
 
 } // namespace
@@ -489,7 +568,27 @@ GDEX_TEST_T(loader, embedded_pck_detection_warning, TAG_INTEGRATION) {
 	// resolves through the archive (direct-VFS branch, embedded probe passes
 	// silently since the globalized file exists too).
 	const godot::String res_path(virtual_path);
-	GDEX_EXPECT_TRUE(loader->_exists(res_path));
+	const bool staged_resolves = loader->_exists(res_path);
+	if (!staged_resolves) {
+		// Distinguish "the archive on disk is not the one just staged" from
+		// "the loader refused to resolve it": probe the same file directly.
+		godot::Ref<godot::DSPkg> probe;
+		probe.instantiate();
+		godot::Error probe_err = probe->open(godot::String("res://textures.dspkg"));
+		godot::String global_path = ps ? ps->globalize_path(godot::String("res://textures.dspkg")) : godot::String("res://textures.dspkg");
+		godot::Engine *engine = godot::Engine::get_singleton();
+		godot::UtilityFunctions::push_warning(
+				"embedded_pck_detection_warning: loader->_exists=false; res_exists=",
+				godot::FileAccess::file_exists(godot::String("res://textures.dspkg")),
+				" global_exists=", godot::FileAccess::file_exists(global_path),
+				" global_path=", global_path,
+				" probe_open=", static_cast<int64_t>(probe_err),
+				" entries=", probe->get_entry_count(),
+				" has_texture=", probe->has_texture(res_path),
+				" force=", ps ? static_cast<bool>(ps->get_setting("directstorage/force_archive_resolution")) : false,
+				" editor=", engine ? engine->is_editor_hint() : false);
+	}
+	GDEX_EXPECT_TRUE(staged_resolves);
 
 	// (2) Remove the archive: the packaged entry no longer resolves (missing,
 	// and the loader's candidate-path diagnostic fires when bundle_dspkg set).

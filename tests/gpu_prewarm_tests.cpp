@@ -128,16 +128,47 @@ bool stage_gpu_dspkg_impl(const char *p_dstex_path, const char *p_dspkg_path, co
     // poisons every later resolve, so a failed verify retries once
     // after a short yield instead of trusting the copy return code.
     for (int attempt = 0; attempt < 2; ++attempt) {
-        remove_abs("res://textures.dspkg");
-        if (godot::DirAccess::copy_absolute(godot::String(p_dspkg_path), godot::String("res://textures.dspkg")) == godot::OK) {
-            godot::Ref<godot::DSPkg> verify;
-            verify.instantiate();
-            if (!verify.is_null() && verify->open(godot::String("res://textures.dspkg")) == godot::OK &&
-                    verify->has_texture(godot::String(p_virtual_path)) &&
-                    verify->has_texture(godot::String(p_control_path))) {
-                return true;
+        godot::Error remove_err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+        godot::Error copy_err = godot::DirAccess::copy_absolute(godot::String(p_dspkg_path), godot::String("res://textures.dspkg"));
+        const bool exists = godot::FileAccess::file_exists(godot::String("res://textures.dspkg"));
+
+        int64_t staged_len = -1;
+        {
+            godot::Ref<godot::FileAccess> staged = godot::FileAccess::open(godot::String("res://textures.dspkg"), godot::FileAccess::READ);
+            if (staged.is_valid()) {
+                staged_len = staged->get_length();
+                staged->close();
             }
         }
+
+        godot::Error open_err = godot::ERR_CANT_OPEN;
+        int64_t entries = -1;
+        bool has_virtual = false;
+        bool has_control = false;
+        godot::Ref<godot::DSPkg> verify;
+        verify.instantiate();
+        if (!verify.is_null()) {
+            open_err = verify->open(godot::String("res://textures.dspkg"));
+            entries = verify->get_entry_count();
+            has_virtual = verify->has_texture(godot::String(p_virtual_path));
+            has_control = verify->has_texture(godot::String(p_control_path));
+        }
+
+        if (exists && open_err == godot::OK && has_virtual && has_control) {
+            return true;
+        }
+
+        godot::UtilityFunctions::push_warning(
+                "gpu_prewarm stage attempt ", attempt,
+                ": remove=", static_cast<int64_t>(remove_err),
+                " copy=", static_cast<int64_t>(copy_err),
+                " exists=", exists,
+                " staged_len=", staged_len,
+                " open=", static_cast<int64_t>(open_err),
+                " entries=", entries,
+                " has_virtual=", has_virtual,
+                " has_control=", has_control);
+
         if (attempt == 0) {
             godot::OS *os = godot::OS::get_singleton();
             if (os != nullptr) {
@@ -145,7 +176,6 @@ bool stage_gpu_dspkg_impl(const char *p_dstex_path, const char *p_dspkg_path, co
             }
         }
     }
-    fprintf(stderr, "[gpu_prewarm] stage self-verify failed for %s + %s\n", p_virtual_path, p_control_path);
     return false;
 }
 
@@ -277,6 +307,14 @@ GDEX_TEST(gpu_prewarm, render_post_smoke) {
 GDEX_TEST_T(gpu_prewarm, dma_fills_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
     if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
         GDEX_SKIP("DSContext/DSTextureCache classes unavailable");
+    }
+    // Drop file handles cached by an earlier suite before staging: the backend
+    // keeps every DMA source open for the life of its context, and a previously
+    // loaded res://textures.dspkg cannot be removed or replaced while that
+    // handle lives (the copy reports success and the safe-save commit rolls
+    // back). require_singleton_context re-initializes right after.
+    if (godot::DSContext *pre = godot::DSContext::get_singleton()) {
+        pre->shutdown_ds();
     }
     godot::DSContext *ds = require_singleton_context(ctx);
     if (!ds->initialize_ds() || !ds->is_initialized()) {
