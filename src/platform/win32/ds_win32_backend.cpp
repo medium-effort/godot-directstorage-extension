@@ -373,7 +373,10 @@ struct DSChunkedRequestState {
 	Vector<uint64_t> destination_offsets;
 };
 
-static std::unordered_map<DSRequest *, DSChunkedRequestState> s_chunked_requests;
+// Never destroyed (see the device cache above). The entries hold Godot Refs,
+// so clearing them here and in shutdown() is what releases those objects -
+// never static destruction during DLL_PROCESS_DETACH.
+static std::unordered_map<DSRequest *, DSChunkedRequestState> &s_chunked_requests = *new std::unordered_map<DSRequest *, DSChunkedRequestState>();
 static std::unordered_map<DSRequest *, DSRequest *> s_chunk_parents;
 static std::unordered_map<DSRequest *, ID3D12Resource *> s_resource_guards;
 static std::unordered_set<std::string> s_staging_buffer_warnings;
@@ -1462,8 +1465,15 @@ void Win32Backend::completion_thread_func() {
 #endif
 
 #ifdef _WIN32
-static Microsoft::WRL::ComPtr<ID3D12Device> s_d3d12_device;
-static Microsoft::WRL::ComPtr<ID3D12CommandQueue> s_d3d12_command_queue;
+// The process-wide cache is deliberately never destroyed. A ComPtr destroyed
+// during DLL_PROCESS_DETACH calls Release() with the loader lock held; when that
+// releases the last reference the D3D12 object is destroyed there, the driver
+// blocks on a thread that needs the same lock, and process exit hangs forever
+// with zero CPU. The references are dropped explicitly from module deinit by
+// ds_win32_release_static_d3d12_state(); these heap objects are then reclaimed
+// by process exit.
+static Microsoft::WRL::ComPtr<ID3D12Device> &s_d3d12_device = *new Microsoft::WRL::ComPtr<ID3D12Device>();
+static Microsoft::WRL::ComPtr<ID3D12CommandQueue> &s_d3d12_command_queue = *new Microsoft::WRL::ComPtr<ID3D12CommandQueue>();
 static std::mutex s_device_mutex;
 
 // One-shot render-thread acquisition context.
@@ -2170,8 +2180,11 @@ struct DSTransitionHandoffContext {
 	Vector<Win32Backend::GPUTargetTransition> transitions;
 	bool to_common = false;
 };
+// Never destroyed (see the device cache above). Each queued handoff owns
+// GPUTargetTransition ComPtr<ID3D12Resource>s, so releasing them from static
+// destruction would touch D3D12 under the loader lock.
 static std::mutex s_transition_dispatch_mutex;
-static std::vector<std::shared_ptr<DSTransitionHandoffContext>> s_transition_queue;
+static std::vector<std::shared_ptr<DSTransitionHandoffContext>> &s_transition_queue = *new std::vector<std::shared_ptr<DSTransitionHandoffContext>>();
 
 void ds_win32_execute_transitions_on_render_thread() {
 	std::shared_ptr<DSTransitionHandoffContext> ctx;
@@ -2191,6 +2204,29 @@ void ds_win32_execute_transitions_on_render_thread() {
 		ctx->success = ok;
 		ctx->completed = true;
 		ctx->cv.notify_one();
+	}
+}
+
+// Drops every process-wide D3D12 reference while the engine is alive and the
+// loader lock is NOT held. Diagnostics that led here: the hung process's main
+// thread sat in ntdll!LdrUnloadDll -> this module -> D3D12 -> nvwgf2umx ->
+// WaitForSingleObject, i.e. ComPtr destructors ran during DLL_PROCESS_DETACH and
+// their Release() destroyed D3D12 objects under the loader lock.
+//
+// Safe without a backend lock: shutdown_ds() has already stopped and joined every
+// backend before module deinit calls this, so no completion thread or render-thread
+// handoff can be writing these containers any more.
+void ds_win32_release_static_d3d12_state() {
+	ds_win32_invalidate_d3d12_device();
+	{
+		std::lock_guard<std::mutex> lock(s_transition_dispatch_mutex);
+		s_transition_queue.clear();
+	}
+	{
+		// Chunked parents/children hold Godot Refs: unreferencing those during
+		// unload would run engine code with the loader lock held.
+		s_chunked_requests.clear();
+		s_chunk_parents.clear();
 	}
 }
 

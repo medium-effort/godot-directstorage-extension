@@ -18,6 +18,10 @@
 #include <godot_cpp/core/defs.hpp>
 #include <godot_cpp/godot.hpp>
 
+#ifdef _WIN32
+#include "platform/win32/ds_win32_backend.h"
+#endif
+
 using namespace godot;
 
 static DSContext *ds_context_singleton = nullptr;
@@ -151,6 +155,13 @@ void uninitialize_directstorage_accelerator_module(ModuleInitializationLevel p_l
 		memdelete(ds_context_singleton);
 		ds_context_singleton = nullptr;
 	}
+	// Every process-wide D3D12 reference must be dropped here, while the engine is
+	// alive and the loader lock is NOT held. Left to static destruction it would
+	// run inside DLL_PROCESS_DETACH, where Release() destroys the D3D12 object
+	// under the loader lock and the driver deadlocks.
+#ifdef _WIN32
+	ds_win32_release_static_d3d12_state();
+#endif
 	// The cache destructor (clear) can defer RIDs behind an in-flight request.
 	// Nothing is writing any more, so release them here rather than letting
 	// RenderingDevice::finalize report them as leaked. A drain timeout leaves

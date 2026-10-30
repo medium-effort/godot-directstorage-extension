@@ -31,6 +31,11 @@ struct DSTexMipEntryV2;
 Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device();
 Microsoft::WRL::ComPtr<ID3D12CommandQueue> ds_win32_get_d3d12_command_queue();
 void ds_win32_invalidate_d3d12_device();
+// Drops every process-wide D3D12 reference (device/queue cache, queued barrier
+// handoffs, chunked-request state) while the engine is alive and the loader lock
+// is NOT held. Must be called from module deinit: a ComPtr destroyed during
+// DLL_PROCESS_DETACH releases under the loader lock and deadlocks the driver.
+void ds_win32_release_static_d3d12_state();
 #endif
 
 class Win32Backend : public PlatformBackend {
