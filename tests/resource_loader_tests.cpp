@@ -126,8 +126,10 @@ void shutdown_ds_singleton() {
 // later resolve, and the copy has reported success over live scan windows.
 // On failure the exact step is logged so a locked destination is
 // distinguishable from a corrupt one.
-bool stage_textures_dspkg(::gdextest::TestContext &ctx, const char *p_dstex_path, const char *p_dspkg_path, const char *p_virtual_path) {
-	shutdown_ds_singleton();
+bool stage_textures_dspkg(::gdextest::TestContext &ctx, const char *p_dstex_path, const char *p_dspkg_path, const char *p_virtual_path, bool p_release_context = true) {
+	if (p_release_context) {
+		shutdown_ds_singleton();
+	}
 	if (!write_loose_dstex(p_dstex_path)) {
 		return false;
 	}
@@ -596,6 +598,72 @@ GDEX_TEST_T(loader, embedded_pck_detection_warning, TAG_INTEGRATION) {
 	(void)err;
 	remove_user_file(dstex_path);
 	remove_user_file(dspkg_path);
+}
+
+// --- Live archive replacement is observed without a restart (#0182) ------------
+
+GDEX_TEST_T(loader, archive_replacement_after_load_is_observed, TAG_INTEGRATION) {
+	// The GPU path caches an IDStorageFile for the archive. It used to live for
+	// the whole context, so a replacement could not even be written (remove
+	// failed, safe-save rolled back) and a new load served the old bytes. The
+	// handle must be released when the batch completes.
+	const char *a_dstex = "user://gdextest_loader_replace_a.dstex";
+	const char *a_dspkg = "user://gdextest_loader_replace_a.dspkg";
+	const char *a_virtual = "res://gdextest_loader_replace_a.png";
+	const char *b_dstex = "user://gdextest_loader_replace_b.dstex";
+	const char *b_dspkg = "user://gdextest_loader_replace_b.dspkg";
+	const char *b_virtual = "res://gdextest_loader_replace_b.png";
+
+	if (!stage_textures_dspkg(ctx, a_dstex, a_dspkg, a_virtual)) {
+		remove_user_file(a_dstex);
+		remove_user_file(a_dspkg);
+		GDEX_ABORT_TEST("archive A staging failed");
+	}
+
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	if (ps) {
+		ps->set_setting("directstorage/force_archive_resolution", true);
+	}
+	ctx.add_teardown([ps]() {
+		if (ps) {
+			ps->set_setting("directstorage/force_archive_resolution", false);
+		}
+	});
+
+	{
+		godot::Ref<godot::DSResourceFormatLoader> loader;
+		loader.instantiate();
+		GDEX_ASSERT_TRUE(loader.is_valid());
+		godot::Ref<godot::Texture2D> first(loader->_load(godot::String(a_virtual), godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE));
+		GDEX_ASSERT_TRUE(first.is_valid());
+		GDEX_EXPECT_TRUE(loader->_exists(godot::String(a_virtual)));
+	}
+
+	// Replace the archive over the same path WITHOUT releasing the context:
+	// the completed batch must already have dropped its handle.
+	if (!stage_textures_dspkg(ctx, b_dstex, b_dspkg, b_virtual, false)) {
+		remove_user_file(a_dstex);
+		remove_user_file(a_dspkg);
+		remove_user_file(b_dstex);
+		remove_user_file(b_dspkg);
+		GDEX_ABORT_TEST("archive replacement failed: the previous handle is still locking res://textures.dspkg");
+	}
+
+	// A fresh loader instance reads the new archive. (A loader instance keeps
+	// its own parsed TOC in memory; that cache is separate from the file
+	// handle.)
+	godot::Ref<godot::DSResourceFormatLoader> reopened;
+	reopened.instantiate();
+	GDEX_ASSERT_TRUE(reopened.is_valid());
+	GDEX_EXPECT_FALSE(reopened->_exists(godot::String(a_virtual)));
+	GDEX_EXPECT_TRUE(reopened->_exists(godot::String(b_virtual)));
+	godot::Ref<godot::Texture2D> second(reopened->_load(godot::String(b_virtual), godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE));
+	GDEX_EXPECT_TRUE(second.is_valid());
+
+	remove_user_file(a_dstex);
+	remove_user_file(a_dspkg);
+	remove_user_file(b_dstex);
+	remove_user_file(b_dspkg);
 }
 
 // --- .dspkg branch: _load returns the archive resource ---------------------------------

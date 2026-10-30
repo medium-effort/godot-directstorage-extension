@@ -1194,19 +1194,17 @@ void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, c
 #endif
 
 #ifdef _WIN32
-// Slot lifetime close: releases every slot-owned file handle, empties the
-// vector, and drops the open-file cache in one step so a cleared slot can
-// never serve a stale handle. Sole closer for BatchSlot files; all reset,
-// completion, cancel, and shutdown paths go through here.
+// Slot lifetime close: drops the slot's reference to every handle it holds.
+// The handle itself is only closed when no other caller, slot or the cache
+// still needs it (see release_source_file), because the same file is shared by
+// every request in a batch and across queues. Sole closer for BatchSlot files;
+// all reset, completion, cancel, and shutdown paths go through here.
 void Win32Backend::close_slot_files(BatchSlot &p_slot) {
-	for (int i = 0; i < p_slot.files.size(); i++) {
-		if (p_slot.files[i]) {
-			p_slot.files[i]->Close();
-			p_slot.files[i]->Release();
-		}
+	for (std::unordered_map<std::wstring, IDStorageFile *>::iterator it = p_slot.file_cache.begin(); it != p_slot.file_cache.end(); ++it) {
+		release_source_file(it->first, it->second);
 	}
-	p_slot.files.clear();
 	p_slot.file_cache.clear();
+	p_slot.files.clear();
 	p_slot.gpu_transitions.clear();
 	p_slot.dstorage_requests.clear();
 }
@@ -1215,14 +1213,142 @@ void Win32Backend::close_slot_files(BatchSlot &p_slot) {
 // batch_mutex or guarantee no concurrent enqueue (init before the
 // completion thread starts, shutdown after it joins).
 void Win32Backend::clear_persistent_files() {
-	for (int i = 0; i < persistent_files.size(); i++) {
-		if (persistent_files[i]) {
-			persistent_files[i]->Close();
-			persistent_files[i]->Release();
+	std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
+	for (std::unordered_map<std::wstring, CachedSourceFile>::iterator it = persistent_file_cache.begin(); it != persistent_file_cache.end(); ++it) {
+		if (it->second.refs > 0) {
+			UtilityFunctions::push_warning("Win32Backend: Releasing a cached source file that still has ", (int64_t)it->second.refs, " outstanding reference(s): ", String(it->first.c_str()));
+		}
+		if (it->second.file) {
+			it->second.file->Close();
+			it->second.file->Release();
+			it->second.file = nullptr;
 		}
 	}
-	persistent_files.clear();
 	persistent_file_cache.clear();
+}
+
+namespace {
+// Size + last-write time, the two fields that decide whether a cached handle
+// still describes the file on disk. Cheap enough to run per enqueue.
+bool stat_source_file(const std::wstring &p_wpath, uint64_t &r_size, uint64_t &r_write_time) {
+	WIN32_FILE_ATTRIBUTE_DATA info = {};
+	if (!GetFileAttributesExW(p_wpath.c_str(), GetFileExInfoStandard, &info)) {
+		return false;
+	}
+	r_size = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | static_cast<uint64_t>(info.nFileSizeLow);
+	r_write_time = (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+			static_cast<uint64_t>(info.ftLastWriteTime.dwLowDateTime);
+	return true;
+}
+} // namespace
+
+// Returns a handle for p_wpath with one caller reference. The caller must hand
+// that reference to a slot (register_slot_source_file) or drop it
+// (release_source_file). Reopens when the file on disk no longer matches the
+// cached metadata, unless a batch still owns the handle - a replacement cannot
+// be adopted mid-DMA, so that batch keeps the bytes it opened.
+IDStorageFile *Win32Backend::resolve_source_file(const std::wstring &p_wpath, String &r_error) {
+	uint64_t size = 0;
+	uint64_t write_time = 0;
+	if (!stat_source_file(p_wpath, size, write_time)) {
+		r_error = "Win32Backend: Failed to stat source file '" + String(p_wpath.c_str()) + "'.";
+		return nullptr;
+	}
+
+	IDStorageFile *cached = nullptr;
+	bool changed_while_in_flight = false;
+	{
+		std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
+		std::unordered_map<std::wstring, CachedSourceFile>::iterator it = persistent_file_cache.find(p_wpath);
+		if (it != persistent_file_cache.end() && it->second.file) {
+			const bool unchanged = it->second.size == size && it->second.write_time == write_time;
+			if (unchanged) {
+				it->second.refs++;
+				cached = it->second.file;
+			} else if (it->second.refs > 0) {
+				// A batch still owns this handle: it must keep the bytes it
+				// opened. Warn once per replacement, not once per request.
+				it->second.refs++;
+				cached = it->second.file;
+				changed_while_in_flight = !it->second.stale_warned;
+				it->second.stale_warned = true;
+			}
+			// Otherwise refs == 0 and the file changed: fall through, reopen
+			// below and replace the entry.
+		}
+	}
+	if (cached) {
+		if (changed_while_in_flight) {
+			UtilityFunctions::push_warning("Win32Backend: Source file changed on disk while a batch still owns its handle; that batch keeps the bytes it opened and the next batch reopens. Path: ", String(p_wpath.c_str()));
+		}
+		return cached;
+	}
+
+	IDStorageFile *file = nullptr;
+	if (!factory || FAILED(factory->OpenFile(p_wpath.c_str(), IID_PPV_ARGS(&file))) || !file) {
+		r_error = "Win32Backend: Failed to open file '" + String(p_wpath.c_str()) + "'.";
+		return nullptr;
+	}
+
+	std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
+	std::unordered_map<std::wstring, CachedSourceFile>::iterator it = persistent_file_cache.find(p_wpath);
+	if (it != persistent_file_cache.end() && it->second.file && it->second.refs > 0) {
+		// Another thread opened the same path while we were away and its handle
+		// is already in use: first opener wins, share it.
+		it->second.refs++;
+		file->Close();
+		file->Release();
+		return it->second.file;
+	}
+	if (it != persistent_file_cache.end() && it->second.file) {
+		it->second.file->Close();
+		it->second.file->Release();
+	}
+	CachedSourceFile entry;
+	entry.file = file;
+	entry.size = size;
+	entry.write_time = write_time;
+	entry.refs = 1;
+	persistent_file_cache[p_wpath] = entry;
+	return file;
+}
+
+// Drops one caller/slot reference. The handle is closed when the last
+// reference goes away, which is what unblocks replacing the file on disk; the
+// stat metadata is kept so the next resolve can decide cheaply.
+void Win32Backend::release_source_file(const std::wstring &p_wpath, IDStorageFile *p_file) {
+	if (!p_file) {
+		return;
+	}
+	std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
+	std::unordered_map<std::wstring, CachedSourceFile>::iterator it = persistent_file_cache.find(p_wpath);
+	if (it == persistent_file_cache.end() || it->second.file != p_file) {
+		// Entry already dropped (shutdown/clear); the caller still owns one.
+		p_file->Release();
+		return;
+	}
+	if (it->second.refs > 0) {
+		it->second.refs--;
+	}
+	if (it->second.refs == 0) {
+		it->second.file->Close();
+		it->second.file->Release();
+		it->second.file = nullptr;
+	}
+}
+
+// Transfers the caller's reference into the slot, once per path: every request
+// in a batch shares the slot's reference.
+void Win32Backend::register_slot_source_file(BatchSlot &r_slot, const std::wstring &p_wpath, IDStorageFile *p_file) {
+	if (!p_file) {
+		return;
+	}
+	if (r_slot.file_cache.find(p_wpath) != r_slot.file_cache.end()) {
+		release_source_file(p_wpath, p_file);
+		return;
+	}
+	r_slot.file_cache[p_wpath] = p_file;
+	r_slot.files.push_back(p_file);
 }
 
 // Inserts an OpenFile'd handle into the backend-level cache. Returns false
@@ -1233,11 +1359,21 @@ bool Win32Backend::cache_file_handle(const std::wstring &p_wpath, IDStorageFile 
 	if (!p_file || p_wpath.empty()) {
 		return false;
 	}
+	uint64_t size = 0;
+	uint64_t write_time = 0;
+	if (!stat_source_file(p_wpath, size, write_time)) {
+		return false;
+	}
+	std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
 	if (persistent_file_cache.find(p_wpath) != persistent_file_cache.end()) {
 		return false;
 	}
-	persistent_files.push_back(p_file);
-	persistent_file_cache[p_wpath] = p_file;
+	CachedSourceFile entry;
+	entry.file = p_file;
+	entry.size = size;
+	entry.write_time = write_time;
+	entry.refs = 0;
+	persistent_file_cache[p_wpath] = entry;
 	return true;
 }
 
@@ -2512,11 +2648,11 @@ bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 			}
 			complete_chunked_requests();
 			release_resource_guards(zombie_slots[z].requests);
-			for (int f = 0; f < zombie_slots[z].files.size(); f++) {
-				if (zombie_slots[z].files[f]) {
-					zombie_slots[z].files[f]->Close();
-				}
+			for (std::unordered_map<std::wstring, IDStorageFile *>::iterator it = zombie_slots[z].file_cache.begin(); it != zombie_slots[z].file_cache.end(); ++it) {
+				release_source_file(it->first, it->second);
 			}
+			zombie_slots[z].file_cache.clear();
+			zombie_slots[z].files.clear();
 		}
 		zombie_slots.clear();
 		return true;
@@ -2800,32 +2936,17 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	String norm_file_path = req_raw_path.replace("/", "\\");
 	std::wstring wpath(reinterpret_cast<const wchar_t *>(norm_file_path.utf16().get_data()));
 
-	IDStorageFile *pre_opened_file = nullptr;
-	{
-		std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
-		std::unordered_map<std::wstring, IDStorageFile *>::const_iterator persistent_handle = persistent_file_cache.find(wpath);
-		if (persistent_handle != persistent_file_cache.end()) {
-			pre_opened_file = persistent_handle->second;
-		}
+	String resolve_error;
+	IDStorageFile *pre_opened_file = resolve_source_file(wpath, resolve_error);
+	if (!pre_opened_file) {
+		p_request->set_status(DSRequest::STATUS_FAILED);
+		p_request->set_error_message(resolve_error);
+		return false;
 	}
-	if (!pre_opened_file && factory) {
-		HRESULT hr = factory->OpenFile(wpath.c_str(), IID_PPV_ARGS(&pre_opened_file));
-		if (FAILED(hr) || !pre_opened_file) {
-			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("Win32Backend: Failed to open file '" + p_request->get_file_path() + "'.");
-			return false;
-		}
-		std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
-		std::unordered_map<std::wstring, IDStorageFile *>::const_iterator persistent_handle = persistent_file_cache.find(wpath);
-		if (persistent_handle != persistent_file_cache.end()) {
-			pre_opened_file->Close();
-			pre_opened_file->Release();
-			pre_opened_file = persistent_handle->second;
-		} else {
-			persistent_file_cache[wpath] = pre_opened_file;
-			persistent_files.push_back(pre_opened_file);
-		}
-	}
+	// The reference is dropped again if this request never reaches a slot
+	// (validation failure); staging transfers it to the slot.
+	bool file_registered = false;
+	SourceRefGuard source_ref_guard(this, wpath, pre_opened_file, file_registered);
 
 	std::lock_guard<std::mutex> lock(batch_mutex);
 	if (sync_batch_in_flight.load()) {
@@ -2949,15 +3070,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	auto enqueue_one = [&](const Ref<DSRequest> &p_child, uint64_t p_destination_offset) -> bool {
 		IDStorageFile *file = pre_opened_file;
 		if (!file) {
-			std::lock_guard<std::mutex> f_lock(persistent_file_mutex);
-			std::unordered_map<std::wstring, IDStorageFile *>::const_iterator persistent_handle = persistent_file_cache.find(wpath);
-			if (persistent_handle != persistent_file_cache.end()) {
-				file = persistent_handle->second;
-			}
-		}
-		if (!file) {
 			p_child->set_status(DSRequest::STATUS_FAILED);
-			p_child->set_error_message("Win32Backend: Failed to resolve file handle for '" + p_child->get_file_path() + "'.");
+			p_child->set_error_message("Win32Backend: Source file handle unavailable for '" + p_child->get_file_path() + "'.");
 			return false;
 		}
 
@@ -3148,10 +3262,12 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		p_child->set_gpu_in_flight(true);
 		p_child->set_status(DSRequest::STATUS_SUBMITTED);
 	}
+	if (!file_registered) {
+		register_slot_source_file(slot, wpath, file);
+		file_registered = true;
+	}
 	slot.requests.push_back(p_child);
 	slot.dstorage_requests.push_back(request);
-	// slot.files push happens once at open time in the cache-miss branch
-	// above; cache hits reuse the already-tracked handle.
 	return true;
 	};
 
@@ -3895,6 +4011,7 @@ void Win32Backend::submit_batch() {
 					zombie.fence_value = slot.fence_value;
 					zombie.requests = slot.requests;
 					zombie.files = slot.files;
+					zombie.file_cache = slot.file_cache;
 					zombie.gpu_transitions = slot.gpu_transitions;
 					zombie_slots.push_back(zombie);
 
@@ -4102,6 +4219,7 @@ void Win32Backend::_debug_zombify_active_batch_for_testing() {
 			zombie.fence_value = slot.fence_value;
 			zombie.requests = slot.requests;
 			zombie.files = slot.files;
+			zombie.file_cache = slot.file_cache;
 			zombie.gpu_transitions = slot.gpu_transitions;
 			zombie_slots.push_back(zombie);
 

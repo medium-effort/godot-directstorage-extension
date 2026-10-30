@@ -92,21 +92,34 @@ private:
 
 	IDStorageFactory *factory = nullptr;
 	std::array<QueueState, QUEUE_COUNT> priority_queues;
-	// Backend-level open-file cache: normalized path -> IDStorageFile handle.
-	// Exported builds funnel every prewarm request through one archive
-	// (textures.dspkg), and the old per-slot cache was wiped by
-	// close_slot_files() on every batch completion, so each slot recycle
-	// re-paid OpenFile + BypassIO negotiation on the calling (main) thread.
-	// These handles are owned here (released in shutdown() via
-	// clear_persistent_files()) and NEVER pushed into BatchSlot::files, so
-	// close_slot_files() cannot close a handle this map still serves.
-	// Guarded by batch_mutex like every other slot member. Staleness
-	// contract matches the preloader's archive handle (rescan_archive keeps
-	// the open handle on unchanged path): a file replaced on disk mid-run
-	// is picked up on restart, which is fine for immutable exported builds.
+	// Backend-level open-file cache: normalized path -> handle plus the stat it
+	// was opened against. Exported builds funnel every prewarm request through
+	// one archive, and a per-request OpenFile costs hundreds of kernel opens
+	// per frame, so every request in a batch shares one handle.
+	//
+	// Lifetime: the cache owns the open handle and each caller/slot holds a
+	// reference (refs). When the last reference drops - which happens at batch
+	// completion - the handle is closed and only its stat metadata is kept.
+	// Closing at completion is what lets a replaced file be deleted or renamed
+	// again; keeping every DMA source open for the life of the context made a
+	// replacement report success while the old bytes stayed (issue #0182).
+	//
+	// Staleness: the metadata is compared against a fresh stat on every resolve,
+	// so a file replaced between batches is reopened instead of served stale. A
+	// replacement that lands while a batch still owns its handle cannot be
+	// adopted mid-DMA: that batch keeps the bytes it opened and the next batch
+	// reopens.
+	//
+	// Lock order: batch_mutex -> persistent_file_mutex. Never the reverse.
+	struct CachedSourceFile {
+		IDStorageFile *file = nullptr; // cache-owned; null once closed
+		uint64_t size = 0;
+		uint64_t write_time = 0;
+		uint32_t refs = 0; // caller/slot references; cache ownership is implicit
+		bool stale_warned = false; // one warning per replaced-and-in-flight file
+	};
 	std::mutex persistent_file_mutex;
-	std::unordered_map<std::wstring, IDStorageFile *> persistent_file_cache;
-	Vector<IDStorageFile *> persistent_files;
+	std::unordered_map<std::wstring, CachedSourceFile> persistent_file_cache;
 	HMODULE dstoragecore_module = nullptr;
 	HMODULE dstorage_module = nullptr;
 	struct BatchMetadata {
@@ -138,6 +151,9 @@ private:
 		uint64_t fence_value = 0;
 		Vector<Ref<DSRequest>> requests;
 		Vector<IDStorageFile *> files;
+		// Path -> handle for the references this zombie owns; released only
+		// after the hardware fence retires (same rule as resource guards).
+		std::unordered_map<std::wstring, IDStorageFile *> file_cache;
 		Vector<GPUTargetTransition> gpu_transitions;
 	};
 	std::vector<ZombieBatchSlot> zombie_slots;
@@ -164,9 +180,34 @@ private:
 	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch);
 	bool has_in_flight_batches_locked() const;
 	void update_profiler_queue_depth_locked();
-	static void close_slot_files(BatchSlot &p_slot);
+	void close_slot_files(BatchSlot &p_slot);
 	void clear_persistent_files();
 	bool cache_file_handle(const std::wstring &p_wpath, IDStorageFile *p_file);
+	IDStorageFile *resolve_source_file(const std::wstring &p_wpath, String &r_error);
+	void release_source_file(const std::wstring &p_wpath, IDStorageFile *p_file);
+	void register_slot_source_file(BatchSlot &r_slot, const std::wstring &p_wpath, IDStorageFile *p_file);
+	// Releases a resolved source-file reference unless the request that owns it
+	// was actually staged into a batch slot. enqueue_request has many
+	// validation failure paths between resolving the handle and staging the
+	// first request; without this, a rejected request would pin the file open.
+	class SourceRefGuard {
+	public:
+		SourceRefGuard(Win32Backend *p_backend, const std::wstring &p_path, IDStorageFile *p_file, bool &r_registered) :
+				backend(p_backend), path(p_path), file(p_file), registered(r_registered) {}
+		SourceRefGuard(const SourceRefGuard &) = delete;
+		SourceRefGuard &operator=(const SourceRefGuard &) = delete;
+		~SourceRefGuard() {
+			if (file != nullptr && !registered) {
+				backend->release_source_file(path, file);
+			}
+		}
+
+	private:
+		Win32Backend *backend = nullptr;
+		std::wstring path;
+		IDStorageFile *file = nullptr;
+		bool &registered;
+	};
 	static int priority_to_queue_index(DSRequest::DSPriority p_priority);
 
 	D3D12BarrierContext barrier_context;
