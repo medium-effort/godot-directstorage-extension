@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <deque>
+#include <functional>
 #include <list>
 #include <atomic>
 #include <mutex>
@@ -48,22 +49,35 @@ private:
 	// neighbours: the teardown getter takes no lock.
 	std::atomic<bool> last_shutdown_clean{ true };
 
-	uint32_t staging_buffer_size_mb = 128;
-	bool disable_gpu_decompression = false;
+	// Atomic: initialize_ds_locked() runs on whichever thread first needs the
+	// context (main, resource-loader worker, or the enqueue path), while the
+	// setters are callable from any thread. Plain scalars here were a data race;
+	// every access below goes through an explicit .load()/.store().
+	std::atomic<uint32_t> staging_buffer_size_mb{ 128 };
+	std::atomic<bool> disable_gpu_decompression{ false };
 	// Reduction-only UMA auto-tune (see initialize_ds_locked): when true and
 	// the active adapter is an integrated/UMA GPU, effective staging/queue
 	// are clamped down to the UMA caps. Explicit low values pass through
 	// untouched; set false to use configured values verbatim.
-	bool auto_tune_for_integrated_gpu = true;
+	std::atomic<bool> auto_tune_for_integrated_gpu{ true };
 	// Must match the ProjectSetting default registered in register_types.cpp
 	// ("directstorage/queue_capacity" = 512); the setting wins at init,
 	// this is only the no-setting fallback.
-	uint16_t queue_capacity = 512;
+	std::atomic<uint16_t> queue_capacity{ 512 };
 
 	PlatformBackend *active_backend = nullptr;
 	mutable std::mutex init_mutex;
 	mutable std::shared_mutex backend_lifecycle_mutex;
 	String initialization_path;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only seam: invoked inside initialize_ds_locked() at the point where
+	// the backend used to be published (after the object exists, before its
+	// initialize() runs). It exists so a test can hold that instant open and
+	// read the public getters from another thread; the real window is a
+	// scheduler race that cannot be produced on demand. Never bound in
+	// _bind_methods().
+	std::function<void()> initialization_window_hook;
+#endif
 	bool gpu_requests_pending = false;
 	uint64_t completion_fence = 0;
 	mutable std::mutex context_mutex;
@@ -239,6 +253,19 @@ public:
 
 	void set_queue_capacity(uint16_t p_capacity);
 	uint16_t get_queue_capacity() const;
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only seam: installs (or clears, with an empty function) the hook that
+	// initialize_ds_locked() fires at the publication point. Never bound in
+	// _bind_methods().
+	void _debug_set_initialization_window_hook_for_testing(const std::function<void()> &p_hook);
+	// Test-only seam: true when the four configuration fields are declared as
+	// std::atomic. A compile-time type probe, not a runtime observation: this
+	// pins the structural half of the invariant that no runtime oracle in this
+	// toolchain (no ThreadSanitizer: MSVC plus prebuilt DirectStorage and
+	// godot-cpp binaries) can observe. Never bound in _bind_methods().
+	bool _debug_config_fields_are_atomic_for_testing() const;
+#endif
 };
 
 } // namespace godot

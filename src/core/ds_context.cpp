@@ -14,6 +14,7 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <string>
+#include <type_traits>
 
 namespace godot {
 
@@ -214,6 +215,13 @@ DSContext::InitStatus DSContext::get_init_status() const {
 }
 
 namespace {
+
+// std::is_atomic is missing from this toolchain's STL, so detect the wrapper
+// directly. Used only by the DEBUG/DEV configuration-field type probe.
+template <typename T>
+struct ds_is_atomic_type : std::false_type {};
+template <typename T>
+struct ds_is_atomic_type<std::atomic<T>> : std::true_type {};
 
 #ifdef _WIN32
 static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_queue_capacity) {
@@ -445,7 +453,7 @@ bool DSContext::is_gpu_decompression_available() const {
 }
 
 bool DSContext::is_gpu_decompression_enabled() const {
-	return is_gpu_decompression_available() && !disable_gpu_decompression;
+	return is_gpu_decompression_available() && !disable_gpu_decompression.load();
 }
 
 int DSContext::get_gpu_decompression_support_tier() const {
@@ -454,7 +462,7 @@ int DSContext::get_gpu_decompression_support_tier() const {
 		return 0;
 	}
 
-	DSTORAGE_COMPRESSION_SUPPORT support = query_gpu_decompression_support(queue_capacity);
+	DSTORAGE_COMPRESSION_SUPPORT support = query_gpu_decompression_support(queue_capacity.load());
 	if ((support & DSTORAGE_COMPRESSION_SUPPORT_GPU_OPTIMIZED) != 0) {
 		return 2;
 	}
@@ -470,7 +478,7 @@ String DSContext::get_gpu_decompression_queue_type() const {
 	if (!is_d3d12_backend()) {
 		return "none";
 	}
-	DSTORAGE_COMPRESSION_SUPPORT support = query_gpu_decompression_support(queue_capacity);
+	DSTORAGE_COMPRESSION_SUPPORT support = query_gpu_decompression_support(queue_capacity.load());
 	if ((support & DSTORAGE_COMPRESSION_SUPPORT_USES_COMPUTE_QUEUE) != 0) {
 		return "compute";
 	}
@@ -486,7 +494,7 @@ bool DSContext::is_gpu_decompression_optimized() const {
 	if (!is_d3d12_backend()) {
 		return false;
 	}
-	DSTORAGE_COMPRESSION_SUPPORT support = query_gpu_decompression_support(queue_capacity);
+	DSTORAGE_COMPRESSION_SUPPORT support = query_gpu_decompression_support(queue_capacity.load());
 	return (support & DSTORAGE_COMPRESSION_SUPPORT_GPU_OPTIMIZED) != 0;
 #else
 	return false;
@@ -556,7 +564,7 @@ Dictionary DSContext::get_capability_report() const {
 
 #ifdef _WIN32
 	String directstorage_version = String::num_int64(DSTORAGE_SDK_VERSION / 100) + "." + String::num_int64(DSTORAGE_SDK_VERSION % 100);
-	DSTORAGE_COMPRESSION_SUPPORT compression_support = is_d3d12_backend() ? query_gpu_decompression_support(queue_capacity) : DSTORAGE_COMPRESSION_SUPPORT_NONE;
+	DSTORAGE_COMPRESSION_SUPPORT compression_support = is_d3d12_backend() ? query_gpu_decompression_support(queue_capacity.load()) : DSTORAGE_COMPRESSION_SUPPORT_NONE;
 	bool gpu_optimized = (compression_support & DSTORAGE_COMPRESSION_SUPPORT_GPU_OPTIMIZED) != 0;
 	bool gpu_shader_fallback = (compression_support & DSTORAGE_COMPRESSION_SUPPORT_GPU_FALLBACK) != 0;
 	bool cpu_fallback = (compression_support & DSTORAGE_COMPRESSION_SUPPORT_CPU_FALLBACK) != 0;
@@ -571,7 +579,7 @@ Dictionary DSContext::get_capability_report() const {
 #endif
 	report["directstorage_version"] = directstorage_version;
 	report["gpu_decompression_available"] = gpu_tier > 0;
-	report["gpu_decompression_enabled"] = gpu_tier > 0 && !disable_gpu_decompression;
+	report["gpu_decompression_enabled"] = gpu_tier > 0 && !disable_gpu_decompression.load();
 	report["gpu_decompression_tier"] = gpu_tier;
 	report["gpu_decompression_queue_type"] = queue_type;
 	report["gpu_decompression_optimized"] = gpu_optimized;
@@ -849,6 +857,11 @@ bool DSContext::initialize_ds_locked() {
 	}
 	shut_down.store(false, std::memory_order_release);
 	last_shutdown_clean.store(true);
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Only the first backend attempt opens the test window; a Win32 failure that
+	// falls back to software must not fire the hook a second time.
+	bool initialization_window_opened = false;
+#endif
 
 	// Load settings from ProjectSettings or set defaults
 	ProjectSettings *ps = ProjectSettings::get_singleton();
@@ -856,18 +869,18 @@ bool DSContext::initialize_ds_locked() {
 		if (ps->has_setting("directstorage/staging_buffer_size_mb")) {
 			Variant v = ps->get_setting("directstorage/staging_buffer_size_mb");
 			uint32_t configured_size = static_cast<uint32_t>(v);
-			staging_buffer_size_mb = clamp_staging_buffer_size_mb(configured_size > 0 ? configured_size : DEFAULT_STAGING_BUFFER_SIZE_MB);
+			staging_buffer_size_mb.store(clamp_staging_buffer_size_mb(configured_size > 0 ? configured_size : DEFAULT_STAGING_BUFFER_SIZE_MB));
 		}
 		if (ps->has_setting("directstorage/disable_gpu_decompression")) {
-			disable_gpu_decompression = ps->get_setting("directstorage/disable_gpu_decompression");
+			disable_gpu_decompression.store(static_cast<bool>(ps->get_setting("directstorage/disable_gpu_decompression")));
 		}
 		if (ps->has_setting("directstorage/queue_capacity")) {
 			Variant v = ps->get_setting("directstorage/queue_capacity");
 			uint32_t configured_cap = static_cast<uint32_t>(v);
-			queue_capacity = clamp_queue_capacity(configured_cap > 0 ? configured_cap : DEFAULT_QUEUE_CAPACITY);
+			queue_capacity.store(clamp_queue_capacity(configured_cap > 0 ? configured_cap : DEFAULT_QUEUE_CAPACITY));
 		}
 		if (ps->has_setting("directstorage/auto_tune_for_integrated_gpu")) {
-			auto_tune_for_integrated_gpu = ps->get_setting("directstorage/auto_tune_for_integrated_gpu");
+			auto_tune_for_integrated_gpu.store(static_cast<bool>(ps->get_setting("directstorage/auto_tune_for_integrated_gpu")));
 		}
 	}
 
@@ -877,18 +890,20 @@ bool DSContext::initialize_ds_locked() {
 	// checks, stream flush budget) observes the clamped values. Members
 	// are reloaded from ProjectSettings on every init, so an explicit
 	// user configuration is never lost — only the in-effect copy shrinks.
-	if (auto_tune_for_integrated_gpu && is_integrated_gpu()) {
-		uint32_t requested_staging = staging_buffer_size_mb;
-		uint16_t requested_queue = queue_capacity;
-		staging_buffer_size_mb = std::min(staging_buffer_size_mb, UMA_MAX_STAGING_BUFFER_SIZE_MB);
-		queue_capacity = std::min(queue_capacity, UMA_MAX_QUEUE_CAPACITY);
-		if (staging_buffer_size_mb != requested_staging || queue_capacity != requested_queue) {
+	if (auto_tune_for_integrated_gpu.load() && is_integrated_gpu()) {
+		const uint32_t requested_staging = staging_buffer_size_mb.load();
+		const uint16_t requested_queue = queue_capacity.load();
+		const uint32_t clamped_staging = std::min<uint32_t>(requested_staging, UMA_MAX_STAGING_BUFFER_SIZE_MB);
+		const uint16_t clamped_queue = std::min<uint16_t>(requested_queue, UMA_MAX_QUEUE_CAPACITY);
+		staging_buffer_size_mb.store(clamped_staging);
+		queue_capacity.store(clamped_queue);
+		if (clamped_staging != requested_staging || clamped_queue != requested_queue) {
 			Dictionary adapter = get_gpu_adapter_info();
 			UtilityFunctions::print("[DirectStorage] Integrated/UMA GPU detected ('" +
 					String(adapter.get("adapter_name", "unknown")) +
 					"'): auto-tune clamped staging " + String::num_uint64(requested_staging) +
-					"->" + String::num_uint64(staging_buffer_size_mb) + " MiB, queue " +
-					String::num_uint64(requested_queue) + "->" + String::num_uint64(queue_capacity) +
+					"->" + String::num_uint64(clamped_staging) + " MiB, queue " +
+					String::num_uint64(requested_queue) + "->" + String::num_uint64(clamped_queue) +
 					" (directstorage/auto_tune_for_integrated_gpu=true; set false to use configured values).");
 		}
 	}
@@ -896,21 +911,30 @@ bool DSContext::initialize_ds_locked() {
 
 #ifdef _WIN32
 	Win32Backend *backend = memnew(Win32Backend);
-	{
-		std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
-		active_backend = backend;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Fires at the position publication used to occupy: the backend object exists
+	// but has not run initialize() yet, so no reader may see it.
+	initialization_window_opened = true;
+	if (initialization_window_hook) {
+		initialization_window_hook();
 	}
+#endif
+	// No publication before the call: a reader that runs while initialize() is in
+	// progress must not see a backend whose queues/fences do not exist yet. The
+	// object is published only after it reports success, under the same unique
+	// lock the shutdown paths use to clear it.
 	bool backend_initialized = initialization_path.is_empty() ? backend->initialize() : backend->initialize(initialization_path);
 	if (backend_initialized) {
+		{
+			std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+			active_backend = backend;
+		}
 		init_status.store(INIT_STATUS_DIRECTSTORAGE_D3D12, std::memory_order_release);
 		initialized.store(true, std::memory_order_release);
 		UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with Win32Backend.");
 		return true;
 	} else {
-		{
-			std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
-			active_backend = nullptr;
-		}
+		// Never published, so there is nothing to un-publish.
 		memdelete(backend);
 		UtilityFunctions::print("[DirectStorage] Win32DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
 	}
@@ -918,19 +942,20 @@ bool DSContext::initialize_ds_locked() {
 
 	// Fallback backend for non-Windows or if Win32 DirectStorage initialization failed
 	FallbackBackend *fallback_backend = memnew(FallbackBackend);
-	{
-		std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
-		active_backend = fallback_backend;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	if (!initialization_window_opened && initialization_window_hook) {
+		initialization_window_hook();
 	}
+#endif
 	if (!fallback_backend->initialize()) {
-		{
-			std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
-			active_backend = nullptr;
-		}
 		memdelete(fallback_backend);
 		init_status.store(INIT_STATUS_FAILED, std::memory_order_release);
 		UtilityFunctions::push_error("[DirectStorage] DirectStorage Context initialization failed: FallbackBackend could not start.");
 		return false;
+	}
+	{
+		std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		active_backend = fallback_backend;
 	}
 	init_status.store(INIT_STATUS_SOFTWARE_FALLBACK, std::memory_order_release);
 	initialized.store(true, std::memory_order_release);
@@ -1666,36 +1691,53 @@ void DSContext::cancel_requests_with_tag(uint64_t p_tag) {
 }
 
 void DSContext::set_staging_buffer_size_mb(uint32_t p_size_mb) {
-	staging_buffer_size_mb = clamp_staging_buffer_size_mb(p_size_mb > 0 ? p_size_mb : DEFAULT_STAGING_BUFFER_SIZE_MB);
+	staging_buffer_size_mb.store(clamp_staging_buffer_size_mb(p_size_mb > 0 ? p_size_mb : DEFAULT_STAGING_BUFFER_SIZE_MB));
 }
 
 uint32_t DSContext::get_staging_buffer_size_mb() const {
-	return staging_buffer_size_mb;
+	return staging_buffer_size_mb.load();
 }
 
 void DSContext::set_disable_gpu_decompression(bool p_disable) {
-	disable_gpu_decompression = p_disable;
+	disable_gpu_decompression.store(p_disable);
 }
 
 bool DSContext::get_disable_gpu_decompression() const {
-	return disable_gpu_decompression;
+	return disable_gpu_decompression.load();
 }
 
 void DSContext::set_auto_tune_for_integrated_gpu(bool p_enable) {
-	auto_tune_for_integrated_gpu = p_enable;
+	auto_tune_for_integrated_gpu.store(p_enable);
 }
 
 bool DSContext::get_auto_tune_for_integrated_gpu() const {
-	return auto_tune_for_integrated_gpu;
+	return auto_tune_for_integrated_gpu.load();
 }
 
 void DSContext::set_queue_capacity(uint16_t p_capacity) {
-	queue_capacity = clamp_queue_capacity(p_capacity > 0 ? p_capacity : DEFAULT_QUEUE_CAPACITY);
+	queue_capacity.store(clamp_queue_capacity(p_capacity > 0 ? p_capacity : DEFAULT_QUEUE_CAPACITY));
 }
 
 uint16_t DSContext::get_queue_capacity() const {
-	return queue_capacity;
+	return queue_capacity.load();
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+void DSContext::_debug_set_initialization_window_hook_for_testing(const std::function<void()> &p_hook) {
+	// Deliberately unlocked: callers install the hook before the initializing
+	// thread starts and clear it after joining, so there is no concurrent access.
+	// Taking init_mutex here would deadlock against initialize_ds(), which holds it
+	// for the whole window the hook is designed to hold open.
+	initialization_window_hook = p_hook;
+}
+
+bool DSContext::_debug_config_fields_are_atomic_for_testing() const {
+	return ds_is_atomic_type<decltype(staging_buffer_size_mb)>::value &&
+			ds_is_atomic_type<decltype(disable_gpu_decompression)>::value &&
+			ds_is_atomic_type<decltype(auto_tune_for_integrated_gpu)>::value &&
+			ds_is_atomic_type<decltype(queue_capacity)>::value;
+}
+#endif
 
 void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_supported"), &DSContext::is_supported);

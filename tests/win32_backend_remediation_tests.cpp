@@ -1273,6 +1273,110 @@ GDEX_TEST_T(win32_remediation, dstorage_requests_not_shared_during_enqueue_windo
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, readers_see_no_backend_until_initialize_returns, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // A backend may only become visible to readers after its initialize() has
+    // returned: until then its queues, fences and events do not exist, so any
+    // reader that takes the pointer calls into a half-built object. The window is
+    // a scheduler race, so the DEBUG/DEV seam parks the initializing thread at the
+    // position publication used to occupy and the test thread asks the public
+    // getters what they see from there.
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    if (ds == nullptr) {
+        GDEX_SKIP("DSContext singleton absent: real extension not loaded in this fixture.");
+    }
+    const bool was_initialized = ds->is_initialized();
+    // LIFO: clear the hook before anything else can observe the context, then put
+    // the process back in the state the previous suite left it in.
+    ctx.add_teardown([ds, was_initialized]() {
+        ds->_debug_set_initialization_window_hook_for_testing({});
+        if (was_initialized && !ds->is_initialized()) {
+            ds->initialize_ds();
+        } else if (!was_initialized && ds->is_initialized()) {
+            ds->shutdown_ds();
+        }
+    });
+
+    ds->shutdown_ds();
+    GDEX_EXPECT_TRUE(!ds->is_initialized());
+
+    godot::String observed_name = godot::String("<unobserved>");
+    bool observed_complete = false;
+    bool hook_fired = false;
+    // initialize_ds() runs on this (main) thread, exactly as production does: on a
+    // D3D12 host the pre-backend UMA check reaches the render thread, which the
+    // engine only services from the main loop, so driving init from a worker would
+    // park against a render-thread request instead of the window under test. The
+    // reader below is the concurrent observer.
+    ds->_debug_set_initialization_window_hook_for_testing([&]() {
+        hook_fired = true;
+        std::thread reader([&]() {
+            observed_name = ds->get_active_backend_name();
+            observed_complete = ds->is_batch_complete();
+        });
+        reader.join();
+    });
+
+    const bool initialize_result = ds->initialize_ds();
+    ds->_debug_set_initialization_window_hook_for_testing({});
+
+    GDEX_EXPECT_TRUE(hook_fired);
+    // Discriminator: with the backend published too early these read its name and
+    // ask it about queues that have not been created yet.
+    GDEX_EXPECT_TRUE(observed_name == godot::String("None"));
+    GDEX_EXPECT_TRUE(observed_complete);
+    // Anti-regression: the reorder must not strand the pointer.
+    GDEX_EXPECT_TRUE(initialize_result);
+    GDEX_EXPECT_TRUE(ds->is_initialized());
+    GDEX_EXPECT_TRUE(ds->get_active_backend_name() != godot::String("None"));
+#else
+    (void)ctx;
+    GDEX_SKIP("The initialization-window seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, config_fields_are_atomic, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // Structural half of the same invariant: initialize_ds_locked() reads these
+    // four fields on whichever thread first needs the context, while the public
+    // setters are callable from any thread. No runtime oracle for the absence of a
+    // data race exists in this toolchain (MSVC plus prebuilt DirectStorage and
+    // godot-cpp binaries, so ThreadSanitizer cannot instrument both sides), so the
+    // case asserts the declared type instead of pretending to observe a torn read.
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    if (ds == nullptr) {
+        GDEX_SKIP("DSContext singleton absent: real extension not loaded in this fixture.");
+    }
+    const int64_t previous_staging = static_cast<int64_t>(ds->get_staging_buffer_size_mb());
+    const int64_t previous_capacity = static_cast<int64_t>(ds->get_queue_capacity());
+    ctx.add_teardown([ds, previous_staging, previous_capacity]() {
+        ds->set_staging_buffer_size_mb(static_cast<uint32_t>(previous_staging));
+        ds->set_queue_capacity(static_cast<uint16_t>(previous_capacity));
+    });
+
+    GDEX_EXPECT_TRUE(ds->_debug_config_fields_are_atomic_for_testing());
+
+    // The conversion must keep the getter/setter contracts intact.
+    ds->set_staging_buffer_size_mb(192);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(ds->get_staging_buffer_size_mb()), static_cast<int64_t>(192));
+    ds->set_queue_capacity(256);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(ds->get_queue_capacity()), static_cast<int64_t>(256));
+#else
+    (void)ctx;
+    GDEX_SKIP("The configuration-field type probe is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, cancel_during_enqueue_window_completes_batch, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
