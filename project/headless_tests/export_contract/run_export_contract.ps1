@@ -530,6 +530,12 @@ Copy-Item -LiteralPath $LiveAddon -Destination $addonTarget -Recurse -Force
 
 $fixtureJson = Get-Content -LiteralPath (Join-Path $MasterProject 'data\dstex_fixtures.json') -Raw | ConvertFrom-Json
 $fixtureMap = @{ used = 'used.dstex'; unused = 'unused.dstex'; trigger = 'zzz_trigger.dstex' }
+# The fixture's assets/ directory is empty in the repository, so git does not track it and a fresh
+# clone has no such directory: create it before the decoded payloads are written into the copy.
+$assetsTarget = Join-Path $MasterProject 'assets'
+if (-not (Test-Path -LiteralPath $assetsTarget)) {
+    New-Item -ItemType Directory -Path $assetsTarget -Force | Out-Null
+}
 foreach ($name in @('used', 'unused', 'trigger')) {
     $bytes = [Convert]::FromBase64String([string]$fixtureJson.$name)
     [System.IO.File]::WriteAllBytes((Join-Path $MasterProject ('assets\' + $fixtureMap[$name])), $bytes)

@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 29 October 2026
+Last updated: 30 October 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1812,4 +1812,41 @@ Never diagnose a slow quit from the texture cache, eviction count, or plugin sta
 Split the exit frame with `RenderingServer.frame_pre_draw` (or log around the flush) and correlate with `RENDER_VIDEO_MEM_USED` / `OS.get_static_memory_usage()` deltas. Identical bytes with wildly different wall time is the environment: check commit charge and where the pagefile lives before touching code. To amortize a genuinely large teardown, detach the level immediately and free a bounded number of nodes per frame instead of `remove_child()` + `queue_free()` on the whole subtree in one frame.
 
 The addon deliberately does not observe scene teardown and emits no warnings about it (documented in the addon README under "Async Prewarm: Who Owns What"), so a game that wants the cost spread must drive that itself. Related: Q43 (eviction semantics), Q63 (exit ordering with an autoload `quit()`).
+
+## 76. Cold `--import --quit` With a GDExtension Exits 0xC0000005
+
+### The Engine Reality
+On a cold first import the editor queues extension documentation generation as a deferred main-thread call (`editor/doc/editor_help.cpp:3041`, `callable_mp_static(&EditorHelp::_gen_extensions_docs).call_deferred()`, commented "Extensions' docs are not cached"). Teardown then frees the data that call depends on: `EditorNode::~EditorNode()` calls `EditorHelp::cleanup_doc()` (`editor/editor_node.cpp:9640`), which does `memdelete(doc); doc = nullptr;` (`editor_help.cpp:3365-3369`). `SceneTree::finalize()` deletes the root (`scene/main/scene_tree.cpp:863`), and the message queue is flushed during `Main::cleanup()`'s `delete_main_loop()` (`main/main.cpp:5259`), so the still-queued callable runs against a null `doc`.
+
+Symbolized stack (custom build of the same commit `ed1daf0bf`, `debug_symbols=yes dev_build=yes lto=none`; the shipped binary reproduces the same fault at its own `+0x53fd042`):
+
+```text
+read on 0x8   godot.windows.editor.dev.x86_64.exe + 0x230d133
+[0] core/templates/hash_map.h:561        HashMap::operator[] on a null 'this'
+[1] editor/doc/doc_tools.cpp:452         class_list[name] = DocData::ClassDoc();
+[2] editor/doc/editor_help.cpp:3084      _gen_extensions_docs(): doc->generate(...)
+[3] core/variant/binder_common.h:530
+[5] core/object/callable_mp.h:245
+[6] core/variant/callable.cpp:58         Callable::callp
+[8] core/object/message_queue.cpp:266    MessageQueue::flush -> _call_function
+[9] main/main.cpp:5259                   Main::cleanup -> delete_main_loop()
+```
+
+### The Trap / Symptom
+`godot --headless --path <fresh project, no .godot> --import --quit` writes `.godot/`, prints `[ DONE ] loading_editor_layout`, and then exits `-1073741819` (`0xC0000005`) with no engine backtrace. It is an engine defect, not ours: the extension DLL is already unloaded by `GDExtensionManager::shutdown()` (`main.cpp:5234`) before the flush, and renaming the `.gdextension` file away makes the same project exit 0.
+
+Three properties make it look like our regression and waste a day if you do not know them:
+
+- **Any GDExtension triggers it.** With an empty extension class list `DocTools::generate()` never touches `class_list`, so the null `doc` is harmless; the first extension class makes the loop body run. Reproduced 2/2 with this addon, 2/2 with an unrelated `gdextest` library, and 0/2 with no addon or without the `.gdextension` file.
+- **Cold first import only.** Re-running the identical command on the same project (now with `.godot/`) exits 0, because no doc-generation callable is pending. Normal interactive editor use is unaffected - the queue is flushed every frame while `doc` is still alive.
+- **The engine stays silent.** On Windows the crash handler is a `__try/__except` around `main` (`platform/windows/godot_windows.cpp:145`), and the fault happens inside `Main::cleanup`, so no `CrashHandlerException` / `Dumping the backtrace` output is produced on the shipped binary or on a `dev_build=yes` build with a PDB.
+
+Measured cost: every CI job that imports a fresh checkout of a project containing a GDExtension reports failure on a successful import (exit code only; no artifacts are wrong).
+
+### The Rule
+Gate on your own sentinel (`DSPKG_BOOT`, the scan output, or an `[ DONE ]` line), never on `$LASTEXITCODE`, and pre-seed `.godot/extension_list.cfg` or run gates against a warm fixture - which is what the export-contract harness already does, and why it never hit this.
+
+Upstream fix options, cheapest first: return early when `doc == nullptr` in `_gen_extensions_docs()` / `generate_doc()`; cancel the queued documentation callables in `EditorHelp::cleanup_doc()`; or do not defer doc work while the editor is quitting.
+
+Repro matrix and capture tooling: `.agents/scratch/import_crash_0169/` (`bisect_import_crash.ps1`, `matrix_addon_vs_autoload.ps1`, `probe_any_extension.ps1`, `dbg2_0169.py`, `resolve_rva.py`). Filed upstream-style report: `.agents/godot-bug-reports/gdextension-cold-import-teardown-access-violation.md`. Related: Q59 (CLI harness traps), Q56 (`--script` only loads extensions from `.godot/extension_list.cfg`).
 

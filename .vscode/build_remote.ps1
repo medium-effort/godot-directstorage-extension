@@ -1301,21 +1301,87 @@ if ($LocalDriveLetter) {
 # 1. Probe connectivity (Local Wi-Fi first, fallback to Tailscale)
 Write-Status "[1/6] Checking connectivity to primary host ($RemoteHost)..." -ForegroundColor Cyan
 $ActiveHost = $null
-& ssh -4 -n -o BatchMode=yes -o ConnectTimeout=2 $RemoteHost "exit 0" 2>$null
 
-if ($LASTEXITCODE -eq 0) {
+# The primary host is pinned to a DHCP address in ~/.ssh/config. If that pin
+# goes stale the probe below fails, and without a diagnosis the build would
+# silently drop to Tailscale for the rest of the run (slower, no warning).
+# Before falling back, ask the LAN name where the box actually is: a DIFFERENT
+# address that authenticates means the pin is stale, not that the host is down.
+function Find-StaleHostPin {
+    param([string]$HostEntry, [string]$PinnedAddress)
+
+    $name = $HostEntry -replace '^[^@]+@', ''
+    # A literal IP has no name to re-resolve - nothing to compare against.
+    if ($name -match '^\d{1,3}(\.\d{1,3}){3}$') { return $null }
+
+    # mDNS/LLMNR multicast loses queries on a busy Wi-Fi link: retry, and treat
+    # "no answer" as unknown rather than as drift.
+    $candidates = @()
+    for ($i = 0; $i -lt 3 -and $candidates.Count -eq 0; $i++) {
+        $candidates = @([System.Net.Dns]::GetHostAddresses($name) |
+                Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                Select-Object -ExpandProperty IPAddressToString -Unique)
+        if ($candidates.Count -eq 0) { Start-Sleep -Milliseconds 300 }
+    }
+
+    $pinUser = if ($HostEntry -match '^([^@]+)@') { $Matches[1] } else { $null }
+
+    foreach ($candidate in $candidates) {
+        if ($candidate -eq $PinnedAddress) { continue }
+
+        # Cheap TCP check first so a dead address costs 1.5s, not an SSH handshake.
+        $client = New-Object System.Net.Sockets.TcpClient
+        $open = $false
+        try {
+            $async = $client.BeginConnect($candidate, 22, $null, $null)
+            $open = $async.AsyncWaitHandle.WaitOne(1500) -and $client.Connected
+        }
+        catch { }
+        finally { $client.Close() }
+        if (-not $open) { continue }
+
+        # Only trust it if we can actually authenticate: a new address with an
+        # unknown host key fails here instead of poisoning the whole build.
+        $target = if ($pinUser) { "$pinUser@$candidate" } else { $candidate }
+        & ssh -4 -n -o BatchMode=yes -o ConnectTimeout=5 $target "exit 0" 2>$null
+        if ($LASTEXITCODE -eq 0) { return $candidate }
+    }
+    return $null
+}
+
+# 10s, not 2s: this link's cold handshakes measure 0.7-2.3s, and a 2s cap made a
+# healthy host look unreachable (silent Tailscale downgrade). Matches ~/.ssh/config.
+& ssh -4 -n -o BatchMode=yes -o ConnectTimeout=10 $RemoteHost "exit 0" 2>$null
+$primaryProbeExit = $LASTEXITCODE
+
+if ($primaryProbeExit -eq 0) {
     $ActiveHost = $RemoteHost
     Write-VerboseHost "Connected via local network ($ActiveHost)." -ForegroundColor Green
 }
 elseif ($RemoteHostFallback) {
-    Write-VerboseHost "Local host unreachable. Attempting Tailscale fallback ($RemoteHostFallback)..." -ForegroundColor Yellow
-    & ssh -n -o BatchMode=yes -o ConnectTimeout=4 $RemoteHostFallback "exit 0" 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        $ActiveHost = $RemoteHostFallback
-        Write-VerboseHost "Connected via Tailscale ($ActiveHost)." -ForegroundColor Green
+    $pinTarget = $RemoteHost -replace '^[^@]+@', ''
+    $pinnedAddress = (& ssh -G $pinTarget 2>$null | Where-Object { $_ -match '^hostname ' }) -replace '^hostname ', ''
+    # No pin to compare against (no ssh config / -G failed): nothing to diagnose.
+    $movedAddress = if ($pinnedAddress) { Find-StaleHostPin -HostEntry $RemoteHost -PinnedAddress $pinnedAddress } else { $null }
+
+    if ($movedAddress) {
+        $pinUser = if ($RemoteHost -match '^([^@]+)@') { $Matches[1] } else { $null }
+        $ActiveHost = if ($pinUser) { "$pinUser@$movedAddress" } else { $movedAddress }
+        Write-Host "  [drift] '$pinTarget' now answers on $movedAddress, but the ssh config pin says $pinnedAddress." -ForegroundColor Yellow
+        Write-Host "  [drift] The DHCP reservation may have been lost. Update HostName in ~/.ssh/config" -ForegroundColor Yellow
+        Write-Host "  [drift] and re-check the router binding, then re-run. Using $movedAddress for this build." -ForegroundColor Yellow
+        Write-VerboseHost "Connected via local network ($ActiveHost)." -ForegroundColor Green
     }
     else {
-        Show-BuildFailure -Step "Step [1/6] Connectivity" -Message "Neither primary host ($RemoteHost) nor fallback ($RemoteHostFallback) could be reached!" -Code 1
+        Write-VerboseHost "Local host unreachable. Attempting Tailscale fallback ($RemoteHostFallback)..." -ForegroundColor Yellow
+        & ssh -n -o BatchMode=yes -o ConnectTimeout=4 $RemoteHostFallback "exit 0" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $ActiveHost = $RemoteHostFallback
+            Write-VerboseHost "Connected via Tailscale ($ActiveHost)." -ForegroundColor Green
+        }
+        else {
+            Show-BuildFailure -Step "Step [1/6] Connectivity" -Message "Neither primary host ($RemoteHost) nor fallback ($RemoteHostFallback) could be reached!" -Code 1
+        }
     }
 }
 else {

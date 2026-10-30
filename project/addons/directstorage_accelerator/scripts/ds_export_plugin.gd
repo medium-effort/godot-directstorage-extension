@@ -1,8 +1,26 @@
 @tool
 extends EditorExportPlugin
 
-## Pure shipping rules, shared with project/headless_tests/test_export_policy.gd.
-const Policy = preload("uid://bpbf4g8bgjeec")
+## Uid of the shipping-rules script (ds_export_policy.gd), shared with
+## project/headless_tests/test_export_policy.gd.
+##
+## Resolved at instantiation instead of a `const Policy = preload(...)`: a cold first
+## import compiles scripts in directory order, and this file is compiled before
+## ds_export_policy.gd has registered its uid, so a compile-time uid preload fails on a
+## freshly copied project (#0187). A runtime load happens after the scan, when the uid is
+## known. Kept as a uid, not a res:// path, so renaming the addon directory cannot break it.
+const POLICY_UID: String = "uid://bpbf4g8bgjeec"
+
+
+static func _load_policy() -> GDScript:
+	var script: GDScript = ResourceLoader.load(POLICY_UID, "GDScript") as GDScript
+	if script == null:
+		push_error("[DirectStorage] Export policy script not found (%s)." % POLICY_UID)
+	return script
+
+
+## Pure shipping rules, resolved once per plugin instance.
+var _policy: GDScript = _load_policy()
 
 ## DirectStorage Export Plugin
 ##
@@ -55,9 +73,9 @@ var _skipped_payloads: int = 0
 var _expect_archive: bool = false
 ## Set when this export cannot deliver a usable archive for any reason.
 var _archive_failed: bool = false
-## One of the four Policy.OUTCOME_* values, decided once per export from the
+## One of the four _policy.OUTCOME_* values, decided once per export from the
 ## active preset. Never cached across exports: "Export All" reuses one instance.
-var _outcome: String = Policy.OUTCOME_DISABLED
+var _outcome: String = _policy.OUTCOME_DISABLED
 ## First failing condition when the outcome is OUTCOME_FAILED, for the error
 ## message only.
 var _protection_failure_reason: String = ""
@@ -167,15 +185,15 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		_archive_name = "textures.dspkg"
 
 	_outcome = _resolve_outcome()
-	if _outcome == Policy.OUTCOME_PROTECTED:
+	if _outcome == _policy.OUTCOME_PROTECTED:
 		_archive_key = _new_archive_key()
 		_archive_id = _new_archive_id()
-	elif _outcome == Policy.OUTCOME_PLAINTEXT:
+	elif _outcome == _policy.OUTCOME_PLAINTEXT:
 		_archive_id = _new_archive_id()
 
 	_publish_contract()
 
-	if _outcome == Policy.OUTCOME_DISABLED:
+	if _outcome == _policy.OUTCOME_DISABLED:
 		print("[DirectStorage Exporter] Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK and loaded via CPU decompression at runtime.")
 		return
 
@@ -185,7 +203,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		_target_dspkg_path = _target_export_dir.path_join(_archive_name)
 		_staging_dspkg_path = _target_export_dir.path_join(_archive_name + ".tmp")
 
-	if _outcome == Policy.OUTCOME_FAILED:
+	if _outcome == _policy.OUTCOME_FAILED:
 		# Fail closed: no key file, no archive, and every texture payload stays
 		# out of the PCK so a protected build cannot ship plaintext textures.
 		_archive_failed = true
@@ -224,7 +242,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 
 	_apply_steampipe_alignment()
 
-	if _outcome == Policy.OUTCOME_PROTECTED:
+	if _outcome == _policy.OUTCOME_PROTECTED:
 		if not _apply_archive_key():
 			_cleanup_staging()
 			return
@@ -241,24 +259,24 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 ## every preset of an "Export All" run.
 func _resolve_outcome() -> String:
 	if not _bundle_dspkg_enabled:
-		return Policy.OUTCOME_DISABLED
+		return _policy.OUTCOME_DISABLED
 
 	var preset: EditorExportPreset = get_export_preset()
 	var requested: bool = preset != null and preset.get_encrypt_pck()
 	if not requested:
-		return Policy.OUTCOME_PLAINTEXT
+		return _policy.OUTCOME_PLAINTEXT
 
 	# Read only for an emptiness test; the archive key is never derived from it.
 	var key_present: bool = not String(preset.get_encryption_key()).strip_edges().is_empty()
 	var key_encrypted: bool = _path_is_encrypted(KEY_FILE_PATH)
 	if key_present and key_encrypted:
-		return Policy.OUTCOME_PROTECTED
+		return _policy.OUTCOME_PROTECTED
 
 	if not key_present:
 		_protection_failure_reason = "the preset has no PCK encryption key"
 	else:
 		_protection_failure_reason = KEY_FILE_PATH + " is not encrypted by the preset's include/exclude filters"
-	return Policy.OUTCOME_FAILED
+	return _policy.OUTCOME_FAILED
 
 ## True when the engine would encrypt this path with the active preset.
 func _path_is_encrypted(path: String) -> bool:
@@ -365,7 +383,7 @@ func _publish_contract() -> void:
 	ProjectSettings.set_as_internal("directstorage/export/bundle_dspkg", true)
 	ProjectSettings.set_setting("directstorage/export/archive_id", _archive_id)
 	ProjectSettings.set_as_internal("directstorage/export/archive_id", true)
-	ProjectSettings.set_setting("directstorage/export/protected", _outcome == Policy.OUTCOME_PROTECTED or _outcome == Policy.OUTCOME_FAILED)
+	ProjectSettings.set_setting("directstorage/export/protected", _outcome == _policy.OUTCOME_PROTECTED or _outcome == _policy.OUTCOME_FAILED)
 	ProjectSettings.set_as_internal("directstorage/export/protected", true)
 	ProjectSettings.set_setting("directstorage/archive_name", _archive_name)
 	ProjectSettings.set_as_internal("directstorage/archive_name", true)
@@ -388,7 +406,7 @@ func _abort_archive(reason: String) -> void:
 ## written after the file walk.
 func _skip_payload(path: String) -> void:
 	_skipped_payloads += 1
-	if not _expect_archive and Policy.resolve_bundle_effective(_bundle_dspkg_enabled, _skipped_payloads):
+	if not _expect_archive and _policy.resolve_bundle_effective(_bundle_dspkg_enabled, _skipped_payloads):
 		_expect_archive = true
 		_publish_contract()
 	skip()
@@ -413,11 +431,11 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 	if dstex_path.is_empty():
 		return
 
-	var action: String = Policy.resolve_file_action(_outcome, _archive_failed, _dspkg != null)
-	if action == Policy.ACTION_PACK:
+	var action: String = _policy.resolve_file_action(_outcome, _archive_failed, _dspkg != null)
+	if action == _policy.ACTION_PACK:
 		# Intended CPU fallback: let Godot export .dstex directly into the PCK.
 		return
-	if action == Policy.ACTION_SKIP:
+	if action == _policy.ACTION_SKIP:
 		# The archive is unavailable, so a protected build must not leave a
 		# plaintext copy of the payload in the PCK.
 		_skip_payload(path)
@@ -427,7 +445,7 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 	var add_err: Error = _dspkg.add_texture(path, dstex_path, mip_metadata)
 	if add_err != OK:
 		_abort_archive("Failed to add texture to archive ('" + path + "' and remap target '" + dstex_path + "'): " + error_string(add_err) + ". DSPkg bundling was aborted.")
-		if _outcome != Policy.OUTCOME_PLAINTEXT:
+		if _outcome != _policy.OUTCOME_PLAINTEXT:
 			_skip_payload(path)
 		return
 
@@ -478,7 +496,7 @@ func _export_end() -> void:
 	var dspkg_ok := true
 	if _archive_failed:
 		dspkg_ok = false
-		if Policy.resolve_failure_action(_outcome, _archive_entries.size()) == Policy.ACTION_DELETE:
+		if _policy.resolve_failure_action(_outcome, _archive_entries.size()) == _policy.ACTION_DELETE:
 			# Nothing can be salvaged: a protected build must fail loudly, and
 			# an unprotected build with no entries still has every texture in
 			# the PCK. Never leave a loadable archive behind either way.
@@ -491,7 +509,7 @@ func _export_end() -> void:
 			# only in the partial archive. Deploy it rather than deleting data.
 			push_warning("[DirectStorage Exporter] WARNING: bundling was aborted after " + str(_archive_entries.size()) + " texture(s) were added. Deploying a PARTIAL archive; the remaining textures stay in the PCK. Re-export to produce a complete archive.")
 
-	if _dspkg != null and _outcome != Policy.OUTCOME_DISABLED and _outcome != Policy.OUTCOME_FAILED and not _archive_entries.is_empty():
+	if _dspkg != null and _outcome != _policy.OUTCOME_DISABLED and _outcome != _policy.OUTCOME_FAILED and not _archive_entries.is_empty():
 		var err: Error = _dspkg.finalize()
 		if err != OK:
 			dspkg_ok = false
@@ -509,14 +527,14 @@ func _export_end() -> void:
 			var rename_err := DirAccess.rename_absolute(_staging_dspkg_path, _target_dspkg_path)
 			if rename_err == OK:
 				print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", _target_dspkg_path)
-				if _outcome == Policy.OUTCOME_PROTECTED:
+				if _outcome == _policy.OUTCOME_PROTECTED:
 					dspkg_ok = _verify_written_archive()
 			else:
 				dspkg_ok = false
 				_report_storage_failure("rename staging archive to " + _target_dspkg_path.get_file(), rename_err, _target_dspkg_path)
 				_cleanup_staging()
 				_remove_file_silent(_target_dspkg_path)
-	elif not _archive_failed and _dspkg != null and _outcome != Policy.OUTCOME_DISABLED and _outcome != Policy.OUTCOME_FAILED:
+	elif not _archive_failed and _dspkg != null and _outcome != _policy.OUTCOME_DISABLED and _outcome != _policy.OUTCOME_FAILED:
 		print("[DirectStorage Exporter] Export finished. No DirectStorage (.dstex) textures were found to bundle.")
 
 	_dspkg = null
