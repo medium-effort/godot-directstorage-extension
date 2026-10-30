@@ -46,6 +46,11 @@ param(
     [ValidateSet('fixed', 'bug')]
     [string]$Expect = 'fixed',
 
+    # Optional scenario filter (comma-separated). Needed because -Expect applies
+    # to the whole run: on a build that is already green for the probe scenarios,
+    # a full-suite bug-mode run fails them and muddies the red evidence.
+    [string[]]$Scenarios = @(),
+
     [ValidateRange(30, 1800)]
     [int]$TimeoutSec = 300,
 
@@ -190,9 +195,20 @@ function Get-TextureLeakCensus {
     return $total
 }
 
-$Scenarios = @('oracle', 'reuse', 'ignore', 'sim_fix', 'disabled_cache', 'prewarm_disabled_cache', 'teardown_immediate', 'deferral_retry', 'hammer')
+$AllScenarios = @('oracle', 'reuse', 'ignore', 'sim_fix', 'disabled_cache', 'prewarm_disabled_cache', 'teardown_immediate', 'teardown_prewarm_pending', 'census_control', 'deferral_retry', 'hammer')
 # Scenarios whose outcome depends on the RID-ownership invariant holding.
 $ProbeScenarios = @('ignore', 'disabled_cache', 'hammer')
+
+# -Scenarios narrows the run; an unknown name is an error, not an ignore, so a
+# typo cannot silently produce a green run that tested nothing.
+$SelectedScenarios = $AllScenarios
+if ($Scenarios.Count -gt 0) {
+    $UnknownScenarios = @($Scenarios | Where-Object { $AllScenarios -notcontains $_ })
+    if ($UnknownScenarios.Count -gt 0) {
+        throw "Unknown scenario(s): $($UnknownScenarios -join ', '). Known: $($AllScenarios -join ', ')"
+    }
+    $SelectedScenarios = @($Scenarios)
+}
 
 # Window placement: a real window is mandatory (D3D12 has no headless
 # RenderingDevice), so make it small and keep it out of the way in the
@@ -215,6 +231,7 @@ if ($null -ne $WorkArea) {
 }
 
 Write-Output "Expectation : $Expect"
+Write-Output "Scenarios   : $($SelectedScenarios -join ', ')"
 Write-Output "Console     : $($ConsoleExe.FullName)"
 Write-Output "Project     : $ProjectPath"
 Write-Output "Harness     : $GdScript"
@@ -225,7 +242,7 @@ $Rows = @()
 $AnySkip = $false
 $AnyFail = $false
 
-foreach ($Scenario in $Scenarios) {
+foreach ($Scenario in $SelectedScenarios) {
     $StdOutPath = Join-Path $LogDir ($Scenario + '.stdout.log')
     $StdErrPath = Join-Path $LogDir ($Scenario + '.stderr.log')
 
@@ -273,6 +290,9 @@ foreach ($Scenario in $Scenarios) {
     $Census = Get-TextureLeakCensus -Text $Text
     $PrewarmTag = Get-MarkerInt -Line $CountsLine -Field 'prewarm_tag'
     $CpuPrewarmStored = Get-MarkerInt -Line $CountsLine -Field 'cpu_prewarm_stored'
+    # Proves the teardown_prewarm_pending scenario actually held a GPU RID; -1
+    # (absent) means the precondition was never met and a census=0 is vacuous.
+    $PrewarmPending = Get-MarkerInt -Line $CountsLine -Field 'prewarm_pending'
     # Preloader refusal warnings: one per entry point (prewarm_async and
     # prewarm_gpu_async), both called once by the scenario while disabled.
     $RefusalWarnings = ([regex]::Matches($Text, 'prewarm(_gpu)?_async skipped')).Count
@@ -319,6 +339,30 @@ foreach ($Scenario in $Scenarios) {
             $Note = 'both prewarm paths refused (2 warnings); capped slice stored 0'
         } else {
             $Note = "tag=$PrewarmTag warnings=$RefusalWarnings census=$Census cpu_stored=$CpuPrewarmStored (want 0/2/0/0)"
+        }
+    } elseif ($Scenario -eq 'census_control') {
+        # Deliberate leak: the census MUST see it, in either expectation mode.
+        if ($Census -ge 1) {
+            $Ok = $true
+            $Note = 'exit census reported the deliberate leak (oracle live)'
+        } else {
+            $Note = 'exit census did not report the deliberate leak - census assertions are unusable here'
+        }
+    } elseif ($Scenario -eq 'teardown_prewarm_pending') {
+        if ($Expect -eq 'bug') {
+            if ($HarnessPass -and ($Census -ge 1) -and ($PrewarmPending -ge 1)) {
+                $Ok = $true
+                $Note = "leak reproduced (census=$Census pending=$PrewarmPending)"
+            } else {
+                $Note = "expected a leaked preloader RID (census=$Census pending=$PrewarmPending harness_pass=$HarnessPass)"
+            }
+        } else {
+            if ($HarnessPass -and ($Census -eq 0) -and ($PrewarmPending -ge 1)) {
+                $Ok = $true
+                $Note = "no leak (census=0, pending=$PrewarmPending)"
+            } else {
+                $Note = "census=$Census pending=$PrewarmPending (want 0 and >=1)"
+            }
         }
     } else {
         $Ok = $HarnessPass

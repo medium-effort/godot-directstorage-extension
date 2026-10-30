@@ -1784,33 +1784,63 @@ int DSPreloader::get_unbuilt_gpu_prewarm_count(uint64_t p_tag) {
 }
 
 void DSPreloader::shutdown() {
-	std::lock_guard<std::mutex> archive_lock(state().archive_mutex);
+	// Destination RIDs this preloader still owns must leave through
+	// DSTextureCache::release_owned_rid(), never by dropping the containers: that
+	// is the only path that consults is_resource_in_flight() and defers a free
+	// until the governing fence retires. Every entry still in `pending` here is
+	// pre-handoff - poll_completed() erases an entry BEFORE complete_gpu_entry()
+	// either gives its RID to the cache or queues it as an orphan - so all of
+	// these are ours to release.
+	std::vector<RID> owned_rids;
 	{
-		std::lock_guard<std::mutex> lock(state().mutex);
-		state().pending.clear();
-		state().pending_paths.clear();
-		state().gpu_chunks.clear();
-		state().gpu_current.items.clear();
-		state().gpu_current_valid = false;
-		state().gpu_chunk_in_flight = false;
-		// RD is tearing down: destination RIDs die with it, drop orphans
-		// without freeing.
-		state().gpu_orphans.clear();
-		state().gpu_orphan_free_posted = false;
-		state().pending_cv.notify_all();
+		std::lock_guard<std::mutex> archive_lock(state().archive_mutex);
+		{
+			std::lock_guard<std::mutex> lock(state().mutex);
+			State &s = state();
+			for (std::unordered_map<int64_t, Tracked>::iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+				if (it->second.gpu_tex_rid.is_valid()) {
+					owned_rids.push_back(it->second.gpu_tex_rid);
+				}
+			}
+			owned_rids.insert(owned_rids.end(), s.gpu_orphans.begin(), s.gpu_orphans.end());
+			s.pending.clear();
+			s.pending_paths.clear();
+			s.gpu_chunks.clear();
+			s.gpu_current.items.clear();
+			s.gpu_current_valid = false;
+			s.gpu_chunk_in_flight = false;
+			s.gpu_orphans.clear();
+			s.gpu_orphan_free_posted = false;
+			s.pending_cv.notify_all();
+		}
+		state().archive.unref();
+		state().archive_path = String();
+		// Invalidate the resolution cache too: a textures.dspkg imported or
+		// copied while the module was live (or between sessions) must be
+		// re-probed on the next prewarm instead of serving a stale miss.
+		state().resolved_archive_path = String();
+		state().resolved_archive_probed = false;
+		state().archive_generation++;
+		// Teardown must not serve stale headers next session: bump the header
+		// generation (called outside the pending-lock scope above; order stays
+		// archive_mutex -> mutex, matching rescan_archive()).
+		invalidate_header_cache();
 	}
-	state().archive.unref();
-	state().archive_path = String();
-	// Invalidate the resolution cache too: a textures.dspkg imported or
-	// copied while the module was live (or between sessions) must be
-	// re-probed on the next prewarm instead of serving a stale miss.
-	state().resolved_archive_path = String();
-	state().resolved_archive_probed = false;
-	state().archive_generation++;
-	// Teardown must not serve stale headers next session: bump the header
-	// generation (called outside the pending-lock scope above; order stays
-	// archive_mutex -> mutex, matching rescan_archive()).
-	invalidate_header_cache();
+	// Released after BOTH mutexes are gone: release_owned_rid() takes the
+	// backend's batch_mutex through is_resource_in_flight() and may post a
+	// render-thread callable, which must never happen under state().mutex (see
+	// pump_gpu_prewarm()). Ordering is still correct: shutdown() runs from
+	// ~DSTextureCache, i.e. before shutdown_ds(), so a RID whose request is still
+	// in flight is deferred to register_types.cpp's teardown flush instead of
+	// racing the DMA. Dedupe is defensive: an entry and an orphan cannot name the
+	// same RID today, and this keeps a future reordering from double-freeing.
+	std::sort(owned_rids.begin(), owned_rids.end(), [](const RID &a, const RID &b) { return a.get_id() < b.get_id(); });
+	owned_rids.erase(std::unique(owned_rids.begin(), owned_rids.end(), [](const RID &a, const RID &b) { return a.get_id() == b.get_id(); }), owned_rids.end());
+	for (size_t i = 0; i < owned_rids.size(); ++i) {
+		if (owned_rids[i].is_valid()) {
+			DSTextureCache::release_owned_rid(owned_rids[i]);
+		}
+	}
 }
 
 bool DSPreloader::is_texture_pending(const String &p_path) {

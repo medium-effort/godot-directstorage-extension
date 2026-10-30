@@ -31,6 +31,13 @@ extends SceneTree
 ##   teardown_immediate
 ##                   drop an uncached texture and quit immediately: the engine's
 ##                   exit census must report no leaked RID.
+##   teardown_prewarm_pending
+##                   leave a GPU prewarm destination RID in the preloader's pending
+##                   table and quit without harvesting: the runner's exit-census
+##                   check decides whether module teardown released it.
+##   census_control  oracle liveness: leak exactly one texture RID on purpose and
+##                   require the exit census to report it, so a `census=0` verdict
+##                   elsewhere cannot come from a census that never fires.
 ##   deferral_retry  a RID released while its request is in flight must be
 ##                   deferred, then freed by the frame-drawn retry.
 ##   hammer          200 uncached GPU loads: no RID and no side-table entry may
@@ -78,6 +85,7 @@ var warmup_orphans := 0
 var prewarm_tag := -1
 var cpu_prewarm_tag := -1
 var cpu_prewarm_stored := -1
+var prewarm_pending := -1
 var extra := ""
 
 
@@ -123,6 +131,10 @@ func _initialize() -> void:
 			_scenario_uncached(rd, cache, ResourceLoader.CACHE_MODE_IGNORE, false, false, HAMMER_COUNT)
 		"teardown_immediate":
 			_scenario_teardown_immediate(rd, cache)
+		"teardown_prewarm_pending":
+			_scenario_teardown_prewarm_pending(cache)
+		"census_control":
+			_scenario_census_control(rd)
 		"deferral_retry":
 			await _scenario_deferral_retry(rd, cache)
 		"prewarm_disabled_cache":
@@ -401,6 +413,72 @@ func _scenario_teardown_immediate(rd: RenderingDevice, cache: Variant) -> void:
 	extra = "cache_disabled_at_exit=true fixture_left_on_disk=true"
 
 
+## Preloader half of teardown ownership: a GPU prewarm destination RID that is
+## allocated but not yet harvested must be released when the module tears down,
+## not dropped. The scenario only has to prove the RID exists and then quit; the
+## runner decides the verdict from the engine's exit census, because a RID that
+## survives to RenderingDevice::finalize() is invisible from in here.
+func _scenario_teardown_prewarm_pending(cache: Variant) -> void:
+	if cache == null:
+		_fail("teardown_prewarm: DSTextureCache singleton missing")
+		return
+	# Pause the tree before allocating. This is load-bearing: DSRuntime._process
+	# calls poll_completed(0, ...) at the start of every frame, so an entry that is
+	# already terminal gets harvested into the cache on frame 1 - and the cache then
+	# frees its RID cleanly, so the leak never reaches the exit census. A paused
+	# tree is also the honest model of the finding: the game exits with a prewarm
+	# batch still pending, before any frame driver has harvested it.
+	paused = true
+	cache.set_enabled(true)
+	if not _write_fixture():
+		return
+
+	# prewarm_gpu_async kicks its first chunk itself, so the render-thread callback
+	# has already run by the time it returns.
+	var paths := PackedStringArray([FIXTURE_PATH])
+	var tag := int(cache.prewarm_gpu_async(paths, 16, true))
+	prewarm_tag = tag
+	if tag == 0:
+		_fail("teardown_prewarm: prewarm_gpu_async refused with the cache enabled")
+		return
+
+	# The landmark is a NON-TERMINAL request: alloc_gpu_item_on_render_thread()
+	# creates the texture and writes it into the request before enqueueing it, so a
+	# request in that state proves the RID was allocated and is still in
+	# state().pending, which also keeps a green run from being vacuous.
+	var pending := int(cache.get_pending_prewarm_count(tag))
+	prewarm_pending = pending
+	if pending <= 0:
+		_fail("teardown_prewarm: no GPU prewarm request reached the stream, so the leak precondition was never met")
+		return
+
+	# Deliberately no poll_completed(), clear() or set_enabled(false): the RID must
+	# be reaped by the real teardown path, not tidied up by the scenario.
+	extra = "cache_enabled_at_exit=true pending_rids_held=true"
+
+
+## Oracle liveness for every other census assertion in this file: those all want
+## `census == 0`, which an oracle that never prints anything would also satisfy.
+## Leak one texture RID on purpose and let the engine's exit census report it.
+func _scenario_census_control(rd: RenderingDevice) -> void:
+	var fmt := RDTextureFormat.new()
+	fmt.format = RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM
+	fmt.width = 8
+	fmt.height = 8
+	fmt.mipmaps = 1
+	fmt.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
+
+	var leaked: RID = rd.texture_create(fmt, RDTextureView.new(), [])
+	if not leaked.is_valid():
+		_fail("census_control: texture_create failed")
+		return
+	if not rd.texture_is_valid(leaked):
+		_fail("census_control: a freshly created RID reports invalid, so the control cannot leak anything")
+		return
+	# Deliberately never freed: this RID is the census probe.
+	extra = "deliberate_leak=" + str(leaked)
+
+
 ## Deferral path (#0126): an RID released while its own request is still in
 ## flight must be queued, survive the release, and then be freed by the
 ## frame-drawn retry once the request retires. Drives the uncached
@@ -613,6 +691,7 @@ func _emit_result() -> void:
 		" prewarm_tag=", prewarm_tag,
 		" cpu_prewarm_tag=", cpu_prewarm_tag,
 		" cpu_prewarm_stored=", cpu_prewarm_stored,
+		" prewarm_pending=", prewarm_pending,
 		" extra=", extra)
 	if failures == 0:
 		print("[PASS] ", scenario, ": no orphaned texture RID")
