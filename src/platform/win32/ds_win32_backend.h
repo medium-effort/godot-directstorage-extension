@@ -257,6 +257,11 @@ public:
 	// backend. Pins the "a handle exists only while a batch owns it" invariant;
 	// never bound in _bind_methods().
 	int _debug_cached_source_file_count() const;
+	// Test-only seam: pins one priority queue's fence counters. The state it
+	// reproduces (two queues at different counter values, one of them still in
+	// flight) needs two live queues whose DMA has run a different number of
+	// times, which cannot be produced on demand. Never bound in _bind_methods().
+	void _debug_set_queue_fence_counters_for_testing(int p_queue_index, uint64_t p_completion_value, uint64_t p_completed_value);
 #endif
 
 	static bool is_path_valid(const String &p_path);

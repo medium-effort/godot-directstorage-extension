@@ -1061,4 +1061,109 @@ GDEX_TEST_T(win32_remediation, staging_rollback_releases_source_file, TAG_INTEGR
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, multi_queue_fence_wait_covers_low_counter_queue, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // A20261029-HIGH-02: get_completion_fence() reports the MAX of three
+    // independent per-queue counters, and each counter restarts at 0 on its own
+    // queue. wait_for_completion() used to wait only on queues whose own counter
+    // was >= that watermark, so a queue drifting behind was skipped and the call
+    // returned "complete" while its DMA was still writing.
+    // The skew is pinned through the DEBUG/DEV seam: producing it for real needs
+    // two live queues whose transfers retire at different speeds.
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        // Mandatory, not hygiene: a pinned counter above the value the real fence
+        // will ever reach makes shutdown()'s drain_all_queues() wait out its full
+        // budget in every later teardown.
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 0, 0);
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_LOW, 0, 0);
+        memdelete(backend);
+    });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    // HIGH has retired 5 batches; LOW still has its first one in flight.
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 5, 5);
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_LOW, 1, 0);
+
+    // The watermark itself is unchanged: it is still the MAX across queues.
+    GDEX_EXPECT_EQ(backend->get_completion_fence(), 5ULL);
+
+    // The discriminator. LOW never reached 5, but it still has DMA pending, so a
+    // zero-budget wait cannot claim completion. A wait that filters on
+    // "counter >= 5" skips LOW entirely and returns true at once.
+    auto t0 = std::chrono::steady_clock::now();
+    bool immediate = backend->wait_for_completion(5, 0);
+    auto d0 = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    GDEX_EXPECT_FALSE(immediate);
+    GDEX_EXPECT_TRUE(d0 < 50);
+
+    // The blocking path must spend the budget on LOW instead of returning at once.
+    constexpr uint32_t kTimeoutMs = 25;
+    auto t1 = std::chrono::steady_clock::now();
+    bool completed = backend->wait_for_completion(5, kTimeoutMs);
+    auto d1 = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t1).count();
+    GDEX_EXPECT_FALSE(completed);
+    GDEX_EXPECT_TRUE(d1 >= (kTimeoutMs - 5));
+    GDEX_EXPECT_TRUE(d1 < 1000);
+#else
+    (void)ctx;
+    GDEX_SKIP("The queue-counter seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, multi_queue_fence_wait_releases_when_low_counter_completes, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // A20261029-HIGH-02, anti-over-wait half: once every queue has actually
+    // retired, the wait must still return true immediately. Without this, a "fix"
+    // that blocks unconditionally (or that waits on the caller's watermark on
+    // every queue) would satisfy the companion case while breaking every caller.
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 0, 0);
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_LOW, 0, 0);
+        memdelete(backend);
+    });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 5, 5);
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_LOW, 1, 1);
+
+    GDEX_EXPECT_EQ(backend->get_completion_fence(), 5ULL);
+
+    auto t0 = std::chrono::steady_clock::now();
+    bool complete = backend->wait_for_completion(5, 0);
+    auto d0 = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    GDEX_EXPECT_TRUE(complete);
+    GDEX_EXPECT_TRUE(d0 < 50);
+#else
+    (void)ctx;
+    GDEX_SKIP("The queue-counter seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 

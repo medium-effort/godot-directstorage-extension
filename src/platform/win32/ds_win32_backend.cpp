@@ -826,10 +826,21 @@ bool Win32Backend::wait_for_completion(uint64_t p_fence_value, uint32_t p_timeou
 		for (int q = 0; q < QUEUE_COUNT; q++) {
 			const QueueState &queue = priority_queues[q];
 			max_completion_fence = MAX(max_completion_fence, queue.completion_fence_value);
-			if (queue.completion_fence && queue.completion_fence_value >= p_fence_value &&
-					queue.completed_fence_value < p_fence_value) {
-				fences_to_wait.push_back({ queue.completion_fence, queue.completion_fence_value });
+			// The three priority queues own independent fences and each counter
+			// restarts at 0 on its own queue, so one queue's value is NOT comparable
+			// to another's. Filtering on `completion_fence_value >= p_fence_value`
+			// dropped every queue whose counter happened to be lower and returned
+			// "complete" while its DMA was still running (A20261029-HIGH-02).
+			// Wait for each queue's own latest value, clamped to the caller's
+			// watermark: a queue below the watermark is still drained.
+			if (!queue.completion_fence || queue.completion_fence_value == 0) {
+				continue;
 			}
+			uint64_t target_value = MIN(p_fence_value, queue.completion_fence_value);
+			if (queue.completed_fence_value >= target_value) {
+				continue;
+			}
+			fences_to_wait.push_back({ queue.completion_fence, target_value });
 		}
 	}
 	if (p_fence_value > max_completion_fence) {
@@ -4174,6 +4185,27 @@ int Win32Backend::_debug_cached_source_file_count() const {
 	return static_cast<int>(persistent_file_cache.size());
 #else
 	return 0;
+#endif
+}
+
+void Win32Backend::_debug_set_queue_fence_counters_for_testing(int p_queue_index, uint64_t p_completion_value, uint64_t p_completed_value) {
+#ifdef _WIN32
+	// Test-only seam. HIGH-02 is about two priority queues holding different
+	// counter values while one of them still has DMA in flight; producing that for
+	// real would need two live queues whose transfers retire at different speeds.
+	// Pinning the counters directly leaves the fence objects alone, so
+	// wait_for_completion() still reads a real ID3D12Fence::GetCompletedValue().
+	// Callers must reset to (0, 0) before deleting the backend: shutdown() drains
+	// every queue whose completion_fence_value is non-zero, and a pinned value the
+	// real fence never reaches would burn that drain budget.
+	// Never bound in _bind_methods().
+	if (p_queue_index < 0 || p_queue_index >= QUEUE_COUNT) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	QueueState &queue = priority_queues[p_queue_index];
+	queue.completion_fence_value = p_completion_value;
+	queue.completed_fence_value = MIN(p_completed_value, p_completion_value);
 #endif
 }
 #endif
