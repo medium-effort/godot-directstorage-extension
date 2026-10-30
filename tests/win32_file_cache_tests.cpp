@@ -1,20 +1,22 @@
 // tests/win32_file_cache_tests.cpp
 //
-// Covers the e1f09ee..HEAD Win32 open-file cache changes
+// Covers the Win32 open-file cache
 // (src/platform/win32/ds_win32_backend.{h,cpp}):
 //
 // - Per-slot file_cache with close_slot_files() single-owner lifetime.
-// - Backend-level persistent_file_cache / persistent_files owned across
-//   batch-slot recycling, released in shutdown() via clear_persistent_files().
-// - Eager textures.dspkg pre-open during initialize().
+// - Backend-level persistent_file_cache holding one handle per path with a live
+//   owner count: shared by every request in a batch, erased when the last
+//   reference goes (nothing is retained between batches).
+// - No eager pre-open: initialize() opens nothing, the first request opens
+//   lazily.
 //
-// cache_file_handle(), clear_persistent_files() and close_slot_files() are
-// private, so this suite asserts the observable contract at the seams:
-// guard ordering (validation/init before any cache lookup), same-archive
-// double enqueue reuse, and post-shutdown staleness (no stale handle ever
-// served after shutdown). SConstruct filters src/platform/win32 out of the
-// test build on non-Windows, so every Win32Backend reference is _WIN32
-// guarded; off-Windows the suite skips green per repo convention.
+// clear_persistent_files() and close_slot_files() are private, so this suite
+// asserts the observable contract at the seams: guard ordering
+// (validation/init before any cache lookup), same-archive double enqueue
+// reuse, and post-shutdown staleness (no stale handle ever served after
+// shutdown). SConstruct filters src/platform/win32 out of the test build on
+// non-Windows, so every Win32Backend reference is _WIN32 guarded; off-Windows
+// the suite skips green per repo convention.
 
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
@@ -116,10 +118,11 @@ GDEX_TEST_T(win32_file_cache, same_archive_double_enqueue_and_shutdown, TAG_INTE
     GDEX_EXPECT_TRUE(backend->enqueue_request(first));
     GDEX_EXPECT_TRUE(backend->enqueue_request(second));
 
-    // Shutdown releases every owned handle (slots via close_slot_files(),
-    // archive via clear_persistent_files()); a post-shutdown enqueue must
-    // fail cleanly rather than serve a stale cached handle, and a second
-    // shutdown must be a safe no-op.
+    // Shutdown releases every owned handle: the staged requests' reference is
+    // dropped by close_slot_files(), and clear_persistent_files() covers any
+    // entry a live batch still owned. A post-shutdown enqueue must fail
+    // cleanly rather than serve a stale cached handle, and a second shutdown
+    // must be a safe no-op.
     backend->shutdown();
     backend->shutdown();
     godot::Ref<godot::DSRequest> late = make_sized_request(kProbePath);
