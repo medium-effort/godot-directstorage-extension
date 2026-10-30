@@ -89,6 +89,8 @@ DSResourceFormatLoader::~DSResourceFormatLoader() {
 	std::lock_guard<std::mutex> lock(archive_mutex);
 	cached_dspkg.unref();
 	cached_archive_path = String();
+	cached_archive_size = 0;
+	cached_archive_write_time = 0;
 	// Rescan-on-shutdown: drop the cached triple-probe resolution so a
 	// textures.dspkg created/imported during this session resolves fresh
 	// after teardown/reload. Lock order (archive_mutex -> resolution
@@ -246,6 +248,21 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 	return found;
 }
 
+// True while the file the cached TOC was parsed from still looks the same.
+// Godot exposes mtime in whole seconds, so size is the discriminating field
+// for a replacement that lands inside one second; a same-size swap within the
+// same second is not detected here.
+bool DSResourceFormatLoader::_cached_archive_is_current(const String &p_path) const {
+	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	const uint64_t size = static_cast<uint64_t>(file->get_length());
+	file->close();
+	const uint64_t write_time = static_cast<uint64_t>(FileAccess::get_modified_time(p_path));
+	return size == cached_archive_size && write_time == cached_archive_write_time;
+}
+
 Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_path) const {
 	if (p_archive_path.is_empty()) {
 		return Ref<DSPkg>();
@@ -253,7 +270,28 @@ Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_
 
 	std::lock_guard<std::mutex> lock(archive_mutex);
 	if (cached_archive_path == p_archive_path && cached_dspkg.is_valid()) {
-		return cached_dspkg;
+		if (_cached_archive_is_current(p_archive_path)) {
+			return cached_dspkg;
+		}
+		// The archive changed on disk: drop the parsed TOC so the next lookup
+		// reads the new file instead of serving the previous entry table
+		// (issue #0182).
+		UtilityFunctions::print_verbose("DSResourceFormatLoader: Archive changed on disk; re-reading TOC for '" + p_archive_path + "'.");
+		cached_dspkg.unref();
+		cached_archive_path = String();
+		cached_archive_size = 0;
+		cached_archive_write_time = 0;
+	}
+
+	uint64_t archive_size = 0;
+	uint64_t archive_write_time = 0;
+	{
+		Ref<FileAccess> file = FileAccess::open(p_archive_path, FileAccess::READ);
+		if (file.is_valid() && file->is_open()) {
+			archive_size = static_cast<uint64_t>(file->get_length());
+			file->close();
+		}
+		archive_write_time = static_cast<uint64_t>(FileAccess::get_modified_time(p_archive_path));
 	}
 
 	uint64_t expected_fingerprint = resolve_expected_fingerprint(ProjectSettings::get_singleton());
@@ -274,6 +312,8 @@ Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_
 
 	cached_archive_path = p_archive_path;
 	cached_dspkg = archive;
+	cached_archive_size = archive_size;
+	cached_archive_write_time = archive_write_time;
 	return cached_dspkg;
 }
 

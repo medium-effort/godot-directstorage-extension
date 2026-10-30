@@ -38,9 +38,14 @@ private:
 	mutable std::mutex archive_mutex;
 	mutable String cached_archive_path;
 	mutable Ref<DSPkg> cached_dspkg;
+	// Identity of the file the cached TOC was parsed from. A replaced archive
+	// must be re-read instead of serving the previous entries.
+	mutable uint64_t cached_archive_size = 0;
+	mutable uint64_t cached_archive_write_time = 0;
 
 	String _resolve_archive_path(const String &p_logical_path) const;
 	Ref<DSPkg> _get_or_open_archive(const String &p_archive_path) const;
+	bool _cached_archive_is_current(const String &p_archive_path) const;
 	bool _is_texture_archive_entry(const String &p_path) const;
 
 	Variant _load_texture_payload(
