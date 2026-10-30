@@ -100,12 +100,13 @@ void remove_user_file(const char *p_path) {
 	}
 }
 
-// Releases the DirectStorage context so the Win32 backend drops its cached
-// IDStorageFile handles. The backend keeps every DMA source open for the life
-// of the context, and a file opened that way cannot be removed or replaced:
-// remove fails with a sharing violation and Godot's safe-save copy commit is
-// rolled back while still reporting success. Any test that stages over
-// res://textures.dspkg after a GPU load must release the handles first.
+// Releases the DirectStorage context so the Win32 backend drops any IDStorageFile
+// handle a batch still owns. Handles now close when the owning batch retires, so
+// this only matters for a request that is still in flight; keeping it here means
+// staging never races a live handle. A file opened by DirectStorage cannot be
+// removed or replaced: remove fails with a sharing violation and Godot's
+// safe-save copy commit is rolled back while still reporting success. Any test
+// that stages over res://textures.dspkg after a GPU load releases first.
 void shutdown_ds_singleton() {
 	godot::Engine *engine = godot::Engine::get_singleton();
 	if (engine && engine->has_singleton(godot::StringName("DSContext"))) {

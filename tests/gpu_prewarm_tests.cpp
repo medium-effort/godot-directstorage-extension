@@ -308,11 +308,12 @@ GDEX_TEST_T(gpu_prewarm, dma_fills_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
     if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
         GDEX_SKIP("DSContext/DSTextureCache classes unavailable");
     }
-    // Drop file handles cached by an earlier suite before staging: the backend
-    // keeps every DMA source open for the life of its context, and a previously
-    // loaded res://textures.dspkg cannot be removed or replaced while that
-    // handle lives (the copy reports success and the safe-save commit rolls
-    // back). require_singleton_context re-initializes right after.
+    // Drop file handles an earlier suite may still have in flight before
+    // staging: a previously loaded res://textures.dspkg cannot be removed or
+    // replaced while a batch owns its handle (the copy reports success and the
+    // safe-save commit rolls back). Handles close at batch completion now, so
+    // this only covers a batch that has not retired yet.
+    // require_singleton_context re-initializes right after.
     if (godot::DSContext *pre = godot::DSContext::get_singleton()) {
         pre->shutdown_ds();
     }
@@ -340,10 +341,10 @@ GDEX_TEST_T(gpu_prewarm, dma_fills_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
         if (ps) {
             ps->set_setting("directstorage/force_archive_resolution", false);
         }
-        // Shutdown FIRST: the Win32 backend persistently caches open
-        // IDStorageFile handles, which lock res://textures.dspkg on
-        // Windows until shutdown releases them. Removing first fails
-        // silently and poisons the next suite with a stale archive.
+        // Shutdown FIRST: a batch can still own the IDStorageFile handle for
+        // res://textures.dspkg, and Windows refuses the remove while it does
+        // (removing first fails silently and poisons the next suite with a
+        // stale archive).
         ds->shutdown_ds();
         remove_abs("res://textures.dspkg");
         remove_abs("user://gdextest_gpu_prewarm_dma.dstex");

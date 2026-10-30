@@ -899,4 +899,166 @@ GDEX_TEST_T(win32_remediation, zombie_slot_reports_resource_in_flight, TAG_INTEG
 #endif
 }
 
+// #0183: poll_batch_status() retired a zombie by closing the slot's handles
+// directly, behind persistent_file_cache, which kept pointing at the closed
+// IDStorageFile with refs still pinned. Two consequences, both asserted here:
+// the next batch reused a closed handle, and the file stayed locked on disk for
+// the rest of the session (so a replacement/patch could never land).
+GDEX_TEST_T(win32_remediation, zombie_slot_releases_source_file_after_fence, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    const godot::String fixture("user://med11_zombie_file_release.dstex");
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        memdelete(backend); // shutdown() drains anything still in flight
+        remove_temp_file("user://med11_zombie_file_release.dstex");
+    });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+    // Nothing is opened eagerly: a handle exists only while a batch owns it.
+    GDEX_EXPECT_EQ(backend->_debug_cached_source_file_count(), 0);
+
+    remove_temp_file("user://med11_zombie_file_release.dstex");
+    GDEX_ASSERT_TRUE(write_gpu_texture_fixture(fixture));
+
+    bool proven = false;
+    for (int attempt = 0; attempt < 3 && !proven; ++attempt) {
+        godot::Ref<godot::DSRequest> request;
+        GDEX_ASSERT_TRUE(build_gpu_texture_request(fixture, 5301, request));
+        const godot::RID rid = create_destination_texture(rd, static_cast<int>(request->get_subresource_count()));
+        GDEX_ASSERT_TRUE(rid.is_valid());
+        request->set_destination_resource(rid);
+
+        GDEX_ASSERT_TRUE(backend->enqueue_request(request));
+        // Staging pins exactly one handle for the fixture path.
+        GDEX_EXPECT_EQ(backend->_debug_cached_source_file_count(), 1);
+        backend->submit_async();
+        const uint64_t fence = backend->get_completion_fence();
+        if (fence == 0 || !backend->is_resource_in_flight(rid)) {
+            // Lost the race: the fence retired before we could zombify. Reset the
+            // slot and retry with a fresh texture instead of failing on jitter.
+            backend->cancel_requests_with_tag(5301);
+            backend->poll_batch_status();
+            if (rd->texture_is_valid(rid)) {
+                rd->free_rid(rid);
+            }
+            continue;
+        }
+
+        backend->_debug_zombify_active_batch_for_testing();
+        if (!backend->is_resource_in_flight(rid)) {
+            // The fence retired before the seam could move the slot, so there is
+            // no zombie to retire. Retry instead of asserting on a lost race.
+            backend->poll_batch_status();
+            if (rd->texture_is_valid(rid)) {
+                rd->free_rid(rid);
+            }
+            continue;
+        }
+        GDEX_EXPECT_EQ(backend->_debug_cached_source_file_count(), 1);
+
+        backend->wait_for_completion(fence, 5000);
+        bool released = false;
+        for (int i = 0; i < 400 && !released; ++i) {
+            backend->poll_batch_status();
+            released = backend->_debug_cached_source_file_count() == 0;
+            if (!released) {
+                godot::OS::get_singleton()->delay_usec(5000);
+            }
+        }
+        GDEX_EXPECT_TRUE(released);
+        // The user-facing symptom: the source is replaceable again once the
+        // zombie retires (a raw Close() left it locked until shutdown).
+        GDEX_EXPECT_EQ(static_cast<int64_t>(godot::DirAccess::remove_absolute(fixture)), static_cast<int64_t>(godot::OK));
+
+        if (rd->texture_is_valid(rid)) {
+            rd->free_rid(rid);
+        }
+        proven = true;
+    }
+    GDEX_ASSERT_TRUE(proven);
+#else
+    (void)ctx;
+    GDEX_SKIP("The zombie seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+// #0184: a child failing mid-staging rolled the requests back but left the
+// slot's file reference in place, because enqueue_one registered the path as
+// soon as the first child succeeded and the guard then saw it as adopted. The
+// leak only closed on the slot's next completed batch, so the file stayed
+// locked in the meantime.
+//
+// Reachable without a test seam: the per-child destination check rejects
+// first_subresource >= the texture's subresource count, so a 2-mip fixture
+// staged into a 1-mip destination fails on child 1 (child 0 is valid).
+GDEX_TEST_T(win32_remediation, staging_rollback_releases_source_file, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    const godot::String fixture("user://med12_rollback_file.dstex");
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        memdelete(backend);
+        remove_temp_file("user://med12_rollback_file.dstex");
+    });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    remove_temp_file("user://med12_rollback_file.dstex");
+    // 64x64 RGBA8 with 2 mips: base 16384 + mip 4096 bytes of raw input.
+    GDEX_ASSERT_TRUE(write_temp_dstex("user://med12_rollback_file.dstex", 64, 64, 2, 64 * 64 * 4 + 32 * 32 * 4));
+
+    godot::Ref<godot::DSRequest> request;
+    GDEX_ASSERT_TRUE(build_gpu_texture_request(fixture, 5401, request));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(request->get_subresource_count()), static_cast<int64_t>(2));
+    const godot::RID rid = create_destination_texture(rd, 1);
+    GDEX_ASSERT_TRUE(rid.is_valid());
+    request->set_destination_resource(rid);
+    ctx.add_teardown([rd, rid]() {
+        if (rd->texture_is_valid(rid)) {
+            rd->free_rid(rid);
+        }
+    });
+
+    // Child 0 stages, child 1 is rejected by the subresource-range check and the
+    // staged child is rolled back. The whole request must fail, and the file
+    // reference must not survive the rollback.
+    GDEX_EXPECT_FALSE(backend->enqueue_request(request));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(request->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(request->get_error_message().contains("out of bounds"));
+    GDEX_EXPECT_EQ(backend->_debug_cached_source_file_count(), 0);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::DirAccess::remove_absolute(fixture)), static_cast<int64_t>(godot::OK));
+#else
+    (void)ctx;
+    GDEX_SKIP("The cache-count seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 

@@ -92,33 +92,30 @@ private:
 
 	IDStorageFactory *factory = nullptr;
 	std::array<QueueState, QUEUE_COUNT> priority_queues;
-	// Backend-level open-file cache: normalized path -> handle plus the stat it
-	// was opened against. Exported builds funnel every prewarm request through
-	// one archive, and a per-request OpenFile costs hundreds of kernel opens
-	// per frame, so every request in a batch shares one handle.
+	// Backend-level open-file cache: normalized path -> handle plus its live
+	// owner count. Exported builds funnel a whole batch through one archive,
+	// and a per-request OpenFile costs hundreds of kernel opens per frame, so
+	// every request in a batch shares one handle.
 	//
 	// Lifetime: the cache owns the open handle and each caller/slot holds a
 	// reference (refs). When the last reference drops - which happens at batch
-	// completion - the handle is closed and only its stat metadata is kept.
-	// Closing at completion is what lets a replaced file be deleted or renamed
-	// again; keeping every DMA source open for the life of the context made a
-	// replacement report success while the old bytes stayed (issue #0182).
+	// completion - the handle is closed and the entry is erased. A cached
+	// handle therefore exists only while a batch is actually using it, which is
+	// what lets a replaced file be deleted or renamed between batches; keeping
+	// every DMA source open for the life of the context made a replacement
+	// report success while the old bytes stayed (issue #0182).
 	//
-	// Staleness: the metadata is compared against a fresh stat on every resolve,
-	// so a file replaced between batches is reopened instead of served stale. A
-	// replacement that lands while a batch still owns its handle cannot be
-	// adopted mid-DMA: that batch keeps the bytes it opened and the next batch
-	// reopens.
+	// Staleness: no stat revalidation is needed and none is done. A path with
+	// no entry is opened fresh, and a path with an entry cannot be replaced on
+	// disk because the open handle blocks deletion/rename. Nothing is held
+	// between batches.
 	//
 	// Lock order: batch_mutex -> persistent_file_mutex. Never the reverse.
 	struct CachedSourceFile {
-		IDStorageFile *file = nullptr; // cache-owned; null once closed
-		uint64_t size = 0;
-		uint64_t write_time = 0;
+		IDStorageFile *file = nullptr; // cache-owned; always open while the entry lives
 		uint32_t refs = 0; // caller/slot references; cache ownership is implicit
-		bool stale_warned = false; // one warning per replaced-and-in-flight file
 	};
-	std::mutex persistent_file_mutex;
+	mutable std::mutex persistent_file_mutex; // const cache-count query locks it
 	std::unordered_map<std::wstring, CachedSourceFile> persistent_file_cache;
 	HMODULE dstoragecore_module = nullptr;
 	HMODULE dstorage_module = nullptr;
@@ -182,7 +179,6 @@ private:
 	void update_profiler_queue_depth_locked();
 	void close_slot_files(BatchSlot &p_slot);
 	void clear_persistent_files();
-	bool cache_file_handle(const std::wstring &p_wpath, IDStorageFile *p_file);
 	IDStorageFile *resolve_source_file(const std::wstring &p_wpath, String &r_error);
 	void release_source_file(const std::wstring &p_wpath, IDStorageFile *p_file);
 	void register_slot_source_file(BatchSlot &r_slot, const std::wstring &p_wpath, IDStorageFile *p_file);
@@ -257,6 +253,10 @@ public:
 	// asserted deterministically; the real branch needs a >500 ms DMA stall.
 	// Never bound in _bind_methods().
 	void _debug_zombify_active_batch_for_testing();
+	// Test-only seam: number of cached DMA source handles currently held by the
+	// backend. Pins the "a handle exists only while a batch owns it" invariant;
+	// never bound in _bind_methods().
+	int _debug_cached_source_file_count() const;
 #endif
 
 	static bool is_path_valid(const String &p_path);
