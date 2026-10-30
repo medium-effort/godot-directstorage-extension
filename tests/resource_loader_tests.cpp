@@ -705,3 +705,210 @@ GDEX_TEST_T(loader, load_dspkg_returns_archive_resource, TAG_INTEGRATION) {
 	remove_user_file(dstex_path);
 	remove_user_file(dspkg_path);
 }
+
+// --- v2 mip-table contract -------------------------------------------------
+//
+// read_header()/read_from_file() now require a v2 mip table to (a) declare a
+// plausible footprint per level, (b) add up to the header totals, and (c) match
+// the padded footprint of its own mip level. Before this, the loader expanded
+// one destination buffer per mip straight from the table with no aggregate
+// bound, so a ~1 KB file could request gigabytes from ResourceLoader.load();
+// and the old header-level width*height*32 heuristic refused the writer's own
+// output for small or narrow textures, whose padded rows exceed that bound.
+
+namespace {
+
+constexpr int64_t DSTEX_OFF_ORIGINAL = 24;
+constexpr int64_t DSTEX_OFF_ENTRY0 = 48;
+constexpr int64_t DSTEX_V2_ENTRY_SIZE = 24;
+constexpr int64_t DSTEX_ENTRY_OFF_UNCOMPRESSED = 12;
+
+godot::PackedByteArray loader_read_all_bytes(const char *p_path) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ);
+	godot::PackedByteArray bytes;
+	if (file.is_valid()) {
+		bytes = file->get_buffer(static_cast<int64_t>(file->get_length()));
+		file->close();
+	}
+	return bytes;
+}
+
+bool loader_write_all_bytes(const char *p_path, const godot::PackedByteArray &p_bytes) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::WRITE);
+	if (file.is_null()) {
+		return false;
+	}
+	file->store_buffer(p_bytes);
+	const bool ok = file->get_error() == godot::OK;
+	file->close();
+	return ok;
+}
+
+void loader_put_u32(godot::PackedByteArray &p_bytes, int64_t p_offset, uint32_t p_value) {
+	for (int i = 0; i < 4; ++i) {
+		p_bytes[p_offset + i] = static_cast<uint8_t>((p_value >> (8 * i)) & 0xFFu);
+	}
+}
+
+void loader_put_u64(godot::PackedByteArray &p_bytes, int64_t p_offset, uint64_t p_value) {
+	for (int i = 0; i < 8; ++i) {
+		p_bytes[p_offset + i] = static_cast<uint8_t>((p_value >> (8 * i)) & 0xFFu);
+	}
+}
+
+// Copies p_src to p_dst and patches one mip entry's uncompressed_size (p_mip >= 0)
+// and/or the header original_size, so a test can break exactly one clause.
+bool patch_v2_mip_table(const char *p_src, const char *p_dst, int p_mip, uint32_t p_uncompressed,
+		bool p_patch_original, uint64_t p_original) {
+	godot::PackedByteArray bytes = loader_read_all_bytes(p_src);
+	if (bytes.is_empty()) {
+		return false;
+	}
+	if (p_mip >= 0) {
+		loader_put_u32(bytes, DSTEX_OFF_ENTRY0 + DSTEX_V2_ENTRY_SIZE * p_mip + DSTEX_ENTRY_OFF_UNCOMPRESSED, p_uncompressed);
+	}
+	if (p_patch_original) {
+		loader_put_u64(bytes, DSTEX_OFF_ORIGINAL, p_original);
+	}
+	return loader_write_all_bytes(p_dst, bytes);
+}
+
+// Writes a v2 .dstex carrying the natural (unpadded) data of a full RGBA8 mip
+// chain for p_width x p_height. The writer pads each level itself.
+bool write_rgba8_chain(const char *p_path, int p_width, int p_height) {
+	godot::PackedByteArray payload;
+	int mip_count = 0;
+	int w = p_width;
+	int h = p_height;
+	while (mip_count < 16) {
+		const int64_t size = static_cast<int64_t>(w) * static_cast<int64_t>(h) * 4;
+		const int64_t base = payload.size();
+		payload.resize(base + size);
+		for (int64_t i = 0; i < size; ++i) {
+			payload[base + i] = static_cast<uint8_t>((i * 31 + mip_count * 7) & 0xFF);
+		}
+		++mip_count;
+		if (w == 1 && h == 1) {
+			break;
+		}
+		w = w > 1 ? w / 2 : 1;
+		h = h > 1 ? h / 2 : 1;
+	}
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	return dstex->write_to_file(godot::String(p_path), payload, p_width, p_height,
+				   godot::Image::FORMAT_RGBA8, mip_count, 1) == godot::OK;
+}
+
+godot::Ref<godot::Texture2D> loader_load(const char *p_path) {
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	const godot::Variant result = loader->_load(godot::String(p_path), godot::String(""), false,
+			godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+	return godot::Ref<godot::Texture2D>(result);
+}
+
+} // namespace
+
+GDEX_TEST_T(loader, v2_mip_sum_mismatch_rejected, TAG_INTEGRATION) {
+	const char *base = "user://gdextest_loader_miptable_base.dstex";
+	const char *patched = "user://gdextest_loader_miptable_sum.dstex";
+	if (!write_loose_dstex(base)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+	godot::Ref<godot::DSTex> reader;
+	reader.instantiate();
+	// Control: the unpatched writer output parses, so a rejection below is
+	// attributable to the patched field and not to fixture assembly.
+	GDEX_ASSERT_TRUE(!reader->read_header(godot::String(base)).is_empty());
+
+	// One entry claims 4 KiB while the header total stays 1 KiB.
+	GDEX_ASSERT_TRUE(patch_v2_mip_table(base, patched, 0, 4096u, false, 0));
+
+	GDEX_EXPECT_TRUE(reader->read_header(godot::String(patched)).is_empty());
+	GDEX_EXPECT_TRUE(reader->read_from_file(godot::String(patched)).is_empty());
+	GDEX_EXPECT_TRUE(loader_load(patched).is_null());
+
+	remove_user_file(base);
+	remove_user_file(patched);
+}
+
+GDEX_TEST_T(loader, v2_mip_uncompressed_underflow_rejected, TAG_INTEGRATION) {
+	const char *base = "user://gdextest_loader_miptable_base2.dstex";
+	const char *patched = "user://gdextest_loader_miptable_underflow.dstex";
+	if (!write_loose_dstex(base)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+	godot::Ref<godot::DSTex> reader;
+	reader.instantiate();
+
+	// 0xFFFFFFFF arrives as int32 -1 and would become a 4 GiB uint32 resize.
+	GDEX_ASSERT_TRUE(patch_v2_mip_table(base, patched, 0, 0xFFFFFFFFu, false, 0));
+
+	GDEX_EXPECT_TRUE(reader->read_header(godot::String(patched)).is_empty());
+	GDEX_EXPECT_TRUE(loader_load(patched).is_null());
+
+	remove_user_file(base);
+	remove_user_file(patched);
+}
+
+GDEX_TEST_T(loader, v2_mip_footprint_must_match_layout, TAG_INTEGRATION) {
+	const char *base = "user://gdextest_loader_miptable_base3.dstex";
+	const char *patched = "user://gdextest_loader_miptable_layout.dstex";
+	if (!write_loose_dstex(base)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+	godot::Ref<godot::DSTex> reader;
+	reader.instantiate();
+
+	// Sums stay consistent (mip 2048 == original 2048) so only the per-level
+	// footprint comparison can reject: 64x4 RGBA8 pads to 1024, not 2048.
+	GDEX_ASSERT_TRUE(patch_v2_mip_table(base, patched, 0, 2048u, true, 2048u));
+
+	GDEX_EXPECT_TRUE(reader->read_header(godot::String(patched)).is_empty());
+	GDEX_EXPECT_TRUE(loader_load(patched).is_null());
+
+	remove_user_file(base);
+	remove_user_file(patched);
+}
+
+GDEX_TEST_T(loader, small_mip_chain_loads, TAG_INTEGRATION) {
+	// Regression for the too-strict width*height*32 clause: an 8x8 RGBA8 full
+	// chain costs 3840 padded bytes against a 2048 heuristic, so the writer's own
+	// output used to be refused by every reader.
+	const char *path = "user://gdextest_loader_small_chain.dstex";
+	if (!write_rgba8_chain(path, 8, 8)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+	godot::Ref<godot::DSTex> reader;
+	reader.instantiate();
+	const godot::Dictionary header = reader->read_header(godot::String(path));
+	GDEX_ASSERT_TRUE(!header.is_empty());
+
+	godot::Ref<godot::Texture2D> tex = loader_load(path);
+	GDEX_ASSERT_TRUE(tex.is_valid());
+	GDEX_EXPECT_EQ(tex->get_width(), 8);
+	GDEX_EXPECT_EQ(tex->get_height(), 8);
+
+	remove_user_file(path);
+}
+
+GDEX_TEST_T(loader, narrow_mip_chain_loads, TAG_INTEGRATION) {
+	// A 4-px-wide texture pads every mip row to 256 bytes; its footprint sum
+	// (524032) is 4x the width*height*32 heuristic (131072) and used to be
+	// rejected outright.
+	const char *path = "user://gdextest_loader_narrow_chain.dstex";
+	if (!write_rgba8_chain(path, 4, 1024)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+	godot::Ref<godot::DSTex> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(!reader->read_header(godot::String(path)).is_empty());
+
+	godot::Ref<godot::Texture2D> tex = loader_load(path);
+	GDEX_ASSERT_TRUE(tex.is_valid());
+	GDEX_EXPECT_EQ(tex->get_width(), 4);
+	GDEX_EXPECT_EQ(tex->get_height(), 1024);
+
+	remove_user_file(path);
+}

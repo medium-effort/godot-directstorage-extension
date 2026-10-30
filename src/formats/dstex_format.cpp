@@ -125,6 +125,49 @@ DSTexMipLayout DSTex::get_mip_layout(uint32_t p_width, uint32_t p_height, int p_
 	return layout;
 }
 
+// v2 mip-table contract, shared by read_header() and read_from_file().
+//
+// Three things must hold, and the third is what the header-level heuristic in
+// dstex_sizes_are_sane() cannot express:
+//   1. every entry declares a plausible uncompressed footprint (non-zero and
+//      within the total-byte cap), so no uint32 -> int32 underflow reaches
+//      mip_uncompressed_sizes and no single mip can request gigabytes;
+//   2. the table adds up to the header totals, so a header cannot declare a
+//      small original_size while its mips claim gigabytes of destination;
+//   3. when the pixel format maps to a known image format, each entry equals the
+//      padded footprint of its own mip level. That is the v2 replacement for the
+//      width*height*32 aggregate: the 256-byte row pitch makes a full chain cost
+//      more than px*32 for small or narrow textures, while the exact per-level
+//      comparison still rejects a table that does not describe the declared
+//      dimensions.
+static bool ds_v2_mip_table_is_sane(const DSTexHeader &p_header, const DSTexMipEntryV2 *p_entries) {
+	const int img_fmt = DSTex::rd_format_to_godot_format(static_cast<int>(p_header.pixel_format));
+	const bool check_layout = img_fmt != Image::FORMAT_MAX;
+	uint32_t w = p_header.width;
+	uint32_t h = p_header.height;
+	uint64_t sum_compressed = 0;
+	uint64_t sum_uncompressed = 0;
+	for (uint32_t i = 0; i < p_header.mip_count; ++i) {
+		const DSTexMipEntryV2 &entry = p_entries[i];
+		if (entry.uncompressed_size == 0 || entry.uncompressed_size > DSTEX_MAX_TOTAL_BYTES) {
+			return false;
+		}
+		if (check_layout) {
+			const DSTexMipLayout layout = DSTex::get_mip_layout(w, h, img_fmt);
+			// A zero footprint means the layout is unknown for this format; the
+			// sum and cap checks above still apply, so skip only the exactness.
+			if (layout.footprint_size != 0 && layout.footprint_size != entry.uncompressed_size) {
+				return false;
+			}
+		}
+		sum_compressed += entry.compressed_size;
+		sum_uncompressed += entry.uncompressed_size;
+		w = w > 1 ? w / 2 : 1;
+		h = h > 1 ? h / 2 : 1;
+	}
+	return sum_compressed == p_header.compressed_size && sum_uncompressed == p_header.original_size;
+}
+
 PackedByteArray DSTex::unpad_footprint_mip(const PackedByteArray &p_footprint, uint32_t p_width, uint32_t p_height, int p_image_format) {
 	if (p_footprint.size() == 0 || p_width == 0 || p_height == 0) {
 		return PackedByteArray();
@@ -658,6 +701,7 @@ Dictionary DSTex::read_header(const String &p_path) {
 		}
 	} else if (header.version == 2) {
 		uint64_t file_len = file->get_length();
+		DSTexMipEntryV2 entries[DSTEX_MAX_MIP_COUNT];
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntryV2 mip_entry;
 			PackedByteArray mip_bytes = file->get_buffer(sizeof(DSTexMipEntryV2));
@@ -672,10 +716,16 @@ Dictionary DSTex::read_header(const String &p_path) {
 				file->close();
 				return Dictionary();
 			}
+			entries[i] = mip_entry;
 			mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			mip_sizes[i] = static_cast<int32_t>(mip_entry.compressed_size);
 			mip_uncompressed_sizes[i] = static_cast<int32_t>(mip_entry.uncompressed_size);
 			mip_row_pitches[i] = static_cast<int32_t>(mip_entry.row_pitch);
+		}
+		if (!ds_v2_mip_table_is_sane(header, entries)) {
+			UtilityFunctions::push_error("DSTex: Mip table does not match the header totals or the declared mip layout.");
+			file->close();
+			return Dictionary();
 		}
 	} else {
 		UtilityFunctions::push_error("DSTex: Unsupported texture version.");
@@ -779,6 +829,7 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 			mip_sizes[i] = static_cast<int32_t>(mip_entry.size);
 		}
 	} else if (header.version == 2) {
+		DSTexMipEntryV2 entries[DSTEX_MAX_MIP_COUNT];
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntryV2 mip_entry;
 			PackedByteArray mip_bytes = file->get_buffer(sizeof(DSTexMipEntryV2));
@@ -787,10 +838,16 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 				return Dictionary();
 			}
 			memcpy(&mip_entry, mip_bytes.ptr(), sizeof(DSTexMipEntryV2));
+			entries[i] = mip_entry;
 			mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			mip_sizes[i] = static_cast<int32_t>(mip_entry.compressed_size);
 			mip_uncompressed_sizes[i] = static_cast<int32_t>(mip_entry.uncompressed_size);
 			mip_row_pitches[i] = static_cast<int32_t>(mip_entry.row_pitch);
+		}
+		if (!ds_v2_mip_table_is_sane(header, entries)) {
+			UtilityFunctions::push_error("DSTex: Mip table does not match the header totals or the declared mip layout.");
+			file->close();
+			return Dictionary();
 		}
 	} else {
 		UtilityFunctions::push_error("DSTex: Unsupported texture version.");

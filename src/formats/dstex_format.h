@@ -62,6 +62,12 @@ static constexpr uint32_t DSTEX_MAX_DIMENSION = 16384;
 static constexpr uint64_t DSTEX_MAX_TOTAL_BYTES = 512ULL * 1024ULL * 1024ULL;
 
 // Generous upper bound: 16 bytes/px (RGBA32F) x 2 for mips + footprint padding.
+// The padding term is load-bearing, not slack: every mip row is rounded up to a
+// 256-byte pitch, and a full chain contributes at most 2 x height rows, so a
+// legal small or narrow texture costs more than px*32 (an 8x8 RGBA8 chain is
+// 3840 bytes against px*32 = 2048). Without it the writer's own output is
+// refused by every reader. v2 files are additionally held to their exact
+// per-level footprint, which this heuristic cannot express.
 inline bool dstex_sizes_are_sane(uint32_t p_width, uint32_t p_height, uint64_t p_original, uint64_t p_compressed) {
 	if (p_width == 0 || p_height == 0 || p_width > DSTEX_MAX_DIMENSION || p_height > DSTEX_MAX_DIMENSION) {
 		return false;
@@ -76,7 +82,11 @@ inline bool dstex_sizes_are_sane(uint32_t p_width, uint32_t p_height, uint64_t p
 	if (px > UINT64_MAX / 32ULL) {
 		return false;
 	}
-	if (p_original > px * 32ULL) {
+	const uint64_t natural_allowance = px * 32ULL;
+	// Rows over a full chain sum to at most 2 x height; each can waste up to 255
+	// bytes of pitch padding, so 512 x height is a safe bound for all of them.
+	const uint64_t padding_allowance = 512ULL * static_cast<uint64_t>(p_height);
+	if (p_original > natural_allowance + padding_allowance) {
 		return false;
 	}
 	return true;

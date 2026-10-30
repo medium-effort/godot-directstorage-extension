@@ -455,9 +455,11 @@ constexpr int kBaseHeight = 64;
 constexpr int kBaseMips = 7;
 // Full-chain footprint total: 16384+8192+4096+2048+1024+512+256.
 constexpr uint64_t kBase7Footprint = 32512ULL;
-// 64*64*32 = 131072, so this violates the footprint clause while staying far
-// below both the 512 MiB total-bytes cap and UINT32_MAX.
-constexpr uint64_t kOverFootprint = 200000ULL;
+// The footprint clause is width*height*32 (131072 here) plus the row-padding
+// allowance the writer needs (512 * height = 32768), so 163840 is the limit;
+// 400000 exceeds it while staying far below both the 512 MiB total-bytes cap
+// and UINT32_MAX.
+constexpr uint64_t kOverFootprint = 400000ULL;
 // 7 x 132 MiB = 924 MiB: above the 512 MiB aggregate cap, and small enough that
 // a pre-fix build allocates it without endangering the runner.
 constexpr uint32_t kMipUncompressed = 132u * 1024u * 1024u;
