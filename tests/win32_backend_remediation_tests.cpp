@@ -19,6 +19,8 @@
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
 #include "core/ds_context.h"
+#include "core/ds_error_handler.h"
+#include "core/ds_profiler.h"
 
 #ifdef _WIN32
 #include "platform/win32/ds_win32_backend.h"
@@ -1513,6 +1515,175 @@ GDEX_TEST_T(win32_remediation, cancel_during_enqueue_window_completes_batch, TAG
 #else
     (void)ctx;
     GDEX_SKIP("The enqueue-window seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, submit_preserves_unread_error, TAG_INTEGRATION) {
+#ifdef _WIN32
+    // A DirectStorage failure lands in the DSErrorHandler singleton and is read back
+    // through the documented has_error() / get_last_error() pair, which a script polls
+    // once per frame. Both submit paths used to reset that state unconditionally, so a
+    // failure reported by the completion thread between frames was already gone when
+    // the next frame's submit returned.
+    //
+    // No seam is needed for this contract: report_error() is public, so the state a
+    // failure leaves behind can be installed directly, and its survival across a
+    // *successful* submit is the whole measurement. The point of doing it with a
+    // sentinel rather than a real queue failure is that it is deterministic: a clean
+    // batch reports no error of its own, so anything missing from the state was wiped
+    // by the submit.
+    godot::DSErrorHandler *eh = godot::DSErrorHandler::get_singleton();
+    if (eh == nullptr) {
+        GDEX_SKIP("DSErrorHandler singleton absent: real extension not loaded in this fixture.");
+    }
+
+    const char *fixture_path = "user://submit_preserves_error_fixture.dstex";
+    remove_temp_file(fixture_path);
+    ctx.add_teardown([fixture_path]() { remove_temp_file(fixture_path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    // LIFO: this runs after the backend is destroyed, so no completion thread can
+    // repopulate the flag once it has been cleared.
+    ctx.add_teardown([eh]() { eh->clear_error(); });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    GDEX_ASSERT_TRUE(write_temp_dstex(fixture_path, 64, 64, 1, 16384));
+
+    constexpr uint64_t kTag = 9205;
+    godot::Ref<godot::DSRequest> request = make_dummy_request(fixture_path, 1024);
+    request->set_uncompressed_size(1024);
+    request->set_cancellation_tag(kTag);
+
+    const godot::String sentinel("diagnostic sentinel: unread queue error");
+    eh->clear_error();
+    eh->report_error(sentinel);
+    GDEX_ASSERT_TRUE(eh->has_error());
+
+    GDEX_ASSERT_TRUE(backend->enqueue_request(request));
+    backend->submit_async();
+
+    const uint64_t fence = backend->get_completion_fence();
+    GDEX_EXPECT_TRUE(backend->wait_for_completion(fence, 5000));
+    bool settled = false;
+    const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < settle_deadline) {
+        backend->poll_batch_status();
+        if (backend->is_batch_complete() && request->get_status() == godot::DSRequest::STATUS_COMPLETED) {
+            settled = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // A failing batch would overwrite the sentinel with its own message, so this has
+    // to hold before the survival assertions mean anything.
+    GDEX_EXPECT_TRUE(settled);
+
+    // The invariant: a reported error stays readable until a caller clears it.
+    GDEX_EXPECT_TRUE(eh->has_error());
+    GDEX_EXPECT_TRUE(eh->get_last_error().contains(sentinel));
+
+    // The other half: the clean batch that followed must not inherit the error either.
+    // The sample is matched by the byte count this request contributes, so a previous
+    // suite's sample cannot satisfy the read.
+    godot::DSProfiler *profiler = godot::DSProfiler::get_singleton();
+    if (profiler != nullptr) {
+        bool sample_found = false;
+        int64_t sample_error_state = -1;
+        const auto sample_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < sample_deadline) {
+            godot::Ref<godot::DSProfilerResult> sample = profiler->get_last_result();
+            if (sample.is_valid() && sample->get_compressed_bytes_read() == 1024 &&
+                    sample->get_request_count() == 1) {
+                sample_error_state = static_cast<int64_t>(sample->get_error_state());
+                sample_found = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        GDEX_EXPECT_TRUE(sample_found);
+        if (sample_found) {
+            GDEX_EXPECT_EQ(sample_error_state, static_cast<int64_t>(0));
+        }
+    }
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, queue_error_retrieval_is_serialized, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // IDStorageQueue::RetrieveErrorRecord() has two callers: the completion thread, which reaches
+    // it through retrieve_queue_error() while holding batch_mutex, and process_queue_errors(),
+    // which used to reach it holding only error_mutex - and that lock is released before the loop,
+    // so the drain was effectively unserialised. The SDK ties the call to the error event and
+    // counts failures "since the last RetrieveErrorRecord call", so two racing drains split one
+    // failure record between them.
+    //
+    // The seam parks the draining thread after it takes the queue-access lock and before the first
+    // RetrieveErrorRecord() call; the test then asks the backend whether its batch_mutex is free.
+    // Post-fix it is held, so the probe answers false.
+    godot::DSErrorHandler *eh = godot::DSErrorHandler::get_singleton();
+    if (eh == nullptr) {
+        GDEX_SKIP("DSErrorHandler singleton absent: real extension not loaded in this fixture.");
+    }
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    // LIFO: the hook captures this frame, so it is cleared before the backend is deleted and
+    // before unregister_queue() drops the borrowed mutex pointer.
+    ctx.add_teardown([eh]() { eh->_debug_set_queue_error_reader_hook_for_testing({}); });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    std::atomic<bool> window_open{ false };
+    std::atomic<bool> release_window{ false };
+    eh->_debug_set_queue_error_reader_hook_for_testing([&window_open, &release_window]() {
+        window_open.store(true);
+        // Self-releasing: a broken build must not hang the suite here.
+        const auto hook_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!release_window.load() && std::chrono::steady_clock::now() < hook_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    std::thread drainer([eh]() { eh->process_queue_errors(); });
+
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!window_open.load() && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool entered = window_open.load();
+    // No batch was submitted, so nothing else in the backend can be holding this lock: a free
+    // lock here means the drain is not serialised with the completion thread's own drain.
+    const bool queue_access_held = entered && !backend->_debug_batch_mutex_is_free_for_testing();
+
+    release_window.store(true);
+    drainer.join();
+    eh->_debug_set_queue_error_reader_hook_for_testing({});
+
+    GDEX_EXPECT_TRUE(entered);
+    GDEX_EXPECT_TRUE(queue_access_held);
+#else
+    (void)ctx;
+    GDEX_SKIP("The queue-error reader seam is compiled out of release builds.");
 #endif
 #else
     (void)ctx;

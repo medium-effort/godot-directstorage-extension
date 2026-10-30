@@ -12,7 +12,7 @@
 		<method name="clear_error">
 			<return type="void" />
 			<description>
-				Clears the last recorded error state.
+				Clears the last recorded error state. This is the only call that clears it: submitting new work does not.
 			</description>
 		</method>
 		<method name="describe_command_type" qualifiers="static">
@@ -34,12 +34,12 @@
 		<method name="has_error" qualifiers="const">
 			<return type="bool" />
 			<description>
-				Returns [code]true[/code] if an asynchronous error has been flagged.
+				Returns [code]true[/code] if an asynchronous error has been flagged. The flag stays set until [method clear_error] is called; submitting new work does not reset it.
 			</description>
 		</method>
 		<method name="process_queue_errors">
 			<return type="void" />
-			<description>Retrieves and reports pending DirectStorage queue failures across all registered priority queues. This method is available only on Windows builds and is normally called by the native backend.</description>
+			<description>Retrieves and reports pending DirectStorage queue failures across all registered priority queues. This method is available only on Windows builds. It is not called by the native backend: the backend drains the same error record itself when a batch retires, and this method is serialised with that drain so a script can never split one failure record with the completion thread.</description>
 		</method>
 		<method name="report_error">
 			<return type="void" />

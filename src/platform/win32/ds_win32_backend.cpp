@@ -1453,7 +1453,7 @@ void Win32Backend::completion_thread_func() {
 					batch.uncompressed_bytes,
 					batch.request_count,
 					-1,
-					(err_handler && err_handler->has_error()) ? 1 : 0);
+					(err_handler && err_handler->get_error_sequence() != batch.error_sequence) ? 1 : 0);
 				profiler->record_workload(batch.compressed_bytes, duration_us);
 		}
 		batch_cv.notify_all();
@@ -2513,7 +2513,7 @@ bool Win32Backend::initialize(const String &p_path) {
 		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 		if (err_handler) {
 			for (const QueueState &queue : priority_queues) {
-				err_handler->register_queue(queue.queue);
+				err_handler->register_queue(queue.queue, &batch_mutex);
 			}
 		}
 		RenderingServer *rs = RenderingServer::get_singleton();
@@ -3654,9 +3654,12 @@ void Win32Backend::submit_async() {
 			}
 		}
 
+		// Snapshot the error generation instead of clearing the handler: a failure reported by an
+		// earlier batch stays readable through has_error()/get_last_error() until a caller clears
+		// it, and this batch's own error_state is derived by comparing the sequence at completion.
 		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 		if (err_handler) {
-			err_handler->clear_error();
+			batch.error_sequence = err_handler->get_error_sequence();
 		}
 		uint64_t completion_value = queue.completion_fence_value + 1;
 		ResetEvent(slot.event);
@@ -3901,10 +3904,6 @@ void Win32Backend::submit_batch() {
 				continue;
 			}
 			uint64_t start_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_usec() : 0;
-			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
-			if (err_handler) {
-				err_handler->clear_error();
-			}
 			int request_count = count_logical_requests(slot.requests);
 			uint64_t total_compressed_bytes = 0;
 			uint64_t total_uncompressed_bytes = 0;
@@ -3923,6 +3922,11 @@ void Win32Backend::submit_batch() {
 			batch.compressed_bytes = total_compressed_bytes;
 			batch.uncompressed_bytes = total_uncompressed_bytes;
 			batch.request_count = request_count;
+			// Same contract as submit_async(): snapshot the error generation, never clear it.
+			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+			if (err_handler) {
+				batch.error_sequence = err_handler->get_error_sequence();
+			}
 			uint64_t completion_value = queue.completion_fence_value + 1;
 			ResetEvent(slot.event);
 			queue.completion_fence_value = completion_value;
@@ -4307,6 +4311,22 @@ int Win32Backend::_debug_pending_enqueue_count() const {
 	return pending;
 #else
 	return 0;
+#endif
+}
+
+bool Win32Backend::_debug_batch_mutex_is_free_for_testing() {
+#ifdef _WIN32
+	// Test-only seam, never bound in _bind_methods(). Called from a thread that is NOT the one
+	// whose lock state is being measured: true means batch_mutex was free, false means something
+	// (in the test's case, the queue-error drain) holds it.
+	if (batch_mutex.try_lock()) {
+		batch_mutex.unlock();
+		return true;
+	}
+	return false;
+#else
+	// No Win32 queue to serialise against; nothing can hold the lock here.
+	return true;
 #endif
 }
 

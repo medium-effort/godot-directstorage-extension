@@ -246,9 +246,14 @@ uint64_t DSProfiler::get_last_duration_us() const {
 }
 
 void DSProfiler::register_performance_monitors() {
-	std::lock_guard<std::mutex> lock(profiler_mutex);
-	if (performance_monitors_registered) {
-		return;
+	// monitor_mutex serialises the transition; the engine calls below must not be made under
+	// profiler_mutex, because every monitor callable takes it (GODOT_QUIRKS.md Q46).
+	std::lock_guard<std::mutex> transition(monitor_mutex);
+	{
+		std::lock_guard<std::mutex> lock(profiler_mutex);
+		if (performance_monitors_registered) {
+			return;
+		}
 	}
 
 	Performance *perf = Performance::get_singleton();
@@ -256,18 +261,30 @@ void DSProfiler::register_performance_monitors() {
 		return;
 	}
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	_debug_invoke_monitor_registration_hook();
+#endif
+
 	perf->add_custom_monitor(THROUGHPUT_MONITOR, Callable(this, "_get_throughput_monitor"));
 	perf->add_custom_monitor(REQUESTS_PER_SECOND_MONITOR, Callable(this, "_get_requests_per_second_monitor"));
 	perf->add_custom_monitor(AVERAGE_LATENCY_MONITOR, Callable(this, "_get_average_latency_monitor"));
 	perf->add_custom_monitor(QUEUE_DEPTH_MONITOR, Callable(this, "_get_queue_depth_monitor"));
 	perf->add_custom_monitor(GPU_DECOMPRESSION_MONITOR, Callable(this, "_get_gpu_decompression_active_monitor"));
+
+	// Written after the engine calls succeed: one write point, no rollback branch. The whole
+	// transition is serialised by monitor_mutex, and nothing outside these two functions reads
+	// the flag, so "true" can never be observed before the monitors exist.
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	performance_monitors_registered = true;
 }
 
 void DSProfiler::unregister_performance_monitors() {
-	std::lock_guard<std::mutex> lock(profiler_mutex);
-	if (!performance_monitors_registered) {
-		return;
+	std::lock_guard<std::mutex> transition(monitor_mutex);
+	{
+		std::lock_guard<std::mutex> lock(profiler_mutex);
+		if (!performance_monitors_registered) {
+			return;
+		}
 	}
 
 	Performance *perf = Performance::get_singleton();
@@ -278,8 +295,38 @@ void DSProfiler::unregister_performance_monitors() {
 		perf->remove_custom_monitor(QUEUE_DEPTH_MONITOR);
 		perf->remove_custom_monitor(GPU_DECOMPRESSION_MONITOR);
 	}
+
+	std::lock_guard<std::mutex> lock(profiler_mutex);
 	performance_monitors_registered = false;
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+void DSProfiler::_debug_set_monitor_registration_hook_for_testing(const std::function<void()> &p_hook) {
+	std::lock_guard<std::mutex> lock(monitor_hook_mutex);
+	monitor_registration_hook = p_hook;
+}
+
+bool DSProfiler::_debug_profiler_mutex_is_free_for_testing() {
+	if (profiler_mutex.try_lock()) {
+		profiler_mutex.unlock();
+		return true;
+	}
+	return false;
+}
+
+void DSProfiler::_debug_invoke_monitor_registration_hook() {
+	// Copy under the hook mutex and release it before invoking: a parked hook must never block
+	// the setter or a monitor callable, and the hook itself runs with no extension mutex held.
+	std::function<void()> hook;
+	{
+		std::lock_guard<std::mutex> lock(monitor_hook_mutex);
+		hook = monitor_registration_hook;
+	}
+	if (hook) {
+		hook();
+	}
+}
+#endif
 
 double DSProfiler::_get_throughput_monitor() const {
 	std::lock_guard<std::mutex> lock(profiler_mutex);

@@ -128,6 +128,10 @@ private:
 		uint64_t uncompressed_bytes = 0;
 		int request_count = 0;
 		uint64_t start_time = 0;
+		// DSErrorHandler's error generation when this batch was submitted. The completion thread
+		// compares it instead of reading a sticky flag, so a clean batch is never labelled failed
+		// by an earlier failure and an error that lands during the batch is still attributed to it.
+		uint64_t error_sequence = 0;
 		// Per-batch tag accounting for the async prewarm path. Filled by
 		// submit_async() only; the sync submit_batch() path leaves this
 		// empty. Each entry groups logical requests (chunk children resolve
@@ -283,6 +287,10 @@ public:
 	// opens: the payload is then owned by the submitting stack frame, so no other
 	// thread can observe, mutate or clear it. Never bound in _bind_methods().
 	int _debug_pending_enqueue_count() const;
+	// Test-only seam: try-lock batch_mutex and release it again; true when it was free. Used to
+	// prove process_queue_errors() is serialised with the completion thread's error drain.
+	// Never bound in _bind_methods().
+	bool _debug_batch_mutex_is_free_for_testing();
 	// Test-only seam: how many times DStorageSetConfiguration has actually been
 	// applied. The counter is per loaded runtime instance, not per process, so a
 	// second load cycle must raise it again; a process-wide latch did not. Never

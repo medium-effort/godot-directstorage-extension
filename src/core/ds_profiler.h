@@ -8,6 +8,7 @@
 #include <godot_cpp/variant/array.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -51,6 +52,10 @@ class DSProfiler : public Object {
 private:
 	static DSProfiler *singleton;
 	mutable std::mutex profiler_mutex;
+	// Serialises the register/unregister transition. No monitor callable takes it, so it cannot
+	// close the Q46 inversion cycle that profiler_mutex closes when the engine is called from
+	// inside a transition.
+	std::mutex monitor_mutex;
 	static constexpr size_t MAX_RESULT_HISTORY = 1024;
 	// Plain-data sample: no Godot types, safe to write from any thread.
 	struct ProfilerSample {
@@ -75,6 +80,13 @@ private:
 	uint64_t last_bytes = 0;
 	uint64_t last_duration_us = 0;
 	bool performance_monitors_registered = false;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// See register_performance_monitors(): the hook is copied under its own mutex and invoked
+	// with no extension mutex held, so a parked test can never block a setter or a callable.
+	std::mutex monitor_hook_mutex;
+	std::function<void()> monitor_registration_hook;
+	void _debug_invoke_monitor_registration_hook();
+#endif
 	void _push_sample_locked(const ProfilerSample &p_sample);
 	static Ref<DSProfilerResult> _make_result(const ProfilerSample &p_sample);
 
@@ -105,6 +117,16 @@ public:
 	double _get_average_latency_monitor() const;
 	int _get_queue_depth_monitor() const;
 	int _get_gpu_decompression_active_monitor() const;
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only seams, never bound in _bind_methods():
+	// the hook runs inside register_performance_monitors() immediately before the first engine
+	// call, so a test can observe from another thread whether profiler_mutex is held there; the
+	// probe try-locks profiler_mutex and releases it again, and must be called from a thread
+	// other than the observed one (a same-thread try_lock on a non-recursive mutex is UB).
+	void _debug_set_monitor_registration_hook_for_testing(const std::function<void()> &p_hook);
+	bool _debug_profiler_mutex_is_free_for_testing();
+#endif
 };
 
 } // namespace godot

@@ -266,11 +266,12 @@ DSErrorHandler::~DSErrorHandler() {
 }
 
 #ifdef _WIN32
-bool DSErrorHandler::register_queue(IDStorageQueue *p_queue) {
+bool DSErrorHandler::register_queue(IDStorageQueue *p_queue, std::mutex *p_queue_access_mutex) {
 	if (!p_queue) {
 		return false;
 	}
 	std::lock_guard<std::mutex> lock(error_mutex);
+	observed_queue_mutex = p_queue_access_mutex;
 	for (IDStorageQueue *queue : observed_queues) {
 		if (queue == p_queue) {
 			return true;
@@ -283,6 +284,7 @@ bool DSErrorHandler::register_queue(IDStorageQueue *p_queue) {
 
 void DSErrorHandler::unregister_queue() {
 	std::lock_guard<std::mutex> lock(error_mutex);
+	observed_queue_mutex = nullptr;
 	for (IDStorageQueue *queue : observed_queues) {
 		if (queue) {
 			queue->Release();
@@ -293,8 +295,10 @@ void DSErrorHandler::unregister_queue() {
 
 void DSErrorHandler::process_queue_errors() {
 	std::vector<IDStorageQueue *> queues_copy;
+	std::mutex *queue_access = nullptr;
 	{
 		std::lock_guard<std::mutex> lock(error_mutex);
+		queue_access = observed_queue_mutex;
 		queues_copy.reserve(observed_queues.size());
 		for (IDStorageQueue *queue : observed_queues) {
 			if (queue) {
@@ -303,6 +307,22 @@ void DSErrorHandler::process_queue_errors() {
 			}
 		}
 	}
+
+	// Serialise this drain with the completion thread's own RetrieveErrorRecord() caller. The
+	// SDK ties that call to the error event and never licenses two callers, and FailureCount
+	// counts failures "since the last RetrieveErrorRecord call", so racing drains split one
+	// failure record between them.
+	std::unique_lock<std::mutex> queue_lock;
+	if (queue_access) {
+		queue_lock = std::unique_lock<std::mutex>(*queue_access);
+	}
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	_debug_invoke_queue_reader_hook();
+#endif
+
+	// Build the messages here; do not call into the engine while the lock is held.
+	std::vector<String> messages;
 	for (IDStorageQueue *queue : queues_copy) {
 		DSTORAGE_ERROR_RECORD errorRecord{};
 		queue->RetrieveErrorRecord(&errorRecord);
@@ -321,14 +341,43 @@ void DSErrorHandler::process_queue_errors() {
 				err_msg += " [File: " + String(failureRecord.Request.Filename) +
 						", RequestName: " + String(failureRecord.Request.RequestName) + "]";
 			}
-			UtilityFunctions::push_error(err_msg);
-			if (singleton) {
-				singleton->report_error(err_msg);
-			}
+			messages.push_back(err_msg);
 		}
+	}
+
+	if (queue_lock.owns_lock()) {
+		queue_lock.unlock();
+	}
+	for (IDStorageQueue *queue : queues_copy) {
 		queue->Release();
 	}
+
+	// Engine calls happen after every extension mutex is released (GODOT_QUIRKS.md Q46).
+	for (const String &message : messages) {
+		UtilityFunctions::push_error(message);
+		if (singleton) {
+			singleton->report_error(message);
+		}
+	}
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+void DSErrorHandler::_debug_set_queue_error_reader_hook_for_testing(const std::function<void()> &p_hook) {
+	std::lock_guard<std::mutex> lock(queue_reader_hook_mutex);
+	queue_reader_hook = p_hook;
+}
+
+void DSErrorHandler::_debug_invoke_queue_reader_hook() {
+	std::function<void()> hook;
+	{
+		std::lock_guard<std::mutex> lock(queue_reader_hook_mutex);
+		hook = queue_reader_hook;
+	}
+	if (hook) {
+		hook();
+	}
+}
+#endif
 #endif
 
 bool DSErrorHandler::has_error() const {
@@ -341,16 +390,24 @@ String DSErrorHandler::get_last_error() const {
 	return last_error;
 }
 
+uint64_t DSErrorHandler::get_error_sequence() const {
+	std::lock_guard<std::mutex> lock(error_mutex);
+	return error_sequence;
+}
+
 void DSErrorHandler::clear_error() {
 	std::lock_guard<std::mutex> lock(error_mutex);
 	last_error = "";
 	error_flag = false;
+	// error_sequence is deliberately NOT rewound: a clear must not relabel an in-flight batch
+	// as failed by moving its snapshot value.
 }
 
 void DSErrorHandler::report_error(const String &p_msg) {
 	std::lock_guard<std::mutex> lock(error_mutex);
 	last_error = p_msg;
 	error_flag = true;
+	error_sequence++;
 }
 
 void DSErrorHandler::_bind_methods() {
