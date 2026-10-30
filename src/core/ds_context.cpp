@@ -225,10 +225,17 @@ struct ds_is_atomic_type<std::atomic<T>> : std::true_type {};
 
 #ifdef _WIN32
 static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_queue_capacity) {
+	// Guarded, and deliberately not latched on the early returns below: "no renderer
+	// yet" or "no device yet" is not an answer, so a later call must be able to ask
+	// again. An unguarded pair of statics here let two callers race on the cache.
+	static std::mutex s_support_cache_mutex;
 	static DSTORAGE_COMPRESSION_SUPPORT s_cached_support = DSTORAGE_COMPRESSION_SUPPORT_NONE;
 	static bool s_support_cached = false;
-	if (s_support_cached) {
-		return s_cached_support;
+	{
+		std::lock_guard<std::mutex> lock(s_support_cache_mutex);
+		if (s_support_cached) {
+			return s_cached_support;
+		}
 	}
 
 	RenderingServer *rs = RenderingServer::get_singleton();
@@ -277,7 +284,7 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 
 	DSTORAGE_COMPRESSION_SUPPORT support = DSTORAGE_COMPRESSION_SUPPORT_NONE;
 	if (dstorage_module) {
-		Win32Backend::apply_dstorage_configuration_once();
+		Win32Backend::apply_dstorage_configuration();
 		using DStorageGetFactoryFunction = HRESULT(WINAPI *)(REFIID, void **);
 		DStorageGetFactoryFunction get_factory = reinterpret_cast<DStorageGetFactoryFunction>(GetProcAddress(dstorage_module, "DStorageGetFactory"));
 		IDStorageFactory *factory = nullptr;
@@ -307,13 +314,19 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 	}
 
 	if (release_dstorage_module) {
+		// The settings lived in the module just dropped; a later load is a different
+		// instance and must be configured again.
+		Win32Backend::notify_runtime_modules_released();
 		FreeLibrary(dstorage_module);
 	}
 	if (release_core_module) {
 		FreeLibrary(core_module);
 	}
-	s_cached_support = support;
-	s_support_cached = true;
+	{
+		std::lock_guard<std::mutex> lock(s_support_cache_mutex);
+		s_cached_support = support;
+		s_support_cached = true;
+	}
 	return support;
 }
 

@@ -60,8 +60,27 @@ struct DSRuntimeProbe {
 	String reason;
 };
 
+// Configuration is applied to a *loaded runtime instance*, not once per process.
+// The settings live inside dstorage.dll, so unloading the module discards them and
+// the next load has to be configured again; a process-wide std::once_flag left every
+// instance after the first running on SDK defaults (telemetry on, the GPU
+// decompression preference ignored).
+static std::mutex s_dstorage_config_mutex;
+static HMODULE s_dstorage_configured_module = nullptr;
+static std::atomic<int> s_dstorage_config_apply_count{ 0 };
+
+// Any release of dstorage.dll invalidates the marker: the settings did not survive
+// with it, and the loader may hand the same base address out again for a different
+// instance. A call that frees nothing (both handles null) must not clear it, or a
+// probe that replaces an empty stash would immediately forget what it just applied.
+static void forget_dstorage_configuration() {
+	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
+	s_dstorage_configured_module = nullptr;
+}
+
 static void unload_runtime_modules(HMODULE p_core, HMODULE p_dstorage) {
 	if (p_dstorage) {
+		forget_dstorage_configuration();
 		FreeLibrary(p_dstorage);
 	}
 	if (p_core) {
@@ -1718,7 +1737,7 @@ static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_ca
 		return result;
 	}
 
-	Win32Backend::apply_dstorage_configuration_once();
+	Win32Backend::apply_dstorage_configuration();
 
 	IDStorageFactory *probe_factory = nullptr;
 	HRESULT hr = DStorageGetFactory(IID_PPV_ARGS(&probe_factory));
@@ -1929,26 +1948,44 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 }
 
 #ifdef _WIN32
-static std::once_flag s_dstorage_config_once;
+void Win32Backend::apply_dstorage_configuration() {
+	// Every caller has just loaded or claimed the runtime modules, so the instance to
+	// configure is whatever `dstorage.dll` resolves to right now. Asking the loader
+	// instead of taking a handle parameter keeps this callable from DSContext during
+	// the pre-initialization capability probe, which owns the same modules.
+	HMODULE current_module = GetModuleHandleW(L"dstorage.dll");
+	if (current_module == nullptr) {
+		return;
+	}
 
-void Win32Backend::apply_dstorage_configuration_once() {
-	std::call_once(s_dstorage_config_once, []() {
-		DSContext *ctx = DSContext::get_singleton();
-		bool disable_gpu = ctx ? ctx->get_disable_gpu_decompression() : false;
+	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
+	if (s_dstorage_configured_module == current_module) {
+		return;
+	}
 
-		DSTORAGE_CONFIGURATION config = {};
-		config.DisableTelemetry = TRUE;
-		config.DisableGpuDecompression = disable_gpu;
-		config.DisableGpuDecompressionMetacommand = disable_gpu;
+	DSContext *ctx = DSContext::get_singleton();
+	bool disable_gpu = ctx ? ctx->get_disable_gpu_decompression() : false;
 
-		HRESULT hr = DStorageSetConfiguration(&config);
-		if (FAILED(hr)) {
-			UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration returned 0x" +
-					String::num_uint64(static_cast<uint32_t>(hr), 16) + " (configuration may already be active).");
-		} else {
-			UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration applied successfully.");
-		}
-	});
+	DSTORAGE_CONFIGURATION config = {};
+	config.DisableTelemetry = TRUE;
+	config.DisableGpuDecompression = disable_gpu;
+	config.DisableGpuDecompressionMetacommand = disable_gpu;
+
+	HRESULT hr = DStorageSetConfiguration(&config);
+	if (FAILED(hr)) {
+		UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration returned 0x" +
+				String::num_uint64(static_cast<uint32_t>(hr), 16) + " (configuration may already be active).");
+	} else {
+		UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration applied successfully.");
+	}
+	// Recorded either way: once a factory exists this call cannot succeed on the same
+	// instance, so retrying it would only repeat the failure log.
+	s_dstorage_configured_module = current_module;
+	s_dstorage_config_apply_count.fetch_add(1);
+}
+
+void Win32Backend::notify_runtime_modules_released() {
+	forget_dstorage_configuration();
 }
 
 PackedStringArray Win32Backend::get_runtime_search_dirs() {
@@ -1991,7 +2028,8 @@ bool Win32Backend::probe_system_support() {
 	return probe.available;
 }
 #else
-void Win32Backend::apply_dstorage_configuration_once() {}
+void Win32Backend::apply_dstorage_configuration() {}
+void Win32Backend::notify_runtime_modules_released() {}
 bool Win32Backend::probe_system_support() { return false; }
 PackedStringArray Win32Backend::get_runtime_search_dirs() { return PackedStringArray(); }
 #endif
@@ -2393,7 +2431,7 @@ bool Win32Backend::initialize(const String &p_path) {
 	bool disable_gpu = ctx->get_disable_gpu_decompression();
 	uint16_t capacity = ctx->get_queue_capacity();
 
-	apply_dstorage_configuration_once();
+	apply_dstorage_configuration();
 
 	String step_name = "DStorageGetFactory";
 	HRESULT hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
@@ -4267,6 +4305,14 @@ int Win32Backend::_debug_pending_enqueue_count() const {
 		}
 	}
 	return pending;
+#else
+	return 0;
+#endif
+}
+
+int Win32Backend::_debug_dstorage_config_apply_count() {
+#ifdef _WIN32
+	return s_dstorage_config_apply_count.load();
 #else
 	return 0;
 #endif

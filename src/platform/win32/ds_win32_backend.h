@@ -227,7 +227,11 @@ public:
 	Win32Backend() = default;
 	~Win32Backend() override { shutdown(); }
 
-	static void apply_dstorage_configuration_once();
+	static void apply_dstorage_configuration();
+	// Called by the context's capability probe after it releases runtime modules it
+	// loaded itself: the configuration does not survive with the module, and the
+	// loader may hand the same base address out again for a different instance.
+	static void notify_runtime_modules_released();
 	static bool probe_system_support();
 	// Candidate directories that may hold dstorage.dll / dstoragecore.dll,
 	// in lookup order. The addon bin dir covers the editor and dev runs;
@@ -279,6 +283,11 @@ public:
 	// opens: the payload is then owned by the submitting stack frame, so no other
 	// thread can observe, mutate or clear it. Never bound in _bind_methods().
 	int _debug_pending_enqueue_count() const;
+	// Test-only seam: how many times DStorageSetConfiguration has actually been
+	// applied. The counter is per loaded runtime instance, not per process, so a
+	// second load cycle must raise it again; a process-wide latch did not. Never
+	// bound in _bind_methods().
+	static int _debug_dstorage_config_apply_count();
 #endif
 
 	static bool is_path_valid(const String &p_path);

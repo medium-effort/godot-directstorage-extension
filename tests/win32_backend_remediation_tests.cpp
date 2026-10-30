@@ -1377,6 +1377,49 @@ GDEX_TEST_T(win32_remediation, config_fields_are_atomic, TAG_INTEGRATION) {
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, runtime_configuration_applies_per_loaded_instance, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // The DirectStorage settings live inside dstorage.dll, so a freshly loaded runtime
+    // must be configured again. A process-wide latch configured only the first
+    // instance, and every later load (after a shutdown released the modules) ran on
+    // SDK defaults with the caller's preference ignored. Two probe cycles bracket a
+    // full unload, so the second cycle necessarily sees a new module instance.
+    if (!godot::Win32Backend::probe_system_support()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    const int after_first_probe = godot::Win32Backend::_debug_dstorage_config_apply_count();
+    GDEX_EXPECT_TRUE(after_first_probe >= 1);
+
+    // Same instance: applying again must be a no-op, the settings are already in it.
+    godot::Win32Backend::apply_dstorage_configuration();
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::Win32Backend::_debug_dstorage_config_apply_count()),
+            static_cast<int64_t>(after_first_probe));
+
+    // initialize() claims the modules the probe stashed; shutdown() releases them,
+    // and that release is what discards the configuration.
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    if (!backend->initialize()) {
+        memdelete(backend);
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+    backend->shutdown();
+    memdelete(backend);
+
+    // New instance: the configuration has to be applied again.
+    GDEX_EXPECT_TRUE(godot::Win32Backend::probe_system_support());
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::Win32Backend::_debug_dstorage_config_apply_count()),
+            static_cast<int64_t>(after_first_probe + 1));
+#else
+    (void)ctx;
+    GDEX_SKIP("The runtime-configuration counter is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, cancel_during_enqueue_window_completes_batch, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
