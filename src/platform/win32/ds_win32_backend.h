@@ -8,6 +8,7 @@
 #include <array>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -168,6 +169,14 @@ private:
 	// be running; readers must not release device resources in that case.
 	// Atomic like the neighbouring flags: the accessor takes no lock.
 	std::atomic<bool> last_shutdown_drained{ true };
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only seam: called immediately after submit_async()/submit_batch()
+	// release batch_mutex and before anything is handed to DirectStorage. It
+	// exists so a test can hold that instant open while another thread calls
+	// cancel_requests_with_tag(); the real interleaving is a scheduler race that
+	// cannot be produced on demand. Never bound in _bind_methods().
+	std::function<void()> enqueue_window_hook;
+#endif
 
 #ifdef _WIN32
 	void completion_thread_func();
@@ -262,6 +271,14 @@ public:
 	// flight) needs two live queues whose DMA has run a different number of
 	// times, which cannot be produced on demand. Never bound in _bind_methods().
 	void _debug_set_queue_fence_counters_for_testing(int p_queue_index, uint64_t p_completion_value, uint64_t p_completed_value);
+	// Test-only seam: installs (or, with an empty callback, clears) the hook that
+	// runs inside the batch_mutex-free enqueue window. Never bound in _bind_methods().
+	void _debug_set_enqueue_window_hook_for_testing(const std::function<void()> &p_hook);
+	// Test-only seam: largest pending enqueue payload across every slot, read
+	// WITHOUT batch_mutex. It must read 0 for the whole window the hook above
+	// opens: the payload is then owned by the submitting stack frame, so no other
+	// thread can observe, mutate or clear it. Never bound in _bind_methods().
+	int _debug_pending_enqueue_count() const;
 #endif
 
 	static bool is_path_valid(const String &p_path);

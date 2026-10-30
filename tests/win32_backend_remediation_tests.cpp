@@ -1166,4 +1166,211 @@ GDEX_TEST_T(win32_remediation, multi_queue_fence_wait_releases_when_low_counter_
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, dstorage_requests_not_shared_during_enqueue_window, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // The enqueue-payload race: submit_async()/submit_batch() released batch_mutex and
+    // then kept working on slot.dstorage_requests - re-seating Name, handing
+    // data()/size() to DirectStorage, clearing - while cancel_requests_with_tag()
+    // read the same vector under that lock. The window is a few hundred
+    // instructions wide, so it is not reachable by a stress loop; the DEBUG/DEV
+    // seam parks the submitting thread inside it instead.
+    //
+    // The discriminator is the slot state at that instant: pre-fix the slot still
+    // owns the payload (>= 1), post-fix it was emptied under the lock and the
+    // payload lives on the submitting thread's stack, so nothing else can read,
+    // mutate or clear what is about to be enqueued.
+    const char *fixture_path = "user://enqueue_window_fixture.dstex";
+    remove_temp_file(fixture_path);
+    // Added before the backend's teardown so LIFO runs that one first: the backend
+    // holds an open IDStorageFile for this fixture, and Windows refuses to delete
+    // a file with a live handle.
+    ctx.add_teardown([fixture_path]() { remove_temp_file(fixture_path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        // Ordering matters: a hook that captured this test's frame must be gone
+        // before the backend is deleted.
+        backend->_debug_set_enqueue_window_hook_for_testing({});
+        memdelete(backend);
+    });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    GDEX_ASSERT_TRUE(write_temp_dstex(fixture_path, 64, 64, 1, 16384));
+
+    constexpr uint64_t kTag = 9101;
+    godot::Ref<godot::DSRequest> first = make_dummy_request(fixture_path, 1024);
+    first->set_uncompressed_size(1024);
+    first->set_cancellation_tag(kTag);
+    godot::Ref<godot::DSRequest> second = make_dummy_request(fixture_path, 1024);
+    second->set_uncompressed_size(1024);
+    second->set_cancellation_tag(kTag);
+    // Memory destinations produce no GPU transitions, so submit_async() reaches
+    // the seam on its first instruction after the lock is released.
+    GDEX_ASSERT_TRUE(backend->enqueue_request(first));
+    GDEX_ASSERT_TRUE(backend->enqueue_request(second));
+
+    std::atomic<bool> window_open{ false };
+    std::atomic<bool> release_window{ false };
+    backend->_debug_set_enqueue_window_hook_for_testing([&window_open, &release_window]() {
+        window_open.store(true);
+        // Self-releasing: a broken build must not hang the suite here.
+        const auto hook_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!release_window.load() && std::chrono::steady_clock::now() < hook_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    std::thread submitter([backend]() { backend->submit_async(); });
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!window_open.load() && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool entered = window_open.load();
+    const int pending_in_slots = backend->_debug_pending_enqueue_count();
+    if (entered) {
+        // The concurrent caller the fix removes from the window.
+        backend->cancel_requests_with_tag(kTag);
+    }
+    release_window.store(true);
+    submitter.join();
+    backend->_debug_set_enqueue_window_hook_for_testing({});
+
+    // No worker is running past this point, so failing assertions are safe.
+    GDEX_EXPECT_TRUE(entered);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(pending_in_slots), static_cast<int64_t>(0));
+
+    const uint64_t fence = backend->get_completion_fence();
+    GDEX_EXPECT_TRUE(backend->wait_for_completion(fence, 5000));
+    bool settled = false;
+    const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < settle_deadline) {
+        backend->poll_batch_status();
+        if (backend->is_batch_complete()) {
+            settled = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    GDEX_EXPECT_TRUE(settled);
+    // Both requests are terminal: cancelled-by-tag marks them FAILED and the
+    // completion path never promotes a terminal request.
+    GDEX_EXPECT_TRUE(first->get_status() == godot::DSRequest::STATUS_FAILED ||
+            first->get_status() == godot::DSRequest::STATUS_COMPLETED);
+#else
+    (void)ctx;
+    GDEX_SKIP("The enqueue-window seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, cancel_during_enqueue_window_completes_batch, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // Anti-regression half of the enqueue-payload fix. Taking the payload out of the slot
+    // must not strand the batch: the slot has to retire and be reusable, and the
+    // retained DSTORAGE_REQUEST::Name pointers have to stay valid because
+    // slot.request_names is never moved or cleared by the snapshot.
+    const char *fixture_path = "user://enqueue_window_reuse_fixture.dstex";
+    remove_temp_file(fixture_path);
+    ctx.add_teardown([fixture_path]() { remove_temp_file(fixture_path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        backend->_debug_set_enqueue_window_hook_for_testing({});
+        memdelete(backend);
+    });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    GDEX_ASSERT_TRUE(write_temp_dstex(fixture_path, 64, 64, 1, 16384));
+
+    constexpr uint64_t kTag = 9202;
+    godot::Ref<godot::DSRequest> first = make_dummy_request(fixture_path, 1024);
+    first->set_uncompressed_size(1024);
+    first->set_cancellation_tag(kTag);
+    GDEX_ASSERT_TRUE(backend->enqueue_request(first));
+
+    std::atomic<bool> window_open{ false };
+    std::atomic<bool> release_window{ false };
+    backend->_debug_set_enqueue_window_hook_for_testing([&window_open, &release_window]() {
+        window_open.store(true);
+        const auto hook_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!release_window.load() && std::chrono::steady_clock::now() < hook_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    std::thread submitter([backend]() { backend->submit_async(); });
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!window_open.load() && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool entered = window_open.load();
+    if (entered) {
+        backend->cancel_requests_with_tag(kTag);
+    }
+    release_window.store(true);
+    submitter.join();
+    backend->_debug_set_enqueue_window_hook_for_testing({});
+
+    GDEX_EXPECT_TRUE(entered);
+
+    const uint64_t fence = backend->get_completion_fence();
+    GDEX_EXPECT_TRUE(backend->wait_for_completion(fence, 5000));
+    bool settled = false;
+    const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < settle_deadline) {
+        backend->poll_batch_status();
+        if (backend->is_batch_complete()) {
+            settled = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    GDEX_EXPECT_TRUE(settled);
+
+    // The slot must be reusable: a second request stages, submits and retires.
+    godot::Ref<godot::DSRequest> second = make_dummy_request(fixture_path, 1024);
+    second->set_uncompressed_size(1024);
+    second->set_cancellation_tag(9203);
+    GDEX_EXPECT_TRUE(backend->enqueue_request(second));
+    backend->submit_async();
+    const uint64_t second_fence = backend->get_completion_fence();
+    GDEX_EXPECT_TRUE(backend->wait_for_completion(second_fence, 5000));
+    bool reused = false;
+    const auto reuse_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < reuse_deadline) {
+        backend->poll_batch_status();
+        if (backend->is_batch_complete() && second->get_status() == godot::DSRequest::STATUS_COMPLETED) {
+            reused = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    GDEX_EXPECT_TRUE(reused);
+#else
+    (void)ctx;
+    GDEX_SKIP("The enqueue-window seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 

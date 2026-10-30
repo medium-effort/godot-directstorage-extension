@@ -3466,6 +3466,9 @@ void Win32Backend::submit_async() {
 	}
 	int submit_slot_index = active_batch_slot.load();
 	Vector<GPUTargetTransition> pre_transitions;
+	// Enqueue payload staged under batch_mutex and consumed after it is released.
+	std::vector<DSTORAGE_REQUEST> local_dstorage[QUEUE_COUNT];
+	bool enqueue_queue[QUEUE_COUNT] = { false };
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		bool has_work = false;
@@ -3484,11 +3487,37 @@ void Win32Backend::submit_async() {
 		if (!has_work) {
 			return;
 		}
-		for (QueueState &queue : priority_queues) {
-			queue.batch_slots[submit_slot_index].closing = true;
+		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
+			QueueState &queue = priority_queues[queue_index];
+			BatchSlot &slot = queue.batch_slots[submit_slot_index];
+			slot.closing = true;
+			// Take the payload out of the slot while the lock is held. The loop
+			// below hands it to DirectStorage with batch_mutex released, so it has
+			// to be memory no other thread can reach: cancel_requests_with_tag()
+			// walks these same containers under this lock, and reading them while
+			// the submitting thread still owns and clears them is a data race.
+			// Copy rather than move so the slot keeps its capacity for the next
+			// flush.
+			enqueue_queue[queue_index] = queue.queue != nullptr && !slot.dstorage_requests.empty();
+			if (!enqueue_queue[queue_index]) {
+				continue;
+			}
+			local_dstorage[queue_index] = slot.dstorage_requests;
+			slot.dstorage_requests.clear();
+			// Re-seat every name while the source strings cannot move: DirectStorage
+			// retains Name for the life of the request.
+			for (size_t i = 0; i < local_dstorage[queue_index].size() && i < slot.request_names.size(); i++) {
+				local_dstorage[queue_index][i].Name = slot.request_names[i].c_str();
+			}
 		}
 		active_batch_slot.store(1 - submit_slot_index);
 	}
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	if (enqueue_window_hook) {
+		enqueue_window_hook();
+	}
+#endif
 
 	if (!pre_transitions.is_empty()) {
 		if (!execute_transitions(pre_transitions, true)) {
@@ -3521,25 +3550,18 @@ void Win32Backend::submit_async() {
 	}
 
 	// Dispatch EnqueueRequest to DirectStorage outside batch_mutex to prevent
-	// queue back-pressure deadlocks with completion polling.
+	// queue back-pressure deadlocks with completion polling. The payload is the
+	// stack-local copy taken above, never the slot's own container.
 	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
-		QueueState &queue = priority_queues[queue_index];
-		BatchSlot &slot = queue.batch_slots[submit_slot_index];
-		if (!queue.queue || slot.dstorage_requests.empty() || !slot.closing || slot.submitted) {
+		if (!enqueue_queue[queue_index] || local_dstorage[queue_index].empty()) {
 			continue;
 		}
-		for (size_t i = 0; i < slot.dstorage_requests.size(); i++) {
-			if (i < slot.request_names.size()) {
-				slot.dstorage_requests[i].Name = slot.request_names[i].c_str();
-			}
-		}
-		queue.queue->EnqueueRequests(
-				slot.dstorage_requests.data(),
-				static_cast<UINT>(slot.dstorage_requests.size()),
+		priority_queues[queue_index].queue->EnqueueRequests(
+				local_dstorage[queue_index].data(),
+				static_cast<UINT>(local_dstorage[queue_index].size()),
 				nullptr,
 				0,
 				DSTORAGE_ENQUEUE_REQUEST_FLAG_NONE);
-		slot.dstorage_requests.clear();
 	}
 
 	std::deque<BatchMetadata> submitted_batches;
@@ -3751,17 +3773,39 @@ void Win32Backend::submit_batch() {
 	}
 
 	Vector<GPUTargetTransition> pre_transitions;
+	// Enqueue payload staged under batch_mutex and consumed after it is released.
+	std::vector<DSTORAGE_REQUEST> local_dstorage[QUEUE_COUNT];
+	bool enqueue_queue[QUEUE_COUNT] = { false };
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
-			BatchSlot &slot = priority_queues[queue_index].batch_slots[submit_slot_index];
+			QueueState &queue = priority_queues[queue_index];
+			BatchSlot &slot = queue.batch_slots[submit_slot_index];
 			slot.closing = true;
 			for (int t = 0; t < slot.gpu_transitions.size(); t++) {
 				pre_transitions.push_back(slot.gpu_transitions[t]);
 			}
+			// Same contract as submit_async(): the payload leaves the slot while the
+			// lock is held, so the enqueue below never shares a container with a
+			// concurrent cancel_requests_with_tag().
+			enqueue_queue[queue_index] = queue.queue != nullptr && !slot.dstorage_requests.empty();
+			if (!enqueue_queue[queue_index]) {
+				continue;
+			}
+			local_dstorage[queue_index] = slot.dstorage_requests;
+			slot.dstorage_requests.clear();
+			for (size_t i = 0; i < local_dstorage[queue_index].size() && i < slot.request_names.size(); i++) {
+				local_dstorage[queue_index][i].Name = slot.request_names[i].c_str();
+			}
 		}
 		active_batch_slot.store(1 - submit_slot_index);
 	}
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	if (enqueue_window_hook) {
+		enqueue_window_hook();
+	}
+#endif
 	if (!pre_transitions.is_empty()) {
 		if (!execute_transitions(pre_transitions, true)) {
 			UtilityFunctions::push_error("[DirectStorage] Failed to transition GPU destination textures to D3D12_RESOURCE_STATE_COMMON; aborting batch submit.");
@@ -3794,25 +3838,18 @@ void Win32Backend::submit_batch() {
 	}
 
 	// Dispatch EnqueueRequest to DirectStorage outside batch_mutex to prevent
-	// queue back-pressure deadlocks with completion polling.
+	// queue back-pressure deadlocks with completion polling. The payload is the
+	// stack-local copy taken above, never the slot's own container.
 	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
-		QueueState &queue = priority_queues[queue_index];
-		BatchSlot &slot = queue.batch_slots[submit_slot_index];
-		if (!queue.queue || slot.dstorage_requests.empty() || !slot.closing || slot.submitted) {
+		if (!enqueue_queue[queue_index] || local_dstorage[queue_index].empty()) {
 			continue;
 		}
-		for (size_t i = 0; i < slot.dstorage_requests.size(); i++) {
-			if (i < slot.request_names.size()) {
-				slot.dstorage_requests[i].Name = slot.request_names[i].c_str();
-			}
-		}
-		queue.queue->EnqueueRequests(
-				slot.dstorage_requests.data(),
-				static_cast<UINT>(slot.dstorage_requests.size()),
+		priority_queues[queue_index].queue->EnqueueRequests(
+				local_dstorage[queue_index].data(),
+				static_cast<UINT>(local_dstorage[queue_index].size()),
 				nullptr,
 				0,
 				DSTORAGE_ENQUEUE_REQUEST_FLAG_NONE);
-		slot.dstorage_requests.clear();
 	}
 
 	Vector<int> submitted_queues;
@@ -4206,6 +4243,32 @@ void Win32Backend::_debug_set_queue_fence_counters_for_testing(int p_queue_index
 	QueueState &queue = priority_queues[p_queue_index];
 	queue.completion_fence_value = p_completion_value;
 	queue.completed_fence_value = MIN(p_completed_value, p_completion_value);
+#endif
+}
+
+void Win32Backend::_debug_set_enqueue_window_hook_for_testing(const std::function<void()> &p_hook) {
+	// Test-only seam. Installs the callback run inside the batch_mutex-free
+	// enqueue window of submit_async()/submit_batch(), or clears it when p_hook is
+	// empty. Callers must clear it before the captured state dies and before
+	// deleting the backend. Never bound in _bind_methods().
+	enqueue_window_hook = p_hook;
+}
+
+int Win32Backend::_debug_pending_enqueue_count() const {
+#ifdef _WIN32
+	// Test-only seam. Deliberately reads the slot containers WITHOUT batch_mutex:
+	// it is called from the test thread while the submitting thread is parked in
+	// the hook, and 0 is exactly the state the fix guarantees - the payload is
+	// owned by the submitting stack frame, not by any slot.
+	int pending = 0;
+	for (int q = 0; q < QUEUE_COUNT; q++) {
+		for (int s = 0; s < BATCH_SLOT_COUNT; s++) {
+			pending = std::max(pending, static_cast<int>(priority_queues[q].batch_slots[s].dstorage_requests.size()));
+		}
+	}
+	return pending;
+#else
+	return 0;
 #endif
 }
 #endif
