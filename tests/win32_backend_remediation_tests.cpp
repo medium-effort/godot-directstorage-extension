@@ -1064,7 +1064,7 @@ GDEX_TEST_T(win32_remediation, staging_rollback_releases_source_file, TAG_INTEGR
 GDEX_TEST_T(win32_remediation, multi_queue_fence_wait_covers_low_counter_queue, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
-    // A20261029-HIGH-02: get_completion_fence() reports the MAX of three
+    // get_completion_fence() reports the MAX of three
     // independent per-queue counters, and each counter restarts at 0 on its own
     // queue. wait_for_completion() used to wait only on queues whose own counter
     // was >= that watermark, so a queue drifting behind was skipped and the call
@@ -1127,7 +1127,7 @@ GDEX_TEST_T(win32_remediation, multi_queue_fence_wait_covers_low_counter_queue, 
 GDEX_TEST_T(win32_remediation, multi_queue_fence_wait_releases_when_low_counter_completes, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
-    // A20261029-HIGH-02, anti-over-wait half: once every queue has actually
+    // Anti-over-wait half: once every queue has actually
     // retired, the wait must still return true immediately. Without this, a "fix"
     // that blocks unconditionally (or that waits on the caller's watermark on
     // every queue) would satisfy the companion case while breaking every caller.

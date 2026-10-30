@@ -830,7 +830,7 @@ bool Win32Backend::wait_for_completion(uint64_t p_fence_value, uint32_t p_timeou
 			// restarts at 0 on its own queue, so one queue's value is NOT comparable
 			// to another's. Filtering on `completion_fence_value >= p_fence_value`
 			// dropped every queue whose counter happened to be lower and returned
-			// "complete" while its DMA was still running (A20261029-HIGH-02).
+			// "complete" while its DMA was still running.
 			// Wait for each queue's own latest value, clamped to the caller's
 			// watermark: a queue below the watermark is still drained.
 			if (!queue.completion_fence || queue.completion_fence_value == 0) {

@@ -701,7 +701,7 @@ GDEX_TEST_T(gpu_prewarm, cancel_in_flight_keeps_parent_and_rid_owned, TAG_INTEGR
     (void)ctx;
     GDEX_SKIP("The prewarm tracking seam is compiled out of release builds.");
 #else
-    // A20261029-CRIT-01: cancelling an in-flight GPU prewarm must not let the
+    // Cancelling an in-flight GPU prewarm must not let the
     // destination RID be freed while DirectStorage is still writing into it.
     // The preloader decides that from the PARENT request's is_gpu_in_flight(), so
     // the parent flag and the chunked-state lifetime are the things under test.
