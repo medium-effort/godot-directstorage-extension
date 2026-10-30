@@ -13,14 +13,35 @@
     that only initializes after the editor's filesystem scan completes.
     Without --editor, there is no Plugin lifecycle to bootstrap the test run.
 
-    Shutdown behavior (verified 2026-09-22): tree->quit() honors cleanly
-    once tests complete (JSON written, GDExtension context shut down,
-    logs close within ~1s). Both backup gates (--quit-after and the
-    external watchdog Kill) are now COMMENTED OUT because they never fired.
-    Re-enable them if a future run hangs.
+    Shutdown behavior: the harness writes the result JSON and then quits the
+    tree. The window disappears at the START of engine shutdown, while worker
+    threads (DirectStorage completion thread, render-thread dispatch, D3D12
+    teardown) are still being joined - so "window closed" and "process exited"
+    are different events, and a thread that never joins keeps the process alive
+    with no window and no output.
+
+    That is why this runner bounds the run in two places instead of trusting
+    tree->quit():
+
+      1. --quit-after <frames> (--QuitAfterFrames). A FRAME count, not a
+         deadline: in --editor mode frames only start after the filesystem
+         scan, and an unfocused 64x64 window can run at a few FPS. It cannot
+         bound start-up, and it cannot bound anything after the main loop ends
+         because it is not evaluated once the loop is gone.
+      2. A hard wall-clock bound (--TimeoutSec) on the WHOLE run, plus a
+         shorter post-results grace (--ShutdownGraceSec). Results landing on
+         disk end the "are the tests hung?" question and start the
+         "is shutdown hung?" question; the two are reported separately because
+         they mean different things.
+
+    Both bounds are armed. A timeout fails the run and reports which phase it
+    was in - it never reports success, because a killed run has no exit code
+    and the JSON alone cannot prove the engine shut down.
 
     Output is redirected at the OS level (Start-Process -RedirectStandard*)
-    so buffered logs survive a shutdown crash.
+    so buffered logs survive a shutdown crash. Godot's stdout is block-buffered,
+    so a killed run may lose its tail; the JSON is written and flushed by the
+    harness and is the authoritative result.
 
 .PARAMETER Filter
     gdextest name-glob filter (e.g. "gpu_*"). Matched against suite.name.
@@ -29,18 +50,29 @@
     Result JSON filename, written inside the fixture project dir.
 
 .PARAMETER QuitAfterFrames
-    --quit-after value (backup auto-close). Default 600. NOTE: redundant
-    since tree->quit() honors cleanly; the flag is commented out below.
+    --quit-after value (frame-count auto-close, passed through to the engine).
+    Default 30: the editor's own exit path, kept as the graceful one. It is a
+    frame count, so it cannot bound start-up or post-main-loop shutdown; the
+    hard bound is -TimeoutSec.
 
 .PARAMETER TimeoutSec
-    External watchdog timeout in seconds. Default 120. NOTE: the kill gate
-    is commented out below; kept as a tunable for manual re-enable.
+    Hard wall-clock bound on the whole run (launch -> process exit), in
+    seconds. Default 180. On expiry the process tree is killed and the run
+    FAILS. Must exceed the slowest expected suite; the windowed D3D12 suite
+    can take minutes on a cold start even though the tests themselves are
+    seconds.
+
+.PARAMETER ShutdownGraceSec
+    Once the result JSON appears, how long the engine gets to exit on its own
+    before the run is reported as "results produced, shutdown did not
+    complete". Default 15.
 #>
 param(
     [string]$Filter = "gpu_*",
     [string]$JsonName = "d3d12_windowed.json",
-    [int]$QuitAfterFrames = 600,
-    [int]$TimeoutSec = 120,
+    [int]$QuitAfterFrames = 30,
+    [int]$TimeoutSec = 180,
+    [int]$ShutdownGraceSec = 15,
     [string]$GodotExe = $env:GODOT,
     [switch]$Verbose
 )
@@ -207,9 +239,16 @@ else {
     Write-VerboseHost "Staged $($RuntimeDlls.Count) DirectStorage runtime DLL(s) into fixture." -ForegroundColor DarkGray
 }
 
-# Remove stale results so a crash cannot be masked by an old JSON.
+# Remove stale results so a crash cannot be masked by an old JSON. A run that
+# was killed leaves Godot holding the redirect files, and Start-Process then
+# fails with an unhelpful "file in use" - verify the clear instead of assuming.
 foreach ($f in @($JsonRel, $LogOut, $LogErr)) {
-    if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+}
+$stillLocked = @(@($JsonRel, $LogOut, $LogErr) | Where-Object { Test-Path -LiteralPath $_ })
+if ($stillLocked.Count -gt 0) {
+    Write-Host ("ERROR: could not clear stale run artifacts: {0}. A previous Godot run may still be alive; stop it and retry." -f ($stillLocked -join ", ")) -ForegroundColor Red
+    exit 1
 }
 Get-ChildItem -Path $FixtureBin -Filter "~*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
@@ -229,31 +268,78 @@ $ArgList = @(
 
 Write-VerboseHost "Godot: $GodotExe" -ForegroundColor DarkGray
 Write-VerboseHost "Args : $($ArgList -join ' ')" -ForegroundColor DarkGray
-Write-VerboseHost "Running windowed D3D12 test (no kill gate; relying on tree->quit())..." -ForegroundColor Cyan
+Write-VerboseHost "Running windowed D3D12 test (hard bound ${TimeoutSec}s, shutdown grace ${ShutdownGraceSec}s)..." -ForegroundColor Cyan
 
 $p = Start-Process -FilePath $GodotExe -ArgumentList $ArgList `
     -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr `
     -PassThru -NoNewWindow
 
-# Watchdog kill gate DISABLED (verified 2026-09-22: tree->quit() exits cleanly,
-# JSON + shutdown log written, process gone within ~1s; the gate never fired).
-# Re-enable if a future run hangs. Original gate:
-#   $timedOut = $false
-#   if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-#       $timedOut = $true
-#       Write-Host "Watchdog timeout (${TimeoutSec}s) - killing process." -ForegroundColor Yellow
-#       try { $p.Kill() } catch {}
-#       $p.WaitForExit(5000) | Out-Null
-#   }
+# Bounded wait in two phases.
+#
+# Phase A (no results yet): the run is bounded by $TimeoutSec only. --quit-after
+# is already on the command line, but it counts frames and is not evaluated
+# before the main loop starts, so it cannot bound start-up.
+#
+# Phase B (results written): the JSON is on disk, so the tests are done. What
+# remains is engine shutdown - and that is the phase that hangs, because the
+# window is destroyed before the worker threads are joined. Give it
+# $ShutdownGraceSec, then report it as its own failure instead of blaming the
+# suite.
+function Stop-ProcessTree {
+    param([System.Diagnostics.Process]$Process, [int]$GraceMs = 5000)
+    try {
+        $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $($Process.Id)" -ErrorAction SilentlyContinue
+        foreach ($child in $children) {
+            try { Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    } catch {}
+    try { if (-not $Process.HasExited) { $Process.Kill() } } catch {}
+    try { $Process.WaitForExit($GraceMs) | Out-Null } catch {}
+}
+
 $timedOut = $false
-try {
-    Wait-Process -InputObject $p -ErrorAction SilentlyContinue
-} catch {}
-$exitCode = if ($null -ne $p.ExitCode) { $p.ExitCode } else { 0 }
+$shutdownHung = $false
+$resultsAtSec = $null
+while (-not $p.HasExited) {
+    $elapsedSec = $ScriptStopwatch.Elapsed.TotalSeconds
+    if ($null -eq $resultsAtSec -and (Test-Path -LiteralPath $JsonRel)) {
+        $resultsAtSec = $elapsedSec
+        Write-VerboseHost ("Results written at {0:F1}s; waiting up to {1}s for engine shutdown." -f $resultsAtSec, $ShutdownGraceSec) -ForegroundColor DarkGray
+    }
+    if ($null -ne $resultsAtSec -and -not $shutdownHung -and ($elapsedSec - $resultsAtSec) -ge $ShutdownGraceSec) {
+        $shutdownHung = $true
+        Write-Host ("WARNING: results were written {0:F1}s ago but the engine is still running (window already closed). This is a shutdown-thread hang, not a test hang; waiting for the {1}s hard bound." -f ($elapsedSec - $resultsAtSec), $TimeoutSec) -ForegroundColor Yellow
+    }
+    if ($elapsedSec -ge $TimeoutSec) {
+        $timedOut = $true
+        break
+    }
+    Start-Sleep -Milliseconds 200
+}
+
+if ($timedOut) {
+    $phase = if ($null -ne $resultsAtSec) { ("engine shutdown (results were written at {0:F1}s)" -f $resultsAtSec) } else { "test execution (no results written)" }
+    Write-Host ("Watchdog timeout: hard bound of {0}s reached during {1} - killing process tree." -f $TimeoutSec, $phase) -ForegroundColor Yellow
+    Stop-ProcessTree -Process $p -GraceMs 5000
+} else {
+    # Exited on its own; collect the code before anything else touches $p.
+    $null = $p.WaitForExit(5000)
+}
+
+# Never manufacture an exit code: an unknown code must not read as success.
+# A code read after our own Kill() describes the kill, not the engine, so it is
+# deliberately not collected.
+$exitCode = $null
+if (-not $timedOut -and $p.HasExited) {
+    try { $exitCode = [int]$p.ExitCode } catch { $exitCode = $null }
+}
+$exitAtSec = $ScriptStopwatch.Elapsed.TotalSeconds
+$resultsAtText = if ($null -ne $resultsAtSec) { ("{0:F1}s" -f $resultsAtSec) } else { "never" }
 
 if ($Verbose) {
     Write-Host ""
-    Write-Host "=== Exit code: $exitCode (timedOut=$timedOut) ===" -ForegroundColor Cyan
+    $exitText = if ($null -eq $exitCode) { "no exit code: process was killed" } else { "exit code $exitCode" }
+    Write-Host "=== Exit: $exitText (timedOut=$timedOut, resultsAt=$resultsAtText) ===" -ForegroundColor Cyan
     Write-Host "=== STDOUT (filtered) ===" -ForegroundColor Cyan
     if (Test-Path $LogOut) {
         Get-Content $LogOut | Select-String -Pattern "DirectStorage|D3D12|RenderingDevice|PASSED|FAILED|SKIP|gpu_|GDX_TEST_OUTPUT|backend|leaked|RID" | Select-Object -First 60
@@ -269,6 +355,7 @@ if ($Verbose) {
 }
 
 $testPassed = $false
+$failureReason = $null
 if (Test-Path $JsonRel) {
     try {
         $doc = Get-Content -LiteralPath $JsonRel -Raw | ConvertFrom-Json
@@ -281,19 +368,41 @@ if (Test-Path $JsonRel) {
                 # loaded library lacks the suite (stale build) or the name is
                 # wrong. Both need a human, not a green banner.
                 Write-Host ("Tests: filter '{0}' matched 0 tests (stale test library or wrong suite name) - loaded {1} from {2:yyyy-MM-dd HH:mm:ss}" -f $Filter, $TestDll.Name, $TestDll.LastWriteTime) -ForegroundColor Red
+                $failureReason = "filter matched 0 tests"
                 $testPassed = $false
             } else {
-                $isSuccess = ($exitCode -eq 0 -and $t.fail -eq 0 -and (-not $t.crashed -or $t.crashed -eq 0))
-                $color = if ($isSuccess) { "Green" } else { "Red" }
-                Write-Host "Tests: passed $($t.pass), failed $($t.fail), skipped $($t.skip)$crashedNote (exit code $exitCode)" -ForegroundColor $color
-                $testPassed = $isSuccess
+                $testsGreen = ($t.fail -eq 0 -and (-not $t.crashed -or $t.crashed -eq 0))
+                $exitOk = ($null -ne $exitCode -and $exitCode -eq 0)
+                $exitText = if ($null -eq $exitCode) { "no exit code: process was killed" } else { "exit code $exitCode" }
+                $color = if ($testsGreen -and $exitOk -and -not $timedOut) { "Green" } else { "Red" }
+                Write-Host "Tests: passed $($t.pass), failed $($t.fail), skipped $($t.skip)$crashedNote ($exitText)" -ForegroundColor $color
+                if ($timedOut) {
+                    # Results can be complete while the engine never exits; say
+                    # which one happened instead of implying the suite failed.
+                    Write-Host ("Shutdown: NOT CLEAN - hard bound {0}s reached and the process was killed." -f $TimeoutSec) -ForegroundColor Red
+                    $failureReason = "engine did not exit (killed at ${TimeoutSec}s)"
+                } elseif ($null -eq $exitCode) {
+                    Write-Host "Shutdown: NOT CLEAN - process exited without a readable exit code." -ForegroundColor Red
+                    $failureReason = "engine exit code unreadable"
+                } elseif ($exitCode -ne 0) {
+                    Write-Host ("Shutdown: engine exited with code {0}." -f $exitCode) -ForegroundColor Red
+                    $failureReason = "engine exit code $exitCode"
+                } elseif ($testsGreen) {
+                    Write-Host ("Shutdown: clean (engine exited {0:F1}s after launch)." -f $exitAtSec) -ForegroundColor DarkGray
+                }
+                $testPassed = ($testsGreen -and $exitOk -and -not $timedOut)
             }
+        } else {
+            Write-Host "Tests: results JSON at $JsonRel has no 'totals' block" -ForegroundColor Red
+            $failureReason = "results JSON missing totals"
         }
     } catch {
         Write-Host "Tests: could not parse totals from $JsonRel" -ForegroundColor Yellow
+        $failureReason = "unparseable results JSON"
     }
 } else {
-    Write-Host "Tests: no results file generated at $JsonRel (exit code $exitCode)" -ForegroundColor Red
+    Write-Host "Tests: no results file generated at $JsonRel" -ForegroundColor Red
+    $failureReason = if ($timedOut) { "no results within ${TimeoutSec}s (killed)" } else { "no results file" }
 }
 
 if (-not $testPassed -and -not $Verbose) {
@@ -318,14 +427,14 @@ if ($testPassed) {
     Write-Host ""
     Write-Host "================================================================================" -ForegroundColor Green
     Write-Host " [RUN SUCCESS] D3D12 windowed tests completed successfully! " -ForegroundColor White -BackgroundColor DarkGreen
-    Write-Host " Duration: ${elapsedSecs}s" -ForegroundColor Green
+    Write-Host " Duration: ${elapsedSecs}s (results at $resultsAtText, clean exit at $('{0:F1}s' -f $exitAtSec))" -ForegroundColor Green
     Write-Host "================================================================================" -ForegroundColor Green
     exit 0
 } else {
     Write-Host ""
     Write-Host "================================================================================" -ForegroundColor Red
-    Write-Host " [RUN FAILED] D3D12 windowed tests failed " -ForegroundColor White -BackgroundColor DarkRed
-    Write-Host " Duration: ${elapsedSecs}s" -ForegroundColor DarkGray
+    Write-Host " [RUN FAILED] D3D12 windowed run failed: $failureReason " -ForegroundColor White -BackgroundColor DarkRed
+    Write-Host " Duration: ${elapsedSecs}s (results at $resultsAtText)" -ForegroundColor DarkGray
     Write-Host "================================================================================" -ForegroundColor Red
-    exit $(if ($exitCode -ne 0) { $exitCode } else { 1 })
+    exit $(if ($null -ne $exitCode -and $exitCode -ne 0) { $exitCode } else { 1 })
 }
