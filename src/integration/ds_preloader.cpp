@@ -313,9 +313,11 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 	DSTexHeader header;
 	memcpy(&header, bulk.ptr(), sizeof(DSTexHeader));
 
-	// Validation mirrors DSTex::read_header exactly (magic, dimensions,
-	// 1..16 mips, mip-table bounds) so the cache never accepts a file the
-	// Dictionary path would reject.
+	// Validation mirrors DSTex::read_header (magic, dimensions, 1..16 mips, the
+	// dstex_sizes_are_sane() size contract, mip-table bounds) and adds the
+	// per-mip sum contract that DSPkg::open() and the Win32 enqueue path already
+	// enforce, so the cache never accepts a file the Dictionary path, the
+	// archive reader or the GPU enqueue path would reject.
 	if (header.magic != 0x58455444) {
 		UtilityFunctions::push_error("DSTex: Invalid magic number.");
 		return false;
@@ -326,6 +328,10 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 	}
 	if (header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT) {
 		UtilityFunctions::push_error("DSTex: Invalid mip count (must be 1..16).");
+		return false;
+	}
+	if (!dstex_sizes_are_sane(header.width, header.height, header.original_size, header.compressed_size)) {
+		UtilityFunctions::push_error("DSTex: Header sizes exceed sane texture bounds (FMT-01).");
 		return false;
 	}
 	uint64_t entry_size = (header.version == 1) ? sizeof(DSTexMipEntry) : sizeof(DSTexMipEntryV2);
@@ -372,6 +378,10 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 			filled.mip_sizes[i] = static_cast<int32_t>(mip_entry.size);
 		}
 	} else if (header.version == 2) {
+		// Each table entry is a uint32 and there are at most 16 of them, so the
+		// sums cannot overflow uint64 and need no guard of their own.
+		uint64_t sum_compressed = 0;
+		uint64_t sum_uncompressed = 0;
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntryV2 mip_entry;
 			memcpy(&mip_entry, table_ptr + i * sizeof(DSTexMipEntryV2), sizeof(DSTexMipEntryV2));
@@ -380,10 +390,20 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 				UtilityFunctions::push_error("DSTex: Mip entry exceeds file bounds or overflows.");
 				return false;
 			}
+			sum_compressed += mip_entry.compressed_size;
+			sum_uncompressed += mip_entry.uncompressed_size;
 			filled.mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			filled.mip_sizes[i] = static_cast<int32_t>(mip_entry.compressed_size);
 			filled.mip_uncompressed_sizes[i] = static_cast<int32_t>(mip_entry.uncompressed_size);
 			filled.mip_row_pitches[i] = static_cast<int32_t>(mip_entry.row_pitch);
+		}
+		// The archive reader (DSPkg::open) and the Win32 enqueue path both require
+		// the mip table to add up to the header totals. Without it a header can
+		// declare a sane total while its mips declare gigabytes, which is what
+		// expand_requests() would allocate from.
+		if (sum_compressed != header.compressed_size || sum_uncompressed != header.original_size) {
+			UtilityFunctions::push_error("DSTex: Mip sizes do not match the header totals.");
+			return false;
 		}
 	} else {
 		UtilityFunctions::push_error("DSTex: Unsupported texture version.");
@@ -543,6 +563,10 @@ bool DSPreloader::validate_payload(const Payload &p_payload) {
 		UtilityFunctions::push_warning("DSPreloader: Invalid dimensions or mip count for '", p_payload.engine_path, "'; skipping prewarm.");
 		return false;
 	}
+	if (!dstex_sizes_are_sane(p_payload.width, p_payload.height, p_payload.original_size, p_payload.compressed_size)) {
+		UtilityFunctions::push_warning("DSPreloader: Header sizes exceed sane texture bounds for '", p_payload.engine_path, "'; skipping prewarm.");
+		return false;
+	}
 	if (p_payload.pixel_format >= (uint32_t)RenderingDevice::DATA_FORMAT_MAX) {
 		UtilityFunctions::push_warning("DSPreloader: Unsupported texture data format for '", p_payload.engine_path, "'; skipping prewarm.");
 		return false;
@@ -556,6 +580,23 @@ bool DSPreloader::validate_payload(const Payload &p_payload) {
 		int64_t mips = (int64_t)p_payload.mip_count;
 		if (p_payload.mip_offsets.size() < mips || p_payload.mip_sizes.size() < mips || p_payload.mip_uncompressed_sizes.size() < mips) {
 			UtilityFunctions::push_warning("DSPreloader: Incomplete v2 mip metadata for '", p_payload.engine_path, "'; skipping prewarm.");
+			return false;
+		}
+		// expand_requests() resizes one destination buffer per mip from these
+		// values, so their SUM is the allocation bound, not each value. A
+		// well-formed file sums to original_size, which the check above already
+		// caps; this only rejects a header whose mip table contradicts it.
+		uint64_t mip_total = 0;
+		for (int64_t i = 0; i < mips; ++i) {
+			const int64_t uncompressed = (int64_t)p_payload.mip_uncompressed_sizes[i];
+			if (uncompressed <= 0) {
+				UtilityFunctions::push_warning("DSPreloader: Invalid v2 mip size (mip ", i, ") for '", p_payload.engine_path, "'; skipping prewarm.");
+				return false;
+			}
+			mip_total += (uint64_t)uncompressed;
+		}
+		if (mip_total > MAX_PREWARM_REQUEST_BYTES) {
+			UtilityFunctions::push_warning("DSPreloader: v2 mip footprints exceed the prewarm buffer cap for '", p_payload.engine_path, "'; skipping prewarm.");
 			return false;
 		}
 	} else {

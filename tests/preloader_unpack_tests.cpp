@@ -12,7 +12,17 @@
 #include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/core/memory.hpp>
 
+#include <godot_cpp/classes/dir_access.hpp>
+#include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
+
+#include <godot_cpp/variant/color.hpp>
+#include <godot_cpp/variant/packed_string_array.hpp>
+#include <godot_cpp/variant/vector2i.hpp>
+
+#include <algorithm>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <vector>
 
@@ -21,6 +31,21 @@ namespace godot {
 struct PreloaderUnpackTest {
 	static Ref<Texture2D> build_texture(const DSPreloader::Payload &p_meta, const std::vector<PackedByteArray> &p_buffers) {
 		return DSPreloader::build_texture(p_meta, p_buffers);
+	}
+
+	// Header/payload validation seams. read_header_uncached() and validate_payload()
+	// are private (ds_preloader.h:295, :316); this friend already exists for
+	// build_texture() and entry injection, so the validation tests need no new seam.
+	static bool validate(const DSPreloader::Payload &p_payload) {
+		return DSPreloader::validate_payload(p_payload);
+	}
+
+	static bool read_header(const String &p_dstex_path, DSPreloader::PayloadHeader &r_out) {
+		return DSPreloader::read_header_uncached(p_dstex_path, r_out);
+	}
+
+	static bool resolve(const String &p_engine_path, DSPreloader::Payload &r_out) {
+		return DSPreloader::resolve_payload(p_engine_path, r_out);
 	}
 
 	// Injects one already-terminal CPU prewarm entry straight into the pending
@@ -400,4 +425,285 @@ GDEX_TEST_T(preloader_budget, disabled_cache_refuses_both_entry_points, TAG_UNIT
 	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(0), before_unbuilt);
 	GDEX_EXPECT_EQ(cache->get_pending_prewarm_count(0), before_pending);
 	GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+}
+
+// --- Header/payload validation parity --------------------------------------
+//
+// Gate A parity: prewarm must not admit a .dstex that the format layer, the
+// archive reader or the Win32 enqueue path already refuse. DSTex::read_header()
+// is the oracle used below: it is the exact predicate ResourceLoader.load()
+// runs for a direct .dstex file, and it is cheap to call from a test.
+//
+// Fixtures are WRITER-PRODUCED then patched. DSTex::write_to_file() emits a
+// valid v2 file, and each case rewrites exactly one field in a byte copy, so
+// magic/format/mip-table/alignment stay valid and a rejection is attributable
+// to the patched field instead of to a malformed fixture. Every rejection case
+// also asserts its unpatched base is still accepted, so an implementation that
+// simply rejects everything cannot pass.
+
+namespace {
+
+const char *const kValidBase1 = "user://gdex_validation_valid_1mip.dstex";
+const char *const kValidBase7 = "user://gdex_validation_valid_7mip.dstex";
+const char *const kPatchDim = "user://gdex_validation_patch_dim.dstex";
+const char *const kPatchFootprint = "user://gdex_validation_patch_footprint.dstex";
+const char *const kPatchMipSum = "user://gdex_validation_patch_mipsum.dstex";
+
+// 64x64 RGBA8: base row is 256 B (already pitch-aligned), base mip 16 KiB.
+constexpr int kBaseWidth = 64;
+constexpr int kBaseHeight = 64;
+constexpr int kBaseMips = 7;
+// Full-chain footprint total: 16384+8192+4096+2048+1024+512+256.
+constexpr uint64_t kBase7Footprint = 32512ULL;
+// 64*64*32 = 131072, so this violates the footprint clause while staying far
+// below both the 512 MiB total-bytes cap and UINT32_MAX.
+constexpr uint64_t kOverFootprint = 200000ULL;
+// 7 x 132 MiB = 924 MiB: above the 512 MiB aggregate cap, and small enough that
+// a pre-fix build allocates it without endangering the runner.
+constexpr uint32_t kMipUncompressed = 132u * 1024u * 1024u;
+
+godot::PackedByteArray make_chain_data(int p_mips) {
+	godot::PackedByteArray data;
+	for (int i = 0; i < p_mips; ++i) {
+		const int dim = std::max(1, kBaseWidth >> i);
+		godot::Ref<godot::Image> mip = godot::Image::create(dim, dim, false, godot::Image::FORMAT_RGBA8);
+		mip->fill(godot::Color(0.2f, 0.4f, 0.6f, 1.0f));
+		data.append_array(mip->get_data());
+	}
+	return data;
+}
+
+bool write_valid_base(const char *p_path, int p_mips) {
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	return dstex->write_to_file(godot::String(p_path), make_chain_data(p_mips), kBaseWidth,
+			kBaseHeight, godot::Image::FORMAT_RGBA8, p_mips, 9) == godot::OK;
+}
+
+godot::PackedByteArray read_bytes(const char *p_path) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		return godot::PackedByteArray();
+	}
+	godot::PackedByteArray bytes = file->get_buffer(static_cast<int64_t>(file->get_length()));
+	file->close();
+	return bytes;
+}
+
+bool write_bytes(const char *p_path, const godot::PackedByteArray &p_bytes) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::WRITE);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	file->store_buffer(p_bytes);
+	// store_buffer() returns void in godot-cpp; the error is only observable here.
+	const bool ok = file->get_error() == godot::OK;
+	file->close();
+	return ok;
+}
+
+void put_u32(godot::PackedByteArray &r_bytes, int64_t p_offset, uint32_t p_value) {
+	memcpy(r_bytes.ptrw() + p_offset, &p_value, sizeof(p_value));
+}
+
+void put_u64(godot::PackedByteArray &r_bytes, int64_t p_offset, uint64_t p_value) {
+	memcpy(r_bytes.ptrw() + p_offset, &p_value, sizeof(p_value));
+}
+
+uint32_t get_u32(const godot::PackedByteArray &p_bytes, int64_t p_offset) {
+	uint32_t value = 0;
+	memcpy(&value, p_bytes.ptr() + p_offset, sizeof(value));
+	return value;
+}
+
+// Registers deletion for every fixture path. Register this BEFORE constructing
+// the cache in integration cases: teardowns run LIFO, and the texture cache must
+// be torn down before its request paths are removed from disk.
+void track_cleanup(::gdextest::TestContext &ctx, std::initializer_list<const char *> p_paths) {
+	for (const char *p : p_paths) {
+		const godot::String path(p);
+		ctx.add_teardown([path]() {
+			godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+			if (ps != nullptr) {
+				godot::DirAccess::remove_absolute(ps->globalize_path(path));
+			}
+		});
+	}
+}
+
+godot::Dictionary loader_header(const char *p_path) {
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	return dstex->read_header(godot::String(p_path));
+}
+
+} // namespace
+
+GDEX_TEST_T(preloader_validation, header_dimension_bound_rejected, TAG_UNIT) {
+	GDEX_ASSERT_TRUE(write_valid_base(kValidBase1, 1));
+	track_cleanup(ctx, { kValidBase1, kPatchDim });
+
+	godot::PackedByteArray bytes = read_bytes(kValidBase1);
+	GDEX_ASSERT_FALSE(bytes.is_empty());
+	put_u32(bytes, 8, 65535u); // width; leaves height/original_size untouched
+	GDEX_ASSERT_TRUE(write_bytes(kPatchDim, bytes));
+
+	// Fixture isolation: the unpatched base parses.
+	godot::DSPreloader::PayloadHeader base_header;
+	GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::read_header(godot::String(kValidBase1), base_header));
+	GDEX_EXPECT_EQ(base_header.width, static_cast<uint32_t>(kBaseWidth));
+
+	// The loader's own predicate rejects the same bytes.
+	GDEX_EXPECT_TRUE(loader_header(kPatchDim).is_empty());
+
+	godot::DSPreloader::PayloadHeader patched_header;
+	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::read_header(godot::String(kPatchDim), patched_header));
+}
+
+GDEX_TEST_T(preloader_validation, header_footprint_bound_rejected, TAG_UNIT) {
+	GDEX_ASSERT_TRUE(write_valid_base(kValidBase1, 1));
+	track_cleanup(ctx, { kValidBase1, kPatchFootprint });
+
+	godot::PackedByteArray bytes = read_bytes(kValidBase1);
+	GDEX_ASSERT_FALSE(bytes.is_empty());
+	put_u64(bytes, 24, kOverFootprint); // original_size
+	GDEX_ASSERT_TRUE(write_bytes(kPatchFootprint, bytes));
+
+	godot::DSPreloader::PayloadHeader base_header;
+	GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::read_header(godot::String(kValidBase1), base_header));
+	GDEX_EXPECT_EQ(base_header.original_size, 16384ULL);
+
+	GDEX_EXPECT_TRUE(loader_header(kPatchFootprint).is_empty());
+
+	godot::DSPreloader::PayloadHeader patched_header;
+	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::read_header(godot::String(kPatchFootprint), patched_header));
+}
+
+GDEX_TEST_T(preloader_validation, v2_mip_sums_must_match_header, TAG_UNIT) {
+	GDEX_ASSERT_TRUE(write_valid_base(kValidBase7, kBaseMips));
+	track_cleanup(ctx, { kValidBase7, kPatchMipSum });
+
+	godot::PackedByteArray bytes = read_bytes(kValidBase7);
+	GDEX_ASSERT_FALSE(bytes.is_empty());
+	const uint32_t mip_count = get_u32(bytes, 20);
+	GDEX_ASSERT_EQ(mip_count, static_cast<uint32_t>(kBaseMips));
+	for (uint32_t i = 0; i < mip_count; ++i) {
+		put_u32(bytes, static_cast<int64_t>(48 + i * 24 + 12), kMipUncompressed);
+	}
+	GDEX_ASSERT_TRUE(write_bytes(kPatchMipSum, bytes));
+
+	// Header totals are untouched and sane; only the mip table contradicts them.
+	godot::DSPreloader::PayloadHeader base_header;
+	GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::read_header(godot::String(kValidBase7), base_header));
+	GDEX_EXPECT_EQ(base_header.original_size, kBase7Footprint);
+
+	godot::DSPreloader::PayloadHeader patched_header;
+	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::read_header(godot::String(kPatchMipSum), patched_header));
+
+	// The same construction through the payload gate: a header that is sane on
+	// its own but whose mip footprints sum to 7 x 132 MiB = 924 MiB.
+	godot::DSPreloader::Payload payload;
+	payload.engine_path = godot::String("user://gdex_validation_synthetic.png");
+	payload.payload_key = payload.engine_path;
+	payload.width = static_cast<uint32_t>(kBaseWidth);
+	payload.height = static_cast<uint32_t>(kBaseHeight);
+	payload.mip_count = static_cast<uint32_t>(kBaseMips);
+	payload.pixel_format = static_cast<uint32_t>(godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGBA8));
+	payload.original_size = kBase7Footprint;
+	payload.compressed_size = base_header.compressed_size;
+	payload.is_v2 = true;
+	for (int i = 0; i < kBaseMips; ++i) {
+		payload.mip_offsets.push_back(static_cast<int64_t>(i) * 4);
+		payload.mip_sizes.push_back(4);
+		payload.mip_uncompressed_sizes.push_back(static_cast<int32_t>(kMipUncompressed));
+		payload.mip_row_pitches.push_back(256);
+	}
+	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::validate(payload));
+}
+
+GDEX_TEST_T(preloader_validation, validate_rejects_oversized_payload, TAG_UNIT) {
+	// 64x4 RGBA8: width*height*32 = 8192, and 16384 exceeds it while staying
+	// under both the 512 MiB total cap and UINT32_MAX, so only the footprint
+	// clause can reject this - in the v1 branch and in the v2 branch alike.
+	godot::DSPreloader::Payload v1;
+	v1.engine_path = godot::String("user://gdex_validation_v1.png");
+	v1.payload_key = v1.engine_path;
+	v1.width = 64;
+	v1.height = 4;
+	v1.mip_count = 1;
+	v1.pixel_format = static_cast<uint32_t>(godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGBA8));
+	v1.original_size = 16384;
+	v1.compressed_size = 1024;
+	v1.is_v2 = false;
+	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::validate(v1));
+
+	godot::DSPreloader::Payload v2 = v1;
+	v2.is_v2 = true;
+	v2.mip_offsets.push_back(0);
+	v2.mip_sizes.push_back(1024);
+	v2.mip_uncompressed_sizes.push_back(16384);
+	v2.mip_row_pitches.push_back(256);
+	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::validate(v2));
+}
+
+GDEX_TEST_T(preloader_validation, writer_output_still_accepted, TAG_UNIT) {
+	// Anti-"reject everything" control: everything the writer emits must keep
+	// passing all three predicates, or the change is a regression, not a fix.
+	GDEX_ASSERT_TRUE(write_valid_base(kValidBase1, 1));
+	GDEX_ASSERT_TRUE(write_valid_base(kValidBase7, kBaseMips));
+	track_cleanup(ctx, { kValidBase1, kValidBase7 });
+
+	const char *const paths[2] = { kValidBase1, kValidBase7 };
+	const int expected_mips[2] = { 1, kBaseMips };
+	for (int i = 0; i < 2; ++i) {
+		godot::DSPreloader::PayloadHeader header;
+		GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::read_header(godot::String(paths[i]), header));
+		GDEX_EXPECT_EQ(static_cast<int>(header.mip_count), expected_mips[i]);
+		GDEX_EXPECT_TRUE(loader_header(paths[i]).size() > 0);
+
+		godot::DSPreloader::Payload payload;
+		GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::resolve(godot::String(paths[i]), payload));
+		GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::validate(payload));
+	}
+}
+
+GDEX_TEST_T(preloader_validation, oversized_dstex_not_tracked, TAG_INTEGRATION) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable (module init did not run)");
+		return;
+	}
+	if (!ds->is_initialized() && !ds->initialize_ds()) {
+		GDEX_SKIP("initialize_ds() failed on this host");
+		return;
+	}
+
+	GDEX_ASSERT_TRUE(write_valid_base(kValidBase1, 1));
+	// Registered before the cache: teardowns run LIFO, so the cache (and its
+	// request paths) is torn down before these files are removed from disk.
+	track_cleanup(ctx, { kValidBase1, kPatchDim });
+
+	godot::PackedByteArray bytes = read_bytes(kValidBase1);
+	GDEX_ASSERT_FALSE(bytes.is_empty());
+	put_u32(bytes, 8, 65535u);
+	GDEX_ASSERT_TRUE(write_bytes(kPatchDim, bytes));
+
+	// No ResourceLoader.load() on this path: loading populates DSTextureCache and
+	// makes the following prewarm a cache hit, which would report (0, 0) for a
+	// reason unrelated to validation.
+	godot::DSTextureCache *cache = make_budget_cache(ctx, true);
+
+	godot::PackedStringArray paths;
+	paths.append(godot::String(kPatchDim));
+	const uint64_t tag = cache->prewarm_async(paths);
+	GDEX_EXPECT_GT(tag, static_cast<uint64_t>(0));
+
+	// 0 tracked requests: the file was refused before any destination buffer or
+	// stream request was created.
+	const godot::Vector2i progress = ds->get_prewarm_progress(tag);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(progress.y), static_cast<int64_t>(0));
+	GDEX_EXPECT_TRUE(ds->is_prewarm_complete(tag));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->get_pending_prewarm_count(tag)), static_cast<int64_t>(0));
+
+	ds->cancel_prewarm(tag);
 }
