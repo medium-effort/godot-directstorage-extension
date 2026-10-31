@@ -9,11 +9,13 @@
 #include "TileStream.h"
 #endif
 
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/classes/thread.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -1652,16 +1654,36 @@ static Microsoft::WRL::ComPtr<ID3D12Device> &s_d3d12_device = *new Microsoft::WR
 static Microsoft::WRL::ComPtr<ID3D12CommandQueue> &s_d3d12_command_queue = *new Microsoft::WRL::ComPtr<ID3D12CommandQueue>();
 static std::mutex s_device_mutex;
 
-// One-shot render-thread acquisition context.
-// Managed via std::shared_ptr so that if waiting times out, any late-running
-// render-thread worker accesses a live heap context without touching a destroyed stack frame (HIGH-01).
-struct DSDeviceAcquireContext {
-	std::mutex mutex;
-	std::condition_variable cv;
-	bool completed = false;
-};
+// Process-wide device acquisition rendezvous.
+//
+// The fetch itself must run on the render thread because
+// RenderingDevice::get_driver_resource() is render-thread affine, but callers
+// reach it from worker threads. Every off-render-thread caller joins the same
+// generation, so a single posted callable serves all of them and no caller can
+// steal another caller's hand-off. A give-up deliberately does NOT cancel the
+// request: the post stays queued, the next RenderingServer::sync() still runs
+// it, and the device is cached for the following call instead of being fetched
+// again.
+//
+// All fields below are guarded by s_device_acquire_mutex. No COM object and no
+// Godot Ref is stored here, so this state is not subject to the module-deinit
+// release rule that covers the D3D12-owning statics above.
 static std::mutex s_device_acquire_mutex;
-static std::shared_ptr<DSDeviceAcquireContext> s_device_acquire_ctx;
+static std::condition_variable s_device_acquire_cv;
+static uint64_t s_device_acquire_generation = 0;
+static uint64_t s_device_acquire_completed_generation = 0;
+static uint64_t s_device_acquire_logged_generation = 0;
+static bool s_device_acquire_posted = false;
+
+// Main-loop liveness probe. Engine::get_process_frames() advances once per
+// Main::iteration(), so a frozen value means the loop that drains the
+// cross-thread render queue is not running: in the default single-threaded
+// renderer that drain happens in RenderingServerDefault::sync() on the main
+// thread, and only that thread can perform it.
+static uint64_t ds_win32_main_loop_frames() {
+	Engine *engine = Engine::get_singleton();
+	return engine ? engine->get_process_frames() : 0;
+}
 
 // Log-only adapter identity. Compares Godot's D3D12 adapter LUID against
 // the default DXGI adapter; a mismatch is informational only (multi-GPU)
@@ -1724,16 +1746,12 @@ static Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_fetch_d3d12_device_direct()
 // callable_mp on `this` is impossible and callable_mp_static is required.
 static void ds_win32_fetch_d3d12_device_on_render_thread() {
 	ds_win32_fetch_d3d12_device_direct();
-	std::shared_ptr<DSDeviceAcquireContext> ctx;
-	{
-		std::lock_guard<std::mutex> lock(s_device_acquire_mutex);
-		ctx = std::move(s_device_acquire_ctx);
-	}
-	if (ctx) {
-		std::lock_guard<std::mutex> lock(ctx->mutex);
-		ctx->completed = true;
-		ctx->cv.notify_one(); // HIGH-01: Notify while holding mutex
-	}
+	std::lock_guard<std::mutex> lock(s_device_acquire_mutex);
+	// s_device_acquire_posted stayed true from the post until here, so no newer
+	// generation could have started: completing the current one is exact.
+	s_device_acquire_completed_generation = s_device_acquire_generation;
+	s_device_acquire_posted = false;
+	s_device_acquire_cv.notify_all(); // notify while holding the protecting mutex
 }
 
 // D3D12-02 / HIGH-03: release owned COM references and clear the cache. Safe from any
@@ -1772,23 +1790,77 @@ Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device() {
 		return ds_win32_fetch_d3d12_device_direct();
 	}
 
-	// Marshal acquisition to the render thread with a bounded wait.
-	auto ctx = std::make_shared<DSDeviceAcquireContext>();
+	// Marshal acquisition to the render thread. A live render pump answers within
+	// one frame, so the wait is short; it is also bounded by main-loop liveness,
+	// because in single-threaded rendering only the main thread can drain the
+	// cross-thread render queue and waiting there is otherwise pure dead time.
+	uint64_t my_generation = 0;
 	{
-		std::lock_guard<std::mutex> lock(s_device_acquire_mutex);
-		s_device_acquire_ctx = ctx;
-	}
-	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_d3d12_device_on_render_thread));
-	{
-		std::unique_lock<std::mutex> lock(ctx->mutex);
-		if (!ctx->cv.wait_for(lock, std::chrono::seconds(5), [&ctx] { return ctx->completed; })) {
-			std::lock_guard<std::mutex> acq_lock(s_device_acquire_mutex);
-			if (s_device_acquire_ctx == ctx) {
-				s_device_acquire_ctx.reset();
+		bool post_request = false;
+		{
+			std::lock_guard<std::mutex> lock(s_device_acquire_mutex);
+			if (!s_device_acquire_posted) {
+				s_device_acquire_generation++;
+				s_device_acquire_posted = true;
+				post_request = true;
 			}
-			UtilityFunctions::print("[DirectStorage] D3D12 device acquisition timed out waiting for the render thread; continuing without a device.");
-			return nullptr;
+			my_generation = s_device_acquire_generation;
 		}
+		if (post_request) {
+			// Post outside our mutex: never hand work to the engine while holding one.
+			rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_d3d12_device_on_render_thread));
+		}
+	}
+
+	constexpr std::chrono::milliseconds kSlice(50);
+	constexpr std::chrono::milliseconds kFrozenGiveUp(400);
+	constexpr std::chrono::milliseconds kCeiling(5000);
+	const bool liveness_gate = !Thread::is_main_thread();
+	const auto wait_start = std::chrono::steady_clock::now();
+	std::chrono::milliseconds waited(0);
+	bool gave_up = false;
+	bool log_give_up = false;
+	{
+		std::unique_lock<std::mutex> lock(s_device_acquire_mutex);
+		uint64_t last_frames = ds_win32_main_loop_frames();
+		auto frozen_since = wait_start;
+		for (;;) {
+			if (s_device_acquire_completed_generation >= my_generation) {
+				break;
+			}
+			if (s_device_acquire_cv.wait_for(lock, kSlice, [my_generation] {
+						return s_device_acquire_completed_generation >= my_generation;
+					})) {
+				break;
+			}
+			const auto now = std::chrono::steady_clock::now();
+			const uint64_t frames = ds_win32_main_loop_frames();
+			if (frames != last_frames) {
+				last_frames = frames;
+				frozen_since = now;
+			} else if (liveness_gate && now - frozen_since >= kFrozenGiveUp) {
+				gave_up = true;
+				break;
+			}
+			if (now - wait_start >= kCeiling) {
+				gave_up = true;
+				break;
+			}
+		}
+		waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_start);
+		if (gave_up && s_device_acquire_logged_generation < my_generation) {
+			s_device_acquire_logged_generation = my_generation;
+			log_give_up = true;
+		}
+	}
+	if (gave_up) {
+		if (log_give_up) {
+			// The post stays queued: the next sync still caches the device.
+			UtilityFunctions::print("[DirectStorage] D3D12 device acquisition gave up after " +
+					String::num_uint64(static_cast<uint64_t>(waited.count())) +
+					" ms (main loop not advancing); the request stays queued.");
+		}
+		return nullptr;
 	}
 
 	std::lock_guard<std::mutex> lock(s_device_mutex);

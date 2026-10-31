@@ -185,15 +185,28 @@ bool wait_until_released(godot::Win32Backend *p_backend, const godot::RID &p_rid
 
 GDEX_TEST_T(win32_remediation, d3d12_comptr_concurrency_and_invalidation, TAG_INTEGRATION) {
 #ifdef _WIN32
-    // HIGH-03: Multiple concurrent threads calling ds_win32_get_d3d12_device()
-    // and ds_win32_get_d3d12_command_queue() while another thread concurrently
-    // invalidates the cached device pointers via ds_win32_invalidate_d3d12_device().
-    // Returns must be safe ComPtr instances with no pointer tearing or dangling references.
+    // Concurrent callers of ds_win32_get_d3d12_device() / ds_win32_get_d3d12_command_queue()
+    // while another thread invalidates the cached pointers. Returns must be safe ComPtr
+    // instances with no pointer tearing or dangling references, and a blocked main thread must
+    // not cost a full acquisition budget per miss (the wait is bounded by main-loop liveness).
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    const bool d3d12_live = rd != nullptr && rs->get_current_rendering_driver_name().to_lower() == "d3d12";
+
+    // Warm the cache first so the workers' first queries are served from it. Without this the
+    // "a worker successfully acquired a device" assertion would race the invalidation storm.
+    Microsoft::WRL::ComPtr<ID3D12Device> warm_device = godot::ds_win32_get_d3d12_device();
+    if (d3d12_live) {
+        GDEX_EXPECT_TRUE(warm_device.Get() != nullptr);
+    }
+
     std::atomic<bool> stop_flag{false};
     std::atomic<int> query_success_count{0};
     constexpr int kWorkerThreads = 4;
     std::vector<std::thread> workers;
     workers.reserve(kWorkerThreads);
+
+    const auto body_start = std::chrono::steady_clock::now();
 
     for (int i = 0; i < kWorkerThreads; ++i) {
         workers.emplace_back([&stop_flag, &query_success_count]() {
@@ -208,6 +221,15 @@ GDEX_TEST_T(win32_remediation, d3d12_comptr_concurrency_and_invalidation, TAG_IN
         });
     }
 
+    // Bounded wait for the workers to have hit the warm cache before invalidating under them.
+    if (d3d12_live) {
+        const auto warm_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+        while (query_success_count.load(std::memory_order_relaxed) == 0 &&
+                std::chrono::steady_clock::now() < warm_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
     // Invalidator thread repeatedly calls invalidate
     for (int i = 0; i < 50; ++i) {
         godot::ds_win32_invalidate_d3d12_device();
@@ -219,8 +241,22 @@ GDEX_TEST_T(win32_remediation, d3d12_comptr_concurrency_and_invalidation, TAG_IN
         t.join();
     }
 
-    // Must complete safely without memory violation or access faults.
-    GDEX_EXPECT_TRUE(true);
+    const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - body_start).count();
+
+    // 4 concurrent waiters against a blocked main thread used to cost two full 5 s budgets
+    // (~11 s). The liveness-bounded wait costs ~400 ms per round; 4 s leaves generous slack.
+    GDEX_EXPECT_TRUE(elapsed_ms < 4000);
+
+    if (d3d12_live) {
+        // The warm-cache window above makes this deterministic, not a start-up race.
+        GDEX_EXPECT_TRUE(query_success_count.load(std::memory_order_relaxed) > 0);
+        // The cache recovers after the invalidate storm, and the recovered device is the same
+        // Godot D3D12 device the workers saw.
+        Microsoft::WRL::ComPtr<ID3D12Device> recovered = godot::ds_win32_get_d3d12_device();
+        GDEX_EXPECT_TRUE(recovered.Get() != nullptr);
+        GDEX_EXPECT_TRUE(recovered.Get() == warm_device.Get());
+    }
 #else
     (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
