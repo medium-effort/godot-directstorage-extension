@@ -1476,7 +1476,7 @@ $tarExcludesList = @(
     "--exclude=*.obj",
     "--exclude=*.pdb",
     "--exclude=*.exp",
-    "--exclude=*.lib",
+    "--exclude=project/addons/directstorage_accelerator/bin/*.lib",
     "--exclude=*.ilk",
     "--exclude=*.idb",
     "--exclude=project/addons/directstorage_accelerator/bin/$AddonBinaryStem*",
@@ -1546,7 +1546,7 @@ $tarExcludes = $tarExcludesList -join " "
 # as it was with the old tar-then-hash order.
 if (-not $SkipVerify) {
     $manifestTimer = [System.Diagnostics.Stopwatch]::StartNew()
-    $SyncVerifyRoots = @("src", "tests", "thirdparty/gdeflate", "thirdparty/libdeflate", "thirdparty/monocypher", "extern/gdextest/src", "extern/gdextest/tools")
+    $SyncVerifyRoots = @("src", "site_scons", "tests", "thirdparty/gdeflate", "thirdparty/libdeflate", "thirdparty/monocypher", "extern/gdextest/src", "extern/gdextest/tools")
     $SyncVerifyFiles = @("SConstruct", ".gdextest.toml", "extern/gdextest/SConscript")
     # NOTE: "project" was verified here once (it caught a truncated GDScript/asset
     # sync) but it is ~400 of the ~620 entries and costs one file open each on

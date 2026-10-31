@@ -222,8 +222,8 @@ if not _non_build:
                 hdr_text = f.read()
             import re
             key_id_match = re.search(r'DSPKG_KEY_ID_TAG\s+"dspkg-key-id=([0-9a-fA-F]{16})"', hdr_text)
-            # Single source of truth for "keyed header": Stage B and write_build_manifest. The binary audit
-            # scanner reuses the same 16-hex id shape but must additionally accept `none` (R9-06).
+            # Single source of truth for "keyed header": Stage B and the build_manifest site tool.
+            # The binary audit scanner reuses the same 16-hex id shape but must additionally accept `none` (R9-06).
             if "DSPKG_ENCRYPTION_ENABLED 1" in hdr_text:
                 if "MASK[32]" in hdr_text and "MASKED_KEY[32]" in hdr_text and key_id_match is not None:
                     # Only honor Branch A if key is actively configured for this process
@@ -528,14 +528,11 @@ if env["tests"]:
     else:
         print("[SCons] Warning: tests=true requested but extern/gdextest/SConscript is missing; skipping test target.")
 
-# Post-build action: record build provenance in build_manifest.json.
+# Build provenance is written by the site tool site_scons/site_tools/build_manifest.py.
 # Deployment (copying artifacts into other projects) is not a build concern and
 # lives in tools/sync_artifacts.py, driven by .vscode/build_remote.ps1.
-import json
 import datetime
-import subprocess
 import atexit
-import SCons.Script
 
 # Load configuration from .env file if present
 def load_env_file(env_path=".env"):
@@ -560,195 +557,20 @@ if "DSPKG_ENCRYPTION_KEY" in os.environ and not _non_build:
 
 BUILD_START_TIME = datetime.datetime.now().astimezone()
 
-def write_build_manifest():
-    if _non_build:
-        return
-
-    build_finish_time = datetime.datetime.now().astimezone()
-    duration_seconds = round((build_finish_time - BUILD_START_TIME).total_seconds(), 3)
-    manifest_path = os.path.join(output_dir, "build_manifest.json")
-    failures = SCons.Script.GetBuildFailures()
-
-    commit_hash = "unknown"
-    commit_short = "unknown"
-    commit_msg = ""
-    commit_date = ""
-    is_dirty = False
-
-    try:
-        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
-        commit_short = commit_hash[:7]
-        commit_msg = subprocess.check_output(["git", "log", "-1", "--pretty=%s"], text=True, stderr=subprocess.DEVNULL).strip()
-        commit_date = subprocess.check_output(["git", "log", "-1", "--pretty=%cI"], text=True, stderr=subprocess.DEVNULL).strip()
-        status_out = subprocess.check_output(["git", "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL).strip()
-        is_dirty = len(status_out) > 0
-    except Exception:
-        pass
-
-    status = "FAILED" if failures else "SUCCESS"
-
-    # Load existing manifest to preserve historical metadata for other targets
-    targets_dict = {}
-    if os.path.exists(manifest_path):
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                old_manifest = json.load(f)
-                if isinstance(old_manifest.get("targets"), dict):
-                    targets_dict = old_manifest["targets"]
-        except Exception:
-            pass
-
-    # Standard known binary targets: flat 2-binary model on Windows,
-    # derived from the ADDON_BINARY_* naming constants above.
-    known_targets = {
-        ADDON_BINARY_NAME + ".dll": "template_release",
-        ADDON_BINARY_NAME + ADDON_BINARY_DEBUG_SUFFIX + ".dll": "template_debug",
-    }
-    for kt_name, kt_type in known_targets.items():
-        if kt_name not in targets_dict:
-            targets_dict[kt_name] = {"target_type": kt_type}
-
-    # Prune legacy long-form binary entries from the pre-dsgd naming scheme.
-    for legacy_name in list(targets_dict.keys()):
-        if (
-            legacy_name.startswith("directstorage_accelerator.windows.")
-            or legacy_name.startswith("libdirectstorage_accelerator.")
-        ):
-            targets_dict.pop(legacy_name, None)
-
-    # Discover any additional compiled shared library binaries in output_dir
-    if os.path.exists(output_dir):
-        for fname in os.listdir(output_dir):
-            if (fname.startswith(ADDON_BINARY_STEM) or fname.startswith("lib" + ADDON_BINARY_STEM)) and (
-                fname.endswith(".dll") or fname.endswith(".so") or fname.endswith(".dylib")
-            ):
-                if fname not in targets_dict:
-                    targets_dict[fname] = {}
-
-    # Inspect all tracked targets on disk for existence, size, and last modification timestamp
-    for fname, entry in list(targets_dict.items()):
-        fpath = os.path.join(output_dir, fname)
-        if os.path.isfile(fpath):
-            try:
-                st = os.stat(fpath)
-                mtime_dt = datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc).astimezone()
-                entry["exists"] = True
-                entry["size_bytes"] = st.st_size
-                entry["last_modified"] = mtime_dt.isoformat()
-            except Exception:
-                entry["exists"] = True
-        else:
-            entry["exists"] = False
-            entry.pop("size_bytes", None)
-
-    # Update metadata specifically for the target compiled in the current SCons run
-    # NOTE: target_type intentionally omits the .dev suffix — flat dsgd_64
-    # naming is identical for dev and non-dev builds.
-    curr_target_type = env.get("target", "unknown")
-
-    curr_entry = targets_dict.setdefault(target_name, {})
-    curr_entry["target_type"] = curr_target_type
-    curr_entry["is_dev_build"] = bool(env.get("dev_build", False))
-    curr_entry.pop("aliased_from", None)
-    curr_fpath = os.path.join(output_dir, target_name)
-    if os.path.isfile(curr_fpath):
-        try:
-            st = os.stat(curr_fpath)
-            mtime_dt = datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc).astimezone()
-            curr_entry["exists"] = True
-            curr_entry["size_bytes"] = st.st_size
-            curr_entry["last_modified"] = mtime_dt.isoformat()
-        except Exception:
-            curr_entry["exists"] = True
-    else:
-        curr_entry["exists"] = False
-
-    curr_entry["last_build_status"] = status
-    curr_entry["last_commit"] = commit_short
-    curr_entry["last_built_at"] = build_finish_time.isoformat()
-    curr_entry["last_build_duration_seconds"] = duration_seconds
-
-    # Per-target "built in this run" test instead of the run-global `status` (R9-07): a
-    # multi-target run in which another target fails must still record the key_id of the
-    # target that DID compile, otherwise its freshly written DLL is audited against a
-    # stale key and the run fails on a false mismatch.
-    _built_this_run = (
-        os.path.isfile(curr_fpath)
-        and os.path.getmtime(curr_fpath) >= (BUILD_START_TIME.timestamp() - 2.0)
-    )
-    if _built_this_run:
-        is_enc = False
-        key_id_hex = None
-        if os.path.isfile(gen_header_file):
-            try:
-                with open(gen_header_file, "r", encoding="utf-8") as f:
-                    txt = f.read()
-                    if "DSPKG_ENCRYPTION_ENABLED 1" in txt:
-                        import re
-                        m = re.search(r'DSPKG_KEY_ID_TAG\s+"dspkg-key-id=([0-9a-fA-F]{16})"', txt)
-                        if m:
-                            is_enc = True
-                            key_id_hex = m.group(1).lower()
-            except Exception: pass
-        curr_entry["encryption"] = {
-            "enabled": is_enc,
-            "key_id": key_id_hex,
-            # Provenance: where this binary's key came from. 'baked' means the key
-            # was compiled in by a source build; 'none' means no key is in the DLL.
-            "key_source": "baked" if is_enc else "none"
-        }
-    elif os.path.isfile(curr_fpath):
-        # Target was up-to-date (not rebuilt this run): reconcile encryption metadata
-        # directly from the binary's embedded tag so stale manifest entries cannot persist.
-        try:
-            with open(curr_fpath, "rb") as f:
-                bin_data = f.read()
-            import re
-            m = re.search(b'dspkg-key-id=([0-9a-fA-F]{16}|none)', bin_data)
-            if m:
-                tag = m.group(1).decode("ascii").lower()
-                curr_entry["encryption"] = {
-                    "enabled": tag != "none",
-                    "key_id": tag if tag != "none" else None,
-                    "key_source": "none" if tag == "none" else "baked",
-                }
-        except Exception:
-            pass
-    else:
-        curr_entry.pop("encryption", None)
-
-    manifest_data = {
-        "status": status,
-        "last_built_target": target_name,
-        "timestamps": {
-            "started_at": BUILD_START_TIME.isoformat(),
-            "finished_at": build_finish_time.isoformat(),
-            "duration_seconds": duration_seconds
-        },
-        "target": target_name,
-        "platform": env.get("platform", "unknown"),
-        "git": {
-            "commit": commit_hash,
-            "short_commit": commit_short,
-            "message": commit_msg,
-            "date": commit_date,
-            "dirty": is_dirty
-        },
-        "targets": targets_dict
-    }
-    if failures:
-        manifest_data["failures_count"] = len(failures)
-
-    try:
-        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest_data, f, indent=2)
-        print(f"[SCons] Updated build manifest ({status}): {manifest_path}")
-
-    except Exception as e:
-        print(f"[SCons] Failed to write build manifest: {e}")
-
-atexit.register(write_build_manifest)
+# Build provenance is a site tool now: SCons builds artifacts, the tool records
+# which commit and key state produced them. Nothing outside the addon bin is
+# written here - deployment is tools/sync_artifacts.py, driven by the pipeline.
+env.Tool("build_manifest")
+env.RegisterBuildManifest(
+    output_dir=output_dir,
+    target_name=target_name,
+    addon_binary_stem=ADDON_BINARY_STEM,
+    addon_binary_name=ADDON_BINARY_NAME,
+    addon_debug_suffix=ADDON_BINARY_DEBUG_SUFFIX,
+    gen_header_file=gen_header_file,
+    build_start_time=BUILD_START_TIME,
+    skip=_non_build,
+)
 
 
 Default(targets)
