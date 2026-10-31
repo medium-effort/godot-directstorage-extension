@@ -75,6 +75,13 @@ namespace GDeflate
     static void TileDecompressionJob(DecompressionContext& context, uint32_t compressorId)
     {
         std::unique_ptr<libdeflate_gdeflate_decompressor> decompressor(libdeflate_alloc_gdeflate_decompressor());
+        if (!decompressor)
+        {
+            // Allocation failure is a clean failure, not a null decompressor handed to
+            // libdeflate (which only checks its page arguments, not this pointer).
+            context.failed = true;
+            return;
+        }
 
         const uint32_t* tileOffsets = reinterpret_cast<const uint32_t*>(context.inputPtr + sizeof(TileStream));
         const uint8_t* inDataPtr = reinterpret_cast<const uint8_t*>(tileOffsets + context.numItems);

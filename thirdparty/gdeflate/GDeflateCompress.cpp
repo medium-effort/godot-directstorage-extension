@@ -124,11 +124,24 @@ namespace GDeflate
         {
             size_t pageCount = 0;
             const size_t scratchSize = libdeflate_gdeflate_compress_bound(nullptr, kDefaultTileSize, &pageCount);
-            assert(pageCount == 1);
+            // assert() is compiled out of release builds, and a zero-sized or multi-page
+            // scratch buffer would be written past by libdeflate on the next call.
+            if (scratchSize == 0 || pageCount != 1)
+            {
+                context.failed = true;
+                return;
+            }
 
-            void* scratch = alloca(scratchSize);
+            // Heap scratch instead of alloca(): a compression worker may run with little
+            // remaining stack, and the size is only known here.
+            std::vector<uint8_t> scratch(scratchSize);
 
             std::unique_ptr<libdeflate_gdeflate_compressor> compressor(libdeflate_alloc_gdeflate_compressor(level));
+            if (!compressor)
+            {
+                context.failed = true;
+                return;
+            }
 
             while (true)
             {
@@ -145,7 +158,7 @@ namespace GDeflate
                 auto& tile = context.tiles[tileIndex];
                 tile.uncompressedSize = uncompressedSize;
 
-                libdeflate_gdeflate_out_page compressedPage{scratch, scratchSize};
+                libdeflate_gdeflate_out_page compressedPage{scratch.data(), scratchSize};
 
                 size_t result = libdeflate_gdeflate_compress(
                     compressor.get(),
