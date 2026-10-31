@@ -2,6 +2,7 @@
 #define DS_WIN32_BACKEND_H
 
 #include "../platform_backend.h"
+#include "../../formats/dspkg_format.h"
 #include <godot_cpp/templates/vector.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <vector>
 
@@ -32,8 +34,8 @@ Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device();
 Microsoft::WRL::ComPtr<ID3D12CommandQueue> ds_win32_get_d3d12_command_queue();
 void ds_win32_invalidate_d3d12_device();
 // Drops every process-wide D3D12 reference (device/queue cache, queued barrier
-// handoffs, chunked-request state) while the engine is alive and the loader lock
-// is NOT held. Must be called from module deinit: a ComPtr destroyed during
+// handoffs) while the engine is alive and the loader lock is NOT held. Must be
+// called from module deinit: a ComPtr destroyed during
 // DLL_PROCESS_DETACH releases under the loader lock and deadlocks the driver.
 void ds_win32_release_static_d3d12_state();
 #endif
@@ -192,6 +194,37 @@ private:
 		Vector<GPUTargetTransition> gpu_transitions;
 	};
 	std::vector<ZombieBatchSlot> zombie_slots;
+	// Instance-owned runtime state. These were file-level statics in the .cpp, so
+	// a second Win32Backend could overwrite the first one's identity, clear its
+	// in-flight chunk bookkeeping, release its resource guards, or drop its cached
+	// archive. Every one of them is still serialised by batch_mutex (or by the
+	// caller's lock), exactly as its static predecessor was; only the owner changed.
+	//
+	// The chunk entries hold Godot Refs, so they must be destroyed while the engine
+	// is alive: ~Win32Backend runs from the DSContext shutdown path, which is
+	// before module deinit, and the drain-timeout path deliberately leaks the whole
+	// instance instead of unreffing under the loader lock.
+	struct DSChunkedRequestState {
+		Ref<DSRequest> parent;
+		Vector<Ref<DSRequest>> children;
+		Vector<uint64_t> destination_offsets;
+	};
+	std::unordered_map<DSRequest *, DSChunkedRequestState> chunked_requests;
+	std::unordered_map<DSRequest *, DSRequest *> chunk_parents;
+	std::unordered_map<DSRequest *, ID3D12Resource *> resource_guards;
+	std::unordered_set<std::string> staging_buffer_warnings;
+	// Cached .dspkg for the active archive path. get_texture_mip_entries() runs on
+	// every texture enqueue; reopening/reparsing the archive per enqueue costs disk
+	// I/O plus full entry-table validation. A path switch drops the old package and
+	// opens the new one; an open failure clears the cache. Empty path + null package
+	// is the "nothing cached" state (the predecessor was a lazily memnew'd pointer).
+	// All access happens under batch_mutex (enqueue_request holds it across the
+	// get_texture_mip_entries call).
+	struct DSPkgCache {
+		String path;
+		Ref<DSPkg> package;
+	};
+	DSPkgCache dspkg_cache;
 	HANDLE completion_stop_event = nullptr;
 #endif
 	std::thread completion_thread;
@@ -243,6 +276,15 @@ private:
 	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch, BatchReport &r_report);
 	bool has_in_flight_batches_locked() const;
 	void update_profiler_queue_depth_locked();
+	// Container helpers own this instance's state only; they are members so one
+	// backend can never read or clear another's bookkeeping.
+	bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries);
+	void release_resource_guards(const Vector<Ref<DSRequest>> &p_requests);
+	void release_all_resource_guards();
+	bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_error, std::unordered_map<int64_t, ID3D12Resource *> *p_rid_cache = nullptr);
+	DSRequest *get_logical_request(DSRequest *p_request) const;
+	int count_logical_requests(const Vector<Ref<DSRequest>> &p_requests) const;
+	void complete_chunked_requests();
 	void close_slot_files(BatchSlot &p_slot);
 	void clear_persistent_files();
 	IDStorageFile *resolve_source_file(const std::wstring &p_wpath, String &r_error);
@@ -313,8 +355,8 @@ public:
 	bool has_pending_results();
 	bool collect_completed_batch(uint64_t &r_fence_value, int &r_completed_count, int &r_error_code, String &r_error_message);
 	void cancel_requests_with_tag(uint64_t p_tag) override;
-	uint64_t get_completion_fence() const;
-	bool wait_for_completion(uint64_t p_fence_value, uint32_t p_timeout_msec);
+	uint64_t get_completion_fence() const override;
+	bool wait_for_completion(uint64_t p_fence_value, uint32_t p_timeout_msec) override;
 	bool is_resource_in_flight(const RID &p_rid) const override;
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
@@ -366,14 +408,22 @@ public:
 	// second load cycle must raise it again; a process-wide latch did not. Never
 	// bound in _bind_methods().
 	static int _debug_dstorage_config_apply_count();
+	// Test-only seam: inserts one synthetic parent/child chunk pair and one
+	// synthetic (null) resource guard, so instance isolation can be asserted
+	// without staging a real multi-mip GPU request. Never bound in _bind_methods().
+	void _debug_seed_instance_state_for_testing();
+	// Test-only seam: this instance's container sizes. Pre-conversion these read
+	// the file-level statics, which is exactly what the isolation test
+	// discriminates on. Never bound in _bind_methods().
+	Dictionary _debug_instance_state_for_testing() const;
 #endif
 
 	static bool is_path_valid(const String &p_path);
 	static Dictionary get_drive_info_for_path(const String &p_path);
 	static bool validate_dstex_chunk_range(uint64_t p_source_offset, uint64_t p_source_size, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t &r_resolved_offset);
 	static void attribute_batch_error_records(Vector<Ref<DSRequest>> &p_requests, const std::unordered_map<std::string, Ref<DSRequest>> &p_name_map, const String &p_failed_request_name, const String &p_queue_error);
-	static Ref<DSRequest> get_chunked_child_request(DSRequest *p_parent, int p_index = 0);
-	static void rollback_staged_requests(Vector<Ref<DSRequest>> &p_slot_requests,
+	Ref<DSRequest> get_chunked_child_request(DSRequest *p_parent, int p_index = 0);
+	void rollback_staged_requests(Vector<Ref<DSRequest>> &p_slot_requests,
 			std::vector<std::string> &p_slot_request_names,
 			std::unordered_map<std::string, Ref<DSRequest>> &p_slot_request_name_map,
 			const std::vector<Ref<DSRequest>> &p_staged_children,
@@ -384,7 +434,7 @@ public:
 #endif
 	);
 	static bool build_single_mip_child_request(Ref<DSRequest> p_parent, const DSTexMipEntryV2 &p_mip_entry, Ref<DSRequest> &r_child);
-	static bool stage_single_mip_request(Ref<DSRequest> p_parent, Ref<DSRequest> &r_child);
+	bool stage_single_mip_request(Ref<DSRequest> p_parent, Ref<DSRequest> &r_child);
 };
 
 } // namespace godot

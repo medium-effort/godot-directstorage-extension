@@ -36,11 +36,13 @@
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/core/memory.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <thread>
 #include <vector>
 #endif
@@ -586,8 +588,13 @@ GDEX_TEST_T(win32_remediation, med03_atomic_child_staging_no_orphans, TAG_INTEGR
     staged_children[2]->set_status(godot::DSRequest::STATUS_FAILED);
     staged_children[2]->set_error_message("Simulated child 2 DMA handle rejection");
 
-    // Execute the true rollback logic invoked on mid-loop enqueue_one failure
-    godot::Win32Backend::rollback_staged_requests(
+    // Execute the true rollback logic invoked on mid-loop enqueue_one failure.
+    // The containers it edits belong to a backend instance now (they used to be
+    // process-global), so the call goes through one. No device and no
+    // initialize() are required: real rollback is pure bookkeeping.
+    godot::Win32Backend *rollback_backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([rollback_backend]() { memdelete(rollback_backend); });
+    rollback_backend->rollback_staged_requests(
             slot_requests, slot_request_names, slot_request_name_map, staged_children, 2, parent, &slot_dstorage_requests);
 
     // Assert: Slot is completely empty (no orphaned child requests or dstorage_requests left in slot)
@@ -763,8 +770,10 @@ GDEX_TEST_T(win32_remediation, med08_single_mip_parsed_values_preserved, TAG_INT
     parent->set_subresource_count(1);
     parent->set_first_subresource(0);
 
+    godot::Win32Backend *stage_backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([stage_backend]() { memdelete(stage_backend); });
     godot::Ref<godot::DSRequest> child;
-    bool staged = godot::Win32Backend::stage_single_mip_request(parent, child);
+    bool staged = stage_backend->stage_single_mip_request(parent, child);
     GDEX_ASSERT_TRUE(staged);
     GDEX_ASSERT_TRUE(child.is_valid());
 
@@ -1847,6 +1856,64 @@ GDEX_TEST_T(win32_remediation, queue_error_report_runs_outside_batch_mutex, TAG_
 #else
     (void)ctx;
     GDEX_SKIP("The queue-error report seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, second_instance_shutdown_preserves_first_instance_state, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // Instance isolation: a second backend's initialize()/shutdown()/destruction
+    // must leave the first instance's bookkeeping untouched. While these
+    // containers were file-level statics, `second->shutdown()` cleared `first`'s
+    // chunked-request state and released its resource guards, so a staged GPU
+    // request lost both its AddRef and the parent link that propagates a terminal
+    // status - the caller's handle stayed SUBMITTED forever. The seam seeds the
+    // containers, so no device, no .dstex and no initialize() are needed.
+    godot::Win32Backend *first = memnew(godot::Win32Backend);
+    godot::Win32Backend *second = memnew(godot::Win32Backend);
+    auto second_alive = std::make_shared<bool>(true);
+    ctx.add_teardown([first, second, second_alive]() {
+        if (*second_alive) {
+            memdelete(second);
+        }
+        memdelete(first);
+    });
+
+    first->_debug_seed_instance_state_for_testing();
+    {
+        const godot::Dictionary before = first->_debug_instance_state_for_testing();
+        GDEX_EXPECT_EQ(static_cast<int64_t>(before["chunked_requests"]), static_cast<int64_t>(1));
+        GDEX_EXPECT_EQ(static_cast<int64_t>(before["chunk_parents"]), static_cast<int64_t>(1));
+        GDEX_EXPECT_EQ(static_cast<int64_t>(before["resource_guards"]), static_cast<int64_t>(1));
+    }
+
+    // The destructive operation the defect names.
+    second->shutdown();
+    {
+        const godot::Dictionary after_shutdown = first->_debug_instance_state_for_testing();
+        GDEX_EXPECT_EQ(static_cast<int64_t>(after_shutdown["chunked_requests"]), static_cast<int64_t>(1));
+        GDEX_EXPECT_EQ(static_cast<int64_t>(after_shutdown["chunk_parents"]), static_cast<int64_t>(1));
+        GDEX_EXPECT_EQ(static_cast<int64_t>(after_shutdown["resource_guards"]), static_cast<int64_t>(1));
+    }
+
+    // Destruction must be instance-scoped too, not only shutdown().
+    memdelete(second);
+    *second_alive = false;
+    second = nullptr;
+    {
+        const godot::Dictionary after_delete = first->_debug_instance_state_for_testing();
+        GDEX_EXPECT_EQ(static_cast<int64_t>(after_delete["chunked_requests"]), static_cast<int64_t>(1));
+        GDEX_EXPECT_EQ(static_cast<int64_t>(after_delete["chunk_parents"]), static_cast<int64_t>(1));
+        GDEX_EXPECT_EQ(static_cast<int64_t>(after_delete["resource_guards"]), static_cast<int64_t>(1));
+    }
+    // `first` is released by the teardown, exercising its own cleanup path.
+#else
+    (void)ctx;
+    GDEX_SKIP("Instance-isolation seams are compiled out of release builds.");
 #endif
 #else
     (void)ctx;

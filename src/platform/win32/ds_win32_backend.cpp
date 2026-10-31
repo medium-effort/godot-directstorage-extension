@@ -102,8 +102,6 @@ static FARPROC WINAPI ds_delay_load_failure_hook(unsigned dliNotify, PDelayLoadI
 extern "C" const PfnDliHook __pfnDliFailureHook2 = ds_delay_load_failure_hook;
 #endif
 
-static Win32Backend *s_backend_instance = nullptr;
-
 static const uint64_t GDEFLATE_PAGE_SIZE = 64ULL * 1024ULL;
 
 struct DSChunkBoundary {
@@ -112,19 +110,6 @@ struct DSChunkBoundary {
 	uint64_t destination_offset = 0;
 	uint64_t destination_size = 0;
 };
-
-// Cached DSPkg for the active .dspkg archive path. get_texture_mip_entries()
-// runs on every texture enqueue; reopening/reparsing the archive per enqueue
-// costs disk I/O plus full entry-table validation. The cache holds the last
-// successfully opened package keyed by resolved path. A path switch frees the
-// old package and opens the new one; an open failure clears the cache and
-// returns empty (no crash). All access happens under Win32Backend::batch_mutex
-// (enqueue_request holds it across the get_texture_mip_entries call), so no
-// additional locking is needed here.
-static struct DSPkgCache {
-	String path;
-	Ref<DSPkg> package;
-} *s_dspkg_cache = nullptr;
 
 bool Win32Backend::validate_dstex_chunk_range(uint64_t p_source_offset, uint64_t p_source_size, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t &r_resolved_offset) {
 	if (p_source_size == 0 || p_payload_size > UINT64_MAX - p_payload_offset) {
@@ -249,7 +234,7 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 	return !r_chunks.is_empty();
 }
 
-static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries) {
+bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries) {
 	r_entries.clear();
 	String resolved_path = p_path;
 	ProjectSettings *ps = ProjectSettings::get_singleton();
@@ -317,10 +302,7 @@ static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vec
 		// Reuse the cached package for the active archive path instead of
 		// reopening/reparsing the .dspkg on every enqueue. Path switch drops
 		// the old package; open failure clears the cache and returns false.
-		if (!s_dspkg_cache) {
-			s_dspkg_cache = memnew(DSPkgCache);
-		}
-		if (s_dspkg_cache->package.is_null() || s_dspkg_cache->path != resolved_path) {
+		if (dspkg_cache.package.is_null() || dspkg_cache.path != resolved_path) {
 			Ref<DSPkg> fresh;
 			fresh.instantiate();
 			// 0 means the archive is unpaired; pairing is the random archive id,
@@ -332,8 +314,8 @@ static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vec
 			}
 			Error open_err = (fresh.is_valid()) ? fresh->open(resolved_path, expected_fingerprint) : ERR_CANT_CREATE;
 			if (open_err != OK) {
-				s_dspkg_cache->package.unref();
-				s_dspkg_cache->path = String();
+				dspkg_cache.package.unref();
+				dspkg_cache.path = String();
 				if (open_err == ERR_UNAUTHORIZED) {
 					static String s_last_backend_unauth_path;
 					if (s_last_backend_unauth_path != resolved_path) {
@@ -343,15 +325,15 @@ static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vec
 				}
 				return false;
 			}
-			s_dspkg_cache->package = fresh;
-			s_dspkg_cache->path = resolved_path;
+			dspkg_cache.package = fresh;
+			dspkg_cache.path = resolved_path;
 		}
 		// O(1) direct lookup by absolute payload offset
 		// (header.data_offset + entry.data_offset). Miss (false) means a
 		// legacy entry without GPU mip metadata or an unknown offset — fall
 		// back to the safe error path in enqueue_request, no crash.
 		Vector<DSPkgMipEntry> package_entries;
-		if (!s_dspkg_cache->package->get_mip_entries_for_offset(p_offset, package_entries) || package_entries.is_empty()) {
+		if (!dspkg_cache.package->get_mip_entries_for_offset(p_offset, package_entries) || package_entries.is_empty()) {
 			return false;
 		}
 		r_entries.resize(package_entries.size());
@@ -368,20 +350,6 @@ static bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vec
 
 	return false;
 }
-
-struct DSChunkedRequestState {
-	Ref<DSRequest> parent;
-	Vector<Ref<DSRequest>> children;
-	Vector<uint64_t> destination_offsets;
-};
-
-// Never destroyed (see the device cache above). The entries hold Godot Refs,
-// so clearing them here and in shutdown() is what releases those objects -
-// never static destruction during DLL_PROCESS_DETACH.
-static std::unordered_map<DSRequest *, DSChunkedRequestState> &s_chunked_requests = *new std::unordered_map<DSRequest *, DSChunkedRequestState>();
-static std::unordered_map<DSRequest *, DSRequest *> s_chunk_parents;
-static std::unordered_map<DSRequest *, ID3D12Resource *> s_resource_guards;
-static std::unordered_set<std::string> s_staging_buffer_warnings;
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 // Test-only seam state (never bound in _bind_methods()). The hook runs immediately
@@ -469,28 +437,28 @@ void Win32Backend::report_batch_outcome(const BatchReport &p_report) {
 	report_queue_error(p_report.error);
 }
 
-static void release_resource_guards(const Vector<Ref<DSRequest>> &p_requests) {
+void Win32Backend::release_resource_guards(const Vector<Ref<DSRequest>> &p_requests) {
 	for (int i = 0; i < p_requests.size(); i++) {
 		if (p_requests[i].is_null()) {
 			continue;
 		}
-		std::unordered_map<DSRequest *, ID3D12Resource *>::iterator it = s_resource_guards.find(p_requests[i].ptr());
-		if (it != s_resource_guards.end()) {
+		std::unordered_map<DSRequest *, ID3D12Resource *>::iterator it = resource_guards.find(p_requests[i].ptr());
+		if (it != resource_guards.end()) {
 			if (it->second) {
 				it->second->Release();
 			}
-			s_resource_guards.erase(it);
+			resource_guards.erase(it);
 		}
 	}
 }
 
-static void release_all_resource_guards() {
-	for (std::unordered_map<DSRequest *, ID3D12Resource *>::iterator it = s_resource_guards.begin(); it != s_resource_guards.end(); ++it) {
+void Win32Backend::release_all_resource_guards() {
+	for (std::unordered_map<DSRequest *, ID3D12Resource *>::iterator it = resource_guards.begin(); it != resource_guards.end(); ++it) {
 		if (it->second) {
 			it->second->Release();
 		}
 	}
-	s_resource_guards.clear();
+	resource_guards.clear();
 }
 
 // Render-thread-affine guard re-query used by validate_resource_guard().
@@ -646,15 +614,15 @@ static bool ds_win32_query_destination_resource_on_render_thread(
 	}
 }
 
-static bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_error, std::unordered_map<int64_t, ID3D12Resource *> *p_rid_cache = nullptr) {
+bool Win32Backend::validate_resource_guard(const Ref<DSRequest> &p_request, String &r_error, std::unordered_map<int64_t, ID3D12Resource *> *p_rid_cache) {
 	if (p_request.is_null() || (p_request->get_destination_type() != DSRequest::DESTINATION_GPU_BUFFER &&
 			p_request->get_destination_type() != DSRequest::DESTINATION_GPU_TEXTURE)) {
 		return true;
 	}
 
-	std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard = s_resource_guards.find(p_request.ptr());
+	std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard = resource_guards.find(p_request.ptr());
 	RID destination_rid = p_request->get_destination_resource();
-	if (guard == s_resource_guards.end() || !guard->second || !destination_rid.is_valid() || !p_request->is_gpu_in_flight()) {
+	if (guard == resource_guards.end() || !guard->second || !destination_rid.is_valid() || !p_request->is_gpu_in_flight()) {
 		r_error = "DirectStorage GPU resource RID was freed or cancelled before batch completion.";
 		return false;
 	}
@@ -702,12 +670,12 @@ static bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_e
 	return true;
 }
 
-static DSRequest *get_logical_request(DSRequest *p_request) {
-	std::unordered_map<DSRequest *, DSRequest *>::const_iterator it = s_chunk_parents.find(p_request);
-	return it != s_chunk_parents.end() ? it->second : p_request;
+DSRequest *Win32Backend::get_logical_request(DSRequest *p_request) const {
+	std::unordered_map<DSRequest *, DSRequest *>::const_iterator it = chunk_parents.find(p_request);
+	return it != chunk_parents.end() ? it->second : p_request;
 }
 
-static int count_logical_requests(const Vector<Ref<DSRequest>> &p_requests) {
+int Win32Backend::count_logical_requests(const Vector<Ref<DSRequest>> &p_requests) const {
 	std::unordered_set<DSRequest *> logical_requests;
 	for (int i = 0; i < p_requests.size(); i++) {
 		if (p_requests[i].is_valid()) {
@@ -727,8 +695,8 @@ static int count_completed_requests(const Vector<Ref<DSRequest>> &p_requests) {
 	return completed_count;
 }
 
-static void complete_chunked_requests() {
-	for (std::unordered_map<DSRequest *, DSChunkedRequestState>::iterator it = s_chunked_requests.begin(); it != s_chunked_requests.end();) {
+void Win32Backend::complete_chunked_requests() {
+	for (std::unordered_map<DSRequest *, DSChunkedRequestState>::iterator it = chunked_requests.begin(); it != chunked_requests.end();) {
 		DSChunkedRequestState &state = it->second;
 		bool all_complete = true;
 		bool failed = false;
@@ -807,29 +775,18 @@ static void complete_chunked_requests() {
 
 		for (int i = 0; i < state.children.size(); i++) {
 			if (state.children[i].is_valid()) {
-				s_chunk_parents.erase(state.children[i].ptr());
+				chunk_parents.erase(state.children[i].ptr());
 			}
 		}
 		if (state.parent.is_valid()) {
 			state.parent->set_gpu_in_flight(false);
 		}
-		it = s_chunked_requests.erase(it);
+		it = chunked_requests.erase(it);
 	}
 }
 
-uint64_t ds_win32_get_completion_fence(PlatformBackend *p_backend) {
-	if (p_backend != s_backend_instance) {
-		return 0;
-	}
-	return static_cast<Win32Backend *>(p_backend)->get_completion_fence();
-}
-
-bool ds_win32_wait_for_completion(PlatformBackend *p_backend, uint64_t p_fence_value, uint32_t p_timeout_msec) {
-	if (p_backend != s_backend_instance) {
-		return false;
-	}
-	return static_cast<Win32Backend *>(p_backend)->wait_for_completion(p_fence_value, p_timeout_msec);
-}
+// Fence queries are PlatformBackend virtuals now: the caller dispatches through
+// the object it holds, so there is no process-global "live instance" to consult.
 #endif
 
 #ifdef _WIN32
@@ -1171,8 +1128,8 @@ Ref<DSRequest> Win32Backend::get_chunked_child_request(DSRequest *p_parent, int 
 	if (!p_parent) {
 		return Ref<DSRequest>();
 	}
-	auto it = s_chunked_requests.find(p_parent);
-	if (it != s_chunked_requests.end()) {
+	auto it = chunked_requests.find(p_parent);
+	if (it != chunked_requests.end()) {
 		if (p_index >= 0 && p_index < it->second.children.size()) {
 			return it->second.children[p_index];
 		}
@@ -1210,7 +1167,7 @@ void Win32Backend::rollback_staged_requests(Vector<Ref<DSRequest>> &p_slot_reque
 			Ref<DSRequest> child = p_staged_children[idx];
 			child->set_status(DSRequest::STATUS_FAILED);
 			child->set_gpu_in_flight(false);
-			s_chunk_parents.erase(child.ptr());
+			chunk_parents.erase(child.ptr());
 			if (!p_slot_requests.is_empty() && p_slot_requests[p_slot_requests.size() - 1] == child) {
 				p_slot_requests.remove_at(p_slot_requests.size() - 1);
 			}
@@ -1222,12 +1179,12 @@ void Win32Backend::rollback_staged_requests(Vector<Ref<DSRequest>> &p_slot_reque
 			if (p_dstorage_requests && !p_dstorage_requests->empty()) {
 				p_dstorage_requests->pop_back();
 			}
-			std::unordered_map<DSRequest *, ID3D12Resource *>::iterator g_it = s_resource_guards.find(child.ptr());
-			if (g_it != s_resource_guards.end()) {
+			std::unordered_map<DSRequest *, ID3D12Resource *>::iterator g_it = resource_guards.find(child.ptr());
+			if (g_it != resource_guards.end()) {
 				if (g_it->second) {
 					g_it->second->Release();
 				}
-				s_resource_guards.erase(g_it);
+				resource_guards.erase(g_it);
 			}
 		}
 	}
@@ -2470,12 +2427,6 @@ void ds_win32_release_static_d3d12_state() {
 		std::lock_guard<std::mutex> lock(s_transition_dispatch_mutex);
 		s_transition_queue.clear();
 	}
-	{
-		// Chunked parents/children hold Godot Refs: unreferencing those during
-		// unload would run engine code with the loader lock held.
-		s_chunked_requests.clear();
-		s_chunk_parents.clear();
-	}
 }
 
 bool Win32Backend::execute_transitions(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common) {
@@ -2622,7 +2573,6 @@ bool Win32Backend::initialize(const String &p_path) {
 		return false;
 	}
 
-	s_backend_instance = this;
 	active_batch_slot.store(0);
 	sync_batch_in_flight.store(false);
 	for (QueueState &queue : priority_queues) {
@@ -2954,9 +2904,6 @@ void Win32Backend::shutdown() {
 		if (completion_thread.joinable()) {
 			completion_thread.detach();
 		}
-		if (s_backend_instance == this) {
-			s_backend_instance = nullptr;
-		}
 		return;
 	}
 
@@ -3041,21 +2988,11 @@ void Win32Backend::shutdown() {
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		completion_queue.clear();
-		s_chunked_requests.clear();
-		s_chunk_parents.clear();
-		s_staging_buffer_warnings.clear();
-		if (s_dspkg_cache) {
-			memdelete(s_dspkg_cache);
-			s_dspkg_cache = nullptr;
-		}
 	}
 	{
 		ds_win32_invalidate_d3d12_device();
 	}
 	active_batch_slot.store(0);
-	if (s_backend_instance == this) {
-		s_backend_instance = nullptr;
-	}
 	unload_runtime_modules(dstoragecore_module, dstorage_module);
 	dstoragecore_module = nullptr;
 	dstorage_module = nullptr;
@@ -3245,7 +3182,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	}
 
 	// GPU synchronization contract - in-flight destination scan. A destination
-	// ID3D12Resource (AddRef'd in s_resource_guards at enqueue time, so the pointer
+	// ID3D12Resource (AddRef'd in resource_guards at enqueue time, so the pointer
 	// is stable while DirectStorage may own it) is in flight while it appears under
 	// guard in any slot with submitted && !completion_ready. That is exactly the
 	// window where D3D12_RESOURCE_STATE_COMMON cannot be established by anyone but
@@ -3292,8 +3229,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 					if (check.requests[check_request].is_null()) {
 						continue;
 					}
-					std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard_it = s_resource_guards.find(check.requests[check_request].ptr());
-					if (guard_it != s_resource_guards.end() && guard_it->second == p_resource) {
+					std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard_it = resource_guards.find(check.requests[check_request].ptr());
+					if (guard_it != resource_guards.end() && guard_it->second == p_resource) {
 						return true;
 					}
 				}
@@ -3307,8 +3244,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 				if (zombie.requests[check_request].is_null()) {
 					continue;
 				}
-				std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard_it = s_resource_guards.find(zombie.requests[check_request].ptr());
-				if (guard_it != s_resource_guards.end() && guard_it->second == p_resource) {
+				std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard_it = resource_guards.find(zombie.requests[check_request].ptr());
+				if (guard_it != resource_guards.end() && guard_it->second == p_resource) {
 					return true;
 				}
 			}
@@ -3497,7 +3434,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	ID3D12Resource *resource_guard = gpu_buffer_destination ? destination_buffer : destination_texture;
 	if (resource_guard) {
 		resource_guard->AddRef();
-		s_resource_guards[p_child.ptr()] = resource_guard;
+		resource_guards[p_child.ptr()] = resource_guard;
 	}
 	if (gpu_texture_destination && destination_texture) {
 		GPUTargetTransition transition;
@@ -3550,7 +3487,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 
 		if (staging_size > 0 && texture_footprint > staging_size) {
 			std::string warning_key = p_request->get_file_path().utf8().get_data();
-			if (s_staging_buffer_warnings.insert(warning_key).second) {
+			if (staging_buffer_warnings.insert(warning_key).second) {
 				UtilityFunctions::push_warning(
 						"[DirectStorage] Texture '", p_request->get_file_path(), "' uncompressed footprint (",
 						String::num_uint64(texture_footprint / (1024 * 1024)), " MiB) exceeds DirectStorage staging buffer size (",
@@ -3613,10 +3550,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			}
 			state.children.push_back(staged_children[c]);
 			state.destination_offsets.push_back(0);
-			s_chunk_parents[staged_children[c].ptr()] = p_request.ptr();
+			chunk_parents[staged_children[c].ptr()] = p_request.ptr();
 		}
 		adopt_source_file();
-		s_chunked_requests[p_request.ptr()] = state;
+		chunked_requests[p_request.ptr()] = state;
 		// The parent is what callers (and DSPreloader) hold and poll, so it must
 		// report the hardware window, not just the children. Without this the
 		// preloader sees a cancelled parent as terminal while its per-mip children
@@ -3669,9 +3606,9 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 		state.children.push_back(child);
 		state.destination_offsets.push_back(0);
-		s_chunk_parents[child.ptr()] = p_request.ptr();
+		chunk_parents[child.ptr()] = p_request.ptr();
 		adopt_source_file();
-		s_chunked_requests[p_request.ptr()] = state;
+		chunked_requests[p_request.ptr()] = state;
 		// Same contract as the multi-mip branch above: the parent carries the
 		// in-flight flag so cancellation cannot look terminal before the fence
 		// retires.
@@ -3767,10 +3704,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			}
 			state.children.push_back(staged_children[c]);
 			state.destination_offsets.push_back(staged_destination_offsets[c]);
-			s_chunk_parents[staged_children[c].ptr()] = p_request.ptr();
+			chunk_parents[staged_children[c].ptr()] = p_request.ptr();
 		}
 		adopt_source_file();
-		s_chunked_requests[p_request.ptr()] = state;
+		chunked_requests[p_request.ptr()] = state;
 		if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER ||
 				p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE) {
 			p_request->set_gpu_in_flight(true);
@@ -4416,8 +4353,8 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 				std::unordered_set<ID3D12Resource *> remaining_resources;
 				for (int r = 0; r < remaining.size(); r++) {
 					if (remaining[r].is_valid()) {
-						std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard_it = s_resource_guards.find(remaining[r].ptr());
-						if (guard_it != s_resource_guards.end()) {
+						std::unordered_map<DSRequest *, ID3D12Resource *>::const_iterator guard_it = resource_guards.find(remaining[r].ptr());
+						if (guard_it != resource_guards.end()) {
 							remaining_resources.insert(guard_it->second);
 						}
 					}
@@ -4432,7 +4369,7 @@ void Win32Backend::cancel_requests_with_tag(uint64_t p_tag) {
 				release_resource_guards(dropped);
 				for (int i = 0; i < dropped.size(); i++) {
 					if (dropped[i].is_valid()) {
-						s_chunk_parents.erase(dropped[i].ptr());
+						chunk_parents.erase(dropped[i].ptr());
 					}
 				}
 			}
@@ -4680,6 +4617,39 @@ void Win32Backend::_debug_inject_queue_error_for_testing(int p_queue_index, cons
 	}
 	report_queue_error(immediate);
 #endif
+}
+
+void Win32Backend::_debug_seed_instance_state_for_testing() {
+#ifdef _WIN32
+	// Test-only seam. Seeds this instance's containers with one synthetic
+	// parent/child chunk pair and one null resource guard (never dereferenced:
+	// both release paths test the pointer before Release()). The real setup needs
+	// a staged multi-mip GPU request, which needs a device and a crafted .dstex;
+	// the invariant under test is only "whose containers are these".
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	Ref<DSRequest> parent;
+	parent.instantiate();
+	Ref<DSRequest> child;
+	child.instantiate();
+	DSChunkedRequestState state;
+	state.parent = parent;
+	state.children.push_back(child);
+	state.destination_offsets.push_back(0);
+	chunked_requests[parent.ptr()] = state;
+	chunk_parents[child.ptr()] = parent.ptr();
+	resource_guards[child.ptr()] = nullptr;
+#endif
+}
+
+Dictionary Win32Backend::_debug_instance_state_for_testing() const {
+	Dictionary state;
+#ifdef _WIN32
+	state["chunked_requests"] = static_cast<int64_t>(chunked_requests.size());
+	state["chunk_parents"] = static_cast<int64_t>(chunk_parents.size());
+	state["resource_guards"] = static_cast<int64_t>(resource_guards.size());
+	state["staging_buffer_warnings"] = static_cast<int64_t>(staging_buffer_warnings.size());
+#endif
+	return state;
 }
 #endif
 

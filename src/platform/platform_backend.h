@@ -28,6 +28,14 @@ public:
 	virtual bool is_batch_complete() const = 0;
 	virtual void collect_completed_results() = 0;
 	virtual void cancel_requests_with_tag(uint64_t p_tag) = 0;
+	// Highest completion fence across every queue this backend owns. Backends
+	// without a fence model return 0, which DSContext reads as "no fence to wait
+	// on". Virtual dispatch is what makes the answer belong to the object the
+	// caller holds: there is no process-global "live instance" to compare against.
+	virtual uint64_t get_completion_fence() const { return 0; }
+	// Bounded wait for the given fence. Backends without a fence model return
+	// false; DSContext only calls it when the backend reports a fence.
+	virtual bool wait_for_completion(uint64_t /*p_fence_value*/, uint32_t /*p_timeout_msec*/) { return false; }
 	virtual bool is_resource_in_flight(const RID & /*p_rid*/) const { return false; }
 };
 

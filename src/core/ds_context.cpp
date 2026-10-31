@@ -22,8 +22,6 @@ namespace godot {
 #include <wrl/client.h>
 #include <dxgi.h>
 Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device();
-uint64_t ds_win32_get_completion_fence(PlatformBackend *p_backend);
-bool ds_win32_wait_for_completion(PlatformBackend *p_backend, uint64_t p_fence_value, uint32_t p_timeout_msec);
 #endif
 
 static bool validate_d3d12_rendering_device_active(const String &p_phase) {
@@ -686,7 +684,7 @@ uint64_t DSContext::get_completion_fence() const {
 		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 		if (initialized.load(std::memory_order_acquire) && !shut_down.load(std::memory_order_acquire) &&
 				active_backend && active_backend->get_name() == "Win32DirectStorage") {
-			uint64_t backend_fence = ds_win32_get_completion_fence(active_backend);
+			uint64_t backend_fence = active_backend->get_completion_fence();
 			if (backend_fence != 0) {
 				return backend_fence;
 			}
@@ -725,7 +723,7 @@ bool DSContext::wait_for_completion(int p_timeout_msec) {
 			return false;
 		}
 		if (active_backend->get_name() == "Win32DirectStorage" &&
-				!ds_win32_wait_for_completion(active_backend, fence_value, static_cast<uint32_t>(p_timeout_msec))) {
+				!active_backend->wait_for_completion(fence_value, static_cast<uint32_t>(p_timeout_msec))) {
 			UtilityFunctions::push_error("[DirectStorage] Completion fence wait timed out or failed.");
 			return false;
 		}
@@ -1191,7 +1189,7 @@ void DSContext::flush_batch() {
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
 	if (active_backend->get_name() == "Win32DirectStorage") {
-		backend_fence = ds_win32_get_completion_fence(active_backend);
+		backend_fence = active_backend->get_completion_fence();
 	}
 #endif
 	{
@@ -1238,7 +1236,7 @@ Error DSContext::flush_batch_async() {
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
 	if (is_win32_backend) {
-		backend_fence = ds_win32_get_completion_fence(active_backend);
+		backend_fence = active_backend->get_completion_fence();
 	}
 #endif
 	{
@@ -1369,7 +1367,7 @@ Error DSContext::flush_stream_async() {
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
 	if (is_win32_backend) {
-		backend_fence = ds_win32_get_completion_fence(active_backend);
+		backend_fence = active_backend->get_completion_fence();
 	}
 #endif
 	{
