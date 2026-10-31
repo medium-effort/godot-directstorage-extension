@@ -1953,6 +1953,121 @@ GDEX_TEST_T(win32_remediation, queue_error_second_record_survives_to_its_batch, 
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, queue_error_two_fatal_records_fail_whole_batch, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // Two fatal records naming two different staged requests, both captured before
+    // the batch that staged them retires. Only one record can decide the batch: the
+    // claim loop examines the slot's own entry first and folds every later record
+    // into that failure, clearing it. This case pins what that fold guarantees, so a
+    // later change to it has to be deliberate - both requests must end
+    // STATUS_FAILED (a fatally failed batch never leaves a request looking
+    // completed), the first record keeps the message root, and the folded record's
+    // request is attributed to that root instead of carrying its own message.
+    //
+    // Both records are injected from the submit's enqueue window: the slot is
+    // frozen (closing, so the queue already counts as unfinished) while the
+    // requests have not been handed to DirectStorage yet. That makes the window
+    // deterministic instead of a race against DMA completion.
+    const char *fixture_path = "user://queue_error_two_fatal_fixture.dstex";
+    remove_temp_file(fixture_path);
+    ctx.add_teardown([fixture_path]() { remove_temp_file(fixture_path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+    GDEX_ASSERT_TRUE(write_temp_dstex(fixture_path, 64, 64, 1, 16384));
+
+    godot::Ref<godot::DSRequest> root_request = make_dummy_request(fixture_path, 1024);
+    root_request->set_uncompressed_size(1024);
+    root_request->set_cancellation_tag(9412);
+    // Low priority maps to queue index 0 (priority_to_queue_index), so the
+    // records below are injected on the queue that actually carries this batch.
+    root_request->set_priority(godot::DSRequest::PRIORITY_LOW);
+
+    godot::Ref<godot::DSRequest> folded_request = make_dummy_request(fixture_path, 1024);
+    folded_request->set_uncompressed_size(1024);
+    folded_request->set_cancellation_tag(9413);
+    folded_request->set_priority(godot::DSRequest::PRIORITY_LOW);
+
+    const godot::String root_message("diagnostic sentinel: first fatal record");
+    const godot::String folded_message("diagnostic sentinel: second fatal record");
+    // Written by the hook and read after submit_async() returns, so both happen on
+    // this thread with a sequencing edge between them.
+    godot::String root_name;
+    std::atomic<int> injected_records{ 0 };
+    backend->_debug_set_enqueue_window_hook_for_testing([&]() {
+        // The fresh backend stages this first batch on slot 0; the second slot is
+        // only consulted so a rotated active slot cannot turn this into a vacuous
+        // pass.
+        godot::PackedStringArray names = backend->_debug_staged_request_names_for_testing(0, 0);
+        if (names.size() < 2) {
+            names = backend->_debug_staged_request_names_for_testing(0, 1);
+        }
+        if (names.size() < 2) {
+            return;
+        }
+        // Staging order is enqueue order, so names[0] belongs to root_request and
+        // names[1] to folded_request. The first injection lands on the entry owned
+        // by the slot that holds these names, which is also the entry the completing
+        // batch examines first - that is what makes the winner deterministic.
+        root_name = names[0];
+        backend->_debug_inject_queue_error_for_testing(0, root_message, names[0], true);
+        backend->_debug_inject_queue_error_for_testing(0, folded_message, names[1], true);
+        injected_records.store(2);
+    });
+    ctx.add_teardown([backend]() { backend->_debug_set_enqueue_window_hook_for_testing({}); });
+
+    GDEX_ASSERT_TRUE(backend->enqueue_request(root_request));
+    GDEX_ASSERT_TRUE(backend->enqueue_request(folded_request));
+    backend->submit_async();
+
+    const uint64_t fence = backend->get_completion_fence();
+    GDEX_EXPECT_TRUE(backend->wait_for_completion(fence, 5000));
+    bool settled = false;
+    const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < settle_deadline) {
+        backend->poll_batch_status();
+        if (backend->is_batch_complete() &&
+                root_request->get_status() == godot::DSRequest::STATUS_FAILED &&
+                folded_request->get_status() == godot::DSRequest::STATUS_FAILED) {
+            settled = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    backend->_debug_set_enqueue_window_hook_for_testing({});
+
+    GDEX_EXPECT_EQ(injected_records.load(), 2);
+    GDEX_EXPECT_TRUE(settled);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(root_request->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(folded_request->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    // The first record decides the batch and keeps its message root.
+    GDEX_EXPECT_TRUE(!root_name.is_empty());
+    GDEX_EXPECT_TRUE(root_request->get_error_message().contains(root_message));
+    // The folded record is cleared, so its request is attributed to the root rather
+    // than completed or given a second root message. Changing this (for example by
+    // surfacing folded records separately) must update this case on purpose.
+    const godot::String folded_prefix =
+            godot::String("DirectStorage batch aborted due to failure in request [") + root_name + "]: ";
+    GDEX_EXPECT_TRUE(folded_request->get_error_message().begins_with(folded_prefix));
+    GDEX_EXPECT_TRUE(!folded_request->get_error_message().contains(folded_message));
+#else
+    (void)ctx;
+    GDEX_SKIP("The queue-error injection seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, second_instance_shutdown_preserves_first_instance_state, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
