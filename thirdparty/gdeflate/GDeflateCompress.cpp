@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <thread> // hardware_concurrency() only: this file spawns no threads
 #include <vector>
 

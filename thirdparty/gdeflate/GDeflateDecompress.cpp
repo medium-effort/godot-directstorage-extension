@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 
 template<>
 struct std::default_delete<libdeflate_gdeflate_decompressor>
