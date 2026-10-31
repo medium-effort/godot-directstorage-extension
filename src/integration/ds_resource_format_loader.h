@@ -46,6 +46,12 @@ private:
 
 	String _resolve_archive_path(const String &p_logical_path) const;
 	Ref<DSPkg> _get_or_open_archive(const String &p_archive_path) const;
+	// Opens p_archive_path into a caller-owned instance. Never reads or writes
+	// the shared cached_dspkg: the resource system must not hand out a mutable
+	// handle into the loader's archive view, because a failed DSPkg::open()
+	// clears the entry tables and would break every in-archive load for the
+	// rest of the process.
+	Ref<DSPkg> _open_archive_instance(const String &p_archive_path) const;
 	bool _cached_archive_is_current(const String &p_archive_path) const;
 	bool _is_texture_archive_entry(const String &p_path) const;
 

@@ -711,6 +711,77 @@ GDEX_TEST_T(loader, load_dspkg_returns_archive_resource, TAG_INTEGRATION) {
 	remove_user_file(dspkg_path);
 }
 
+// --- .dspkg instance isolation ------------------------------------------------------
+//
+// The loader keeps a parsed archive for in-archive .dstex redirection. A public
+// .dspkg load must not hand that instance out: DSPkg::open() clears the entry
+// tables, so a caller's failed open would silently empty the loader's view and
+// every packaged texture after it would load as null. The invariant is that the
+// object the resource system returns is never the object the loader keeps.
+
+GDEX_TEST_T(loader, dspkg_resource_instance_isolated_from_loader_cache, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_loader_isolated.dstex";
+	const char *dspkg_path = "user://gdextest_loader_isolated.dspkg";
+	const char *virtual_path = "res://gdextest_loader_isolated_entry.png";
+	if (!stage_textures_dspkg(ctx, dstex_path, dspkg_path, virtual_path)) {
+		remove_user_file(dstex_path);
+		remove_user_file(dspkg_path);
+		GDEX_ABORT_TEST("textures.dspkg staging failed");
+	}
+
+	// In gdextest (--editor), override editor bypass so the archive resolves.
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	if (ps) {
+		ps->set_setting("directstorage/force_archive_resolution", true);
+	}
+	ctx.add_teardown([ps]() {
+		if (ps) {
+			ps->set_setting("directstorage/force_archive_resolution", false);
+		}
+	});
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	const godot::String archive_path("res://textures.dspkg");
+	const godot::String entry_path(virtual_path);
+
+	// T1: prime the loader's internal archive cache through the redirection path.
+	GDEX_EXPECT_TRUE(loader->_exists(entry_path));
+
+	// T2/T3: the public archive load works and returns a usable archive.
+	godot::Ref<godot::DSPkg> pub(loader->_load(archive_path, godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE));
+	GDEX_ASSERT_TRUE(pub.is_valid());
+	GDEX_EXPECT_EQ(pub->get_entry_count(), 1);
+	GDEX_EXPECT_TRUE(pub->has_texture(entry_path));
+
+	// T4: a second load is a distinct object, not the loader's cache entry.
+	godot::Ref<godot::DSPkg> pub_again(loader->_load(archive_path, godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE));
+	GDEX_ASSERT_TRUE(pub_again.is_valid());
+	GDEX_EXPECT_TRUE(pub.ptr() != pub_again.ptr());
+
+	// T5: poison the public handle with an open() that cannot succeed. DSPkg::open()
+	// clears the entry tables on entry and leaves them cleared when it fails.
+	godot::Error poison_err = pub->open(godot::String("user://gdextest_loader_isolated_missing.dspkg"));
+	GDEX_EXPECT_TRUE(poison_err != godot::OK);
+	GDEX_EXPECT_EQ(pub->get_entry_count(), 0);
+
+	// T6: the loader's archive view survives the mutation.
+	GDEX_EXPECT_TRUE(loader->_exists(entry_path));
+
+	// T7: an in-archive texture still loads through the untouched cache.
+	godot::Ref<godot::Texture2D> tex(loader->_load(entry_path, godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE));
+	GDEX_ASSERT_TRUE(tex.is_valid());
+	GDEX_EXPECT_EQ(tex->get_width(), LOADER_TEX_WIDTH);
+	GDEX_EXPECT_EQ(tex->get_height(), LOADER_TEX_HEIGHT);
+
+	godot::Error err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+	(void)err;
+	remove_user_file(dstex_path);
+	remove_user_file(dspkg_path);
+}
+
 // --- v2 mip-table contract -------------------------------------------------
 //
 // read_header()/read_from_file() now require a v2 mip table to (a) declare a

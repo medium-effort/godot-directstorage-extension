@@ -298,6 +298,19 @@ Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_
 		archive_write_time = static_cast<uint64_t>(FileAccess::get_modified_time(p_archive_path));
 	}
 
+	Ref<DSPkg> archive = _open_archive_instance(p_archive_path);
+	if (archive.is_null()) {
+		return Ref<DSPkg>();
+	}
+
+	cached_archive_path = p_archive_path;
+	cached_dspkg = archive;
+	cached_archive_size = archive_size;
+	cached_archive_write_time = archive_write_time;
+	return cached_dspkg;
+}
+
+Ref<DSPkg> DSResourceFormatLoader::_open_archive_instance(const String &p_archive_path) const {
 	uint64_t expected_fingerprint = resolve_expected_fingerprint(ProjectSettings::get_singleton());
 
 	Ref<DSPkg> archive;
@@ -313,12 +326,7 @@ Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_
 		}
 		return Ref<DSPkg>();
 	}
-
-	cached_archive_path = p_archive_path;
-	cached_dspkg = archive;
-	cached_archive_size = archive_size;
-	cached_archive_write_time = archive_write_time;
-	return cached_dspkg;
+	return archive;
 }
 
 bool DSResourceFormatLoader::_is_texture_archive_entry(const String &p_path) const {
@@ -898,7 +906,9 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 	String resolved_archive_path = _resolve_archive_path(p_path);
 	String ext = p_path.get_extension().to_lower();
 	if (ext == "dspkg" && !resolved_archive_path.is_empty()) {
-		Ref<DSPkg> pkg = _get_or_open_archive(resolved_archive_path);
+		// A caller-owned instance, never the loader's cached archive: a script
+		// may open() it, and that clears the entry tables the loader relies on.
+		Ref<DSPkg> pkg = _open_archive_instance(resolved_archive_path);
 		if (pkg.is_valid()) {
 			return pkg;
 		}
@@ -985,7 +995,7 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 	}
 
 	if (ext == "dspkg") {
-		Ref<DSPkg> pkg = _get_or_open_archive(p_path);
+		Ref<DSPkg> pkg = _open_archive_instance(p_path);
 		if (pkg.is_valid()) {
 			return pkg;
 		}
