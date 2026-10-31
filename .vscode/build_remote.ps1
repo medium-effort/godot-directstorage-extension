@@ -6,6 +6,7 @@ param(
     [switch]$IncludePdb,
     [switch]$IncludeTests,
     [switch]$Verbose,
+    [switch]$ShowWarnings,
     [switch]$SkipVerify,
     [switch]$NoPrune,
     [switch]$SkipDocClasses,
@@ -1909,6 +1910,39 @@ if ($markerMissing -or $sconsFailed) {
     }
     $why = if ($sconsFailed) { "SCons reported compilation errors" } else { "missing success marker (SCons did not complete successfully)" }
     Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost). Detected via $why." -Code 1
+}
+
+# Compiler-warning summary, OPT-IN via -ShowWarnings. SCons output lives only in
+# the two temp logs above and is discarded on a successful build, so a green run
+# hides every warning unless the caller re-runs with -Verbose. This switch exists
+# for that case; the default stays byte-silent so existing logs and monitors see
+# exactly what they saw before. Third-party godot-cpp headers are reported as a
+# count only (they are not ours to fix); project-sourced warnings are listed.
+# ADVISORY ONLY: this never changes the exit code and never fails the build.
+if ($ShowWarnings -and -not $Verbose -and $sconsLines) {
+    $rawWarnings = @($sconsLines | Where-Object { $_ -match 'warning [A-Z]+[0-9]+' })
+    if ($rawWarnings.Count -gt 0) {
+        $thirdPartyWarnings = @($rawWarnings | Where-Object { $_ -match 'godot-cpp[\\/]include[\\/]' })
+        $projectWarnings = @($rawWarnings | Where-Object { $_ -notmatch 'godot-cpp[\\/]include[\\/]' })
+        Write-Status ("    Compiler warnings: {0} total (project {1}, godot-cpp headers {2}) - advisory only, build continues." -f $rawWarnings.Count, $projectWarnings.Count, $thirdPartyWarnings.Count) -ForegroundColor Yellow
+        # Collapse repeats first: one header warning is re-emitted per translation
+        # unit that instantiates the template, so raw counts overstate the issue.
+        $uniqueProjectWarnings = @($projectWarnings | Select-Object -Unique)
+        $shownWarnings = @($uniqueProjectWarnings | Select-Object -First 5)
+        foreach ($warningLine in $shownWarnings) {
+            $displayLine = [string]$warningLine
+            foreach ($prefix in @($RemoteDirWin, $WorkspaceRoot)) {
+                if ($prefix) { $displayLine = $displayLine -replace ([regex]::Escape($prefix) + '\\'), '' }
+            }
+            Write-Status "      $($displayLine.Trim())" -ForegroundColor DarkYellow
+        }
+        if ($uniqueProjectWarnings.Count -gt $shownWarnings.Count) {
+            Write-Status ("      ... and {0} more unique project warning(s); re-run with -Verbose for the full log." -f ($uniqueProjectWarnings.Count - $shownWarnings.Count)) -ForegroundColor DarkYellow
+        }
+        if ($thirdPartyWarnings.Count -gt 0) {
+            Write-Status "      (godot-cpp header warnings are third-party and listed only under -Verbose.)" -ForegroundColor DarkGray
+        }
+    }
 }
 
 # 5. Pull back compiled binary and debug symbols to Device A
