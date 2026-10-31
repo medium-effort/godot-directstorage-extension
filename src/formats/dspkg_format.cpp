@@ -1377,6 +1377,12 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 
 	TOCBufferReader reader(plaintext_toc.ptr(), plaintext_toc.size());
 
+	// Absolute end of the previous entry's payload. finalize() writes entries in
+	// resource-path order over one running payload offset, so writer output is
+	// ordered and disjoint; this is the boundary every following entry must
+	// start at or after.
+	uint64_t previous_payload_end = loaded_header.data_offset;
+
 	for (uint32_t i = 0; i < loaded_header.entry_count; ++i) {
 		if (!reader.has_remaining(DSPKG_ENTRY_PREFIX_SIZE)) {
 			return fail(ERR_FILE_CORRUPT, "Entry header extends past TOC buffer.");
@@ -1396,6 +1402,16 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 			return fail(ERR_FILE_CORRUPT, "Failed to read entry path from TOC buffer.");
 		}
 		entry.path = String::utf8(reinterpret_cast<const char *>(path_bytes.ptr()), path_len);
+
+		// The TOC stores a hash of the resource path beside the path itself
+		// (finalize() writes path.hash()), and entries_by_hash is keyed by that
+		// stored value. A stored hash that does not reproduce from the decoded
+		// path can only come from a rewritten or corrupted TOC: accept it and
+		// find_entry_for_path() keeps serving the entry from entries_by_path
+		// while the hash index stays keyed to a value no lookup can produce.
+		if (entry.path_hash != static_cast<uint64_t>(entry.path.hash())) {
+			return fail(ERR_FILE_CORRUPT, "Entry path hash does not match its path.");
+		}
 
 		entry.data_offset = reader.get_64();
 		entry.compressed_size = reader.get_64();
@@ -1424,6 +1440,15 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		if (abs_payload_end > file_len) {
 			return fail(ERR_FILE_CORRUPT, "Entry payload extends past archive length.");
 		}
+
+		// Writer output is ordered and disjoint (see previous_payload_end above),
+		// and the exact-duplicate check below is keyed by absolute offset and only
+		// runs for entries carrying GPU mip metadata, so a partially overlapping
+		// span would otherwise pass unremarked.
+		if (abs_payload_offset < previous_payload_end) {
+			return fail(ERR_FILE_CORRUPT, "Entry payload spans overlap a previous entry.");
+		}
+		previous_payload_end = abs_payload_end;
 
 		if (has_gpu_metadata) {
 			uint64_t metadata_size = 0;

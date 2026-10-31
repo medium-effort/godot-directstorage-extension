@@ -234,6 +234,39 @@ bool write_u64_at(const char *p_path, int64_t p_offset, uint64_t p_value) {
 	return true;
 }
 
+bool read_u64_at(const char *p_path, int64_t p_offset, uint64_t &r_value) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	file->seek(p_offset);
+	r_value = file->get_64();
+	file->close();
+	return true;
+}
+
+bool read_u32_at(const char *p_path, int64_t p_offset, uint32_t &r_value) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	file->seek(p_offset);
+	r_value = file->get_32();
+	file->close();
+	return true;
+}
+
+bool read_u16_at(const char *p_path, int64_t p_offset, uint16_t &r_value) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	file->seek(p_offset);
+	r_value = file->get_16();
+	file->close();
+	return true;
+}
+
 // Header offset of DSPkgHeader::data_offset (magic 4 + version 2 + flags 2 +
 // entry_count 4). Payloads start there, so a file that stops at this length
 // streamed nothing.
@@ -271,6 +304,82 @@ bool build_single_entry_archive(const char *p_dstex_path, const char *p_dspkg_pa
 		return false;
 	}
 	return builder->finalize() == godot::OK;
+}
+
+// Builds a two-entry plaintext archive whose entries both point at one
+// incompressible 128x128 .dstex. The payload is incompressible on purpose:
+// entry A's compressed span has to be much larger than the 512-byte step the
+// span case shifts entry B by, so a shifted B lands strictly inside A.
+bool build_two_entry_archive(const char *p_dstex_path, const char *p_dspkg_path) {
+	if (!write_temp_dstex_incompressible(p_dstex_path, 128, 128, 1, 128 * 128 * 4)) {
+		return false;
+	}
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	if (builder.is_null()) {
+		return false;
+	}
+	if (builder->create(godot::String(p_dspkg_path), 0ULL) != godot::OK) {
+		return false;
+	}
+	if (builder->add_texture("a.png", godot::String(p_dstex_path)) != godot::OK) {
+		return false;
+	}
+	if (builder->add_texture("b.png", godot::String(p_dstex_path)) != godot::OK) {
+		return false;
+	}
+	return builder->finalize() == godot::OK;
+}
+
+// Byte offsets of the two-entry fixture above, read back from the TOC instead
+// of assumed: finalize() sorts by resource path ("a.png" < "b.png") and
+// add_texture() derives GPU mip metadata from the .dstex header, so each entry
+// carries one 24-byte mip record after its fixed fields. Returns false when the
+// file does not have that shape, so a future layout change fails loudly rather
+// than patching the wrong bytes.
+struct TwoEntryLayout {
+	uint64_t payload_start = 0;
+	uint64_t off_a = 0;
+	uint64_t size_a = 0;
+	uint64_t mip0_a = 0;
+	uint64_t off_b = 0;
+	uint64_t mip0_b = 0;
+	uint16_t path_len_a = 0;
+	uint16_t path_len_b = 0;
+	uint64_t hash_a = 0;
+	int64_t entry_b_offset_field = 0;
+	int64_t entry_b_mip0_field = 0;
+};
+
+bool read_two_entry_layout(const char *p_path, TwoEntryLayout &r_layout) {
+	const int64_t entry_a = static_cast<int64_t>(godot::DSPKG_HEADER_SIZE_V4);
+	r_layout.payload_start = dspkg_payload_start(p_path);
+
+	if (!read_u16_at(p_path, entry_a + 8, r_layout.path_len_a) ||
+			!read_u64_at(p_path, entry_a, r_layout.hash_a)) {
+		return false;
+	}
+	const int64_t field_off_a = entry_a + static_cast<int64_t>(godot::DSPKG_ENTRY_PREFIX_SIZE) +
+			static_cast<int64_t>(r_layout.path_len_a);
+	uint32_t mip_count_a = 0;
+	if (!read_u64_at(p_path, field_off_a, r_layout.off_a) ||
+			!read_u64_at(p_path, field_off_a + 8, r_layout.size_a) ||
+			!read_u32_at(p_path, field_off_a + 36, mip_count_a) ||
+			!read_u64_at(p_path, field_off_a + static_cast<int64_t>(godot::DSPKG_ENTRY_FIELDS_SIZE_V3), r_layout.mip0_a)) {
+		return false;
+	}
+
+	const int64_t entry_b = field_off_a + static_cast<int64_t>(godot::DSPKG_ENTRY_FIELDS_SIZE_V3) +
+			static_cast<int64_t>(sizeof(godot::DSPkgMipEntry)) * static_cast<int64_t>(mip_count_a);
+	if (!read_u16_at(p_path, entry_b + 8, r_layout.path_len_b)) {
+		return false;
+	}
+	r_layout.entry_b_offset_field = entry_b + static_cast<int64_t>(godot::DSPKG_ENTRY_PREFIX_SIZE) +
+			static_cast<int64_t>(r_layout.path_len_b);
+	r_layout.entry_b_mip0_field = r_layout.entry_b_offset_field +
+			static_cast<int64_t>(godot::DSPKG_ENTRY_FIELDS_SIZE_V3);
+	return read_u64_at(p_path, r_layout.entry_b_offset_field, r_layout.off_b) &&
+			read_u64_at(p_path, r_layout.entry_b_mip0_field, r_layout.mip0_b);
 }
 
 } // namespace
@@ -1398,6 +1507,118 @@ GDEX_TEST_T(dspkg, med09_corrupt_entry_caps_rejected, TAG_INTEGRATION) {
 	GDEX_ASSERT_TRUE(reader.is_valid());
 	godot::Error err = reader->open(godot::String(dspkg_path), 0ULL);
 	GDEX_EXPECT_EQ(err, godot::ERR_FILE_CORRUPT);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, path_hash_mismatch_rejected, TAG_INTEGRATION) {
+	// The TOC stores a hash of the resource path beside the path itself
+	// (finalize() writes path.hash()) and entries_by_hash is keyed by that
+	// stored value. An entry whose stored hash does not reproduce from its
+	// decoded path cannot have been written by finalize(), so open() must
+	// refuse it instead of publishing an index no lookup can agree with.
+	const char *dstex_path = "user://temp_dspkg_path_hash.dstex";
+	const char *dspkg_path = "user://temp_dspkg_path_hash.dspkg";
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+
+	GDEX_ASSERT_TRUE(build_two_entry_archive(dstex_path, dspkg_path));
+
+	{
+		// Negative control: the writer-produced archive is accepted and both
+		// entries resolve before any byte is patched.
+		godot::Ref<godot::DSPkg> control;
+		control.instantiate();
+		GDEX_ASSERT_TRUE(control.is_valid());
+		GDEX_EXPECT_EQ(control->open(godot::String(dspkg_path), 0ULL), godot::OK);
+		GDEX_EXPECT_EQ(control->get_entry_count(), 2);
+		GDEX_EXPECT_TRUE(control->has_texture("a.png"));
+		GDEX_EXPECT_TRUE(control->has_texture("b.png"));
+	}
+
+	// The first byte of the TOC is entry A's path_hash: an unencrypted v4
+	// entry table starts right after the 64-byte header.
+	const int64_t path_hash_offset = static_cast<int64_t>(godot::DSPKG_HEADER_SIZE_V4);
+	GDEX_ASSERT_TRUE(mutate_file_byte(dspkg_path, path_hash_offset));
+
+	{
+		godot::Ref<godot::DSPkg> patched;
+		patched.instantiate();
+		GDEX_ASSERT_TRUE(patched.is_valid());
+		GDEX_EXPECT_EQ(patched->open(godot::String(dspkg_path), 0ULL), godot::ERR_FILE_CORRUPT);
+	}
+
+	// Restoring the byte proves the rejection came from the patch and not from
+	// a fixture the parser never accepted.
+	GDEX_ASSERT_TRUE(mutate_file_byte(dspkg_path, path_hash_offset));
+	{
+		godot::Ref<godot::DSPkg> restored;
+		restored.instantiate();
+		GDEX_ASSERT_TRUE(restored.is_valid());
+		GDEX_EXPECT_EQ(restored->open(godot::String(dspkg_path), 0ULL), godot::OK);
+	}
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+}
+
+GDEX_TEST_T(dspkg, overlapping_payload_span_rejected, TAG_INTEGRATION) {
+	// finalize() writes entries in resource-path order over one running payload
+	// offset, so writer output is ordered and disjoint. A span that starts
+	// inside the previous entry's span can only come from a hand-edited TOC,
+	// and the exact-duplicate-offset check cannot see it (it is keyed by offset
+	// and only runs for entries carrying GPU mip metadata).
+	const char *dstex_path = "user://temp_dspkg_span.dstex";
+	const char *dspkg_path = "user://temp_dspkg_span.dspkg";
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+
+	GDEX_ASSERT_TRUE(build_two_entry_archive(dstex_path, dspkg_path));
+
+	{
+		godot::Ref<godot::DSPkg> control;
+		control.instantiate();
+		GDEX_ASSERT_TRUE(control.is_valid());
+		GDEX_EXPECT_EQ(control->open(godot::String(dspkg_path), 0ULL), godot::OK);
+		GDEX_EXPECT_EQ(control->get_entry_count(), 2);
+	}
+
+	TwoEntryLayout layout;
+	GDEX_ASSERT_TRUE(read_two_entry_layout(dspkg_path, layout));
+	// Self-checks: entry A is the "a.png" entry at the start of the table, its
+	// span is far larger than the overlap step, and entry B follows it at the
+	// next 512-byte boundary with mip[0] equal to its payload start (the parser
+	// requires that equality, so a data_offset-only patch would be rejected as
+	// "Invalid entry mip metadata" instead of exercising the span check).
+	GDEX_EXPECT_EQ(layout.path_len_a, static_cast<uint16_t>(5));
+	GDEX_EXPECT_EQ(layout.path_len_b, static_cast<uint16_t>(5));
+	GDEX_EXPECT_EQ(layout.hash_a, static_cast<uint64_t>(godot::String("a.png").hash()));
+	GDEX_EXPECT_EQ(layout.off_a, 0ULL);
+	GDEX_EXPECT_TRUE(layout.size_a > 1024);
+	GDEX_EXPECT_EQ(layout.mip0_a, layout.payload_start);
+	GDEX_EXPECT_EQ(layout.off_b, align_up_local(layout.size_a, 512ULL));
+	GDEX_EXPECT_EQ(layout.mip0_b, layout.payload_start + layout.off_b);
+
+	const uint64_t overlap_step = 512;
+	GDEX_ASSERT_TRUE(write_u64_at(dspkg_path, layout.entry_b_offset_field, overlap_step));
+	GDEX_ASSERT_TRUE(write_u64_at(dspkg_path, layout.entry_b_mip0_field, layout.payload_start + overlap_step));
+
+	{
+		godot::Ref<godot::DSPkg> patched;
+		patched.instantiate();
+		GDEX_ASSERT_TRUE(patched.is_valid());
+		GDEX_EXPECT_EQ(patched->open(godot::String(dspkg_path), 0ULL), godot::ERR_FILE_CORRUPT);
+	}
+
+	GDEX_ASSERT_TRUE(write_u64_at(dspkg_path, layout.entry_b_offset_field, layout.off_b));
+	GDEX_ASSERT_TRUE(write_u64_at(dspkg_path, layout.entry_b_mip0_field, layout.mip0_b));
+	{
+		godot::Ref<godot::DSPkg> restored;
+		restored.instantiate();
+		GDEX_ASSERT_TRUE(restored.is_valid());
+		GDEX_EXPECT_EQ(restored->open(godot::String(dspkg_path), 0ULL), godot::OK);
+	}
 
 	remove_temp_file(dstex_path);
 	remove_temp_file(dspkg_path);
