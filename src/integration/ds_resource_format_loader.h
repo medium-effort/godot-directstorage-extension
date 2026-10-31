@@ -16,6 +16,7 @@
 
 namespace godot {
 
+class DSContext;
 class DSPkg;
 
 class DSResourceFormatLoader : public ResourceFormatLoader {
@@ -47,6 +48,13 @@ private:
 	Ref<DSPkg> _get_or_open_archive(const String &p_archive_path) const;
 	bool _cached_archive_is_current(const String &p_archive_path) const;
 	bool _is_texture_archive_entry(const String &p_path) const;
+
+	// Initializes the DirectStorage context for a load, without ever waiting for a
+	// device acquisition the calling thread cannot serve. Main-thread and
+	// render-thread callers initialize inline; a background caller posts one
+	// deferred initialization for the main thread and returns true so the load
+	// takes the CPU path instead of publishing the software fallback.
+	bool _maybe_initialize_context(DSContext *p_ctx) const;
 
 	Variant _load_texture_payload(
 			const String &p_file_path,
@@ -82,6 +90,14 @@ public:
 	virtual String _get_resource_type(const String &p_path) const override;
 	virtual bool _exists(const String &p_path) const override;
 	virtual Variant _load(const String &p_path, const String &p_original_path, bool p_use_sub_threads, int32_t p_cache_mode) const override;
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only seams, deliberately NEVER bound to GDScript: run the lazy-init
+	// decision on the calling thread, and run a pending deferred initialization
+	// synchronously (what the main thread does when it drains the call).
+	bool _debug_loader_init_decision_for_testing() const;
+	void _debug_run_pending_loader_init_for_testing();
+#endif
 };
 
 } // namespace godot

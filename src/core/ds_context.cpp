@@ -10,6 +10,7 @@
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/classes/thread.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -968,6 +969,22 @@ bool DSContext::initialize_ds_locked() {
 		std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 		active_backend = fallback_backend;
 	}
+#ifdef _WIN32
+	// A background-thread initialization that ends up on the software backend while
+	// a D3D12 driver is active is almost always a caller that cannot serve a device
+	// acquisition (see DSResourceFormatLoader::_maybe_initialize_context). Keep it
+	// visible, but only once, and never on headless/non-D3D12 runs where the
+	// fallback is the correct backend.
+	{
+		RenderingServer *warning_rs = RenderingServer::get_singleton();
+		static std::atomic<bool> s_off_main_fallback_warned{false};
+		if (!Thread::is_main_thread() && warning_rs &&
+				warning_rs->get_current_rendering_driver_name().to_lower() == "d3d12" &&
+				!s_off_main_fallback_warned.exchange(true)) {
+			UtilityFunctions::push_warning("[DirectStorage] DirectStorage context initialized on a background thread and fell back to the software backend. Initialize it on the main thread at startup (the DSRuntime autoload does this).");
+		}
+	}
+#endif
 	init_status.store(INIT_STATUS_SOFTWARE_FALLBACK, std::memory_order_release);
 	initialized.store(true, std::memory_order_release);
 	UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with FallbackBackend.");

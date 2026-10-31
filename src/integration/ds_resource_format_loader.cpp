@@ -18,7 +18,11 @@
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/texture2drd.hpp>
+#include <godot_cpp/classes/thread.hpp>
+#include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
+
+#include <atomic>
 
 #include <chrono>
 #include <cstdlib>
@@ -329,6 +333,58 @@ bool DSResourceFormatLoader::_exists(const String &p_path) const {
 	return _is_texture_archive_entry(p_path);
 }
 
+// One deferred lazy initialization at a time, process-wide. The deferred call is
+// drained by the main thread, which is the only thread that can both serve the
+// device acquisition in single-threaded rendering and publish the backend.
+static std::atomic<bool> s_loader_init_posted{false};
+
+// Runs on the main thread at a MessageQueue flush inside Main::iteration().
+static void ds_loader_initialize_context_on_main_thread() {
+	s_loader_init_posted.store(false);
+	DSContext *ctx = DSContext::get_singleton();
+	if (ctx && !ctx->is_initialized()) {
+		ctx->initialize_ds();
+	}
+}
+
+bool DSResourceFormatLoader::_maybe_initialize_context(DSContext *p_ctx) const {
+	if (!p_ctx || p_ctx->is_initialized()) {
+		return false;
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	// The main thread is the render thread in single-threaded rendering and can
+	// wait one frame when rendering is threaded; the render thread fetches
+	// inline. Only a background caller cannot serve an acquisition.
+	const bool background_caller = !Thread::is_main_thread() && !(rs && rs->is_on_render_thread());
+	if (!background_caller) {
+		p_ctx->initialize_ds();
+		return false;
+	}
+	Engine *engine = Engine::get_singleton();
+	if (!engine || engine->get_main_loop() == nullptr) {
+		// Nothing will drain a deferred call; keep this load on the CPU path.
+		return true;
+	}
+	if (!s_loader_init_posted.exchange(true)) {
+		UtilityFunctions::print_verbose("[DirectStorage] Loader deferred context initialization to the main thread; this load uses the CPU path.");
+		callable_mp_static(ds_loader_initialize_context_on_main_thread).call_deferred();
+	}
+	return true;
+}
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+bool DSResourceFormatLoader::_debug_loader_init_decision_for_testing() const {
+	return _maybe_initialize_context(DSContext::get_singleton());
+}
+
+void DSResourceFormatLoader::_debug_run_pending_loader_init_for_testing() {
+	if (!s_loader_init_posted.load()) {
+		return;
+	}
+	ds_loader_initialize_context_on_main_thread();
+}
+#endif
+
 Variant DSResourceFormatLoader::_load_texture_payload(
 		const String &p_file_path,
 		uint64_t p_offset,
@@ -377,9 +433,10 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	}
 
 	DSContext *ds_ctx = DSContext::get_singleton();
-	if (ds_ctx && !ds_ctx->is_initialized()) {
-		ds_ctx->initialize_ds();
-	}
+	// A background caller must not initialize the context: the acquisition would
+	// either stall for its full budget or publish the software fallback for the
+	// whole process. Defer to the main thread and decode this load on the CPU.
+	_maybe_initialize_context(ds_ctx);
 
 	Ref<Texture2D> result_texture;
 	// True once the GPU branch has handed its RID to the cache. Guards the

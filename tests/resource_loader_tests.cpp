@@ -1,6 +1,7 @@
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
 
+#include "core/ds_context.h"
 #include "integration/ds_resource_format_loader.h"
 #include "integration/ds_texture_cache.h"
 #include "formats/dspkg_format.h"
@@ -13,7 +14,10 @@
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/rendering_device.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/resource_format_loader.hpp>
+#include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/classes/texture2drd.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
@@ -24,6 +28,7 @@
 #include <godot_cpp/variant/variant.hpp>
 
 #include <cstdint>
+#include <thread>
 
 // Live-engine suite for DSResourceFormatLoader (covers the same area as
 // project/headless_tests/test_integration.gd loader sections — which stay
@@ -911,4 +916,144 @@ GDEX_TEST_T(loader, narrow_mip_chain_loads, TAG_INTEGRATION) {
 	GDEX_EXPECT_EQ(tex->get_height(), 1024);
 
 	remove_user_file(path);
+}
+
+// --- Lazy initialization must never publish the software backend --------------
+//
+// A resource load can reach the loader's lazy initialization on a background
+// worker (proved at runtime: the worker prints main_thread=false for both
+// load_threaded_request modes). Before this contract, such a caller either burned
+// the whole device-acquisition budget or published FallbackBackend for the entire
+// process, silently disabling DirectStorage until the next explicit shutdown.
+
+#ifdef _WIN32
+namespace {
+
+// The environment gate: these cases only mean anything with a live D3D12 device.
+bool loader_worker_gate_d3d12() {
+	godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+	godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	return rd != nullptr && rs->get_current_rendering_driver_name().to_lower() == "d3d12";
+}
+
+} // namespace
+#endif
+
+GDEX_TEST_T(loader, worker_lazy_init_defers_to_main_thread, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if !defined(DEBUG_ENABLED) && !defined(DEV_ENABLED)
+	(void)ctx;
+	GDEX_SKIP("Lazy-init decision seams are DEBUG/DEV-only.");
+#else
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	if (!loader_worker_gate_d3d12()) {
+		GDEX_SKIP("No live D3D12 RenderingDevice (headless or non-D3D12 driver).");
+	}
+	ctx.add_teardown([ds]() {
+		ds->shutdown_ds();
+		ds->initialize_ds();
+	});
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	ds->shutdown_ds();
+	GDEX_EXPECT_FALSE(ds->is_initialized());
+
+	bool deferred = false;
+	{
+		std::thread worker([&loader, &deferred]() {
+			deferred = loader->_debug_loader_init_decision_for_testing();
+		});
+		worker.join();
+	}
+
+	// The worker must defer, not initialize: an acquisition it cannot serve would
+	// publish the software fallback for the whole context.
+	GDEX_EXPECT_TRUE(deferred);
+	GDEX_EXPECT_FALSE(ds->is_initialized());
+	GDEX_EXPECT_STR_NE(ds->get_active_backend_name(), godot::String("SoftwareFallback"));
+
+	// What the main thread does when it drains the deferred call.
+	loader->_debug_run_pending_loader_init_for_testing();
+	GDEX_EXPECT_TRUE(ds->is_initialized());
+	GDEX_EXPECT_TRUE(ds->is_d3d12_backend());
+#endif
+#else
+	(void)ctx;
+	GDEX_SKIP("Win32 backend is excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(loader, threaded_load_before_init_keeps_d3d12, TAG_INTEGRATION) {
+#ifdef _WIN32
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	godot::ResourceLoader *rl = godot::ResourceLoader::get_singleton();
+	if (rl == nullptr) {
+		GDEX_SKIP("ResourceLoader singleton unavailable.");
+	}
+	if (!loader_worker_gate_d3d12()) {
+		GDEX_SKIP("No live D3D12 RenderingDevice (headless or non-D3D12 driver).");
+	}
+	ctx.add_teardown([ds]() {
+		ds->shutdown_ds();
+		ds->initialize_ds();
+	});
+
+	const char *dstex_path = "user://gdextest_loader_worker_init.dstex";
+	ctx.add_teardown([dstex_path]() { remove_user_file(dstex_path); });
+	if (!write_loose_dstex(dstex_path)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	const bool modes[2] = { false, true };
+	for (int m = 0; m < 2; ++m) {
+		ds->shutdown_ds();
+		GDEX_EXPECT_FALSE(ds->is_initialized());
+
+		bool loaded_ok = false;
+		for (int attempt = 0; attempt < 3 && !loaded_ok; ++attempt) {
+			godot::Error req = rl->load_threaded_request(dstex_path, "Texture2D", modes[m],
+					godot::ResourceLoader::CACHE_MODE_IGNORE);
+			GDEX_ASSERT_EQ(static_cast<int64_t>(req), static_cast<int64_t>(godot::OK));
+
+			int polls = 0;
+			while (polls++ < 20000) {
+				godot::ResourceLoader::ThreadLoadStatus status = rl->load_threaded_get_status(dstex_path);
+				if (status != godot::ResourceLoader::THREAD_LOAD_IN_PROGRESS) {
+					break;
+				}
+				godot::OS::get_singleton()->delay_usec(1000);
+			}
+			godot::ResourceLoader::ThreadLoadStatus status = rl->load_threaded_get_status(dstex_path);
+			godot::Ref<godot::Resource> loaded = rl->load_threaded_get(dstex_path);
+			loaded_ok = status == godot::ResourceLoader::THREAD_LOAD_LOADED && loaded.is_valid();
+		}
+		GDEX_EXPECT_TRUE(loaded_ok);
+
+		// The load may reach the loader on a worker; it must never have published
+		// the software backend. If initialization is still pending, drain it the way
+		// the main thread would, then both invariants must hold.
+		GDEX_EXPECT_STR_NE(ds->get_active_backend_name(), godot::String("SoftwareFallback"));
+		if (!ds->is_initialized()) {
+			loader->_debug_run_pending_loader_init_for_testing();
+		}
+		GDEX_EXPECT_TRUE(ds->is_initialized());
+		GDEX_EXPECT_TRUE(ds->is_d3d12_backend());
+	}
+#else
+	(void)ctx;
+	GDEX_SKIP("Win32 backend is excluded from the test build on non-Windows.");
+#endif
 }
