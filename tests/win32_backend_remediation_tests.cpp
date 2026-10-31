@@ -1691,4 +1691,131 @@ GDEX_TEST_T(win32_remediation, queue_error_retrieval_is_serialized, TAG_INTEGRAT
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, queue_error_drain_requires_error_event, TAG_INTEGRATION) {
+#ifdef _WIN32
+    // The SDK ties RetrieveErrorRecord() to the queue's error event: it may only be
+    // called once that event has signalled, and not again until the next signal.
+    // The completion path used to read the record on every batch completion - twice
+    // per batch, because the main-thread poll drains too - so a failure record could
+    // be consumed by a slot whose batch did not own the failing request.
+    //
+    // Measurement: a batch that reports no failure must not reach the API at all.
+    // The counter is process-wide, so a delta is used and sibling cases that cancel
+    // requests (which legitimately raise it) cannot distort the expectation.
+    const char *fixture_path = "user://queue_error_event_fixture.dstex";
+    remove_temp_file(fixture_path);
+    ctx.add_teardown([fixture_path]() { remove_temp_file(fixture_path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    GDEX_ASSERT_TRUE(write_temp_dstex(fixture_path, 64, 64, 1, 16384));
+
+    godot::Ref<godot::DSRequest> request = make_dummy_request(fixture_path, 1024);
+    request->set_uncompressed_size(1024);
+    request->set_cancellation_tag(9301);
+
+    const int reads_before = backend->_debug_error_record_read_count();
+    GDEX_ASSERT_TRUE(backend->enqueue_request(request));
+    backend->submit_async();
+
+    const uint64_t fence = backend->get_completion_fence();
+    GDEX_EXPECT_TRUE(backend->wait_for_completion(fence, 5000));
+    bool settled = false;
+    const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < settle_deadline) {
+        backend->poll_batch_status();
+        if (backend->is_batch_complete() && request->get_status() == godot::DSRequest::STATUS_COMPLETED) {
+            settled = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    GDEX_ASSERT_TRUE(settled);
+
+    // The invariant under test: a clean batch never reads an error record.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(backend->_debug_error_record_read_count()),
+            static_cast<int64_t>(reads_before));
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, queue_error_report_runs_outside_batch_mutex, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // Two contracts in one measurement. (1) A failure that no retiring batch can
+    // carry must still be reported - the old per-completion drain only ever looked
+    // at the record while a batch was finishing, so a record with no batch in
+    // flight was never surfaced. (2) push_error()/report_error() must run after
+    // batch_mutex is released, or the completion thread parks inside the engine
+    // while holding the lock every enqueue and eviction caller needs.
+    //
+    // The seam installs the record the SDK would have returned after an error event
+    // (the only real source of an out-of-band record is a device removal) and runs
+    // the same stash-or-report decision the error-event handler uses. Only the SDK
+    // read is bypassed, so no runtime or initialized backend is required.
+    godot::DSErrorHandler *eh = godot::DSErrorHandler::get_singleton();
+    if (eh == nullptr) {
+        GDEX_SKIP("DSErrorHandler singleton absent: real extension not loaded in this fixture.");
+    }
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        backend->_debug_set_queue_error_report_hook_for_testing({});
+        memdelete(backend);
+    });
+    ctx.add_teardown([eh]() { eh->clear_error(); });
+
+    const godot::String sentinel("diagnostic sentinel: out-of-band queue error");
+    eh->clear_error();
+
+    std::atomic<bool> window_open{ false };
+    std::atomic<bool> release_window{ false };
+    backend->_debug_set_queue_error_report_hook_for_testing([&window_open, &release_window]() {
+        window_open.store(true);
+        // Self-releasing: a broken build must not hang the suite here.
+        const auto hook_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!release_window.load() && std::chrono::steady_clock::now() < hook_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    std::thread injector([backend, sentinel]() { backend->_debug_inject_queue_error_for_testing(0, sentinel); });
+
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!window_open.load() && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool entered = window_open.load();
+    // Nothing else can hold the lock here: no batch exists. A held lock at this
+    // instant means the report is still inside the batch_mutex block.
+    const bool mutex_free = entered && backend->_debug_batch_mutex_is_free_for_testing();
+
+    release_window.store(true);
+    injector.join();
+    backend->_debug_set_queue_error_report_hook_for_testing({});
+
+    GDEX_EXPECT_TRUE(entered);
+    GDEX_EXPECT_TRUE(mutex_free);
+    GDEX_EXPECT_TRUE(eh->has_error());
+    GDEX_EXPECT_TRUE(eh->get_last_error().contains(sentinel));
+#else
+    (void)ctx;
+    GDEX_SKIP("The queue-error report seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 

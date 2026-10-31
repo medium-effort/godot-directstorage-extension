@@ -87,12 +87,40 @@ private:
 		bool completion_ready = false;
 		bool is_sync_submission = false;
 	};
+	// One failure read from IDStorageQueue::RetrieveErrorRecord(). The message is
+	// built where the record is read so the caller can push/report it only after
+	// every extension mutex has been released.
+	struct QueueErrorInfo {
+		bool present = false;
+		// False for a cancellation (ERROR_OPERATION_ABORTED). The record is still
+		// consumed and logged verbosely, but the batch is not a failure.
+		bool fatal = true;
+		String message;
+		String failed_request_name;
+	};
+	// Everything a retiring batch has to say to the engine once batch_mutex is
+	// released: the queue failure (if any) plus the resource-guard warnings
+	// collected while validating the batch's requests.
+	struct BatchReport {
+		QueueErrorInfo error;
+		std::vector<String> warnings;
+	};
 	struct QueueState {
 		IDStorageQueue3 *queue = nullptr;
 		HANDLE completion_event = nullptr;
+		// Queue-owned handle from IDStorageQueue::GetErrorEvent(); the backend
+		// waits on it but never CloseHandle()s it. RetrieveErrorRecord may only
+		// be called once this event has signalled, so it is the only drain
+		// trigger and the completion path no longer reads the record itself.
+		HANDLE error_event = nullptr;
 		ID3D12Fence *completion_fence = nullptr;
 		uint64_t completion_fence_value = 0;
 		uint64_t completed_fence_value = 0;
+		// Failure captured on error_event that has not reached a completing
+		// batch yet. Guarded by batch_mutex. The completion path must consume it:
+		// poll_batch_status() treats "no record" as "batch succeeded", so a record
+		// dropped here would turn a failed batch into a completed one.
+		QueueErrorInfo pending_error;
 		std::array<BatchSlot, BATCH_SLOT_COUNT> batch_slots;
 	};
 
@@ -190,9 +218,29 @@ private:
 #ifdef _WIN32
 	void completion_thread_func();
 	bool drain_all_queues(uint32_t p_timeout_ms);
-	void poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uint64_t p_fence_value);
-	void poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value);
-	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch);
+	// Reads the queue's error record and builds its message. Never calls into the
+	// engine and never takes a lock of its own: callers hold batch_mutex, and the
+	// result is reported by report_queue_error() after that lock is released.
+	static QueueErrorInfo read_queue_error(IDStorageQueue *p_queue);
+	// Pushes the record to the engine (push_error/report_error, or print_verbose
+	// for cancellations). Must be called with no extension mutex held.
+	static void report_queue_error(const QueueErrorInfo &p_error);
+	// Reports a retiring batch's warnings and queue failure. Callers invoke this
+	// after the batch_mutex block that produced the report has closed.
+	static void report_batch_outcome(const BatchReport &p_report);
+	void handle_queue_error_event(int p_queue_index);
+	// Hands a captured record to the batch that will consume it, or returns it for
+	// immediate reporting when no batch on that queue is still unfinished.
+	void stash_queue_error_locked(QueueState &p_queue, const QueueErrorInfo &p_error, QueueErrorInfo *r_immediate);
+	bool has_unfinished_batch_on_queue_locked(const QueueState &p_queue) const;
+	// True when this slot staged the request the record names, or when the record
+	// names no request at all (nothing to match on). Caller holds batch_mutex.
+	bool slot_owns_error_name_locked(const BatchSlot &p_slot, const String &p_failed_request_name) const;
+	// True when any slot of the queue still holds the named request, i.e. the
+	// record belongs to a later completion. Caller holds batch_mutex.
+	bool queue_has_request_name_locked(const QueueState &p_queue, const String &p_failed_request_name) const;
+	void poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uint64_t p_fence_value, BatchReport &r_report);
+	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch, BatchReport &r_report);
 	bool has_in_flight_batches_locked() const;
 	void update_profiler_queue_depth_locked();
 	void close_slot_files(BatchSlot &p_slot);
@@ -296,6 +344,23 @@ public:
 	// prove process_queue_errors() is serialised with the completion thread's error drain.
 	// Never bound in _bind_methods().
 	bool _debug_batch_mutex_is_free_for_testing();
+	// Test-only seam: installs (or, with an empty callback, clears) the hook that
+	// runs immediately before a captured queue error is pushed to the engine. A
+	// test parks in it and asks another thread whether batch_mutex is free: the
+	// report must happen after the lock, never inside it.
+	// Never bound in _bind_methods().
+	void _debug_set_queue_error_report_hook_for_testing(const std::function<void()> &p_hook);
+	// Test-only seam: number of RetrieveErrorRecord() calls made process-wide since
+	// the extension was loaded. Stays flat for a batch that reports no failure,
+	// which is exactly what the event-driven contract requires. Compare deltas:
+	// sibling cases that cancel requests raise it legitimately.
+	// Never bound in _bind_methods().
+	int _debug_error_record_read_count() const;
+	// Test-only seam: installs a queue failure that the SDK cannot be made to
+	// produce on demand (the real out-of-band trigger is device removal), so the
+	// "report a failure with no batch in flight" path can be executed.
+	// Never bound in _bind_methods().
+	void _debug_inject_queue_error_for_testing(int p_queue_index, const String &p_message);
 	// Test-only seam: how many times DStorageSetConfiguration has actually been
 	// applied. The counter is per loaded runtime instance, not per process, so a
 	// second load cycle must raise it again; a process-wide latch did not. Never

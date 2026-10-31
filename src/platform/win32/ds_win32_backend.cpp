@@ -381,17 +381,31 @@ static std::unordered_map<DSRequest *, DSRequest *> s_chunk_parents;
 static std::unordered_map<DSRequest *, ID3D12Resource *> s_resource_guards;
 static std::unordered_set<std::string> s_staging_buffer_warnings;
 
-static String retrieve_queue_error(IDStorageQueue *p_queue, String *r_failed_request_name = nullptr) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+// Test-only seam state (never bound in _bind_methods()). The hook runs immediately
+// before a captured queue error is pushed to the engine, so a test can prove the
+// push happens with batch_mutex released.
+static std::mutex s_queue_error_report_hook_mutex;
+static std::function<void()> s_queue_error_report_hook;
+static std::atomic<int> s_error_record_read_count{ 0 };
+#endif
+
+Win32Backend::QueueErrorInfo Win32Backend::read_queue_error(IDStorageQueue *p_queue) {
+	QueueErrorInfo info;
 	if (!p_queue) {
-		return String();
+		return info;
 	}
 
 	DSTORAGE_ERROR_RECORD error_record = {};
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	s_error_record_read_count.fetch_add(1);
+#endif
 	p_queue->RetrieveErrorRecord(&error_record);
 	if (error_record.FailureCount == 0) {
-		return String();
+		return info;
 	}
 
+	info.present = true;
 	const DSTORAGE_ERROR_FIRST_FAILURE &failure = error_record.FirstFailure;
 	String hresult_desc = DSErrorHandler::describe_hresult(static_cast<uint32_t>(failure.HResult));
 	if (hresult_desc.is_empty()) {
@@ -400,35 +414,57 @@ static String retrieve_queue_error(IDStorageQueue *p_queue, String *r_failed_req
 
 	String command_type_str = DSErrorHandler::describe_command_type(static_cast<int32_t>(failure.CommandType));
 
-	String message = "DirectStorage queue error (HRESULT 0x" +
+	info.message = "DirectStorage queue error (HRESULT 0x" +
 			String::num_uint64(static_cast<uint32_t>(failure.HResult), 16) +
 			", command type " + command_type_str + "): " +
 			hresult_desc;
 
 	if (failure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST) {
 		String req_name_str = String(failure.Request.RequestName);
-		message += " [File: " + String(failure.Request.Filename) + ", RequestName: " + req_name_str + "]";
-		if (r_failed_request_name) {
-			*r_failed_request_name = req_name_str;
-		}
+		info.message += " [File: " + String(failure.Request.Filename) + ", RequestName: " + req_name_str + "]";
+		info.failed_request_name = req_name_str;
 	}
 
-#ifdef _WIN32
 	const HRESULT hr_aborted = HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
 	if (failure.HResult == hr_aborted) {
-		// Cancellation via CancelRequestsWithTag() is an intentional application event,
-		// not a fatal failure. Suppress push_error/report_error and log verbosely.
-		UtilityFunctions::print_verbose("[DirectStorage] Request aborted on queue: " + message);
-		return String();
+		// Cancellation via CancelRequestsWithTag() is an intentional application
+		// event, not a fatal failure: log verbosely, never fail the batch for it.
+		info.fatal = false;
+	}
+	return info;
+}
+
+void Win32Backend::report_queue_error(const QueueErrorInfo &p_error) {
+	if (!p_error.present) {
+		return;
+	}
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	std::function<void()> hook;
+	{
+		std::lock_guard<std::mutex> lock(s_queue_error_report_hook_mutex);
+		hook = s_queue_error_report_hook;
+	}
+	if (hook) {
+		hook();
 	}
 #endif
-
-	UtilityFunctions::push_error(message);
+	if (!p_error.fatal) {
+		UtilityFunctions::print_verbose("[DirectStorage] Request aborted on queue: " + p_error.message);
+		return;
+	}
+	// Engine calls happen after every extension mutex is released (GODOT_QUIRKS.md Q46).
+	UtilityFunctions::push_error(p_error.message);
 	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 	if (err_handler) {
-		err_handler->report_error(message);
+		err_handler->report_error(p_error.message);
 	}
-	return message;
+}
+
+void Win32Backend::report_batch_outcome(const BatchReport &p_report) {
+	for (const String &warning : p_report.warnings) {
+		UtilityFunctions::push_warning(warning);
+	}
+	report_queue_error(p_report.error);
 }
 
 static void release_resource_guards(const Vector<Ref<DSRequest>> &p_requests) {
@@ -810,6 +846,90 @@ bool Win32Backend::has_in_flight_batches_locked() const {
 }
 #endif
 
+#ifdef _WIN32
+// Caller holds batch_mutex.
+bool Win32Backend::has_unfinished_batch_on_queue_locked(const QueueState &p_queue) const {
+	for (const BatchSlot &slot : p_queue.batch_slots) {
+		if (slot.completion_ready) {
+			continue;
+		}
+		// closing covers the window between slot freeze and Submit(): its requests
+		// are about to be handed to this queue, so a failure belongs to them.
+		if (slot.submitted || slot.closing) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Caller holds batch_mutex.
+bool Win32Backend::slot_owns_error_name_locked(const BatchSlot &p_slot, const String &p_failed_request_name) const {
+	if (p_failed_request_name.is_empty()) {
+		return true;
+	}
+	const std::string key = p_failed_request_name.utf8().get_data();
+	return p_slot.request_name_map.find(key) != p_slot.request_name_map.end();
+}
+
+// Caller holds batch_mutex.
+bool Win32Backend::queue_has_request_name_locked(const QueueState &p_queue, const String &p_failed_request_name) const {
+	if (p_failed_request_name.is_empty()) {
+		return false;
+	}
+	const std::string key = p_failed_request_name.utf8().get_data();
+	for (const BatchSlot &slot : p_queue.batch_slots) {
+		if (slot.request_name_map.find(key) != slot.request_name_map.end()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Caller holds batch_mutex.
+void Win32Backend::stash_queue_error_locked(QueueState &p_queue, const QueueErrorInfo &p_error, QueueErrorInfo *r_immediate) {
+	if (!p_error.present) {
+		return;
+	}
+	if (has_unfinished_batch_on_queue_locked(p_queue) && !p_queue.pending_error.present) {
+		p_queue.pending_error = p_error;
+		return;
+	}
+	// Either no batch can carry this failure, or the single stash is already
+	// claimed by another failure: report it here rather than dropping the record.
+	if (r_immediate && !r_immediate->present) {
+		*r_immediate = p_error;
+	}
+}
+
+void Win32Backend::handle_queue_error_event(int p_queue_index) {
+	QueueErrorInfo immediate;
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		QueueState &queue = priority_queues[p_queue_index];
+		// Bounded re-drain. The SDK signals the event again for failures that land
+		// while this thread is reading, so a zero-timeout re-check closes the
+		// window between the read and the reset. ResetEvent() is a no-op on an
+		// auto-reset event and required for a manual-reset one, so it is correct
+		// for either.
+		for (int attempt = 0; attempt < 4; attempt++) {
+			QueueErrorInfo record = read_queue_error(queue.queue);
+			if (!record.present) {
+				break;
+			}
+			stash_queue_error_locked(queue, record, &immediate);
+			if (!queue.error_event) {
+				break;
+			}
+			ResetEvent(queue.error_event);
+			if (WaitForSingleObject(queue.error_event, 0) != WAIT_OBJECT_0) {
+				break;
+			}
+		}
+	}
+	report_queue_error(immediate);
+}
+#endif
+
 bool Win32Backend::is_batch_complete() const {
 #ifdef _WIN32
 	std::lock_guard<std::mutex> lock(batch_mutex);
@@ -991,13 +1111,24 @@ void Win32Backend::poll_batch_status() {
 	}
 
 	if (!completed_batches.empty()) {
-		std::lock_guard<std::mutex> lock(batch_mutex);
-		for (const BatchMetadata &batch : completed_batches) {
-			complete_batch_slot(priority_queues[batch.queue_index], priority_queues[batch.queue_index].batch_slots[batch.slot_index], batch);
+		std::vector<BatchReport> reports;
+		{
+			std::lock_guard<std::mutex> lock(batch_mutex);
+			for (const BatchMetadata &batch : completed_batches) {
+				BatchReport report;
+				complete_batch_slot(priority_queues[batch.queue_index], priority_queues[batch.queue_index].batch_slots[batch.slot_index], batch, report);
+				if (report.error.present || !report.warnings.empty()) {
+					reports.push_back(report);
+				}
+			}
+			batch_in_flight.store(has_in_flight_batches_locked());
+			update_profiler_queue_depth_locked();
+			batch_cv.notify_all();
 		}
-		batch_in_flight.store(has_in_flight_batches_locked());
-		update_profiler_queue_depth_locked();
-		batch_cv.notify_all();
+		// Outside batch_mutex: these calls reach the engine.
+		for (const BatchReport &report : reports) {
+			report_batch_outcome(report);
+		}
 	}
 #endif
 }
@@ -1146,15 +1277,47 @@ bool Win32Backend::stage_single_mip_request(Ref<DSRequest> p_parent, Ref<DSReque
 #endif
 }
 
-void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uint64_t p_fence_value) {
+void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uint64_t p_fence_value, BatchReport &r_report) {
 	if (!p_queue.completion_fence || p_fence_value == 0 ||
 			p_queue.completion_fence->GetCompletedValue() < p_fence_value) {
 		return;
 	}
 
 	p_queue.completed_fence_value = std::max(p_queue.completed_fence_value, p_queue.completion_fence->GetCompletedValue());
-	String failed_request_name;
-	String queue_error = retrieve_queue_error(p_queue.queue, &failed_request_name);
+	// The SDK can raise the error event just after the batch's own completion
+	// signal. Read it here only when it is already signalled - still the
+	// contract's trigger - so a failing batch is not marked completed because the
+	// two events raced. A clean batch never reaches RetrieveErrorRecord.
+	if (p_queue.error_event && !p_queue.pending_error.present &&
+			WaitForSingleObject(p_queue.error_event, 0) == WAIT_OBJECT_0) {
+		QueueErrorInfo raced = read_queue_error(p_queue.queue);
+		ResetEvent(p_queue.error_event);
+		if (raced.present) {
+			p_queue.pending_error = raced;
+		}
+	}
+	// Consume the failure captured on this queue's error event. Only a record the
+	// SDK actually signalled can be pending here, so a clean batch leaves this
+	// empty and still completes. The record names the request that failed and every
+	// staged request has a unique name, so it belongs to exactly one slot: a batch
+	// that does not own that request must never be failed by it.
+	QueueErrorInfo queue_error = p_queue.pending_error;
+	if (queue_error.present) {
+		if (slot_owns_error_name_locked(p_slot, queue_error.failed_request_name)) {
+			p_queue.pending_error = QueueErrorInfo();
+		} else {
+			if (!queue_has_request_name_locked(p_queue, queue_error.failed_request_name)) {
+				// The owning request already retired, so no later batch will claim
+				// this record: surface it now instead of stashing it forever.
+				p_queue.pending_error = QueueErrorInfo();
+				r_report.error = queue_error;
+			}
+			// Another slot on this queue still holds the named request. Leave the
+			// record stashed for that slot's completion; this batch is clean.
+			queue_error = QueueErrorInfo();
+		}
+	}
+	const bool queue_failed = queue_error.present && queue_error.fatal;
 
 	std::unordered_map<int64_t, ID3D12Resource *> rid_cache;
 	for (int i = 0; i < p_slot.requests.size(); i++) {
@@ -1162,16 +1325,21 @@ void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uin
 		if (req.is_valid()) {
 			String resource_error;
 			if (!validate_resource_guard(req, resource_error, &rid_cache)) {
-				UtilityFunctions::push_warning(resource_error);
+				// Collected, not pushed: push_warning is an engine call and the
+				// caller holds batch_mutex here.
+				r_report.warnings.push_back(resource_error);
 				req->set_status(DSRequest::STATUS_FAILED);
 				req->set_error_message(resource_error);
-			} else if (queue_error.is_empty() && req->get_status() != DSRequest::STATUS_FAILED) {
+			} else if (!queue_failed && req->get_status() != DSRequest::STATUS_FAILED) {
 				req->set_status(DSRequest::STATUS_COMPLETED);
 			}
 		}
 	}
-	if (!queue_error.is_empty()) {
-		attribute_batch_error_records(p_slot.requests, p_slot.request_name_map, failed_request_name, queue_error);
+	if (queue_error.present) {
+		r_report.error = queue_error;
+	}
+	if (queue_failed) {
+		attribute_batch_error_records(p_slot.requests, p_slot.request_name_map, queue_error.failed_request_name, queue_error.message);
 	}
 	for (int i = 0; i < p_slot.requests.size(); i++) {
 		if (p_slot.requests[i].is_valid()) {
@@ -1179,12 +1347,6 @@ void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uin
 		}
 	}
 	complete_chunked_requests();
-}
-
-void Win32Backend::poll_batch_status(QueueState &p_queue, Vector<Ref<DSRequest>> &p_requests, uint64_t p_fence_value) {
-	BatchSlot dummy_slot;
-	dummy_slot.requests = p_requests;
-	poll_batch_status(p_queue, dummy_slot, p_fence_value);
 }
 #endif
 
@@ -1204,8 +1366,8 @@ void Win32Backend::update_profiler_queue_depth_locked() {
 	}
 }
 
-void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &) {
-	poll_batch_status(p_queue, p_slot, p_slot.fence_value);
+void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &, BatchReport &r_report) {
+	poll_batch_status(p_queue, p_slot, p_slot.fence_value, r_report);
 	p_slot.completed_count = count_completed_requests(p_slot.requests);
 	p_slot.error_code = 0;
 	p_slot.error_message = String();
@@ -1346,11 +1508,16 @@ void Win32Backend::register_slot_source_file(BatchSlot &r_slot, const std::wstri
 }
 
 void Win32Backend::completion_thread_func() {
-	HANDLE wait_handles[QUEUE_COUNT * BATCH_SLOT_COUNT + 1] = { completion_stop_event };
+	constexpr int kSlotHandleCount = QUEUE_COUNT * BATCH_SLOT_COUNT;
+	HANDLE wait_handles[kSlotHandleCount + QUEUE_COUNT + 1] = { completion_stop_event };
 	for (int i = 0; i < QUEUE_COUNT; i++) {
 		for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; slot_index++) {
 			wait_handles[1 + i * BATCH_SLOT_COUNT + slot_index] = priority_queues[i].batch_slots[slot_index].event;
 		}
+		// One handle per queue. RetrieveErrorRecord is only legal once the SDK has
+		// signalled this event, so it is the sole drain trigger; without it a
+		// failure with no batch retiring would never be read at all.
+		wait_handles[1 + kSlotHandleCount + i] = priority_queues[i].error_event;
 	}
 	auto fail_pending_batches = [this](const String &p_message) {
 		for (BatchMetadata &batch : completion_queue) {
@@ -1395,7 +1562,7 @@ void Win32Backend::completion_thread_func() {
 			}
 		}
 
-		DWORD wait_result = WaitForMultipleObjects(QUEUE_COUNT * BATCH_SLOT_COUNT + 1, wait_handles, FALSE, 500);
+		DWORD wait_result = WaitForMultipleObjects(kSlotHandleCount + QUEUE_COUNT + 1, wait_handles, FALSE, 500);
 		if (wait_result == WAIT_TIMEOUT) {
 			continue;
 		}
@@ -1404,13 +1571,20 @@ void Win32Backend::completion_thread_func() {
 			fail_pending_batches("DirectStorage backend shut down before batch completion.");
 			return;
 		}
-		if (wait_result < WAIT_OBJECT_0 + 1 || wait_result >= WAIT_OBJECT_0 + QUEUE_COUNT * BATCH_SLOT_COUNT + 1) {
+		if (wait_result < WAIT_OBJECT_0 + 1 || wait_result >= WAIT_OBJECT_0 + kSlotHandleCount + QUEUE_COUNT + 1) {
 			std::lock_guard<std::mutex> lock(batch_mutex);
 			fail_pending_batches("DirectStorage batch completion wait failed.");
 			return;
 		}
 
-		int completed_handle_index = static_cast<int>(wait_result - WAIT_OBJECT_0 - 1);
+		const int signaled_index = static_cast<int>(wait_result - WAIT_OBJECT_0);
+		if (signaled_index > kSlotHandleCount) {
+			// Queue error event: drain it (the only legal read) and report after the
+			// lock this handler takes internally has been released.
+			handle_queue_error_event(signaled_index - kSlotHandleCount - 1);
+			continue;
+		}
+		int completed_handle_index = signaled_index - 1;
 		int completed_queue_index = completed_handle_index / BATCH_SLOT_COUNT;
 		int completed_slot_index = completed_handle_index % BATCH_SLOT_COUNT;
 		BatchMetadata batch;
@@ -1438,12 +1612,14 @@ void Win32Backend::completion_thread_func() {
 			execute_transitions(post_transitions, false);
 		}
 
+		BatchReport report;
 		{
 			std::lock_guard<std::mutex> lock(batch_mutex);
-			complete_batch_slot(priority_queues[batch.queue_index], priority_queues[batch.queue_index].batch_slots[batch.slot_index], batch);
+			complete_batch_slot(priority_queues[batch.queue_index], priority_queues[batch.queue_index].batch_slots[batch.slot_index], batch, report);
 			batch_in_flight.store(has_in_flight_batches_locked());
 			update_profiler_queue_depth_locked();
 		}
+		report_batch_outcome(report);
 
 		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 
@@ -2517,12 +2693,22 @@ bool Win32Backend::initialize(const String &p_path) {
 				break;
 			}
 			hr = factory->CreateQueue(&queueDesc, IID_PPV_ARGS(&queue.queue));
+			if (SUCCEEDED(hr) && queue.queue) {
+				// Queue-owned: waited on by the completion thread, never CloseHandle()d.
+				// RetrieveErrorRecord is only legal once this has signalled, so a null
+				// handle would leave failures unobservable - refuse to run that way.
+				queue.error_event = queue.queue->GetErrorEvent();
+				if (queue.error_event == nullptr) {
+					UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: IDStorageQueue::GetErrorEvent() returned no handle for '" + String(queueDesc.Name) + "'.");
+					hr = E_FAIL;
+				}
+			}
 		}
 	}
 
 	bool queues_ready = SUCCEEDED(hr);
 	for (const QueueState &queue : priority_queues) {
-		queues_ready = queues_ready && queue.queue != nullptr && queue.completion_event != nullptr && queue.batch_slots[0].event != nullptr && queue.batch_slots[1].event != nullptr && queue.completion_fence != nullptr;
+		queues_ready = queues_ready && queue.queue != nullptr && queue.completion_event != nullptr && queue.batch_slots[0].event != nullptr && queue.batch_slots[1].event != nullptr && queue.completion_fence != nullptr && queue.error_event != nullptr;
 	}
 	if (queues_ready) {
 		init_barrier_context(ds_win32_get_d3d12_device().Get(), ds_win32_get_d3d12_command_queue().Get());
@@ -2745,6 +2931,10 @@ void Win32Backend::shutdown() {
 			queue.queue->Release();
 			queue.queue = nullptr;
 		}
+		// Queue-owned handle: dropping the reference above invalidates it, so it is
+		// only forgotten here, never CloseHandle()d.
+		queue.error_event = nullptr;
+		queue.pending_error = QueueErrorInfo();
 		if (queue.completion_event) {
 			CloseHandle(queue.completion_event);
 			queue.completion_event = nullptr;
@@ -4371,6 +4561,52 @@ int Win32Backend::_debug_dstorage_config_apply_count() {
 	return s_dstorage_config_apply_count.load();
 #else
 	return 0;
+#endif
+}
+
+void Win32Backend::_debug_set_queue_error_report_hook_for_testing(const std::function<void()> &p_hook) {
+	// Test-only seam. Installs the callback run inside report_queue_error(), i.e.
+	// after the caller has released batch_mutex and immediately before the engine
+	// push; clears it with an empty callback. Callers must clear it before the
+	// captured state dies. Never bound in _bind_methods().
+#ifdef _WIN32
+	std::lock_guard<std::mutex> lock(s_queue_error_report_hook_mutex);
+	s_queue_error_report_hook = p_hook;
+#else
+	(void)p_hook;
+#endif
+}
+
+int Win32Backend::_debug_error_record_read_count() const {
+#ifdef _WIN32
+	// Test-only seam, never bound in _bind_methods(). Counts RetrieveErrorRecord()
+	// calls: a batch that reports no failure must contribute 0.
+	return s_error_record_read_count.load();
+#else
+	return 0;
+#endif
+}
+
+void Win32Backend::_debug_inject_queue_error_for_testing(int p_queue_index, const String &p_message) {
+#ifdef _WIN32
+	// Test-only seam, never bound in _bind_methods(). The only real source of an
+	// error record with no batch in flight is a device removal, which cannot be
+	// produced on demand. This installs the record the SDK would have returned and
+	// runs the same stash-or-report decision the error-event handler uses, so the
+	// reporting half is exercised while only the SDK read is bypassed.
+	if (p_queue_index < 0 || p_queue_index >= QUEUE_COUNT) {
+		return;
+	}
+	QueueErrorInfo injected;
+	injected.present = true;
+	injected.fatal = true;
+	injected.message = p_message;
+	QueueErrorInfo immediate;
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		stash_queue_error_locked(priority_queues[p_queue_index], injected, &immediate);
+	}
+	report_queue_error(immediate);
 #endif
 }
 #endif
