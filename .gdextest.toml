@@ -30,6 +30,11 @@ plugin_class = "GdextestPlugin"
 [gdextest.fixture]
 directory = "build/gdextest/project"
 project_name = "dsgd-tests"
+# Pin the manifest name. Without manifest_name the SConscript derives it from
+# [gdextest.output] name (libdsgd_tests.gdextension), while the CLI generator
+# defaults to and run_d3d12_windowed.ps1 hardcodes gdextest.gdextension; the
+# generator deletes stale manifests, so the name flipped on every tests build.
+manifest_name = "gdextest.gdextension"
 # Only what the suites actually load: the checked-in test.png fixture plus its
 # import stub (the stub pins the directstorage_texture params that the fixture
 # warmup import uses). Everything else under project/test_assets is local-only:
