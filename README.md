@@ -185,3 +185,80 @@ Unchanged textures keep identical payload bytes, so the archive delta stays smal
 ### 7.7 What this does not give you
 
 The payload bytes inside the archive are compressed GDeflate streams, not encrypted data. Someone who knows the format can recover them without any key. The protection covers the archive's table of contents and the delivery of its key; it does not cover the texture data itself, and the boot sentinel and scanner are diagnostics rather than enforcement. The user-facing guide with the permitted wording is [`docs/encryption-guide.md`](docs/encryption-guide.md); the two verification checks are in [`docs/verifying-an-exported-build.md`](docs/verifying-an-exported-build.md); the internal contract is [`.agents/guides_and_docs/encryption-key-handling.md`](.agents/guides_and_docs/encryption-key-handling.md).
+
+---
+
+## 8. Building from Source
+
+### 8.1 Prerequisites
+
+The extension is built with SCons against the vendored SDKs, so there is no package to install for DirectStorage itself.
+
+| Requirement | Version / notes |
+| :--- | :--- |
+| Windows | Windows 10/11 x64 for the DirectStorage path. The same sources also build on Linux/macOS, where they compile to the software fallback backend only. |
+| Python | 3.8 or newer on `PATH` (3.10 verified). SCons and the godot-cpp binding generator run on it. |
+| SCons | **4.11 or newer**: `python -m pip install --upgrade "scons>=4.11"` (verified with 4.11.1). Older releases such as 4.6 do not know Visual Studio 2026 (VS 18 / MSVC 14.5), silently fall back to MinGW, and fail at the first compile with `x86_64-w64-mingw32-gcc` not found. Check with `scons --version`. |
+| MSVC C++ toolset | Visual Studio 2022 or 2026 **Build Tools** with the “Desktop development with C++” workload (MSVC 14.50 verified). Only the C++ toolset and the Windows SDK are needed — the IDE is not. |
+| Windows SDK | A 10.x SDK providing D3D12 and DXGI (`d3d12.h`, `dxgi.lib`; `dxgi.h` lives in the SDK’s `shared` include directory). 10.0.26100 verified. |
+| Git | Required: submodules, plus the commit stamp written into `build_manifest.json`. |
+| Godot (tests and export only) | 4.7.2-stable **console** executable, pointed at by `GODOT_CONSOLE_PATH` in `.env`. The `.gdextension` manifest declares `compatibility_minimum = "4.3"`. |
+
+Vendored and already in the repository — nothing to download or install:
+
+- `thirdparty/directstorage/` — DirectStorage SDK headers, `dstorage.lib`, and the `dstorage.dll` / `dstoragecore.dll` runtime redistributables.
+- `thirdparty/gdeflate/`, `thirdparty/libdeflate/`, `thirdparty/monocypher/` — compression and crypto sources compiled into the DLL.
+- `godot-cpp/` — submodule. Its static library is compiled into `godot-cpp/bin/` by the same SCons run as the extension, so no prebuilt bindings are required.
+- `extern/gdextest/` — submodule, needed only for the native test suite.
+
+### 8.2 First build
+
+```powershell
+git submodule update --init --recursive
+python -m pip install --upgrade "scons>=4.11"
+
+scons platform=windows target=template_debug
+scons platform=windows target=template_release
+```
+
+Add `dev_build=yes` to a `template_debug` build for the development variant with extra checks. Outputs land in `project/addons/directstorage_accelerator/bin/`:
+
+| Artifact | Purpose |
+| :--- | :--- |
+| `dsgd_64.debug.dll` | editor and `template_debug` libraries |
+| `dsgd_64.dll` | `template_release` library |
+| `dstorage.dll`, `dstoragecore.dll` | copied from the vendored SDK next to the DLL |
+| `build_manifest.json` | build status, commit, sizes and the `dspkg-key-id` tag of each binary |
+
+The default build carries no archive key in the DLL: every export generates a fresh key and delivers it inside the encrypted PCK. A key compiled into the DLL is the legacy build with a baked key (`DSPKG_ENCRYPTION_KEY_FILE`), intended for experiments only — the build audit rejects it in editor, `template_debug` and `template_release` binaries.
+
+### 8.3 Tests (optional)
+
+The native suite is built from `tests/` plus the sources under test, and needs the Godot console executable:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .vscode/build_remote.ps1 -Local -IncludeTests -Target template_debug
+powershell -ExecutionPolicy Bypass -File .vscode/run_gdextest_local.ps1
+```
+
+`-IncludeTests` builds the gdextest library; the second script runs the doctor/fixture/warmup/headless-report pipeline without rebuilding. Windowed D3D12 suites (`run_d3d12_windowed.ps1`) additionally exercise the live RendererDevice.
+
+### 8.4 Local versus remote builds
+
+Pipeline behaviour is read from `.env` (gitignored). Copy [`.env.example`](.env.example) and adjust:
+
+- `REMOTE_BUILD` — `0` compiles here; `1` offloads the build to `REMOTE_HOST` over SSH/SCP.
+- `PREVENT_BUILD_ON_THIS_DEVICE` — when `1`, `SConstruct` refuses to compile on this machine so a workstation cannot silently produce a different binary. `build_remote.ps1 -Local` skips the SSH leg but still honours this guard; clear the flag, or set it to `0` in the environment for a single run, to build locally.
+- `GODOT_CONSOLE_PATH` — source of the executable used by the test and export-verification runners.
+- `SYNC_TEST_DIR`, `SYNC_ADDON_COPYABLE_DIR`, `SYNC_ADDON_DIR` — optional deployment targets; each is skipped unless its path is defined.
+
+### 8.5 Deploying a build
+
+Building and deploying are separate steps. `SCons` only produces artifacts: the flat `dsgd_64*.dll` binaries plus `build_manifest.json` in `project/addons/directstorage_accelerator/bin/`, next to the DirectStorage runtime DLLs it installs from `thirdparty/directstorage/bin/x64/`. Running `scons` by hand therefore never writes into another project.
+
+Deployment is one implementation, [`tools/sync_artifacts.py`](tools/sync_artifacts.py), invoked by the pipeline:
+
+- `.vscode/build_remote.ps1` runs it as step `[6/6]` after a successful build — locally, and for a remote build after the artifacts are pulled back — so the mirror is always built from the local `bin/`.
+- `.vscode/sync_addon.ps1` runs the same code without building: `-Targets all` for every configured mirror, `-Targets copyable`, or `-DryRun` to preview. This is the "Sync Addon to Test Project (no build)" task.
+
+Only loadable modules and the manifest are mirrored (`bin/` outside those stays local), and the build manifest is patched once with the sync result before being copied to each target. The former `scons sync*` aliases are gone: a build tool should not be copying files into other repositories.

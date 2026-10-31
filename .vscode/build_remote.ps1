@@ -2054,168 +2054,44 @@ if (-not $SkipVerify) {
     }
 }
 
-# 6. Post-build synchronization to external project (e.g. TPS demo)
-# Environment-driven: syncs whenever SYNC_ADDON_DIR is defined.
+# 6. Post-build synchronization (deployment stage).
+# The mechanism lives once in tools/sync_artifacts.py: SCons only produces
+# artifacts and records build provenance, while this pipeline decides where
+# they are deployed. Each target runs only when its SYNC_* path is configured
+# (see .env.example) - addon -> SYNC_ADDON_DIR, copyable -> SYNC_ADDON_COPYABLE_DIR,
+# test -> SYNC_TEST_DIR. Running `scons` directly never mirrors anything.
 $EnableSyncVal = if ($env:ENABLE_POST_BUILD_ADDON_SYNC) { $env:ENABLE_POST_BUILD_ADDON_SYNC } `
     elseif ($env:ENABLE_ADDON_SYNC) { $env:ENABLE_ADDON_SYNC } `
     elseif ($env:DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC) { $env:DIRECTSTORAGE_ENABLE_EXTERNAL_SYNC } `
     else { "1" }
 
 $ShouldSync = ($EnableSyncVal.Trim().ToLower() -notin @("0", "false", "no", "off"))
-$SyncTargetDir = if ($env:SYNC_ADDON_DIR) { $env:SYNC_ADDON_DIR }
 $copiedCount = 0
-$orphanedSyncFiles = [System.Collections.Generic.List[string]]::new()
 
 if ($ShouldSync) {
-    if (-not $SyncTargetDir) {
-        Write-VerboseHost "Skipping post-build sync: SYNC_ADDON_DIR is not configured." -ForegroundColor DarkGray
+    $SyncScript = Join-Path $WorkspaceRoot "tools\sync_artifacts.py"
+    if (-not (Test-Path -LiteralPath $SyncScript)) {
+        Show-BuildFailure -Step "Post-build Sync" -Message "tools/sync_artifacts.py is missing; the deployment step cannot run." -Code 1
     }
-    else {
-        Write-Status "[6/6] Syncing addon to external project ($SyncTargetDir)..." -ForegroundColor Cyan
-        $LocalAddonDir = (Resolve-Path (Join-Path $PSScriptRoot "..\project\addons\directstorage_accelerator")).Path
 
-        if (Test-Path $LocalAddonDir) {
-            if (-not (Test-Path $SyncTargetDir)) {
-                New-Item -ItemType Directory -Force -Path $SyncTargetDir | Out-Null
-            }
+    Write-Status "[6/6] Syncing build output to configured targets..." -ForegroundColor Cyan
+    $syncArgs = @($SyncScript, "--targets", "all")
+    if ($Verbose) { $syncArgs += "--verbose" }
+    $syncOutput = & python @syncArgs 2>&1
+    $syncExit = $LASTEXITCODE
+    $syncOutput | ForEach-Object { Write-Status ([string]$_) }
+    foreach ($syncLine in $syncOutput) {
+        if ([string]$syncLine -match 'copied=(\d+) src_copied=') { $copiedCount = [int]$Matches[1] }
+    }
 
-            function Copy-SafeFile {
-                param(
-                    [string]$SourcePath,
-                    [string]$DestinationPath
-                )
-                if ($DestinationPath.ToLower().EndsWith(".dll")) {
-                    $oldPath = "$DestinationPath.old"
-                    if (Test-Path $oldPath) {
-                        try { Remove-Item -Force -Path $oldPath -ErrorAction SilentlyContinue } catch { $null = $_ }
-                    }
-                }
-                try {
-                    Copy-Item -Path $SourcePath -Destination $DestinationPath -Force -ErrorAction Stop
-                }
-                catch {
-                    if ((Test-Path $DestinationPath) -and $DestinationPath.ToLower().EndsWith(".dll")) {
-                        $oldPath = "$DestinationPath.old"
-                        if (Test-Path $oldPath) {
-                            try { Remove-Item -Force -Path $oldPath -ErrorAction SilentlyContinue } catch { $null = $_ }
-                        }
-                        if (Test-Path $oldPath) {
-                            $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-                            $oldPath = "$DestinationPath.$timestamp.old"
-                        }
-                        try {
-                            Move-Item -Path $DestinationPath -Destination $oldPath -Force -ErrorAction SilentlyContinue
-                        }
-                        catch { $null = $_ }
-                        Copy-Item -Path $SourcePath -Destination $DestinationPath -Force -ErrorAction SilentlyContinue
-                    }
-                    else {
-                        throw $_
-                    }
-                }
-            }
-
-            $copiedCount = 0
-            Get-ChildItem -Path $LocalAddonDir -Recurse | ForEach-Object {
-                $item = $_
-                $relPath = $item.FullName.Substring($LocalAddonDir.Length).TrimStart("\", "/")
-
-                # Exclude temporary, old, and dev build files
-                if ($item.Name.StartsWith("~") -or $item.Name.EndsWith(".tmp") -or $item.Name.EndsWith(".old")) {
-                    return
-                }
-                if ($relPath.StartsWith("bin") -and $item.Name.Contains(".dev.")) {
-                    return
-                }
-
-                $destPath = Join-Path $SyncTargetDir $relPath
-                if ($item.PSIsContainer) {
-                    if (-not (Test-Path $destPath)) {
-                        New-Item -ItemType Directory -Force -Path $destPath | Out-Null
-                    }
-                }
-                else {
-                    $destParent = Split-Path $destPath -Parent
-                    if (-not (Test-Path $destParent)) {
-                        New-Item -ItemType Directory -Force -Path $destParent | Out-Null
-                    }
-
-                    $needCopy = $false
-                    if (-not (Test-Path $destPath)) {
-                        $needCopy = $true
-                    }
-                    else {
-                        $destItem = Get-Item $destPath
-                        if ($item.Length -ne $destItem.Length -or $item.LastWriteTime -gt $destItem.LastWriteTime.AddSeconds(1)) {
-                            $needCopy = $true
-                        }
-                    }
-
-                    if ($needCopy) {
-                        try {
-                            Copy-SafeFile -SourcePath $item.FullName -DestinationPath $destPath
-                            $copiedCount++
-                        }
-                        catch {
-                            Write-Status "Warning: Failed to copy $($item.Name): $_" -ForegroundColor Yellow
-                        }
-                    }
-                }
-            }
-
-            # Track orphaned files in destination that no longer exist in source addon
-            Get-ChildItem -Path $SyncTargetDir -Recurse -File | ForEach-Object {
-                $destFile = $_
-                $relPath = $destFile.FullName.Substring($SyncTargetDir.Length).TrimStart("\", "/")
-
-                # Exclude binaries, temporary, and old files
-                if ($relPath.StartsWith("bin") -or $destFile.Name.EndsWith(".old") -or $destFile.Name.EndsWith(".tmp")) {
-                    return
-                }
-
-                $sourcePath = Join-Path $LocalAddonDir $relPath
-                if (-not (Test-Path $sourcePath)) {
-                    $orphanedSyncFiles.Add($destFile.FullName)
-                }
-            }
-
-            # Attempt to clean up unlocked .old files in destination bin
-            $destBin = Join-Path $SyncTargetDir "bin"
-            if (Test-Path $destBin) {
-                Get-ChildItem -Path $destBin -Filter "*.old" -ErrorAction SilentlyContinue | ForEach-Object {
-                    try { Remove-Item -Force -Path $_.FullName -ErrorAction SilentlyContinue } catch { $null = $_ }
-                }
-            }
-
-            # Update build_manifest.json on Device A using Python for clean 2-space indent (avoiding PS 5.1 column spacing and BOM)
-            $manifestLocalPath = Join-Path $LocalAddonDir "bin\build_manifest.json"
-            if (Test-Path $manifestLocalPath) {
-                try {
-                    $pyCmd = "import json, sys; p = sys.argv[1]; d = json.load(open(p, encoding='utf-8-sig')); d.setdefault('post_build_sync', {}).setdefault('tps_demo_addon', {})['synced'] = True; d['post_build_sync']['tps_demo_addon']['copied_files_count'] = int(sys.argv[2]); json.dump(d, open(p, 'w', encoding='utf-8'), indent=2)"
-                    & python -c $pyCmd $manifestLocalPath $copiedCount
-
-                    $destManifest = Join-Path $destBin "build_manifest.json"
-                    if (Test-Path $destBin) {
-                        Copy-Item -Path $manifestLocalPath -Destination $destManifest -Force
-                    }
-                }
-                catch {
-                    $null = $_
-                }
-            }
-
-            if ($copiedCount -gt 0) {
-                Write-VerboseHost "Post-build sync complete: Updated $copiedCount file(s) -> $SyncTargetDir" -ForegroundColor Green
-            }
-            else {
-                Write-VerboseHost "Post-build sync: Target $SyncTargetDir is already up to date." -ForegroundColor DarkGray
-            }
-        }
+    if ($syncExit -ne 0) {
+        Show-BuildFailure -Step "Post-build Sync" -Message "Sync failed with exit code $syncExit (see the [sync] lines above)." -Code $syncExit
     }
 }
 else {
     Write-VerboseHost "Post-build addon sync is disabled (ENABLE_POST_BUILD_ADDON_SYNC=0)." -ForegroundColor DarkGray
 }
+
 
 # Deployment audit: reports files present in a deployed addon folder
 # that its .gdextension does not declare (stale binaries from an older naming
@@ -2260,15 +2136,5 @@ if (Test-Path -LiteralPath $freshnessScript) {
 
 $syncMsg = if ($ShouldSync -and $copiedCount -gt 0) { " (Synced $copiedCount file(s))" } else { "" }
 Show-BuildSuccess -Message "All build and sync steps completed successfully!$syncMsg"
-
-if ($orphanedSyncFiles -and $orphanedSyncFiles.Count -gt 0) {
-    Write-Host ""
-    Write-Host "WARNING: Found $($orphanedSyncFiles.Count) orphaned file(s) in sync target ($SyncTargetDir) that no longer exist in source addon:" -ForegroundColor Yellow
-    foreach ($orphan in $orphanedSyncFiles) {
-        Write-Host "  - $orphan" -ForegroundColor Yellow
-    }
-    Write-Host "Please remove them manually if they are no longer needed." -ForegroundColor Yellow
-    Write-Host ""
-}
 
 
