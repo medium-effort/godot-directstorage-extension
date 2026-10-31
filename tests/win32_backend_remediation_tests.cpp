@@ -37,6 +37,7 @@
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_string_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 
@@ -1856,6 +1857,95 @@ GDEX_TEST_T(win32_remediation, queue_error_report_runs_outside_batch_mutex, TAG_
 #else
     (void)ctx;
     GDEX_SKIP("The queue-error report seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, queue_error_second_record_survives_to_its_batch, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // One queue, one batch, two records captured before that batch retires: a
+    // cancellation and a fatal failure naming the same staged request. Both must
+    // reach the batch and the fatal one must decide it. While QueueState held a
+    // single pending_error, the second record was routed to the out-of-band report
+    // and cleared, so poll_batch_status() then saw "no record" for the batch that
+    // owned it - and "no record" means "batch succeeded" - so the failing request
+    // completed as STATUS_COMPLETED.
+    //
+    // Both records are injected from the submit's enqueue window: the slot is
+    // frozen (closing, so the queue already counts as unfinished) while the
+    // requests have not been handed to DirectStorage yet. That makes the window
+    // deterministic instead of a race against DMA completion.
+    const char *fixture_path = "user://queue_error_two_records_fixture.dstex";
+    remove_temp_file(fixture_path);
+    ctx.add_teardown([fixture_path]() { remove_temp_file(fixture_path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+    GDEX_ASSERT_TRUE(write_temp_dstex(fixture_path, 64, 64, 1, 16384));
+
+    godot::Ref<godot::DSRequest> request = make_dummy_request(fixture_path, 1024);
+    request->set_uncompressed_size(1024);
+    request->set_cancellation_tag(9402);
+    // Low priority maps to queue index 0 (priority_to_queue_index), so the
+    // records below are injected on the queue that actually carries this batch.
+    request->set_priority(godot::DSRequest::PRIORITY_LOW);
+
+    const godot::String cancel_message("diagnostic sentinel: cancelled request record");
+    const godot::String fatal_message("diagnostic sentinel: fatal request record");
+    std::atomic<int> injected_records{ 0 };
+    backend->_debug_set_enqueue_window_hook_for_testing([&]() {
+        // The fresh backend stages this first batch on slot 0; the second slot is
+        // only consulted so a rotated active slot cannot turn this into a vacuous
+        // pass.
+        godot::PackedStringArray names = backend->_debug_staged_request_names_for_testing(0, 0);
+        if (names.is_empty()) {
+            names = backend->_debug_staged_request_names_for_testing(0, 1);
+        }
+        if (names.is_empty()) {
+            return;
+        }
+        const godot::String staged_name = names[0];
+        backend->_debug_inject_queue_error_for_testing(0, cancel_message, staged_name, false);
+        backend->_debug_inject_queue_error_for_testing(0, fatal_message, staged_name, true);
+        injected_records.store(2);
+    });
+    ctx.add_teardown([backend]() { backend->_debug_set_enqueue_window_hook_for_testing({}); });
+
+    GDEX_ASSERT_TRUE(backend->enqueue_request(request));
+    backend->submit_async();
+
+    const uint64_t fence = backend->get_completion_fence();
+    GDEX_EXPECT_TRUE(backend->wait_for_completion(fence, 5000));
+    bool settled = false;
+    const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < settle_deadline) {
+        backend->poll_batch_status();
+        if (backend->is_batch_complete() && request->get_status() == godot::DSRequest::STATUS_FAILED) {
+            settled = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    backend->_debug_set_enqueue_window_hook_for_testing({});
+
+    GDEX_EXPECT_EQ(injected_records.load(), 2);
+    GDEX_EXPECT_TRUE(settled);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(request->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(request->get_error_message().contains(fatal_message));
+#else
+    (void)ctx;
+    GDEX_SKIP("The queue-error injection seam is compiled out of release builds.");
 #endif
 #else
     (void)ctx;

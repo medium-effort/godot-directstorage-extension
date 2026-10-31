@@ -118,11 +118,16 @@ private:
 		ID3D12Fence *completion_fence = nullptr;
 		uint64_t completion_fence_value = 0;
 		uint64_t completed_fence_value = 0;
-		// Failure captured on error_event that has not reached a completing
-		// batch yet. Guarded by batch_mutex. The completion path must consume it:
-		// poll_batch_status() treats "no record" as "batch succeeded", so a record
-		// dropped here would turn a failed batch into a completed one.
-		QueueErrorInfo pending_error;
+		// Failures captured on error_event that have not reached their completing
+		// batch yet, one entry per slot. Guarded by batch_mutex. The completion
+		// path must consume these: poll_batch_status() treats "no record" as
+		// "batch succeeded", so a record dropped here would turn a failed batch
+		// into a completed one. A single shared entry was not enough - both slots
+		// of a queue can be in flight (the async path pipelines them), and the
+		// second failing batch would then evict the first record. Every staged
+		// request has a unique name, so a record belongs to exactly one slot and
+		// is stashed on that slot's entry.
+		std::array<QueueErrorInfo, BATCH_SLOT_COUNT> pending_errors;
 		std::array<BatchSlot, BATCH_SLOT_COUNT> batch_slots;
 	};
 
@@ -263,16 +268,21 @@ private:
 	static void report_batch_outcome(const BatchReport &p_report);
 	void handle_queue_error_event(int p_queue_index);
 	// Hands a captured record to the batch that will consume it, or returns it for
-	// immediate reporting when no batch on that queue is still unfinished.
+	// immediate reporting when no batch on that queue is still unfinished or every
+	// slot entry is already claimed.
 	void stash_queue_error_locked(QueueState &p_queue, const QueueErrorInfo &p_error, QueueErrorInfo *r_immediate);
 	bool has_unfinished_batch_on_queue_locked(const QueueState &p_queue) const;
+	// Index of the slot that staged the named request, or -1 when no slot on this
+	// queue holds it (a record for an already-retired request, or a record that
+	// names no request at all). Caller holds batch_mutex.
+	int slot_index_for_error_name_locked(const QueueState &p_queue, const String &p_failed_request_name) const;
 	// True when this slot staged the request the record names, or when the record
 	// names no request at all (nothing to match on). Caller holds batch_mutex.
 	bool slot_owns_error_name_locked(const BatchSlot &p_slot, const String &p_failed_request_name) const;
 	// True when any slot of the queue still holds the named request, i.e. the
 	// record belongs to a later completion. Caller holds batch_mutex.
 	bool queue_has_request_name_locked(const QueueState &p_queue, const String &p_failed_request_name) const;
-	void poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uint64_t p_fence_value, BatchReport &r_report);
+	void poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, int p_slot_index, uint64_t p_fence_value, BatchReport &r_report);
 	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch, BatchReport &r_report);
 	bool has_in_flight_batches_locked() const;
 	void update_profiler_queue_depth_locked();
@@ -400,9 +410,17 @@ public:
 	int _debug_error_record_read_count() const;
 	// Test-only seam: installs a queue failure that the SDK cannot be made to
 	// produce on demand (the real out-of-band trigger is device removal), so the
-	// "report a failure with no batch in flight" path can be executed.
-	// Never bound in _bind_methods().
-	void _debug_inject_queue_error_for_testing(int p_queue_index, const String &p_message);
+	// "report a failure with no batch in flight" path can be executed. When
+	// p_failed_request_name is given, the record is attributed exactly like a real
+	// RetrieveErrorRecord() result (stashed for the slot that staged that request)
+	// instead of landing on the first completing slot. p_fatal=false reproduces the
+	// cancellation record the SDK builds for ERROR_OPERATION_ABORTED, which must be
+	// consumed but must not fail the batch. Never bound in _bind_methods().
+	void _debug_inject_queue_error_for_testing(int p_queue_index, const String &p_message, const String &p_failed_request_name = String(), bool p_fatal = true);
+	// Test-only seam: the request names currently staged on one slot, in staging
+	// order. Lets a test inject a record that names a real staged request without
+	// reaching into the slot's containers. Never bound in _bind_methods().
+	PackedStringArray _debug_staged_request_names_for_testing(int p_queue_index, int p_slot_index) const;
 	// Test-only seam: how many times DStorageSetConfiguration has actually been
 	// applied. The counter is per loaded runtime instance, not per process, so a
 	// second load cycle must raise it again; a process-wide latch did not. Never

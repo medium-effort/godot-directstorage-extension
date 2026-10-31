@@ -831,17 +831,22 @@ bool Win32Backend::slot_owns_error_name_locked(const BatchSlot &p_slot, const St
 }
 
 // Caller holds batch_mutex.
-bool Win32Backend::queue_has_request_name_locked(const QueueState &p_queue, const String &p_failed_request_name) const {
+int Win32Backend::slot_index_for_error_name_locked(const QueueState &p_queue, const String &p_failed_request_name) const {
 	if (p_failed_request_name.is_empty()) {
-		return false;
+		return -1;
 	}
 	const std::string key = p_failed_request_name.utf8().get_data();
-	for (const BatchSlot &slot : p_queue.batch_slots) {
-		if (slot.request_name_map.find(key) != slot.request_name_map.end()) {
-			return true;
+	for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; slot_index++) {
+		if (p_queue.batch_slots[slot_index].request_name_map.find(key) != p_queue.batch_slots[slot_index].request_name_map.end()) {
+			return slot_index;
 		}
 	}
-	return false;
+	return -1;
+}
+
+// Caller holds batch_mutex.
+bool Win32Backend::queue_has_request_name_locked(const QueueState &p_queue, const String &p_failed_request_name) const {
+	return slot_index_for_error_name_locked(p_queue, p_failed_request_name) >= 0;
 }
 
 // Caller holds batch_mutex.
@@ -849,12 +854,26 @@ void Win32Backend::stash_queue_error_locked(QueueState &p_queue, const QueueErro
 	if (!p_error.present) {
 		return;
 	}
-	if (has_unfinished_batch_on_queue_locked(p_queue) && !p_queue.pending_error.present) {
-		p_queue.pending_error = p_error;
-		return;
+	if (has_unfinished_batch_on_queue_locked(p_queue)) {
+		// Every staged request has a unique name, so a record belongs to exactly
+		// one slot: keep it on that slot's own entry. A record that names no
+		// request - or one no slot holds any more - cannot be attributed, so it
+		// takes the first free entry and the completion path surfaces it when no
+		// slot claims it.
+		const int owner_slot = slot_index_for_error_name_locked(p_queue, p_error.failed_request_name);
+		if (owner_slot >= 0 && !p_queue.pending_errors[owner_slot].present) {
+			p_queue.pending_errors[owner_slot] = p_error;
+			return;
+		}
+		for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; slot_index++) {
+			if (!p_queue.pending_errors[slot_index].present) {
+				p_queue.pending_errors[slot_index] = p_error;
+				return;
+			}
+		}
 	}
-	// Either no batch can carry this failure, or the single stash is already
-	// claimed by another failure: report it here rather than dropping the record.
+	// Either no batch can carry this failure, or every slot entry is already
+	// claimed: report it here rather than dropping the record.
 	if (r_immediate && !r_immediate->present) {
 		*r_immediate = p_error;
 	}
@@ -1236,47 +1255,74 @@ bool Win32Backend::stage_single_mip_request(Ref<DSRequest> p_parent, Ref<DSReque
 #endif
 }
 
-void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, uint64_t p_fence_value, BatchReport &r_report) {
+void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, int p_slot_index, uint64_t p_fence_value, BatchReport &r_report) {
 	if (!p_queue.completion_fence || p_fence_value == 0 ||
 			p_queue.completion_fence->GetCompletedValue() < p_fence_value) {
 		return;
 	}
 
 	p_queue.completed_fence_value = std::max(p_queue.completed_fence_value, p_queue.completion_fence->GetCompletedValue());
+	// Consume every record this batch can claim. Only a record the SDK actually
+	// signalled can be stashed here, so a clean batch leaves this empty and still
+	// completes. The record names the request that failed and every staged request
+	// has a unique name, so it belongs to exactly one slot: a batch that does not
+	// own that request must never be failed by it, and must not swallow it either.
+	// This slot's own entry is examined first, so the record routed to it decides
+	// the failure and the message root.
+	QueueErrorInfo queue_error;
+	bool claimed_error = false;
+	for (int offset = 0; offset < BATCH_SLOT_COUNT; offset++) {
+		const int entry = (p_slot_index + offset) % BATCH_SLOT_COUNT;
+		if (!p_queue.pending_errors[entry].present) {
+			continue;
+		}
+		const bool owns = slot_owns_error_name_locked(p_slot, p_queue.pending_errors[entry].failed_request_name);
+		if (!owns && queue_has_request_name_locked(p_queue, p_queue.pending_errors[entry].failed_request_name)) {
+			// Another slot on this queue still holds the named request. Leave the
+			// record stashed for that slot's completion; this batch is clean.
+			continue;
+		}
+		// Either this batch staged the named request, or the owning request already
+		// retired (so no later batch will claim it: surface it now instead of
+		// stashing it forever). A second record for a batch that is already failing
+		// is folded into the failure, because a batch fails as a whole
+		// (attribute_batch_error_records) - except that a fatal record always wins
+		// over a cancellation, so a cancelled request can never mask a hardware
+		// failure on the same queue.
+		if (!claimed_error || (p_queue.pending_errors[entry].fatal && !queue_error.fatal)) {
+			queue_error = p_queue.pending_errors[entry];
+			claimed_error = true;
+		}
+		p_queue.pending_errors[entry] = QueueErrorInfo();
+	}
 	// The SDK can raise the error event just after the batch's own completion
 	// signal. Read it here only when it is already signalled - still the
 	// contract's trigger - so a failing batch is not marked completed because the
-	// two events raced. A clean batch never reaches RetrieveErrorRecord.
-	if (p_queue.error_event && !p_queue.pending_error.present &&
-			WaitForSingleObject(p_queue.error_event, 0) == WAIT_OBJECT_0) {
+	// two events raced, and only when no stashed record already made this batch
+	// fail. A clean batch never reaches RetrieveErrorRecord.
+	if (!claimed_error && p_queue.error_event && WaitForSingleObject(p_queue.error_event, 0) == WAIT_OBJECT_0) {
 		QueueErrorInfo raced = read_queue_error(p_queue.queue);
 		ResetEvent(p_queue.error_event);
 		if (raced.present) {
-			p_queue.pending_error = raced;
-		}
-	}
-	// Consume the failure captured on this queue's error event. Only a record the
-	// SDK actually signalled can be pending here, so a clean batch leaves this
-	// empty and still completes. The record names the request that failed and every
-	// staged request has a unique name, so it belongs to exactly one slot: a batch
-	// that does not own that request must never be failed by it.
-	QueueErrorInfo queue_error = p_queue.pending_error;
-	if (queue_error.present) {
-		if (slot_owns_error_name_locked(p_slot, queue_error.failed_request_name)) {
-			p_queue.pending_error = QueueErrorInfo();
-		} else {
-			if (!queue_has_request_name_locked(p_queue, queue_error.failed_request_name)) {
-				// The owning request already retired, so no later batch will claim
-				// this record: surface it now instead of stashing it forever.
-				p_queue.pending_error = QueueErrorInfo();
-				r_report.error = queue_error;
+			if (!slot_owns_error_name_locked(p_slot, raced.failed_request_name) &&
+					queue_has_request_name_locked(p_queue, raced.failed_request_name)) {
+				// The record belongs to another slot that is still in flight: keep it
+				// for that slot's completion instead of failing this clean batch.
+				QueueErrorInfo immediate;
+				stash_queue_error_locked(p_queue, raced, &immediate);
+				if (immediate.present) {
+					// Every entry is claimed and this is the only batch that can retire
+					// now: the queue is failing, so never drop the record.
+					queue_error = immediate;
+					claimed_error = true;
+				}
+			} else {
+				queue_error = raced;
+				claimed_error = true;
 			}
-			// Another slot on this queue still holds the named request. Leave the
-			// record stashed for that slot's completion; this batch is clean.
-			queue_error = QueueErrorInfo();
 		}
 	}
-	const bool queue_failed = queue_error.present && queue_error.fatal;
+	const bool queue_failed = claimed_error && queue_error.fatal;
 
 	std::unordered_map<int64_t, ID3D12Resource *> rid_cache;
 	for (int i = 0; i < p_slot.requests.size(); i++) {
@@ -1325,8 +1371,8 @@ void Win32Backend::update_profiler_queue_depth_locked() {
 	}
 }
 
-void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &, BatchReport &r_report) {
-	poll_batch_status(p_queue, p_slot, p_slot.fence_value, r_report);
+void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch, BatchReport &r_report) {
+	poll_batch_status(p_queue, p_slot, p_batch.slot_index, p_slot.fence_value, r_report);
 	p_slot.completed_count = count_completed_requests(p_slot.requests);
 	p_slot.error_code = 0;
 	p_slot.error_message = String();
@@ -2953,7 +2999,7 @@ void Win32Backend::shutdown() {
 		// Queue-owned handle: dropping the reference above invalidates it, so it is
 		// only forgotten here, never CloseHandle()d.
 		queue.error_event = nullptr;
-		queue.pending_error = QueueErrorInfo();
+		queue.pending_errors.fill(QueueErrorInfo());
 		if (queue.completion_event) {
 			CloseHandle(queue.completion_event);
 			queue.completion_event = nullptr;
@@ -4596,27 +4642,56 @@ int Win32Backend::_debug_error_record_read_count() const {
 #endif
 }
 
-void Win32Backend::_debug_inject_queue_error_for_testing(int p_queue_index, const String &p_message) {
+void Win32Backend::_debug_inject_queue_error_for_testing(int p_queue_index, const String &p_message, const String &p_failed_request_name, bool p_fatal) {
 #ifdef _WIN32
 	// Test-only seam, never bound in _bind_methods(). The only real source of an
 	// error record with no batch in flight is a device removal, which cannot be
 	// produced on demand. This installs the record the SDK would have returned and
 	// runs the same stash-or-report decision the error-event handler uses, so the
-	// reporting half is exercised while only the SDK read is bypassed.
+	// reporting half is exercised while only the SDK read is bypassed. Naming a
+	// staged request routes the record exactly like a real one (by name, to the
+	// slot that holds it); without a name it lands on the first completing slot.
 	if (p_queue_index < 0 || p_queue_index >= QUEUE_COUNT) {
 		return;
 	}
 	QueueErrorInfo injected;
 	injected.present = true;
-	injected.fatal = true;
+	injected.fatal = p_fatal;
 	injected.message = p_message;
+	injected.failed_request_name = p_failed_request_name;
 	QueueErrorInfo immediate;
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		stash_queue_error_locked(priority_queues[p_queue_index], injected, &immediate);
 	}
 	report_queue_error(immediate);
+#else
+	(void)p_queue_index;
+	(void)p_message;
+	(void)p_failed_request_name;
+	(void)p_fatal;
 #endif
+}
+
+PackedStringArray Win32Backend::_debug_staged_request_names_for_testing(int p_queue_index, int p_slot_index) const {
+	PackedStringArray names;
+#ifdef _WIN32
+	// Test-only seam, never bound in _bind_methods(). Reads the slot's staging
+	// order so a test can name a real staged request in an injected record
+	// without touching the slot's containers.
+	if (p_queue_index < 0 || p_queue_index >= QUEUE_COUNT || p_slot_index < 0 || p_slot_index >= BATCH_SLOT_COUNT) {
+		return names;
+	}
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	const std::vector<std::string> &staged = priority_queues[p_queue_index].batch_slots[p_slot_index].request_names;
+	for (size_t i = 0; i < staged.size(); i++) {
+		names.push_back(String(staged[i].c_str()));
+	}
+#else
+	(void)p_queue_index;
+	(void)p_slot_index;
+#endif
+	return names;
 }
 
 void Win32Backend::_debug_seed_instance_state_for_testing() {
