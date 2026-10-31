@@ -151,7 +151,14 @@ namespace GDeflate
             return false;
 
         const size_t uncompressedSize = header->GetUncompressedSize();
-        if (uncompressedSize == 0 || outputSize < uncompressedSize) {
+        // The caller sizes its destination from the uncompressed size it declared, and
+        // this stream is the only thing that says how many bytes it can produce. A
+        // stream that declares fewer bytes than the destination is truncated or
+        // hostile: decoding it would leave the tail of the destination untouched while
+        // reporting success. The hardware path rejects the same mismatch before
+        // submission and GDeflateDecompressor::validate_stream() rejects it before this
+        // function is reached; the codec must not be the weakest of the three.
+        if (uncompressedSize == 0 || outputSize != uncompressedSize) {
             return false;
         }
 

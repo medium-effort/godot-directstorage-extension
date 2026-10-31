@@ -2,6 +2,7 @@
 #include "gdextest/registry.h"
 #include "compression/gdeflate_compressor.h"
 #include "compression/gdeflate_decompressor.h"
+#include "GDeflate.h"
 #include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/core/memory.hpp>
 
@@ -229,4 +230,46 @@ GDEX_TEST(gdeflate, truncated_stream_yields_empty_no_crash) {
     truncated.resize(compressed.size() / 2);
     GDEX_EXPECT_EQ(
             decompressor->decompress(truncated, static_cast<int>(original.size())).size(), 0);
+}
+
+// A container's declared size is what sizes the destination; the stream header is
+// the only thing that says how many bytes it can produce. A stream that declares
+// fewer bytes than the destination must be rejected, never decoded into a
+// partially written buffer that is then reported as success.
+GDEX_TEST(gdeflate, short_stream_rejected_for_larger_destination) {
+    // One tile of payload: the stream header declares exactly kTileSize bytes.
+    godot::PackedByteArray original = make_pattern(kTileSize);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
+    godot::PackedByteArray compressed = compressor->compress(original, 1);
+    GDEX_EXPECT_GT(compressed.size(), 0);
+    if (compressed.size() == 0) {
+        return;
+    }
+
+    // The destination a request hands the codec when its container entry claims
+    // two tiles of output for a one-tile payload.
+    godot::PackedByteArray destination;
+    destination.resize(kTileSize * 2);
+    for (int64_t i = 0; i < destination.size(); i++) {
+        destination[i] = 0xCD;
+    }
+    const godot::PackedByteArray canary = destination;
+
+    const bool ok = GDeflate::Decompress(destination.ptrw(),
+            static_cast<size_t>(destination.size()), compressed.ptr(),
+            static_cast<size_t>(compressed.size()), 1);
+
+    // Discriminator: a stream that cannot fill the destination is rejected.
+    GDEX_EXPECT_FALSE(ok);
+    // Rejection is up front: nothing was decoded into the destination either.
+    GDEX_EXPECT_TRUE(destination == canary);
+
+    // Control: the same stream is accepted into a destination it does fill, so
+    // this case cannot pass by rejecting everything.
+    godot::PackedByteArray exact;
+    exact.resize(original.size());
+    GDEX_EXPECT_TRUE(GDeflate::Decompress(exact.ptrw(), static_cast<size_t>(exact.size()),
+            compressed.ptr(), static_cast<size_t>(compressed.size()), 1));
+    GDEX_EXPECT_TRUE(exact == original);
 }
