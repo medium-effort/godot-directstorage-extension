@@ -8,6 +8,7 @@
 #include <chrono>
 #include "GDeflate.h"
 #include "TileStream.h"
+#include "../../compression/gdeflate_parallel.h"
 
 namespace godot {
 
@@ -248,7 +249,8 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 				static_cast<size_t>(uncompressed_size),
 				raw_bytes.ptr(),
 				raw_bytes.size(),
-				effective_workers);
+				effective_workers,
+				&ds_gdeflate_parallel_for);
 
 		if (!ok) {
 			p_request->set_status(DSRequest::STATUS_FAILED);

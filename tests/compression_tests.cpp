@@ -2,8 +2,10 @@
 #include "gdextest/registry.h"
 #include "compression/gdeflate_compressor.h"
 #include "compression/gdeflate_decompressor.h"
+#include "compression/gdeflate_parallel.h"
 #include "GDeflate.h"
 #include <godot_cpp/classes/ref.hpp>
+#include <godot_cpp/classes/worker_thread_pool.hpp>
 #include <godot_cpp/core/memory.hpp>
 
 // C++ mirror of project/headless_tests/test_gdeflate.gd (authoritative).
@@ -272,4 +274,52 @@ GDEX_TEST(gdeflate, short_stream_rejected_for_larger_destination) {
     GDEX_EXPECT_TRUE(GDeflate::Decompress(exact.ptrw(), static_cast<size_t>(exact.size()),
             compressed.ptr(), static_cast<size_t>(compressed.size()), 1));
     GDEX_EXPECT_TRUE(exact == original);
+}
+
+namespace {
+
+struct PoolDecompressJob {
+    godot::PackedByteArray *compressed = nullptr;
+    godot::PackedByteArray *destination = nullptr;
+    bool ok = false;
+};
+
+void run_pool_decompress(void *p_user) {
+    PoolDecompressJob *job = static_cast<PoolDecompressJob *>(p_user);
+    job->ok = GDeflate::Decompress(job->destination->ptrw(),
+            static_cast<size_t>(job->destination->size()), job->compressed->ptr(),
+            static_cast<size_t>(job->compressed->size()), 4, &godot::ds_gdeflate_parallel_for);
+}
+
+} // namespace
+
+// Tile work runs on whatever executor the caller supplies. A caller that is itself a
+// worker-pool task is the shape that can stall an engine pool, so it gets a case:
+// decompression driven from inside a pool task has to finish and produce the same
+// bytes as the inline path.
+GDEX_TEST(gdeflate, decompress_runs_inside_worker_thread_pool_task) {
+    godot::WorkerThreadPool *pool = godot::WorkerThreadPool::get_singleton();
+    if (pool == nullptr) {
+        GDEX_SKIP("WorkerThreadPool singleton unavailable");
+    }
+    // Eight tiles so the codec actually fans out (numItems > 2 * numWorkers).
+    godot::PackedByteArray original = make_pattern(kTileSize * 8);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
+    godot::PackedByteArray compressed = compressor->compress(original, 1);
+    GDEX_EXPECT_GT(compressed.size(), 0);
+    if (compressed.size() == 0) {
+        return;
+    }
+    godot::PackedByteArray destination;
+    destination.resize(original.size());
+    PoolDecompressJob job{ &compressed, &destination, false };
+    const int64_t task = pool->add_native_task(&run_pool_decompress, &job, false, "ds gdeflate test");
+    GDEX_EXPECT_NE(task, static_cast<int64_t>(godot::WorkerThreadPool::INVALID_TASK_ID));
+    if (task == static_cast<int64_t>(godot::WorkerThreadPool::INVALID_TASK_ID)) {
+        return;
+    }
+    pool->wait_for_task_completion(task);
+    GDEX_EXPECT_TRUE(job.ok);
+    GDEX_EXPECT_TRUE(destination == original);
 }

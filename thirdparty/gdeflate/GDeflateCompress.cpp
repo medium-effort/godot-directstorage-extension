@@ -27,7 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
-#include <thread>
+#include <thread> // hardware_concurrency() only: this file spawns no threads
 #include <vector>
 
 template<>
@@ -98,13 +98,87 @@ namespace GDeflate
         std::atomic_bool failed;
     };
 
+    // Tile work for one worker: claims tiles from the shared index until the stream is
+    // exhausted. Free function (not a lambda) so an executor can call it through a
+    // plain function pointer.
+    static void TileCompressionJob(CompressionContext& context, uint32_t level)
+    {
+        size_t pageCount = 0;
+        const size_t scratchSize = libdeflate_gdeflate_compress_bound(nullptr, kDefaultTileSize, &pageCount);
+        // assert() is compiled out of release builds, and a zero-sized or multi-page
+        // scratch buffer would be written past by libdeflate on the next call.
+        if (scratchSize == 0 || pageCount != 1)
+        {
+            context.failed = true;
+            return;
+        }
+
+        // Heap scratch instead of alloca(): a compression worker may run with little
+        // remaining stack, and the size is only known here.
+        std::vector<uint8_t> scratch(scratchSize);
+
+        std::unique_ptr<libdeflate_gdeflate_compressor> compressor(libdeflate_alloc_gdeflate_compressor(level));
+        if (!compressor)
+        {
+            context.failed = true;
+            return;
+        }
+
+        while (true)
+        {
+            const uint32_t tileIndex = context.globalIndex.fetch_add(1, std::memory_order_relaxed);
+
+            if (tileIndex >= context.numItems)
+                break;
+
+            const size_t tilePos = tileIndex * kDefaultTileSize;
+
+            size_t remaining = context.inputSize - tilePos;
+            size_t uncompressedSize = std::min<size_t>(remaining, kDefaultTileSize);
+
+            auto& tile = context.tiles[tileIndex];
+            tile.uncompressedSize = uncompressedSize;
+
+            libdeflate_gdeflate_out_page compressedPage{scratch.data(), scratchSize};
+
+            size_t result = libdeflate_gdeflate_compress(
+                compressor.get(),
+                context.inputPtr + tilePos,
+                uncompressedSize,
+                &compressedPage,
+                1);
+
+            if (result == 0)
+            {
+                context.failed = true;
+                break;
+            }
+
+            tile.data.resize(compressedPage.nbytes);
+            memcpy(tile.data.data(), compressedPage.data, compressedPage.nbytes);
+        }
+    }
+
+    struct CompressJob
+    {
+        CompressionContext* context;
+        uint32_t level;
+    };
+
+    static void TileCompressionWorker(void* p_user, uint32_t /*p_index*/)
+    {
+        CompressJob* job = static_cast<CompressJob*>(p_user);
+        TileCompressionJob(*job->context, job->level);
+    }
+
     static bool DoCompress(
         uint8_t* output,
         size_t* outputSize,
         const uint8_t* in,
         size_t inSize,
         uint32_t level,
-        uint32_t flags)
+        uint32_t flags,
+        ParallelForFn p_parallelFor)
     {
         if (outputSize == nullptr || output == nullptr || in == nullptr || inSize == 0)
             return false;
@@ -120,89 +194,22 @@ namespace GDeflate
         context.tiles.resize(context.numItems);
         context.failed = false;
 
-        auto TileCompressionJob = [&context, level]()
-        {
-            size_t pageCount = 0;
-            const size_t scratchSize = libdeflate_gdeflate_compress_bound(nullptr, kDefaultTileSize, &pageCount);
-            // assert() is compiled out of release builds, and a zero-sized or multi-page
-            // scratch buffer would be written past by libdeflate on the next call.
-            if (scratchSize == 0 || pageCount != 1)
-            {
-                context.failed = true;
-                return;
-            }
-
-            // Heap scratch instead of alloca(): a compression worker may run with little
-            // remaining stack, and the size is only known here.
-            std::vector<uint8_t> scratch(scratchSize);
-
-            std::unique_ptr<libdeflate_gdeflate_compressor> compressor(libdeflate_alloc_gdeflate_compressor(level));
-            if (!compressor)
-            {
-                context.failed = true;
-                return;
-            }
-
-            while (true)
-            {
-                const uint32_t tileIndex = context.globalIndex.fetch_add(1, std::memory_order_relaxed);
-
-                if (tileIndex >= context.numItems)
-                    break;
-
-                const size_t tilePos = tileIndex * kDefaultTileSize;
-
-                size_t remaining = context.inputSize - tilePos;
-                size_t uncompressedSize = std::min<size_t>(remaining, kDefaultTileSize);
-
-                auto& tile = context.tiles[tileIndex];
-                tile.uncompressedSize = uncompressedSize;
-
-                libdeflate_gdeflate_out_page compressedPage{scratch.data(), scratchSize};
-
-                size_t result = libdeflate_gdeflate_compress(
-                    compressor.get(),
-                    context.inputPtr + tilePos,
-                    uncompressedSize,
-                    &compressedPage,
-                    1);
-
-                if (result == 0)
-                {
-                    context.failed = true;
-                    break;
-                }
-
-                tile.data.resize(compressedPage.nbytes);
-                memcpy(tile.data.data(), compressedPage.data, compressedPage.nbytes);
-            }
-        };
-
-        std::thread workers[kMaxWorkers + 1];
         const uint32_t maxWorkers = std::min(kMaxWorkers, std::thread::hardware_concurrency());
 
-        uint32_t numWorkersLeft =
-            std::min(maxWorkers, (context.numItems + kMinTilesPerWorker - 1) / kMinTilesPerWorker);
+        // The old expression counted extra threads next to the inline one, so the total
+        // is one more; a single-thread request stays at one runner.
+        const uint32_t workers = (flags & COMPRESS_SINGLE_THREAD)
+            ? 1u
+            : 1u + std::min(maxWorkers, (context.numItems + kMinTilesPerWorker - 1) / kMinTilesPerWorker);
 
-        if (flags & COMPRESS_SINGLE_THREAD)
-            numWorkersLeft = 0;
-
-        for (auto& worker : workers)
+        CompressJob job{ &context, level };
+        if (workers > 1 && p_parallelFor != nullptr)
         {
-            if (numWorkersLeft == 0)
-                break;
-
-            worker = std::thread([TileCompressionJob]() { TileCompressionJob(); });
-
-            --numWorkersLeft;
+            p_parallelFor(&job, &TileCompressionWorker, workers);
         }
-
-        TileCompressionJob();
-
-        for (auto& worker : workers)
+        else
         {
-            if (worker.joinable())
-                worker.join();
+            TileCompressionJob(context, level);
         }
 
         // Compression failed
@@ -275,9 +282,9 @@ namespace GDeflate
         return numTiles * tileSize + sizeof(TileStream) + sizeof(uint64_t);
     }
 
-    bool Compress(uint8_t* output, size_t* outputSize, const uint8_t* in, size_t inSize, uint32_t level, uint32_t flags)
+    bool Compress(uint8_t* output, size_t* outputSize, const uint8_t* in, size_t inSize, uint32_t level, uint32_t flags, ParallelForFn p_parallelFor)
     {
-        return DoCompress(output, outputSize, in, inSize, level, flags);
+        return DoCompress(output, outputSize, in, inSize, level, flags, p_parallelFor);
     }
 
 } // namespace GDeflate

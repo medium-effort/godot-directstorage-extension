@@ -1,4 +1,5 @@
 #include "gdeflate_decompressor.h"
+#include "gdeflate_parallel.h"
 #include "../core/ds_error_handler.h"
 #include "../formats/dstex_format.h"
 #include <godot_cpp/classes/os.hpp>
@@ -118,7 +119,8 @@ PackedByteArray GDeflateDecompressor::decompress(const PackedByteArray &p_compre
 			static_cast<size_t>(p_original_size),
 			p_compressed.ptr(),
 			p_compressed.size(),
-			effective_workers);
+			effective_workers,
+			&ds_gdeflate_parallel_for);
 
 	if (!ok) {
 		report_decompression_error("GDeflateDecompressor: Decompression failed.");

@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include "GDeflate.h"
 #include "TileStream.h"
 #include "Utils.h"
 
@@ -23,7 +24,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <thread>
 
 template<>
 struct std::default_delete<libdeflate_gdeflate_decompressor>
@@ -140,7 +140,19 @@ namespace GDeflate
         }
     }
 
-    bool Decompress(uint8_t* output, size_t outputSize, const uint8_t* in, size_t inSize, uint32_t numWorkers)
+    struct DecompressJob
+    {
+        DecompressionContext* context;
+        uint32_t compressorId;
+    };
+
+    static void TileDecompressionWorker(void* p_user, uint32_t /*p_index*/)
+    {
+        DecompressJob* job = static_cast<DecompressJob*>(p_user);
+        TileDecompressionJob(*job->context, job->compressorId);
+    }
+
+    bool Decompress(uint8_t* output, size_t outputSize, const uint8_t* in, size_t inSize, uint32_t numWorkers, ParallelForFn p_parallelFor)
     {
         if (nullptr == output || nullptr == in || 0 == outputSize || inSize < sizeof(TileStream))
             return false;
@@ -182,27 +194,20 @@ namespace GDeflate
 
         context.failed = false;
 
-        std::thread workers[kMaxWorkers];
-
-        uint32_t numWorkersLeft = context.numItems > (2 * numWorkers) ? numWorkers : 1;
         const uint32_t compressorId = header->id;
 
-        for (auto& worker : workers)
+        // Tiles are claimed from an atomic index, so the worker count only decides how
+        // much of the stream decodes in parallel; one runner always covers all tiles.
+        const uint32_t workers = context.numItems > (2 * numWorkers) ? numWorkers : 1;
+
+        DecompressJob job{ &context, compressorId };
+        if (workers > 1 && p_parallelFor != nullptr)
         {
-            if (numWorkersLeft == 1)
-                break;
-
-            worker = std::thread([&context, compressorId]() { TileDecompressionJob(context, compressorId); });
-
-            --numWorkersLeft;
+            p_parallelFor(&job, &TileDecompressionWorker, workers);
         }
-
-        TileDecompressionJob(context, compressorId);
-
-        for (auto& worker : workers)
+        else
         {
-            if (worker.joinable())
-                worker.join();
+            TileDecompressionJob(context, compressorId);
         }
 
         return (!context.failed);

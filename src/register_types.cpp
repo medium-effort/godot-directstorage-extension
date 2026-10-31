@@ -1,6 +1,7 @@
 #include "register_types.h"
 #include "compression/gdeflate_compressor.h"
 #include "compression/gdeflate_decompressor.h"
+#include "compression/gdeflate_parallel.h"
 #include "core/ds_context.h"
 #include "core/ds_error_handler.h"
 #include "core/ds_profiler.h"
@@ -15,6 +16,7 @@
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/resource_loader.hpp>
+#include <godot_cpp/classes/worker_thread_pool.hpp>
 #include <godot_cpp/core/defs.hpp>
 #include <godot_cpp/godot.hpp>
 
@@ -66,6 +68,13 @@ void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_lev
 	}
 
 	register_directstorage_project_settings();
+
+	// godot-cpp resolves an engine singleton lazily on first use; do it here, on the
+	// main thread, so a loader worker that later dispatches GDeflate tile jobs cannot
+	// race the binding's static initialisation. The pool capacity is resolved here too:
+	// both values are process-wide and must not be read per decompression.
+	(void)WorkerThreadPool::get_singleton();
+	ds_gdeflate_init_pool_capacity();
 
 	ClassDB::register_class<DSContext>();
 	ClassDB::register_class<DSRequest>();

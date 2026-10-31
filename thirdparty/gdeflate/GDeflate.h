@@ -31,6 +31,14 @@ namespace GDeflate
         COMPRESS_SINGLE_THREAD = 0x200, /*!< Force compression using a single thread. */
     };
 
+    // Runs p_job(p_user, p_index) for every p_index in [0, p_workers) and returns only
+    // after all invocations finished. The codecs never create threads of their own: with
+    // p_parallelFor == nullptr the work runs inline on the calling thread, otherwise the
+    // caller's executor decides where it runs and how many workers it really gets. Both
+    // codecs claim work from an atomic index, so an executor with fewer real workers is
+    // slow but always correct.
+    using ParallelForFn = void (*)(void* p_user, void (*p_job)(void*, uint32_t), uint32_t p_workers);
+
     size_t CompressBound(size_t size);
 
     bool Compress(
@@ -39,8 +47,15 @@ namespace GDeflate
         const uint8_t* in,
         size_t inSize,
         uint32_t level,
-        uint32_t flags);
+        uint32_t flags,
+        ParallelForFn p_parallelFor = nullptr);
 
-    bool Decompress(uint8_t* output, size_t outputSize, const uint8_t* in, size_t inSize, uint32_t numWorkers);
+    bool Decompress(
+        uint8_t* output,
+        size_t outputSize,
+        const uint8_t* in,
+        size_t inSize,
+        uint32_t numWorkers,
+        ParallelForFn p_parallelFor = nullptr);
 
 } // namespace GDeflate
