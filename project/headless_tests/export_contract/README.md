@@ -45,6 +45,7 @@ under `not_covered` and the run is not a full pass.
 | Partial salvage | `partial_salvage` (deployed, opened, failed payload stays in the PCK) |
 | Skip implies expectation | `skip_on_first_add_failure`, `skip_on_finalize_failure`, `partial_salvage` (mid-walk); `skip_on_create_failure` is limited by the builder (see footer) |
 | Corrupted TOC | `corrupted_toc` (`status=fail reason=archive_unauthorized`) |
+| Plaintext archive in a protected build | `protected_plaintext_archive` (an ordinary unprotected archive with the protected archive id copied into its cleartext header is refused: `status=fail reason=archive_unauthorized`) |
 | Boot invocation | `protected_success` (user args reach the player, engine args empty, `DISPLAY=headless`) |
 | Alert bypass | `alert_bypass` (missing archive exits without a dialog; a timeout fails) |
 | Pack scan | every case; `key_scan_control` proves a plaintext key is found |

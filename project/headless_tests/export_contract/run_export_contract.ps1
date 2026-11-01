@@ -20,6 +20,8 @@ param(
 #   * partial salvage and a stale archive left by a failed export
 #   * encrypt_directory on and off
 #   * a corrupted TOC
+#   * a plaintext archive substituted into a protected build (the archive id is
+#     copied out of the cleartext header) must be refused at boot
 #   * "a skipped payload implies a declared archive" with failures injected at
 #     create(), the first add_texture(), mid-walk and finalize()
 #   * the pack scan: validity, key-leak absence, and a positive control that a
@@ -121,6 +123,7 @@ $script:Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.
 $script:LastBoot = $null
 $script:ProtectedStage = $null
 $script:ProtectedArchive = $null
+$script:PlainArchiveStage = $null
 $script:BootSeq = 0
 $MasterProject = ''
 
@@ -645,6 +648,9 @@ Invoke-Case 'unprotected_success' {
         Add-Check 'unprotected_success.archive_present' ($archives.Count -eq 1) ('archives=' + $archives.Count)
 
         $stage = Copy-ReleaseStage -SourceDir $out -Name 'unprotected_success'
+        # Kept for protected_plaintext_archive: an ordinary unprotected export is
+        # exactly the archive an attacker would substitute.
+        $script:PlainArchiveStage = $stage
         Assert-BootOk -Case 'unprotected_success' -StageDir $stage -Mode 'unprotected' -MinEntries 3
         $boot = $script:LastBoot
         if ($null -ne $boot) {
@@ -655,6 +661,56 @@ Invoke-Case 'unprotected_success' {
         }
         $scan = Invoke-Scan -PackPath (Join-Path $stage 'game.pck')
         Add-Check 'unprotected_success.scan_ok' ($scan.Ok -and -not $scan.TimedOut) ('verdict=' + $scan.Verdict)
+    }
+}
+
+# ---------------------------------------------------------------- plaintext archive in a protected build
+#
+# The requirement must come from the build, not from the archive. A protected
+# export ships an authenticated TOC, and the archive id it pairs against sits in
+# the cleartext header, so an attacker who can replace the archive can also copy
+# that id into a plaintext archive of their own. Before the build published the
+# requirement, such an archive opened and the game booted. It must now be refused
+# with the same reason the runtime uses for a decryption failure.
+
+Invoke-Case 'protected_plaintext_archive' {
+    if (-not $ProtectedAvailable) {
+        Add-NotCovered 'protected_plaintext_archive' $TemplateReason
+    } elseif ($null -eq $script:ProtectedStage) {
+        Add-NotCovered 'protected_plaintext_archive' 'no protected release to attack'
+    } elseif ($null -eq $script:PlainArchiveStage) {
+        Add-NotCovered 'protected_plaintext_archive' 'no unprotected release to source a plaintext archive from'
+    } else {
+        $stage = Join-Path $WorkRoot 'stage-protected_plaintext_archive'
+        if (Test-Path -LiteralPath $stage) { throw ('stage directory already exists: ' + $stage) }
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        foreach ($item in @(Get-ChildItem -LiteralPath $script:ProtectedStage -File)) {
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $stage $item.Name) -Force
+        }
+
+        $protectedBytes = [System.IO.File]::ReadAllBytes((Join-Path $script:ProtectedStage 'textures.dspkg'))
+        $plainBytes = [System.IO.File]::ReadAllBytes((Join-Path $script:PlainArchiveStage 'textures.dspkg'))
+
+        # Fixture proof: the source archive really is a plaintext v4 archive and
+        # the deployed one really is encrypted, or this case proves nothing.
+        $plainVersion = [BitConverter]::ToUInt16($plainBytes, 4)
+        $plainFlags = [BitConverter]::ToUInt16($plainBytes, 6)
+        $plainKeyId = [BitConverter]::ToUInt64($plainBytes, 52)
+        $protectedVersion = [BitConverter]::ToUInt16($protectedBytes, 4)
+        $protectedFlags = [BitConverter]::ToUInt16($protectedBytes, 6)
+        Add-Check 'protected_plaintext_archive.source_is_plaintext' (($plainVersion -eq 4) -and (($plainFlags -band 2) -eq 0) -and ($plainKeyId -eq 0)) ('version=' + $plainVersion + ' flags=' + $plainFlags + ' key_id=' + $plainKeyId)
+        Add-Check 'protected_plaintext_archive.target_is_encrypted' (($protectedVersion -eq 4) -and (($protectedFlags -band 2) -ne 0)) ('version=' + $protectedVersion + ' flags=' + $protectedFlags)
+
+        # The attack: copy the eight id bytes out of the cleartext protected header.
+        $protectedId = [BitConverter]::ToUInt64($protectedBytes, 20)
+        $plainId = [BitConverter]::ToUInt64($plainBytes, 20)
+        [Array]::Copy([BitConverter]::GetBytes($protectedId), 0, $plainBytes, 20, 8)
+        [System.IO.File]::WriteAllBytes((Join-Path $stage 'textures.dspkg'), $plainBytes)
+
+        Add-Check 'protected_plaintext_archive.id_differs_before_copy' ($plainId -ne $protectedId) ('source_id=0x' + $plainId.ToString('x') + ' protected_id=0x' + $protectedId.ToString('x'))
+        Add-Check 'protected_plaintext_archive.id_copied' ($protectedId -ne 0) ('id=0x' + $protectedId.ToString('x'))
+
+        Assert-BootFail -Case 'protected_plaintext_archive' -StageDir $stage -Reason 'archive_unauthorized'
     }
 }
 
