@@ -270,9 +270,20 @@ if _godot_cpp_prebuilt:
 else:
     # Inverse safety check. A worktree provisioned for prebuilt mode has
     # godot-cpp/gen junctioned to the shared store and its libraries hardlinked
-    # from it. Building godot-cpp here would write objects through the junction
+    # from it. Building godot-cpp there would write objects through the junction
     # and relink the hardlinked .lib IN PLACE, corrupting the copy every other
-    # worktree links against. Fail loudly instead of doing that silently.
+    # worktree links against.
+    #
+    # Only linked worktrees are guarded. The primary checkout is the *owner* of
+    # those artifacts: its godot-cpp/bin libraries are the hardlink targets the
+    # store points at, so nlink > 1 there is normal and rebuilding them in place
+    # is exactly what the primary is for (and is how a new godot-cpp reaches every
+    # worktree). Guarding it would break ad-hoc `scons` and `scons compiledb` in
+    # the main checkout. `.git` is a directory in the primary and a file in a
+    # linked worktree, which is what distinguishes them here.
+    # Non-build invocations (compiledb, dry run, --clean) never compile, so they
+    # cannot corrupt anything and stay allowed in a worktree too.
+    _is_linked_worktree = os.path.isfile(".git")
     _shared_markers = []
     if os.path.isfile(os.path.join("godot-cpp", "gen", ".stamp")):
         _shared_markers.append("godot-cpp/gen is the shared generated tree (junction)")
@@ -286,7 +297,7 @@ else:
                     _shared_markers.append(f"godot-cpp/bin/{_entry} is hardlinked to the shared store")
             except OSError:
                 pass
-    if _shared_markers:
+    if _shared_markers and _is_linked_worktree and not _non_build:
         print("[SCons] ERROR: this worktree shares godot-cpp with the primary worktree, but GODOT_CPP_PREBUILT is not set:")
         for _marker in _shared_markers:
             print(f"[SCons]   - {_marker}")

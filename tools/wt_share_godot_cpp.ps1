@@ -49,8 +49,6 @@ $worktree = (Resolve-Path -LiteralPath $WorktreePath).Path.TrimEnd('\', '/')
 $primaryGen = Join-Path $primary "godot-cpp\gen"
 $primaryBin = Join-Path $primary "godot-cpp\bin"
 $store = Join-Path $primary ".cache\godot-cpp-shared"
-$storeGen = Join-Path $store "gen"
-$stampFile = Join-Path $storeGen ".stamp"
 
 if (-not (Test-Path -LiteralPath (Join-Path $primaryGen "include") -PathType Container)) {
     Write-Host "[wt] primary godot-cpp/gen is not generated yet - skipping prebuilt sharing (this worktree will build godot-cpp itself)."
@@ -73,9 +71,11 @@ if (-not $supportsPrebuilt) {
     exit 0
 }
 
-# Refresh the shared generated sources when the submodule commit changes. The
-# commit is the only thing that makes the generated tree stale; local object
-# files are filtered out below and never shared.
+# One generated tree per godot-cpp commit, in its own directory. Never refresh in
+# place: other worktrees are junctioned to an existing tree and may be building
+# against it right now, and deleting or rewriting those files is what produced
+# "used by another process" mid-build. A new commit simply gets a new directory;
+# old ones stay until someone removes them.
 $commit = ""
 try {
     $commit = (& git -C (Join-Path $primary "godot-cpp") rev-parse HEAD 2>$null | Out-String).Trim()
@@ -83,37 +83,41 @@ try {
 catch {
     $commit = "unknown"
 }
-$stale = $Force -or -not (Test-Path -LiteralPath $stampFile -PathType Leaf)
-if (-not $stale) {
-    $stale = (Get-Content -LiteralPath $stampFile -Raw).Trim() -ne $commit
-}
+$commitTag = if ($commit -match '^[0-9a-f]{7,}$') { $commit.Substring(0, 12) } else { "unknown" }
+$storeGen = Join-Path $store "gen-$commitTag"
+$stampFile = Join-Path $storeGen ".stamp"
 
-if ($stale) {
-    if (Test-Path -LiteralPath $storeGen) {
-        # Only inside .cache/godot-cpp-shared - a cache, safe to drop.
-        Remove-Item -LiteralPath $storeGen -Recurse -Force
-    }
+if (-not (Test-Path -LiteralPath (Join-Path $storeGen "include") -PathType Container)) {
     New-Item -ItemType Directory -Force -Path (Join-Path $storeGen "include") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $storeGen "src") | Out-Null
     # /XF *.obj: never share object files, they are per-target and per-tree.
     & robocopy (Join-Path $primaryGen "include") (Join-Path $storeGen "include") /E /XF *.obj /NFL /NDL /NJH /NJS /NP | Out-Null
     & robocopy (Join-Path $primaryGen "src") (Join-Path $storeGen "src") /E /XF *.obj /NFL /NDL /NJH /NJS /NP | Out-Null
     Set-Content -LiteralPath $stampFile -Value $commit -Encoding utf8
-    Write-Host "[wt] refreshed shared godot-cpp generated sources (commit $commit)"
+    Write-Host "[wt] created shared generated sources for godot-cpp commit $commitTag"
+}
+elseif ($Force) {
+    Write-Host "[wt] -Force ignored: recreating a shared tree can break worktrees building against it. Remove $storeGen manually while nothing is building, then re-run."
 }
 
 # Worktree: gen as a junction (skip only when the worktree already has its own
 # generated tree, e.g. it was built before sharing was enabled).
 $worktreeGen = Join-Path $worktree "godot-cpp\gen"
 if (Test-Path -LiteralPath $worktreeGen) {
-    $linkType = (Get-Item -LiteralPath $worktreeGen).LinkType
-    if ($linkType -ne "Junction") {
+    $genItem = Get-Item -LiteralPath $worktreeGen -Force
+    if ($genItem.LinkType -eq "Junction") {
+        $currentTarget = @($genItem.Target)[0]
+        if ($currentTarget -and $currentTarget.TrimEnd('\', '/') -ne $storeGen.TrimEnd('\', '/')) {
+            Write-Host "[wt] this worktree's godot-cpp/gen still points at an older shared tree ($currentTarget); it keeps working. Re-run this after the worktree is idle to switch it to commit $commitTag."
+        }
+    }
+    else {
         Write-Host "[wt] worktree already has a real godot-cpp/gen; leaving it alone."
     }
 }
 else {
     New-Item -ItemType Junction -Path $worktreeGen -Target $storeGen | Out-Null
-    Write-Host "[wt] linked godot-cpp/gen -> shared generated sources"
+    Write-Host "[wt] linked godot-cpp/gen -> shared generated sources ($commitTag)"
 }
 
 # Libraries: hardlink every variant the primary has built, so whichever

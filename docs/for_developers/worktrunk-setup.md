@@ -313,7 +313,7 @@ the guardrails and failure signatures.
 | `.worktrees/<branch>` | that worktree's checkout and build output | yes, via `wt remove` |
 | `.git/worktrees/<branch>` | per-worktree git state and cloned submodule repos | yes, removed by `wt remove` |
 | `.cache/scons` | shared object cache for every worktree | yes — it is a cache; the next build refills it, cold |
-| `.cache/godot-cpp-shared` | generated bindings plus the libs exposed as hardlinks | **not freely** — worktrees hold junctions into it; remove the worktrees first, or re-run the hook afterwards |
+| `.cache/godot-cpp-shared` | one generated tree per godot-cpp commit (`gen-<commit>`) plus the libs exposed as hardlinks | old `gen-<commit>` trees are safe to delete once no worktree's junction points at them; deleting the one in use breaks those junctions |
 | `.cache/buildcache-bin` | optional compiler-cache tool | yes, if unused |
 
 The SCons cache has no size cap and no eviction, so it grows with every target/variant combination;
