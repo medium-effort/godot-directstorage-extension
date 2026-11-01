@@ -820,6 +820,42 @@ if (-not $ProvenanceOk) {
     Show-BuildFailure -Step "Provenance" -Message "Vendored dependency provenance check failed (thirdparty/monocypher). Update thirdparty/monocypher/VERSION only after verifying the new bytes against the named upstream tag." -Code 1
 }
 
+# Hardening gate: every translation unit - C as well as C++ - must be compiled with /guard:cf
+# and /Qspectre. Like the provenance gate it is a property of the checkout rather than of the
+# deployed files, so it sits beside it and its output is re-emitted through Write-Status (which
+# keeps -Json stdout machine-readable). Unlike provenance it is skipped under -AuditOnly: this
+# gate runs SCons, and audit mode is documented to stay read-only and runnable while a build is
+# in progress - .sconsign and the shared godot-cpp tree are exactly what a concurrent build
+# holds. There is deliberately no override switch; the flags live in one place in SConstruct.
+if (-not $AuditOnly) {
+    $HardeningScript = Join-Path $WorkspaceRoot ".vscode\check_build_flags.ps1"
+    if (-not (Test-Path -LiteralPath $HardeningScript -PathType Leaf)) {
+        Show-BuildFailure -Step "Hardening" -Message ("Hardening-flag gate missing: " + $HardeningScript + " - C translation units could compile uninstrumented.") -Code 1
+    }
+    $HardeningOutput = @(& $HardeningScript -Root $WorkspaceRoot 2>&1)
+    $HardeningExit = $LASTEXITCODE
+    $HardeningOk = ($HardeningExit -eq 0) -and (@($HardeningOutput | Where-Object { $_.ToString() -like '*compile with /guard:cf and /Qspectre*' }).Count -gt 0)
+    foreach ($HardeningLine in $HardeningOutput) {
+        $HardeningText = $HardeningLine.ToString()
+        $HardeningColor = "DarkGray"
+        if ($HardeningText -match '^\[hardening\] ERROR:') {
+            $HardeningColor = "Red"
+        }
+        elseif ($HardeningText -match '^\[hardening\]') {
+            $HardeningColor = "Green"
+        }
+        if ($HardeningText.Trim()) {
+            Write-Status ("  " + $HardeningText) -ForegroundColor $HardeningColor
+        }
+    }
+    if ($HardeningExit -eq 2) {
+        Show-BuildFailure -Step "Hardening" -Message "The hardening-flag gate could not run (see [hardening] ERROR above: the compilation database is unavailable, which is an environment failure, not a flag regression)." -Code 1
+    }
+    if (-not $HardeningOk) {
+        Show-BuildFailure -Step "Hardening" -Message "At least one translation unit compiles without /guard:cf or /Qspectre, or carries a flag twice. Fix the Windows/MSVC flag block in SConstruct (CCFLAGS) - do not weaken this gate." -Code 1
+    }
+}
+
 # Audit-only mode: report deployment contents without compiling or syncing.
 if ($AuditOnly) {
     # Ensure fresh checkout has Branch B header even if SCons has not run, or reset header if -ResetKeyHeader (R7-03, R8-10)

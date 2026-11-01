@@ -526,12 +526,19 @@ if env["platform"] == "windows":
             env.Append(CXXFLAGS=["/std:c++20"])
         if "/EHsc" not in env["CXXFLAGS"]:
             env.Append(CXXFLAGS=["/EHsc"])
-        if "/guard:cf" not in env["CXXFLAGS"]:
-            env.Append(CXXFLAGS=["/guard:cf"])
+        # /guard:cf and /Qspectre are code-generation flags, and this extension compiles
+        # attacker-reachable C (libdeflate's GDeflate decoder, Monocypher) as well as C++.
+        # SCons expands $CFLAGS/$CCFLAGS on the C compile line and $CXXFLAGS/$CCFLAGS on
+        # the C++ line, so a flag that lives only in CXXFLAGS never reaches a .c file:
+        # keep both here, where every translation unit picks them up exactly once.
+        # .vscode/check_build_flags.ps1 reads the emitted command lines and fails the build
+        # if that stops being true.
+        if "/guard:cf" not in env["CCFLAGS"]:
+            env.Append(CCFLAGS=["/guard:cf"])
         if "/guard:cf" not in env["LINKFLAGS"]:
             env.Append(LINKFLAGS=["/guard:cf"])
-        if "/Qspectre" not in env["CXXFLAGS"]:
-            env.Append(CXXFLAGS=["/Qspectre"])
+        if "/Qspectre" not in env["CCFLAGS"]:
+            env.Append(CCFLAGS=["/Qspectre"])
         if "/FS" not in env["CXXFLAGS"]:
             env.Append(CXXFLAGS=["/FS"])
 
