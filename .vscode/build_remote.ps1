@@ -793,7 +793,7 @@ if ($ResetKeyHeader -and ($EncryptionKeyFile -or $EncryptionKey)) {
 # Provenance gate: the vendored crypto must match its pinned upstream release.
 # Runs in every mode, including -AuditOnly, because a drift is a property of the checkout rather
 # than of the deployed files. There is deliberately no override switch: an intentional local
-# patch has to update thirdparty/monocypher/VERSION, which is how the change becomes visible in
+# patch has to update thirdparty/monocypher/VERSION.txt, which is how the change becomes visible in
 # review. The checker's output is captured and re-emitted through Write-Status so that -Json mode
 # keeps machine-readable stdout (Write-Status routes to stderr there).
 $ProvenanceScript = Join-Path $WorkspaceRoot ".vscode\check_vendored_provenance.ps1"
@@ -817,7 +817,7 @@ foreach ($ProvenanceLine in $ProvenanceOutput) {
     }
 }
 if (-not $ProvenanceOk) {
-    Show-BuildFailure -Step "Provenance" -Message "Vendored dependency provenance check failed (thirdparty/monocypher). Update thirdparty/monocypher/VERSION only after verifying the new bytes against the named upstream tag." -Code 1
+    Show-BuildFailure -Step "Provenance" -Message "Vendored dependency provenance check failed (thirdparty/monocypher). Update thirdparty/monocypher/VERSION.txt only after verifying the new bytes against the named upstream tag." -Code 1
 }
 
 # Hardening gate: every translation unit - C as well as C++ - must be compiled with /guard:cf

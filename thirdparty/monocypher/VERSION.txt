@@ -2,7 +2,13 @@
 #
 # Format: '#' metadata comments plus sha256sum-compatible "<hex>  <path>" pairs, so the pins
 # can be re-verified without this repository's tooling, from this directory:
-#   sha256sum -c VERSION
+#   sha256sum -c VERSION.txt
+#
+# Name: keep the ".txt" suffix. This directory is on CPPPATH (monocypher.h is included as a
+# plain header), and macOS/Windows filesystems are case-insensitive, so a file named exactly
+# "VERSION" shadows the C++ standard header <version> that libc++ pulls in through <limits>:
+# clang then parses this record as a header and every C++ translation unit fails with
+# "invalid preprocessing directive". Do not rename this file back to "VERSION".
 #
 # name: monocypher
 # upstream: https://github.com/LoupVaillant/Monocypher
