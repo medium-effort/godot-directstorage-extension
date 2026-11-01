@@ -7,6 +7,11 @@
     against Godot Engine in headless mode (--check-only --headless) within the
     project context (--path project), ensuring GDExtension symbols and export
     plugins parse without errors.
+
+    Imports the project first when it has never been opened (delegated to
+    tools/ensure_project_imported.ps1), because GDExtension symbols only resolve
+    after the editor has written .godot/extension_list.cfg. Without that, every
+    script touching a class reports a parse error on a fresh checkout.
 #>
 [CmdletBinding()]
 param(
@@ -113,6 +118,23 @@ $scriptFiles = @(Get-ChildItem -LiteralPath $absScriptsDir -Filter "*.gd" -File 
 if ($scriptFiles.Count -eq 0) {
     Write-Warning "[check_scripts] No GDScript (*.gd) files found in '$absScriptsDir'."
     exit 0
+}
+
+# GDExtension classes resolve only when the project has been imported once: without
+# .godot/extension_list.cfg, --check-only reports "Identifier ... not declared" for
+# every script that touches a class, which looks like a code break but is an
+# unimported checkout (a fresh clone or worktree). Import instead of failing.
+$importHelper = Join-Path $repoRoot "tools\ensure_project_imported.ps1"
+if (Test-Path -LiteralPath $importHelper) {
+    $registryPath = Join-Path $absProjectDir ".godot\extension_list.cfg"
+    if (-not (Test-Path -LiteralPath $registryPath)) {
+        Write-Host "[check_scripts] This checkout has never been imported; importing once so GDExtension classes resolve..." -ForegroundColor Yellow
+    }
+    & powershell -ExecutionPolicy Bypass -File $importHelper -ProjectDir $absProjectDir -GodotPath $resolvedGodot -Quiet
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[check_scripts] Project import failed, so GDExtension classes stay unresolved; stopping here instead of reporting misleading parse errors." -ForegroundColor Red
+        exit 1
+    }
 }
 
 Write-Host "================================================================================" -ForegroundColor Cyan
