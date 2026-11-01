@@ -7,7 +7,12 @@ param(
     [string[]]$Only = @(),
     [int]$ExportTimeoutSec = 420,
     [int]$BootTimeoutSec = 90,
-    [switch]$NegativeControl
+    [switch]$NegativeControl,
+    # Fail the run when a case was skipped for a real reason (missing template, fixture or
+    # prerequisite stage). Contract limitations are reported separately and do not trip it.
+    [switch]$RequireFullCoverage,
+    # Remove the work root after a passing run; a failing run keeps its artefacts for diagnosis.
+    [switch]$Cleanup
 )
 
 # Export-contract gate.
@@ -34,11 +39,13 @@ param(
 # a failure. A deliberately broken export fails the gate: the fail-closed cases
 # assert that no `status=ok` line exists and that the scanner rejects the pack.
 #
-# Requirements: the Godot console binary named by .env (GODOT_CONSOLE_PATH), a
-# 4.7.2 keyed release template plus its key file (protected cases), and the
-# extension DLLs in project/addons/directstorage_accelerator/bin/. The key is
-# read from the template directory at run time and never written into this
-# script or the fixture.
+# Requirements: the Godot console binary named by .env or by the environment
+# (GODOT_CONSOLE_PATH), a 4.7.2 keyed release template plus its key file
+# (protected cases), and the extension DLLs in
+# project/addons/directstorage_accelerator/bin/. The positive-control fixture is
+# in this directory; the old .agents/scratch copy is still accepted as a fallback.
+# The key is read from the template directory at run time and never written into
+# this script or the fixture.
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -55,7 +62,12 @@ $FixtureRoot = Join-Path $Here 'fixture'
 $CaseScripts = Join-Path $Here 'cases'
 $ScannerScript = Join-Path $WorkspaceRoot 'project\addons\directstorage_accelerator\tools\dspkg_pack_scan.gd'
 $LiveAddon = Join-Path $WorkspaceRoot 'project\addons\directstorage_accelerator'
-$ControlFixture = Join-Path $WorkspaceRoot '.agents\scratch\key_scan_control'
+# The positive control lives in the repository so a fresh clone can run it; the old
+# gitignored scratch copy is still honoured for workstations that already have one.
+$ControlFixture = Join-Path $Here 'control_fixture\key_scan_control'
+if (-not (Test-Path -LiteralPath $ControlFixture)) {
+    $ControlFixture = Join-Path $WorkspaceRoot '.agents\scratch\key_scan_control'
+}
 $ControlKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
 if ([string]::IsNullOrEmpty($WorkRoot)) {
@@ -74,8 +86,13 @@ if (Test-Path -LiteralPath $EnvFile) {
     $line = Get-Content -LiteralPath $EnvFile | Where-Object { $_ -match '^\s*GODOT_CONSOLE_PATH\s*=' } | Select-Object -First 1
     if ($null -ne $line) { $Godot = ($line -split '=', 2)[1].Trim().Trim('"').Trim("'") }
 }
+if ([string]::IsNullOrEmpty($Godot)) {
+    # A worktree, a script or a second machine can supply the binary without writing .env.
+    $Godot = [string]$env:GODOT_CONSOLE_PATH
+    if (-not [string]::IsNullOrEmpty($Godot)) { $Godot = $Godot.Trim().Trim('"').Trim("'") }
+}
 if ([string]::IsNullOrEmpty($Godot) -or -not (Test-Path -LiteralPath $Godot)) {
-    throw 'Godot console binary not found: set GODOT_CONSOLE_PATH in .env.'
+    throw 'Godot console binary not found: set GODOT_CONSOLE_PATH in .env or in the environment.'
 }
 if ($Godot -notmatch 'console') {
     throw ('GODOT_CONSOLE_PATH must name a console build (stdout streaming); got: ' + $Godot)
@@ -118,6 +135,7 @@ if ($ProtectedAvailable) {
 $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Covered = New-Object System.Collections.Generic.List[string]
 $script:NotCovered = New-Object System.Collections.Generic.List[string]
+$script:KnownLimits = New-Object System.Collections.Generic.List[string]
 $script:CurrentCase = ''
 $script:Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrEmpty($_) })
 $script:LastBoot = $null
@@ -143,6 +161,15 @@ function Add-NotCovered {
     $script:Covered.Remove($Name) | Out-Null
     $script:NotCovered.Add($Name + ' (' + $Reason + ')')
     Write-Output ('[SKIP] ' + $Name + ' :: ' + $Reason)
+}
+
+# A contract limitation is a sub-check that cannot pass on any machine (an engine behaviour or
+# an unreachable branch), so it is reported separately from a real coverage gap and the case it
+# belongs to stays in `covers=`. -RequireFullCoverage only trips on real gaps.
+function Add-KnownLimitation {
+    param([string]$Name, [string]$Reason)
+    $script:KnownLimits.Add($Name + ' (' + $Reason + ')')
+    Write-Output ('[LIMIT] ' + $Name + ' :: ' + $Reason)
 }
 
 function Invoke-Case {
@@ -537,6 +564,12 @@ Copy-Item -LiteralPath $FixtureRoot -Destination $MasterProject -Recurse -Force
 $addonTarget = Join-Path $MasterProject 'addons\directstorage_accelerator'
 if (Test-Path -LiteralPath $addonTarget) { throw ('fixture already carries an addon copy: ' + $addonTarget) }
 Copy-Item -LiteralPath $LiveAddon -Destination $addonTarget -Recurse -Force
+# The export copies only the DLLs the .gdextension names, so the linker and symbol
+# artefacts in bin/ (a 41 MB pdb and a 27 MB ilk on a debug-symbols build) would
+# otherwise be duplicated into every case directory for nothing.
+Get-ChildItem -LiteralPath (Join-Path $addonTarget 'bin') -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -in '.pdb', '.ilk', '.lib', '.exp' } |
+    Remove-Item -Force
 
 $fixtureJson = Get-Content -LiteralPath (Join-Path $MasterProject 'data\dstex_fixtures.json') -Raw | ConvertFrom-Json
 $fixtureMap = @{ used = 'used.dstex'; unused = 'unused.dstex'; trigger = 'zzz_trigger.dstex' }
@@ -790,7 +823,7 @@ Invoke-Case 'protected_empty_key' {
             # security property is still asserted - the pack carries no key.
             $scan = Invoke-Scan -PackPath $pck
             Add-Check 'protected_empty_key.scan_finds_no_plaintext_key' (($scan.Ok) -or ($scan.Reason -eq 'zero_entries')) ('verdict=' + $scan.Verdict)
-            Add-NotCovered 'protected_empty_key.pack_truncation' ('engine wrote a complete PCK (' + $pckBytes + ' bytes, scan=' + $scan.Verdict + ') instead of the 112-byte truncation; the fail-closed payload removal and the missing_archive boot are covered')
+            Add-KnownLimitation 'protected_empty_key.pack_truncation' ('engine wrote a complete PCK (' + $pckBytes + ' bytes, scan=' + $scan.Verdict + ') instead of the 112-byte truncation; the fail-closed payload removal and the missing_archive boot are covered')
         }
         $stage = Copy-ReleaseStage -SourceDir $out -Name 'protected_empty_key'
         Assert-BootFail -Case 'protected_empty_key' -StageDir $stage -Reason 'missing_archive' -Timeout 30
@@ -993,7 +1026,7 @@ Invoke-Case 'skip_on_create_failure' {
         $log = Get-ExportText $run
         Save-Log -Name 'skip_on_create_failure' -Text $log
         Add-Check 'skip_on_create_failure.create_is_not_io' (($log -match 'Initialized DSPkg staging archive') -and -not ($log -match 'Failed to create DSPkg staging archive')) 'create() returned OK with the staging path held under an exclusive lock'
-        Add-NotCovered 'skip_on_create_failure' 'DSPkg.create() initializes builder state only and opens no file, so its failure branch cannot be reached from outside the builder; the exporter then failed at the rename (measured: staging path locked, finalize wrote a unique temp, rename failed). The contract consequence is still asserted below.'
+        Add-KnownLimitation 'skip_on_create_failure' 'DSPkg.create() initializes builder state only and opens no file, so its failure branch cannot be reached from outside the builder; the exporter then failed at the rename (measured: staging path locked, finalize wrote a unique temp, rename failed). The contract consequence is still asserted below.'
         $pck = Join-Path $out 'contract_create_fail.pck'
         $probe = Invoke-PackProbe -PackPath $pck
         Add-Check 'skip_on_create_failure.expects_archive' ($probe.Bundle -and $probe.Protected) ('bundle=' + $probe.Bundle + ' protected=' + $probe.Protected)
@@ -1142,7 +1175,7 @@ Invoke-Case 'magic_parity' {
 
 Invoke-Case 'key_scan_control' {
     if (-not (Test-Path -LiteralPath (Join-Path $ControlFixture 'addons\control_exporter\plugin.cfg'))) {
-        Add-NotCovered 'key_scan_control' 'control fixture missing: .agents/scratch/key_scan_control'
+        Add-NotCovered 'key_scan_control' 'control fixture missing: project/headless_tests/export_contract/control_fixture/key_scan_control'
     } else {
         $proj = Join-Path $WorkRoot 'case-key_scan_control'
         if (Test-Path -LiteralPath $proj) { throw ('case directory already exists: ' + $proj) }
@@ -1170,6 +1203,8 @@ $failed = @($script:Results | Where-Object { -not $_.Pass })
 $coversList = @($script:Covered | Sort-Object -Unique)
 $notCoveredText = 'none'
 if ($script:NotCovered.Count -gt 0) { $notCoveredText = ($script:NotCovered -join '; ') }
+$knownLimitsText = 'none'
+if ($script:KnownLimits.Count -gt 0) { $knownLimitsText = ($script:KnownLimits -join '; ') }
 
 Write-Output ''
 Write-Output ('[gate] checks=' + $script:Results.Count + ' failed=' + $failed.Count)
@@ -1179,10 +1214,23 @@ foreach ($failure in $failed) {
 Write-Output ''
 Write-Output ('covers=' + ($coversList -join ','))
 Write-Output ('not_covered=' + $notCoveredText)
+Write-Output ('known_limits=' + $knownLimitsText)
 Write-Output ''
 if ($failed.Count -gt 0) {
     Write-Output ('[gate] RESULT FAIL checks=' + $script:Results.Count + ' failed=' + $failed.Count)
     exit 1
 }
+if ($RequireFullCoverage -and $script:NotCovered.Count -gt 0) {
+    Write-Output ('[gate] RESULT FAIL coverage_required checks=' + $script:Results.Count + ' not_covered=' + $script:NotCovered.Count)
+    exit 1
+}
 Write-Output ('[gate] RESULT PASS checks=' + $script:Results.Count)
+if ($Cleanup) {
+    Write-Output ('[gate] cleanup: removing ' + $WorkRoot)
+    try {
+        Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction Stop
+    } catch {
+        Write-Output ('[gate] cleanup failed (artifacts kept): ' + $_.Exception.Message)
+    }
+}
 exit 0

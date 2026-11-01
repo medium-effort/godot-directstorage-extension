@@ -9,8 +9,12 @@ exactly one `DSPKG_BOOT status=ok` line in stdout and in the
 ## Run
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1
+powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1 -RequireFullCoverage
 ```
+
+Run it before exporting a release, not on every build: it takes about 2.5 minutes
+and needs roughly 0.9 GB of scratch space. Nothing runs it automatically - there
+is no CI job for it - so a release is only checked if a person checks it.
 
 Options:
 
@@ -22,14 +26,25 @@ Options:
 | `-WorkRoot <path>` | artifact directory (default: `out/run-<timestamp>`) |
 | `-ExportTimeoutSec`, `-BootTimeoutSec` | process timeouts |
 | `-NegativeControl` | self-test: leaves the archive in place during `alert_bypass`; the gate must then fail |
+| `-RequireFullCoverage` | fail the run when any case was skipped for a real reason (missing template, fixture or prerequisite stage) |
+| `-Cleanup` | delete the work root after a **passing** run; a failing run keeps it for diagnosis |
 
 The key is read from the template directory at run time. This script and the
 fixture never store a key.
 
-Requirements: `GODOT_CONSOLE_PATH` in `.env` must point at a **console** build of
-Godot 4.7.2, and `project/addons/directstorage_accelerator/bin/` must hold the
-built extension DLLs. Without a keyed template the protected cases are reported
-under `not_covered` and the run is not a full pass.
+Requirements: `GODOT_CONSOLE_PATH` must point at a **console** build of Godot
+4.7.2, in `.env` or in the environment, and
+`project/addons/directstorage_accelerator/bin/` must hold the built extension
+DLLs. The keyed template is needed for the protected cases; without it they are
+reported under `not_covered` and `-RequireFullCoverage` fails the run rather than
+passing silently.
+
+The work root is disposable. `-Cleanup` removes it after a pass; without it,
+delete old `out/run-*` directories yourself (keeping the newest few is enough):
+
+```powershell
+Get-ChildItem out | Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 | Remove-Item -Recurse -Force
+```
 
 ## What is covered
 
@@ -51,8 +66,30 @@ under `not_covered` and the run is not a full pass.
 | Pack scan | every case; `key_scan_control` proves a plaintext key is found |
 | Magic parity | `magic_parity` (C++, exporter and scanner labels and digests agree) |
 
-The runner prints `covers=... not_covered=...` at the end. A case listed under
-`not_covered` is not a pass; the footer states the reason and the measurement.
+The runner ends with three lines that are read together:
+
+```text
+covers=<case names that ran>
+not_covered=<cases skipped for a real reason, with the reason>
+known_limits=<sub-checks that cannot pass on any machine, with the reason>
+```
+
+`covers=` is the surface actually exercised and `checks=` (printed just above)
+is its size - a full run is 162 checks over 20 cases. `not_covered=` is a gap: a
+case did not run because something was missing, and `-RequireFullCoverage` turns
+any entry there into a failing exit code. `known_limits=` is not a gap: two
+sub-checks are limited by the engine or by the builder and cannot pass anywhere -
+
+- `protected_empty_key.pack_truncation`, because this Godot writes a complete PCK
+  instead of the truncated one the case asks for (the fail-closed payload removal
+  and the `missing_archive` boot are still asserted);
+- `skip_on_create_failure`, because `DSPkg.create()` only initialises builder
+  state and never opens a file, so its failure branch is unreachable from outside
+  (the contract consequence is asserted in the same case).
+
+Read the footer as: `covers=`/`checks=` say what ran, `not_covered=none` says
+nothing was skipped for want of a prerequisite, `known_limits=` says the two
+permanent exceptions are still the only ones.
 
 ## Fixture
 
@@ -69,8 +106,12 @@ mutation guard.
 
 ## Positive control
 
-`.agents/scratch/key_scan_control/` is a throwaway exporter that injects
+`control_fixture/key_scan_control/` is a throwaway exporter that injects
 `res://.dspkg/toc.key` as `magic16 || random32` with an encryption include filter
 that misses the key path. The product exporter refuses that preset before
 `add_file()`, so the control cannot come from the addon. The gate requires the
 scan to report `status=fail reason=key_magic_found` for its pack.
+
+It lives in the repository so a fresh clone can run it; a workstation that still
+has the older gitignored `.agents/scratch/key_scan_control/` copy uses that
+instead (both are accepted, the repository copy wins when present).

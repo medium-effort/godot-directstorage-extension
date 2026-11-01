@@ -337,12 +337,23 @@ Run these after touching the exporter, the runtime, or the archive reader.
 | Harness | Command | Proves |
 |---|---|---|
 | Policy unit test | `godot --headless --path project --script headless_tests/test_export_policy.gd` | the whole decision table above, in seconds, with no extension or export (17 checks) |
-| Export-contract gate | `powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1` | protected/unprotected/bundling-off exports, the three fail-closed presets, subset modes, stale-archive deletion, partial salvage, corrupted TOC, the boot grammar, the pack scan and the key-scan positive control |
+| Export-contract gate | `powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1 -RequireFullCoverage` (2.5 min, ~0.9 GB of scratch) | protected/unprotected/bundling-off exports, the three fail-closed presets, subset modes, stale-archive deletion, partial salvage, corrupted TOC, the boot grammar, the pack scan and the key-scan positive control |
 | Pack scan | `godot --headless --path project --script res://addons/directstorage_accelerator/tools/dspkg_pack_scan.gd -- --pack <pck>` | pack validity and key-magic absence for one file |
 
-The gate prints `covers=... not_covered=...` at the end; a case listed under `not_covered` is not a
-pass. Without a keyed template the protected cases are reported as `not_covered` and the run is not a
-full pass.
+The gate is run manually before exporting a release; nothing runs it automatically, so a change to the
+exporter, the runtime or the archive reader is only checked if someone runs it. It ends with `covers=`,
+`not_covered=` and `known_limits=`:
+
+- `covers=` and `checks=` state what actually ran (a full run is 162 checks over 20 cases).
+- `not_covered=` is a gap - a case that did not run for want of a prerequisite. `-RequireFullCoverage`
+  turns any entry there into a failing exit code, which is why the documented command passes it.
+- `known_limits=` lists the two sub-checks that cannot pass on any machine:
+  `protected_empty_key.pack_truncation` (this engine writes a complete PCK instead of the truncated one the
+  case asks for) and `skip_on_create_failure` (the builder never opens a file in `create()`, so that failure
+  branch is unreachable; the contract consequence is asserted in the same case).
+
+Without a keyed template the protected cases land in `not_covered`, and with `-RequireFullCoverage` the run
+fails rather than reporting a pass it did not earn.
 
 Gotchas learned while building these tests, useful for the next harness:
 
