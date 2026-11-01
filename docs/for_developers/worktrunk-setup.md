@@ -244,11 +244,11 @@ cd .worktrees/<branch>
 powershell -ExecutionPolicy Bypass -File .vscode/build_remote.ps1 -Local -Target template_debug
 powershell -ExecutionPolicy Bypass -File .vscode/run_gdextest_local.ps1        # after -IncludeTests
 
-# 3. one commit on the worktree branch
+# 3. one commit on the worktree branch (only if the user asked for a commit)
 git add -A
 git commit -m "feat(scope): ..."
 
-# 4. land it as a single commit, no merge commit
+# 4. land it as a single commit, no merge commit (only if the user asked to land)
 git log --oneline <target>..HEAD      # expect exactly one line
 wt step push <target>                 # fast-forward; updates the worktree that holds <target>
 wt remove <branch>
@@ -263,6 +263,27 @@ After `wt remove`, expect a line like "Branch unmerged; to delete, run wt remove
 not the removal failing: the worktree is already gone. Worktrunk only deletes a branch automatically
 when its content is in the **default branch** (`main`), and work branched from `dspkg-encryption` is not.
 Finish with `wt remove -D <branch>` or `git branch -D <branch>` once the commits are on your target.
+
+Steps 3 and 4 are opt-in. A change that only needs to exist somewhere does not need a commit, and a
+request to "change X" is not a request to move the user's branch: landing rewrites the files in the
+primary checkout, which may be exactly what the user is editing.
+
+### Files a worktree cannot see
+
+A worktree is a checkout of a commit, so it contains none of the primary's uncommitted work and none of
+the ignored files. This repository ignores `.agents/skills/audit-pipeline`, `.agents/skills/xmlq`,
+`.agents/skills/godot-specifics` and `.env`, so those never appear in a worktree at all. Editing them is
+a primary-checkout job; a copy placed inside a worktree is an untracked duplicate that no commit can
+carry back to the user's tree.
+
+For tracked files with uncommitted edits, pick one of these and say which you chose:
+
+- commit or stash them first (simplest, and the user owns that state);
+- snapshot without disturbing the working tree — `git stash create` prints a commit of the dirty tracked
+  state, then `git worktree add -b <branch> <path> <sha>`, after `git add -N <file>` for files git does
+  not know yet;
+- move the work with `git stash push -u`, then `git stash pop` inside the worktree, which empties the
+  primary's working tree and needs explicit agreement.
 
 Agents should follow `.agents/skills/do-it-in-a-worktree/SKILL.md`, which carries the same steps plus
 the guardrails and failure signatures.
