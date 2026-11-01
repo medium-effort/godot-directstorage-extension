@@ -117,19 +117,28 @@ function Stop-OrphanFixtureProcess {
     try {
         $godotProcs = Get-Process -Name "*godot*" -ErrorAction SilentlyContinue
         if ($godotProcs) {
+            # Match on this worktree's ABSOLUTE fixture path only. The engine is
+            # always launched with an absolute --path, so the path in the command
+            # line identifies the worktree unambiguously. A repo-wide pattern
+            # ("build\gdextest\project" or "--gdextest-run") also matches a
+            # parallel agent's fixture process in another worktree, and killing
+            # that one is a cross-agent failure that looks like a random test
+            # crash. Trade-off: an orphan left by an older runner that passed a
+            # relative --path is not reaped here; the locked-DLL retry below
+            # still reports it instead of silently proceeding.
             $resolved = ""
-            if (Test-Path -LiteralPath $FixturePath) {
-                $resolved = (Resolve-Path -LiteralPath $FixturePath -ErrorAction SilentlyContinue).Path
+            if ($FixturePath) {
+                $resolved = [System.IO.Path]::GetFullPath($FixturePath)
             }
+            $resolvedFwd = $resolved.Replace('\', '/')
             foreach ($p in $godotProcs) {
                 $match = $false
                 try {
                     $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue
-                    if ($cim -and $cim.CommandLine) {
+                    if ($resolved -and $cim -and $cim.CommandLine) {
                         $cmd = $cim.CommandLine
-                        if ($resolved -and $cmd.IndexOf($resolved, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                            $match = $true
-                        } elseif ($cmd -match "build[/\\]gdextest[/\\]project" -or $cmd -match "--gdextest-run") {
+                        if ($cmd.IndexOf($resolved, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                            $cmd.IndexOf($resolvedFwd, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                             $match = $true
                         }
                     }
@@ -155,19 +164,15 @@ function Stop-OrphanFixtureProcess {
             try {
                 Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction Stop
             } catch {
-                # Stale DLL is still locked; re-check only matching fixture processes before retrying
-                $resolved = ""
-                if (Test-Path -LiteralPath $FixturePath) {
-                    $resolved = (Resolve-Path -LiteralPath $FixturePath -ErrorAction SilentlyContinue).Path
-                }
+                # Stale DLL is still locked; re-check only this worktree's fixture processes before retrying
                 $remainingProcs = Get-Process -Name "*godot*" -ErrorAction SilentlyContinue
                 foreach ($p in $remainingProcs) {
                     try {
                         $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue
-                        if ($cim -and $cim.CommandLine) {
+                        if ($resolved -and $cim -and $cim.CommandLine) {
                             $cmd = $cim.CommandLine
-                            if (($resolved -and $cmd.IndexOf($resolved, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                                ($cmd -match "build[/\\]gdextest[/\\]project" -or $cmd -match "--gdextest-run")) {
+                            if ($cmd.IndexOf($resolved, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                                $cmd.IndexOf($resolvedFwd, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                                 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
                             }
                         }
@@ -267,6 +272,12 @@ if (-not (Test-Path -LiteralPath $GdextestCli)) {
 }
 
 $FixtureRoot = "build/gdextest/project"
+# Absolute form of the same path, anchored to the repo root rather than the
+# process cwd. Passed to Godot as --path so the process command line carries a
+# path that is unique to THIS worktree: Stop-OrphanFixtureProcess can then match
+# on it instead of a repo-wide pattern that would also match a parallel agent's
+# fixture process in another worktree.
+$FixtureAbs = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $PSScriptRoot) $FixtureRoot))
 
 # Artifact names mirror .gdextest.toml: [gdextest.output] name and
 # [gdextest.fixture] project_name. Keep both in sync with that file.
@@ -297,7 +308,7 @@ if ((-not $?) -or ($null -eq $DoctorCode) -or ($DoctorCode -ne 0)) {
 }
 
 # [2/5] fixture: generate the disposable Godot project for the test library.
-Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
+Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
 Write-VerboseHost "[2/5] fixture: generating Godot fixture project..." -ForegroundColor Cyan
 $TestDll = Get-ChildItem -Path "./bin/$TestLibraryName*.dll" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
@@ -419,7 +430,7 @@ if ($RenderingDriver) {
     $WarmupArgs += $RenderingDriver
 }
 $WarmupArgs += "--path"
-$WarmupArgs += $FixtureRoot
+$WarmupArgs += $FixtureAbs
 $WarmupArgs += "--quit-after"
 $WarmupArgs += "2"
 
@@ -438,7 +449,7 @@ if ($WarmupCode -eq 134) {
 } elseif ($WarmupCode -ne 0) {
     Show-StepFailure -Step "Step [3/5] Warmup" -Message "Warmup pass failed twice." -Code $WarmupCode
 }
-Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
+Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
 
 # [4/5] run: renderer flag BEFORE `--`, runner flags AFTER `--`,
 # and never anything else after `--`. Test failures (exit 1) still proceed
@@ -450,7 +461,7 @@ if ($RenderingDriver) {
     $GodotArgs += $RenderingDriver
 }
 $GodotArgs += "--path"
-$GodotArgs += $FixtureRoot
+$GodotArgs += $FixtureAbs
 $GodotArgs += "--"
 $GodotArgs += "--gdextest-run"
 if ($Filter) {
@@ -495,7 +506,7 @@ if (-not (Test-Path $ReportJson)) {
     }
     Show-StepFailure -Step "Step [4/5] Run" -Message "Test run produced no results file at $ReportJson (exit $RunCode); the suite likely aborted during startup." -Code $(if ($RunCode -ne 0) { $RunCode } else { 1 })
 }
-Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
+Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
 if ($RunCode -ne 0) {
     Write-VerboseHost "Test run exited $RunCode; proceeding to report (report exit code gates the pipeline)." -ForegroundColor Yellow
 }
@@ -558,6 +569,6 @@ if ($ReportCode -ne 0) {
     Show-StepFailure -Step "Step [5/5] Report" -Message "Tests failed or report could not be generated (see console report above)." -Code $ReportCode
 }
 
-Stop-OrphanFixtureProcess -FixturePath $FixtureRoot
+Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
 Show-RunSuccess -Message "All test stages completed successfully!"
 exit 0
