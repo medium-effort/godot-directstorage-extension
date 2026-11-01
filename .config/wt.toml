@@ -1,0 +1,44 @@
+# Parallel-agent worktree workflow (worktrunk: `wt switch --create <branch>`).
+#
+# Hooks execute in Git Bash, so the commands are bash-compatible. pre-start hooks
+# block worktree creation, so the new tree is buildable the moment you cd into it:
+#
+#   1. submodule working trees - they live in the shared .git/modules, so this is
+#      a local checkout, not a network clone.
+#   2. a worktree-local .env (see tools/wt_bootstrap_env.ps1) with the shared
+#      addon-sync target disabled and the shared SCons object cache wired up.
+#   3. one prebuilt godot-cpp, shared by hardlink/junction (see
+#      tools/wt_share_godot_cpp.ps1): ~424 MB of generated objects + a ~436 MB
+#      static library that SCons' cache cannot share, because a cache hit still
+#      writes a real file into the tree. Measured: a built worktree drops from
+#      ~1,040 MB to ~149 MB, at ~20 s extra build time (52 s vs 32 s).
+#      Remove this block to go back to compiling godot-cpp per worktree.
+#
+# Every other piece of build state is private per worktree by construction:
+# .sconsign.dblite, the .obj files written next to their sources,
+# project/addons/directstorage_accelerator/bin, build/gdextest, .godot/,
+# src/gen/dspkg_encryption_key.h. The build mutex in build_remote.ps1 is keyed on
+# the workspace root, so two builds of the SAME worktree still serialize while
+# builds in different worktrees run in parallel.
+#
+# Deliberately NOT using `wt step copy-ignored` here: the export-contract tests
+# leave ~3.4 GB of gitignored fixtures behind, and copying object trees or a
+# stale .sconsign.dblite per worktree costs disk while saving no compile -
+# the shared SCons cache (.cache/scons in the primary worktree) already covers
+# the cross-worktree reuse.
+#
+# Compiler-cache wrappers (USE_CC_WRAPPER=sccache|buildcache) are opt-in and do
+# NOT share hits between worktrees - measured: sccache 0.14 and buildcache 0.33.2
+# both miss on identical sources in two worktrees (MSVC puts worktree-absolute
+# paths in the hashed input; buildcache misses in direct AND preprocessor mode,
+# with ACCURACY=DEFAULT and SLOPPY). Their value is CI/remote caching and
+# intra-worktree iteration, not parallel worktrees.
+
+[[pre-start]]
+submodules = "git submodule update --init --recursive"
+
+[[pre-start]]
+godotcpp = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_share_godot_cpp.ps1 {{ primary_worktree_path }} {{ worktree_path }}"
+
+[[pre-start]]
+env = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_bootstrap_env.ps1 {{ primary_worktree_path }} -GodotCppPrebuilt"

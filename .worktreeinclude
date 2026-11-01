@@ -1,0 +1,10 @@
+# Gitignored files `wt step copy-ignored` may copy into a new worktree.
+#
+# Kept intentionally minimal: the pre-start hook in .config/wt.toml already
+# materializes .env, so nothing here is required for a build. Only add content
+# that is expensive to regenerate AND safe to copy verbatim.
+#
+# Never add: .sconsign.dblite (per-worktree signature DB), *.obj / object trees,
+# build/ (owned by the gdextest fixture), project/headless_tests/**/out/
+# (multi-GB test output), or .cache/scons (the shared object cache).
+.env

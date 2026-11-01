@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import os
 import re
+import shutil
 import sys
 
 import SCons.Script
@@ -27,6 +28,62 @@ def _prevent_build_flag_set():
     except Exception:
         pass
     return False
+
+
+def _dotenv_or_env_value(key):
+    """Read an environment variable, falling back to .env.
+
+    load_env_file() does not run until much later in this file, and the
+    construction environment snapshots ENV before that, so this fallback is the
+    only way these settings reach the compiler subprocess or godot-cpp.
+    """
+    val = os.environ.get(key, "").strip()
+    if val:
+        return val
+    try:
+        if os.path.isfile(".env"):
+            with open(".env", "r", encoding="utf-8") as env_file:
+                for line in env_file:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        name, value = line.split("=", 1)
+                        if name.strip() == key:
+                            return value.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
+# godot-cpp enables its shared object cache (CacheDir + MD5 decider) when
+# SCONS_CACHE is in the environment, but it reads that inside its own SConscript
+# - before this file's load_env_file() runs. Resolving it from .env here means a
+# bare `scons` run in a worktree gets the same shared cache as a
+# build_remote.ps1 run. The cache is what makes a new worktree's first build
+# cheap: SCons signatures are content/command based and path independent, so an
+# object built in one worktree is retrieved by another.
+if not os.environ.get("SCONS_CACHE"):
+    _scons_cache_setting = _dotenv_or_env_value("SCONS_CACHE")
+    if _scons_cache_setting:
+        os.environ["SCONS_CACHE"] = _scons_cache_setting
+
+
+# --- Optional prebuilt godot-cpp ---------------------------------------------
+# GODOT_CPP_PREBUILT=1 builds godot-cpp once (in the primary worktree) and reuses
+# its static library from every worktree, instead of recompiling ~1,000 generated
+# class translation units + a ~436 MB dev library per worktree. That is the only
+# per-worktree cost SCons' cache cannot remove: a cache hit still materialises a
+# real .obj/.lib inside the tree (the linker needs a file there, and SCons never
+# hardlinks), so a built worktree costs ~1 GB regardless of hits.
+#
+# Requirements, all checked below rather than assumed:
+#   * godot-cpp/bin/<libgodot-cpp...>.lib present - the worktree bootstrap
+#     hardlinks it from the shared store, costing no extra bytes;
+#   * godot-cpp/gen/include present - generated once, junctioned by the bootstrap;
+#   * the same target/dev_build and godot-cpp submodule commit as the provider.
+# build_library=no must be forced before godot-cpp reads its options, hence here.
+_godot_cpp_prebuilt = _dotenv_or_env_value("GODOT_CPP_PREBUILT").lower() in ("1", "true", "yes", "y", "on")
+if _godot_cpp_prebuilt:
+    SCons.Script.ARGUMENTS["build_library"] = "no"
 
 
 _sync_only = {"compiledb"}
@@ -187,6 +244,171 @@ EnsurePythonVersion(3, 8)
 
 # Delegate environment initialization to godot-cpp/SConstruct
 env = SConscript("godot-cpp/SConstruct")
+
+if _godot_cpp_prebuilt:
+    # godot-cpp appends its library to LIBS even with build_library=no, so the
+    # hardlinked file is what the extension links against. Verify it here: an
+    # absent lib would otherwise surface as an unrelated LNK1104 much later.
+    if not os.path.isdir(os.path.join("godot-cpp", "gen", "include")):
+        print("[SCons] ERROR: GODOT_CPP_PREBUILT=1 but godot-cpp/gen/include is missing.")
+        print("[SCons] Re-run the worktree bootstrap (tools/wt_bootstrap_env.ps1) to link the shared generated headers.")
+        Exit(1)
+    _prebuilt_libs = [lib for lib in env.get("LIBS", []) if "libgodot-cpp" in str(lib)]
+    _prebuilt_paths = []
+    for _lib in _prebuilt_libs:
+        _lib_path = _lib.get_abspath() if hasattr(_lib, "get_abspath") else str(_lib)
+        if not os.path.isfile(_lib_path):
+            print(f"[SCons] ERROR: GODOT_CPP_PREBUILT=1 but the prebuilt library is missing:\n[SCons]   {_lib_path}")
+            print("[SCons] Re-run the worktree bootstrap (tools/wt_bootstrap_env.ps1), or build godot-cpp here.")
+            Exit(1)
+        _prebuilt_paths.append(_lib_path)
+    if not _prebuilt_paths:
+        print("[SCons] ERROR: GODOT_CPP_PREBUILT=1 but godot-cpp appended no library to LIBS.")
+        Exit(1)
+    for _lib_path in _prebuilt_paths:
+        print(f"[SCons] reusing prebuilt godot-cpp library: {_lib_path}")
+else:
+    # Inverse safety check. A worktree provisioned for prebuilt mode has
+    # godot-cpp/gen junctioned to the shared store and its libraries hardlinked
+    # from it. Building godot-cpp here would write objects through the junction
+    # and relink the hardlinked .lib IN PLACE, corrupting the copy every other
+    # worktree links against. Fail loudly instead of doing that silently.
+    _shared_markers = []
+    if os.path.isfile(os.path.join("godot-cpp", "gen", ".stamp")):
+        _shared_markers.append("godot-cpp/gen is the shared generated tree (junction)")
+    _bin_dir = os.path.join("godot-cpp", "bin")
+    if os.path.isdir(_bin_dir):
+        for _entry in os.listdir(_bin_dir):
+            if not _entry.endswith(".lib"):
+                continue
+            try:
+                if os.stat(os.path.join(_bin_dir, _entry)).st_nlink > 1:
+                    _shared_markers.append(f"godot-cpp/bin/{_entry} is hardlinked to the shared store")
+            except OSError:
+                pass
+    if _shared_markers:
+        print("[SCons] ERROR: this worktree shares godot-cpp with the primary worktree, but GODOT_CPP_PREBUILT is not set:")
+        for _marker in _shared_markers:
+            print(f"[SCons]   - {_marker}")
+        print("[SCons] Building godot-cpp here would corrupt the shared copy. Either set GODOT_CPP_PREBUILT=1 in .env,")
+        print("[SCons] or remove godot-cpp/gen and godot-cpp/bin/*.lib from this worktree to build it locally.")
+        Exit(1)
+
+
+# --- Optional compiler-cache wrapper (sccache / buildcache) -------------------
+# Opt in per worktree with USE_CC_WRAPPER=sccache|buildcache (process env or
+# .env). USE_SCCACHE=1 is kept as a backwards-compatible alias for sccache.
+#
+# NOTE (measured): neither wrapper is the shared cache for parallel worktrees -
+# use SCONS_CACHE for that. sccache hashes MSVC's preprocessed output, which
+# carries `#line "D:\\...\\<worktree>\\src\\..."` entries that SCCACHE_BASEDIRS
+# cannot strip (it strips plain paths, not backslash-escaped ones) and /pathmap
+# does not rewrite, so two worktrees miss on identical sources. buildcache is the
+# only one of the two that can share across worktrees, because its
+# BUILDCACHE_ACCURACY=DEFAULT stops counting debug-info paths in the key.
+#
+# Both wrappers need /Z7 instead of /Zi: godot-cpp's common_compiler_flags.py
+# adds /Zi with no per-object /Fd, i.e. every object writes the same vc140.pdb,
+# which is not cacheable (sccache reports it as "Non-cacheable reasons: shared
+# pdb"; buildcache's MSVC docs require Embedded/C7 debug info too).
+#
+# Applied *after* the godot-cpp SConscript deliberately: every node created
+# there keeps a reference to this same construction environment, so mutating it
+# here also changes their compile commands (verified with `scons -n`). Doing it
+# earlier is impossible - godot-cpp runs `env.Tool("msvc")`, which resets CC to
+# `cl` after any wrapper placed before it.
+_WRAPPER_TOOLS = {
+    # name: (env var holding an explicit exe path, env vars passed through)
+    "sccache": (
+        "SCCACHE_EXE",
+        ("SCCACHE_DIR", "SCCACHE_CACHE_SIZE", "SCCACHE_LOG", "SCCACHE_ERROR_LOG"),
+    ),
+    "buildcache": (
+        "BUILDCACHE_EXE",
+        ("BUILDCACHE_DIR", "BUILDCACHE_ACCURACY", "BUILDCACHE_COMPRESS",
+         "BUILDCACHE_COMPRESS_FORMAT", "BUILDCACHE_HARD_LINKS",
+         "BUILDCACHE_MAX_CACHE_SIZE", "BUILDCACHE_MAX_LOCAL_ENTRY_SIZE",
+         "BUILDCACHE_DIRECT_MODE", "BUILDCACHE_DEBUG", "BUILDCACHE_LOG_FILE",
+         "BUILDCACHE_STAT_ID"),
+    ),
+}
+
+
+def _cc_wrapper_kind():
+    """Return 'sccache', 'buildcache', or '' when no wrapper is requested."""
+    kind = _dotenv_or_env_value("USE_CC_WRAPPER").strip().lower()
+    if kind in _WRAPPER_TOOLS:
+        return kind
+    if kind not in ("", "none", "0", "off", "false"):
+        print(f"[SCons] WARNING: unknown USE_CC_WRAPPER={kind!r}; expected 'sccache' or 'buildcache'. Compiling without a wrapper.")
+        return ""
+    if _dotenv_or_env_value("USE_SCCACHE").lower() in ("1", "true", "yes", "y", "on"):
+        return "sccache"
+    return ""
+
+
+def _cc_wrapper_exe(kind):
+    """Explicit path from .env first (the tools may live in a gitignored dir), then PATH."""
+    explicit = _dotenv_or_env_value(_WRAPPER_TOOLS[kind][0])
+    if explicit:
+        return explicit if os.path.isfile(explicit) else ""
+    return shutil.which(kind)
+
+
+_cc_wrapper = _cc_wrapper_kind()
+if _cc_wrapper:
+    _cc_wrapper_exe_path = _cc_wrapper_exe(_cc_wrapper)
+    if not _cc_wrapper_exe_path:
+        print(f"[SCons] WARNING: USE_CC_WRAPPER={_cc_wrapper} but the executable was not found (set {_WRAPPER_TOOLS[_cc_wrapper][0]} or put it on PATH); compiling without it.")
+    else:
+        def _wrap_compiler_var(_name):
+            """Prepend the wrapper to one compiler variable, once.
+
+            Skips variables that are aliases of another one: the MSVC tool sets
+            CXX = "$CC" (and SHCC = "$CC", SHCXX = "$CXX"), so prepending here
+            would expand to "<wrapper> <wrapper> cl" and the wrapper would treat
+            itself as the compiler (sccache: "Compiler not supported: unexpected
+            argument '-E'"). The alias picks the wrapper up from the variable it
+            points at, so wrapping CC is enough for CXX/SHCC/SHCXX.
+            """
+            _current = env[_name]
+            if isinstance(_current, str):
+                _current = [_current]
+            _current = list(_current)
+            if len(_current) == 1 and str(_current[0]).startswith(("$", "${")):
+                return False
+            if _current and os.path.normcase(str(_current[0])) == os.path.normcase(_cc_wrapper_exe_path):
+                return False
+            env[_name] = [_cc_wrapper_exe_path] + _current
+            return True
+
+        _wrapped = [_n for _n in ("CC", "CXX") if _wrap_compiler_var(_n)]
+        if not _wrapped:
+            print(f"[SCons] WARNING: USE_CC_WRAPPER={_cc_wrapper} but neither CC nor CXX could be wrapped; compiling without it.")
+        else:
+            if "ENV" not in env:
+                env["ENV"] = dict(os.environ)
+            for _passthrough in _WRAPPER_TOOLS[_cc_wrapper][1]:
+                _value = _dotenv_or_env_value(_passthrough)
+                if _value:
+                    env["ENV"][_passthrough] = _value
+            if _cc_wrapper == "sccache":
+                env["ENV"]["SCCACHE_BASEDIRS"] = os.path.abspath(".")
+                # A dead cache daemon must degrade to a plain compile, never fail a build.
+                env["ENV"]["SCCACHE_IGNORE_SERVER_IO_ERROR"] = "1"
+            for _flag_var in ("CCFLAGS", "CXXFLAGS", "SHCCFLAGS", "SHCXXFLAGS"):
+                if _flag_var not in env:
+                    continue
+                _flags = list(env[_flag_var])
+                _swapped = False
+                for _i, _flag in enumerate(_flags):
+                    if str(_flag).strip().lower() == "/zi":
+                        _flags[_i] = "/Z7"
+                        _swapped = True
+                if _swapped:
+                    env[_flag_var] = _flags
+            print(f"[SCons] compiler cache wrapper enabled: {_cc_wrapper} -> {_cc_wrapper_exe_path} via {'+'.join(_wrapped)} (/Zi swapped to /Z7)")
+
 
 gen_header_dir = os.path.join("src", "gen")
 gen_header_file = os.path.join(gen_header_dir, "dspkg_encryption_key.h")
