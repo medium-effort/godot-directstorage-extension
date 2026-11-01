@@ -1225,6 +1225,23 @@ if (-not $IsRemote) {
     if ($LocalExit -ne 0) {
         Show-BuildFailure -Step "Local SCons Compilation" -Message "Local SCons build failed with exit code $LocalExit." -Code $LocalExit
     }
+    # A cache-restored test library keeps the mtime it had when it was first built
+    # (SCons' CacheDir preserves it), so the runners' mtime freshness check reports
+    # "Stale test library" after a revert or a rebase even though SCons has just
+    # verified the artifact against the current sources. Stamp it with the build
+    # that validated it. The check keeps working for its real purpose: sources
+    # changed and nothing rebuilt them, so no run touches the DLL. Only reached on
+    # success, because Show-BuildFailure exits above.
+    if ($IncludeTests) {
+        foreach ($testDll in @(Get-ChildItem -LiteralPath (Join-Path $WorkspaceRoot "bin") -Filter "libdsgd_tests*.dll" -File -ErrorAction SilentlyContinue)) {
+            try {
+                $testDll.LastWriteTime = Get-Date
+            }
+            catch {
+                $null = $_
+            }
+        }
+    }
     # Same opt-in summary the remote leg prints; it only reports for green builds
     # and never duplicates the -Verbose dump or the failure excerpt above.
     Write-SconsWarningSummary -Lines $LocalSconsLines -PathPrefixes @($WorkspaceRoot)
