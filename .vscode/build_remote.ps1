@@ -25,6 +25,11 @@ param(
 
 $ScriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
+# Opt-in compiler-warning summary. The enable expression lives here, in one place,
+# because the shared display helper (Write-SconsWarningSummary) is called from both
+# the local and the remote build legs and must gate identically for both.
+$WarningSummaryEnabled = [bool]$ShowWarnings -and -not [bool]$Verbose
+
 function Get-FormattedElapsed {
     param([System.Diagnostics.Stopwatch]$Stopwatch)
     if (-not $Stopwatch) { return "" }
@@ -110,6 +115,62 @@ function Write-VerboseHost {
     )
     if ($Verbose) {
         Write-Status $Message -ForegroundColor $ForegroundColor
+    }
+}
+
+# SCons output is captured to temp logs in BOTH modes (local and remote) and
+# discarded on a green build, so a default run stays quiet: only the step header
+# and a 1-minute heartbeat are printed. These two helpers are the shared display
+# paths for what is left to say - the failure excerpt and the opt-in warning
+# summary - so local and remote builds cannot drift apart in what they show.
+function Write-SconsErrorOutput {
+    param([string[]]$Lines)
+    if (-not $Lines) { return }
+    $errorLines = @($Lines | Where-Object { $_ -match "error[:\s]|fatal|failed|exception" })
+    if ($errorLines) {
+        Write-Status "--- SCons Compilation Errors ---" -ForegroundColor Red
+        $errorLines | Select-Object -Last 30 | ForEach-Object { Write-Status $_ }
+    }
+    else {
+        Write-Status "--- SCons Output (tail) ---" -ForegroundColor Red
+        $Lines | Select-Object -Last 30 | ForEach-Object { Write-Status $_ }
+    }
+}
+
+# Compiler-warning summary, OPT-IN via -ShowWarnings. SCons output lives only in
+# the two temp logs and is discarded on a successful build, so a green run hides
+# every warning unless the caller re-runs with -Verbose. This switch exists for
+# that case; the default stays byte-silent so existing logs and monitors see
+# exactly what they saw before. Third-party godot-cpp headers are reported as a
+# count only (they are not ours to fix); project-sourced warnings are listed.
+# ADVISORY ONLY: this never changes the exit code and never fails the build.
+function Write-SconsWarningSummary {
+    param(
+        [string[]]$Lines,
+        [string[]]$PathPrefixes = @()
+    )
+    if (-not ($WarningSummaryEnabled -and $Lines)) { return }
+    $rawWarnings = @($Lines | Where-Object { $_ -match 'warning [A-Z]+[0-9]+' })
+    if ($rawWarnings.Count -eq 0) { return }
+    $thirdPartyWarnings = @($rawWarnings | Where-Object { $_ -match 'godot-cpp[\\/]include[\\/]' })
+    $projectWarnings = @($rawWarnings | Where-Object { $_ -notmatch 'godot-cpp[\\/]include[\\/]' })
+    Write-Status ("    Compiler warnings: {0} total (project {1}, godot-cpp headers {2}) - advisory only, build continues." -f $rawWarnings.Count, $projectWarnings.Count, $thirdPartyWarnings.Count) -ForegroundColor Yellow
+    # Collapse repeats first: one header warning is re-emitted per translation
+    # unit that instantiates the template, so raw counts overstate the issue.
+    $uniqueProjectWarnings = @($projectWarnings | Select-Object -Unique)
+    $shownWarnings = @($uniqueProjectWarnings | Select-Object -First 5)
+    foreach ($warningLine in $shownWarnings) {
+        $displayLine = [string]$warningLine
+        foreach ($prefix in $PathPrefixes) {
+            if ($prefix) { $displayLine = $displayLine -replace ([regex]::Escape($prefix) + '\\'), '' }
+        }
+        Write-Status "      $($displayLine.Trim())" -ForegroundColor DarkYellow
+    }
+    if ($uniqueProjectWarnings.Count -gt $shownWarnings.Count) {
+        Write-Status ("      ... and {0} more unique project warning(s); re-run with -Verbose for the full log." -f ($uniqueProjectWarnings.Count - $shownWarnings.Count)) -ForegroundColor DarkYellow
+    }
+    if ($thirdPartyWarnings.Count -gt 0) {
+        Write-Status "      (godot-cpp header warnings are third-party and listed only under -Verbose.)" -ForegroundColor DarkGray
     }
 }
 
@@ -1067,6 +1128,11 @@ if (-not $IsRemote) {
         }
 
         $LocalExit = 0
+        $LocalSconsLines = @()
+        $sconsCommand = Get-Command -Name scons -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $sconsCommand) {
+            Show-BuildFailure -Step "Local SCons Compilation" -Message "scons was not found on PATH as an application. Install SCons or activate the environment that provides it." -Code 1
+        }
         foreach ($tDef in $targetsToBuild) {
             Write-Status "[Local] Compiling target=$($tDef.Name) dev_build=$($tDef.DevBuild)$(if ($tDef.Tests) { ' tests=true' })..." -ForegroundColor Cyan
             # NOTE: each SCons variable must be a separate process argument.
@@ -1076,9 +1142,45 @@ if (-not $IsRemote) {
             if ($ResetKeyHeader) { $SconsArgs += "DSPKG_KEY_HEADER_RESET=1" }
             $env:DSPKG_KEY_HEADER_ACTIVE = if ($EffectiveKey) { "1" } else { "0" }
 
-            & scons @SconsArgs 2>&1 | ForEach-Object { Write-Status ([string]$_) }
-            $LocalExit = $LASTEXITCODE
-            if ($LocalExit -ne 0) {
+            # Output is captured instead of streamed, mirroring the remote path:
+            # a default run prints the header above plus a 1-minute heartbeat
+            # (so a long build never looks hung), and the full log only on failure
+            # or under -Verbose. Start-Process is used for the heartbeat; the
+            # redirect files are the same shape the remote leg reads back.
+            $sconsOutFile = Join-Path $env:TEMP ("scons_local_out_" + [System.Guid]::NewGuid().ToString() + ".log")
+            $sconsErrFile = Join-Path $env:TEMP ("scons_local_err_" + [System.Guid]::NewGuid().ToString() + ".log")
+            $sconsLines = @()
+            $sconsProc = Start-Process -FilePath $sconsCommand.Source -ArgumentList $SconsArgs -NoNewWindow -PassThru -RedirectStandardOutput $sconsOutFile -RedirectStandardError $sconsErrFile
+            $sconsWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $lastHeartbeatMin = 0
+            while (-not $sconsProc.WaitForExit(10000)) {
+                $elapsedMin = [int][Math]::Floor($sconsWatch.Elapsed.TotalMinutes)
+                if ($elapsedMin -gt $lastHeartbeatMin) {
+                    $lastHeartbeatMin = $elapsedMin
+                    Write-Status "    [Local] Still compiling target=$($tDef.Name)... ($lastHeartbeatMin min elapsed)" -ForegroundColor DarkCyan
+                }
+            }
+            $sconsWatch.Stop()
+            if (Test-Path -LiteralPath $sconsOutFile) {
+                $sconsLines += @(Get-Content -LiteralPath $sconsOutFile)
+                Remove-Item -LiteralPath $sconsOutFile -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $sconsErrFile) {
+                $sconsLines += @(Get-Content -LiteralPath $sconsErrFile)
+                Remove-Item -LiteralPath $sconsErrFile -Force -ErrorAction SilentlyContinue
+            }
+            if ($Verbose -and $sconsLines) {
+                $sconsLines | ForEach-Object { Write-Status $_ }
+            }
+            $LocalSconsLines += $sconsLines
+            $reportedFailure = @($sconsLines | Where-Object { $_ -match "terminated because of errors|scons: \*\*\* \[|error C[0-9]+|error LNK[0-9]+" }).Count -gt 0
+            # Start-Process leaves ExitCode unset for a .bat/.cmd SCons shim, so a
+            # shim failure would otherwise read as success: fall back to the same
+            # error scan the remote path uses.
+            $LocalExit = if ($null -ne $sconsProc.ExitCode) { [int]$sconsProc.ExitCode } elseif ($reportedFailure) { 1 } else { 0 }
+            if ($LocalExit -ne 0 -or $reportedFailure) {
+                Write-SconsErrorOutput -Lines $sconsLines
+                if ($LocalExit -eq 0) { $LocalExit = 1 }
                 break
             }
         }
@@ -1093,6 +1195,9 @@ if (-not $IsRemote) {
     if ($LocalExit -ne 0) {
         Show-BuildFailure -Step "Local SCons Compilation" -Message "Local SCons build failed with exit code $LocalExit." -Code $LocalExit
     }
+    # Same opt-in summary the remote leg prints; it only reports for green builds
+    # and never duplicates the -Verbose dump or the failure excerpt above.
+    Write-SconsWarningSummary -Lines $LocalSconsLines -PathPrefixes @($WorkspaceRoot)
     $ArtifactLocalDir = "./project/addons/directstorage_accelerator/bin"
     $LocalManifest = Join-Path $WorkspaceRoot "project/addons/directstorage_accelerator/bin/build_manifest.json"
     if (-not (Test-Path -LiteralPath $LocalManifest)) {
@@ -1897,53 +2002,14 @@ if ($sshDropped) {
 $markerMissing = $LASTEXITCODE -ne 0
 $sconsFailed = @($sconsLines | Where-Object { $_ -match "terminated because of errors|scons: \*\*\* \[|error C[0-9]+|error LNK[0-9]+" }).Count -gt 0
 if ($markerMissing -or $sconsFailed) {
-    if ($sconsLines) {
-        $errorLines = $sconsLines | Where-Object { $_ -match "error[:\s]|fatal|failed|exception" }
-        if ($errorLines) {
-            Write-Status "--- SCons Compilation Errors ---" -ForegroundColor Red
-            $errorLines | Select-Object -Last 30 | ForEach-Object { Write-Status $_ }
-        }
-        else {
-            Write-Status "--- SCons Output (tail) ---" -ForegroundColor Red
-            $sconsLines | Select-Object -Last 30 | ForEach-Object { Write-Status $_ }
-        }
-    }
+    Write-SconsErrorOutput -Lines $sconsLines
     $why = if ($sconsFailed) { "SCons reported compilation errors" } else { "missing success marker (SCons did not complete successfully)" }
     Show-BuildFailure -Step "Step [4/6] SCons Compilation" -Message "Compilation failed on Device B ($ActiveHost). Detected via $why." -Code 1
 }
 
-# Compiler-warning summary, OPT-IN via -ShowWarnings. SCons output lives only in
-# the two temp logs above and is discarded on a successful build, so a green run
-# hides every warning unless the caller re-runs with -Verbose. This switch exists
-# for that case; the default stays byte-silent so existing logs and monitors see
-# exactly what they saw before. Third-party godot-cpp headers are reported as a
-# count only (they are not ours to fix); project-sourced warnings are listed.
-# ADVISORY ONLY: this never changes the exit code and never fails the build.
-if ($ShowWarnings -and -not $Verbose -and $sconsLines) {
-    $rawWarnings = @($sconsLines | Where-Object { $_ -match 'warning [A-Z]+[0-9]+' })
-    if ($rawWarnings.Count -gt 0) {
-        $thirdPartyWarnings = @($rawWarnings | Where-Object { $_ -match 'godot-cpp[\\/]include[\\/]' })
-        $projectWarnings = @($rawWarnings | Where-Object { $_ -notmatch 'godot-cpp[\\/]include[\\/]' })
-        Write-Status ("    Compiler warnings: {0} total (project {1}, godot-cpp headers {2}) - advisory only, build continues." -f $rawWarnings.Count, $projectWarnings.Count, $thirdPartyWarnings.Count) -ForegroundColor Yellow
-        # Collapse repeats first: one header warning is re-emitted per translation
-        # unit that instantiates the template, so raw counts overstate the issue.
-        $uniqueProjectWarnings = @($projectWarnings | Select-Object -Unique)
-        $shownWarnings = @($uniqueProjectWarnings | Select-Object -First 5)
-        foreach ($warningLine in $shownWarnings) {
-            $displayLine = [string]$warningLine
-            foreach ($prefix in @($RemoteDirWin, $WorkspaceRoot)) {
-                if ($prefix) { $displayLine = $displayLine -replace ([regex]::Escape($prefix) + '\\'), '' }
-            }
-            Write-Status "      $($displayLine.Trim())" -ForegroundColor DarkYellow
-        }
-        if ($uniqueProjectWarnings.Count -gt $shownWarnings.Count) {
-            Write-Status ("      ... and {0} more unique project warning(s); re-run with -Verbose for the full log." -f ($uniqueProjectWarnings.Count - $shownWarnings.Count)) -ForegroundColor DarkYellow
-        }
-        if ($thirdPartyWarnings.Count -gt 0) {
-            Write-Status "      (godot-cpp header warnings are third-party and listed only under -Verbose.)" -ForegroundColor DarkGray
-        }
-    }
-}
+# Compiler-warning summary, OPT-IN via -ShowWarnings (shared helper keeps the
+# local leg's output identical). ADVISORY ONLY: never changes the exit code.
+Write-SconsWarningSummary -Lines $sconsLines -PathPrefixes @($RemoteDirWin, $WorkspaceRoot)
 
 # 5. Pull back compiled binary and debug symbols to Device A
 Write-Status "[5/6] Pulling artifacts back to Device A (compressed)..." -ForegroundColor Cyan
