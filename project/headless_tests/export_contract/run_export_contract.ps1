@@ -434,7 +434,7 @@ function Assert-BootOk {
 }
 
 function Assert-BootFail {
-    param([string]$Case, [string]$StageDir, [string]$Reason, [string]$UserArgs = '--dspkg-validate=protected', [int]$Timeout = 0)
+    param([string]$Case, [string]$StageDir, [string]$Reason, [string]$UserArgs = '--dspkg-validate=protected', [int]$Timeout = 0, [switch]$RequireNonZeroExit)
     $script:LastBoot = $null
     $result = Invoke-Boot -StageDir $StageDir -UserArgs $UserArgs -Timeout $Timeout
     if ($result.MissingExecutable) {
@@ -446,6 +446,13 @@ function Assert-BootFail {
     Add-Check ($Case + '.boot_no_timeout') (-not $boot.TimedOut) ('timed_out=' + $boot.TimedOut + ' exit=' + $result.ExitCode)
     Add-Check ($Case + '.boot_failure_reason') (($boot.FailCount -eq 1) -and ($boot.FailReason -eq $Reason)) ('reason=' + $boot.FailReason + ' expected=' + $Reason + ' line=' + $boot.FailLine)
     Add-Check ($Case + '.boot_no_ok_line') (($boot.OkCount -eq 0) -and ($boot.SinkOkCount -eq 0)) ('stdout_ok=' + $boot.OkCount + ' sink_ok=' + $boot.SinkOkCount)
+    # The verdict is the sentinel line, but a launcher that only reads the process
+    # code must still see a failure. A failure verdict can be overwritten by a
+    # later quit(0) from the game's own main loop, so this is opt-in and asserted
+    # where that specific overwrite is expected to happen.
+    if ($RequireNonZeroExit) {
+        Add-Check ($Case + '.boot_nonzero_exit') ($result.ExitCode -ne 0) ('exit=' + $result.ExitCode)
+    }
 }
 
 function Invoke-Scan {
@@ -710,7 +717,7 @@ Invoke-Case 'protected_plaintext_archive' {
         Add-Check 'protected_plaintext_archive.id_differs_before_copy' ($plainId -ne $protectedId) ('source_id=0x' + $plainId.ToString('x') + ' protected_id=0x' + $protectedId.ToString('x'))
         Add-Check 'protected_plaintext_archive.id_copied' ($protectedId -ne 0) ('id=0x' + $protectedId.ToString('x'))
 
-        Assert-BootFail -Case 'protected_plaintext_archive' -StageDir $stage -Reason 'archive_unauthorized'
+        Assert-BootFail -Case 'protected_plaintext_archive' -StageDir $stage -Reason 'archive_unauthorized' -RequireNonZeroExit
     }
 }
 

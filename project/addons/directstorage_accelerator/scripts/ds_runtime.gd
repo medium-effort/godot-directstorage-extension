@@ -43,6 +43,15 @@ const DSPKG_STATIC_PATH: String = "res://addons/directstorage_accelerator/script
 ## silent rather than repeat the verdict.
 static var _boot_ok_reported: bool = false
 
+## Exit code recorded by `_fail_boot`, re-applied at teardown. A failure verdict
+## is a `quit(code)` during the autoload's `_ready()`, and the game's own main
+## scene can still call `quit(0)` afterwards: `SceneTree.quit()` only sets the
+## process exit code, so the last caller wins and the failure code is erased.
+## Re-applying it from `_exit_tree` makes the code stick without changing the
+## diagnostic contract - later nodes still run, only the code is protected.
+## Negative means no failure was reported.
+var _boot_failure_code: int = -1
+
 ## Per-tag prewarm progress: (tag: int, done: int, total: int).
 signal prewarm_progress(tag: int, done: int, total: int)
 ## Fired once per tracked tag when `is_prewarm_complete(tag)` turns true.
@@ -344,7 +353,8 @@ func _emit_boot_line(line: String) -> void:
 ##
 ## The verdict is diagnostic: this only quits with the code, it never pauses the
 ## tree or frees siblings, so later autoloads and the main scene still run and a
-## later `quit(0)` can override the exit code.
+## later `quit(0)` can override the exit code. That override is why the code is
+## recorded here and re-applied in `_exit_tree`.
 func _fail_boot(reason: String, message: String, title: String, code: int = 1) -> void:
 	_emit_boot_line("%s status=fail reason=%s mode=%s" % [BOOT_SENTINEL, reason, _boot_mode()])
 	printerr("[DirectStorage] ", message.replace("\n", " "))
@@ -353,7 +363,19 @@ func _fail_boot(reason: String, message: String, title: String, code: int = 1) -
 			get_tree().root.hide()
 		OS.alert(message, title)
 	if get_tree():
+		_boot_failure_code = code
 		get_tree().quit(code)
+
+
+## Re-applies the failure exit code after everything else has run. The engine
+## reads the process code once at shutdown, so writing it here is the last word;
+## see `_boot_failure_code` for why the first write does not survive.
+func _exit_tree() -> void:
+	if _boot_failure_code <= 0:
+		return
+	var loop: MainLoop = Engine.get_main_loop()
+	if loop is SceneTree:
+		(loop as SceneTree).quit(_boot_failure_code)
 
 
 ## True when no human is available to dismiss an `OS.alert()` dialog.

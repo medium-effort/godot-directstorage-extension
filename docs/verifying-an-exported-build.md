@@ -193,7 +193,9 @@ autoload runs. Ship the archive from the same export, and see the ordering note 
 the dialog.
 
 **Can I just check the exit code?**
-No. It is supporting evidence only; the line is the verdict.
+Not as the verdict. It is supporting evidence; the line names the reason and is the contract. Since
+`_fail_boot()` re-applies its code at teardown, a non-zero exit now reliably accompanies a failure
+line even when the game's own main loop quits with 0.
 
 **Does `status=ok` mean the build is protected?**
 No. `key_id=none` means no key was involved. The evidence for a protected build is `mode=protected`,
