@@ -28,6 +28,7 @@
 #include "formats/dstex_format.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
+#include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
@@ -87,6 +88,18 @@ void remove_temp_file(const char *p_path) {
     if (dir.is_valid()) {
         dir->remove(godot::String(p_path));
     }
+}
+
+// Win32 reports paths with backslashes; Godot composes them with forward slashes.
+// Any comparison of the two has to normalise, or it fails on a path that is equal.
+std::string normalized_path(const godot::String &p_path) {
+    std::string path = ::gdextest::to_std_string(p_path);
+    for (char &ch : path) {
+        if (ch == '\\') {
+            ch = '/';
+        }
+    }
+    return path;
 }
 
 // HIGH-01 fixtures: a 2048^2 incompressible RGBA8 payload keeps the DMA +
@@ -1463,6 +1476,110 @@ GDEX_TEST_T(win32_remediation, runtime_configuration_applies_per_loaded_instance
 #else
     (void)ctx;
     GDEX_SKIP("The runtime-configuration counter is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, runtime_module_load_uses_hardened_search_flags, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // One loader for the DirectStorage runtime, with one search policy. The suite
+    // pins the policy the helper applies, not the path a dependency resolves to: a
+    // dependency that exists in System32 is bound from System32 under both the
+    // hardened flags and a bare LoadLibraryW, so only the flag mask distinguishes
+    // them. The mask is what decides whether a dependency absent from System32 fails
+    // the load or is silently satisfied from the working directory or PATH.
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps == nullptr) {
+        GDEX_SKIP("ProjectSettings unavailable in this fixture.");
+    }
+
+    // Locate the shipped pair the same way production does.
+    godot::String source_dir;
+    const godot::PackedStringArray search_dirs = godot::Win32Backend::get_runtime_search_dirs();
+    for (int i = 0; i < search_dirs.size(); i++) {
+        const godot::String dir = search_dirs[i];
+        const godot::Ref<godot::FileAccess> core = godot::FileAccess::open(dir.path_join("dstoragecore.dll"), godot::FileAccess::READ);
+        const godot::Ref<godot::FileAccess> runtime = godot::FileAccess::open(dir.path_join("dstorage.dll"), godot::FileAccess::READ);
+        if (core.is_valid() && runtime.is_valid()) {
+            source_dir = dir;
+            break;
+        }
+    }
+    if (source_dir.is_empty()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+
+    // A directory that has never held these DLLs, so the module path asserted below
+    // cannot be a leftover mapping of the shipped copy.
+    const godot::String fixture_abs = ps->globalize_path("user://gdextest_runtime_loader");
+    const godot::String core_abs = fixture_abs.path_join("dstoragecore.dll");
+    const godot::String runtime_abs = fixture_abs.path_join("dstorage.dll");
+    // Registered first, so it runs last (teardowns are LIFO): the module handles are
+    // released before the files disappear.
+    ctx.add_teardown([core_abs, runtime_abs, fixture_abs]() {
+        godot::DirAccess::remove_absolute(runtime_abs);
+        godot::DirAccess::remove_absolute(core_abs);
+        godot::DirAccess::remove_absolute(fixture_abs);
+    });
+
+    godot::DirAccess::remove_absolute(runtime_abs);
+    godot::DirAccess::remove_absolute(core_abs);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::DirAccess::make_dir_recursive_absolute(fixture_abs)),
+            static_cast<int64_t>(godot::OK));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::DirAccess::copy_absolute(source_dir.path_join("dstoragecore.dll"), core_abs)),
+            static_cast<int64_t>(godot::OK));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::DirAccess::copy_absolute(source_dir.path_join("dstorage.dll"), runtime_abs)),
+            static_cast<int64_t>(godot::OK));
+    {
+        const godot::Ref<godot::FileAccess> copied = godot::FileAccess::open(runtime_abs, godot::FileAccess::READ);
+        GDEX_EXPECT_TRUE(copied.is_valid());
+        if (copied.is_valid()) {
+            GDEX_EXPECT_TRUE(copied->get_length() > 0);
+            copied->close();
+        }
+    }
+
+    const HMODULE runtime_module = godot::Win32Backend::load_runtime_module(fixture_abs, "dstorage.dll");
+    if (runtime_module != nullptr) {
+        ctx.add_teardown([runtime_module]() { FreeLibrary(runtime_module); });
+    }
+    GDEX_EXPECT_TRUE(runtime_module != nullptr);
+
+    // The policy itself, stated independently of the production constant.
+    godot::String recorded_path;
+    uint32_t recorded_flags = 0;
+    godot::Win32Backend::_debug_last_runtime_module_load_for_testing(recorded_path, recorded_flags);
+    const uint32_t expected_flags = static_cast<uint32_t>(LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(recorded_flags), static_cast<int64_t>(expected_flags));
+    // The two flags are mutually exclusive, so an implementation that reaches for the
+    // altered-search-path flag instead must fail here rather than pass by accident.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(recorded_flags & LOAD_WITH_ALTERED_SEARCH_PATH), static_cast<int64_t>(0));
+    GDEX_EXPECT_EQ(normalized_path(recorded_path), normalized_path(runtime_abs));
+
+    if (runtime_module != nullptr) {
+        wchar_t buffer[4096] = {};
+        const DWORD length = GetModuleFileNameW(runtime_module, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
+        GDEX_EXPECT_TRUE(length > 0);
+        GDEX_EXPECT_EQ(normalized_path(godot::String::utf16(reinterpret_cast<const char16_t *>(buffer))),
+                normalized_path(runtime_abs));
+    }
+
+    // The core load is the one whose own dependency resolution the policy governs.
+    const HMODULE core_module = godot::Win32Backend::load_runtime_module(fixture_abs, "dstoragecore.dll");
+    if (core_module != nullptr) {
+        ctx.add_teardown([core_module]() { FreeLibrary(core_module); });
+    }
+    GDEX_EXPECT_TRUE(core_module != nullptr);
+    godot::Win32Backend::_debug_last_runtime_module_load_for_testing(recorded_path, recorded_flags);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(recorded_flags), static_cast<int64_t>(expected_flags));
+    GDEX_EXPECT_EQ(normalized_path(recorded_path), normalized_path(core_abs));
+#else
+    (void)ctx;
+    GDEX_SKIP("The runtime-loader seam is compiled out of release builds.");
 #endif
 #else
     (void)ctx;

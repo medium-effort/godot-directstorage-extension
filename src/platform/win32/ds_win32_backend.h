@@ -348,6 +348,18 @@ public:
 	// GDExtension exporter places all DLLs flat next to the game binary.
 	static PackedStringArray get_runtime_search_dirs();
 
+#if defined(_WIN32)
+	// Loads one DirectStorage runtime DLL ("dstoragecore.dll" or "dstorage.dll")
+	// from p_dir. The only loader for the runtime: the backend and the context's
+	// capability report both call it, so a dependency resolves only from the DLL's
+	// own directory, the application directory, or the system directories - never
+	// from the current directory or a PATH entry, which the bare loader this
+	// replaced did search.
+	// Returns null on failure. The caller owns the reference and must FreeLibrary
+	// it; nothing here changes the module's lifetime.
+	static HMODULE load_runtime_module(const String &p_dir, const char *p_dll_name);
+#endif
+
 	bool is_available() const override;
 	String get_name() const override;
 
@@ -426,6 +438,11 @@ public:
 	// second load cycle must raise it again; a process-wide latch did not. Never
 	// bound in _bind_methods().
 	static int _debug_dstorage_config_apply_count();
+	// Test-only seam: path and search flags of the most recent runtime-DLL load
+	// attempt, failed attempts included, so the hardened search policy can be
+	// pinned without a second copy of the runtime loaded into the process.
+	// Never bound in _bind_methods().
+	static void _debug_last_runtime_module_load_for_testing(String &r_path, uint32_t &r_flags);
 	// Test-only seam: inserts one synthetic parent/child chunk pair and one
 	// synthetic (null) resource guard, so instance isolation can be asserted
 	// without staging a real multi-mip GPU request. Never bound in _bind_methods().

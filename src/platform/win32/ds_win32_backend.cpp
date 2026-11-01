@@ -90,6 +90,35 @@ static void unload_runtime_modules(HMODULE p_core, HMODULE p_dstorage) {
 	}
 }
 
+// The one search policy for the DirectStorage runtime. DLL_LOAD_DIR covers the
+// addon-bin layout, where dstorage.dll sits beside the dstoragecore.dll it loads
+// at runtime; DEFAULT_DIRS covers the dependencies the SDK pulls from the system.
+// The legacy-order locations that are not wanted here - the current directory and
+// every PATH entry - are excluded by construction rather than by convention, so a
+// dependency the shipped set does not provide fails the load instead of being
+// satisfied by whatever happens to sit in the working directory.
+static constexpr uint32_t kRuntimeModuleSearchFlags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+static std::mutex s_runtime_load_record_mutex;
+static std::wstring s_last_runtime_load_path;
+static uint32_t s_last_runtime_load_flags = 0;
+#endif
+
+HMODULE Win32Backend::load_runtime_module(const String &p_dir, const char *p_dll_name) {
+	const String absolute_path = p_dir + String("/") + String(p_dll_name);
+	std::wstring w_path(reinterpret_cast<const wchar_t *>(absolute_path.utf16().get_data()));
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	{
+		// Recorded before the call so a failed attempt is visible to the seam too.
+		std::lock_guard<std::mutex> lock(s_runtime_load_record_mutex);
+		s_last_runtime_load_path = w_path;
+		s_last_runtime_load_flags = kRuntimeModuleSearchFlags;
+	}
+#endif
+	return LoadLibraryExW(w_path.c_str(), nullptr, kRuntimeModuleSearchFlags);
+}
+
 #if defined(_WIN32) && defined(_MSC_VER)
 static FARPROC WINAPI ds_delay_load_failure_hook(unsigned dliNotify, PDelayLoadInfo pdli) {
 	if (dliNotify == dliFailLoadLib || dliNotify == dliFailGetProc) {
@@ -1980,18 +2009,14 @@ static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_ca
 		return result;
 	}
 
-	String core_path = p_bin_dir + String("/dstoragecore.dll");
-	String dstorage_path = p_bin_dir + String("/dstorage.dll");
 	std::wstring w_bin_dir(reinterpret_cast<const wchar_t *>(p_bin_dir.utf16().get_data()));
-	std::wstring w_core_path(reinterpret_cast<const wchar_t *>(core_path.utf16().get_data()));
-	std::wstring w_dstorage_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
 
-	core = LoadLibraryExW(w_core_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+	core = Win32Backend::load_runtime_module(p_bin_dir, "dstoragecore.dll");
 	if (!core) {
 		result.reason = "DirectStorage runtime DLL 'dstoragecore.dll' could not be loaded from '" + p_bin_dir + "'.";
 		return result;
 	}
-	dstorage = LoadLibraryExW(w_dstorage_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+	dstorage = Win32Backend::load_runtime_module(p_bin_dir, "dstorage.dll");
 	if (!dstorage) {
 		result.reason = "DirectStorage runtime DLL 'dstorage.dll' could not be loaded from '" + p_bin_dir + "'.";
 		unload_runtime_modules(core, nullptr);
@@ -2677,18 +2702,12 @@ bool Win32Backend::initialize(const String &p_path) {
 				break;
 			}
 
-			String dstoragecore_path = bin_dir + String("/dstoragecore.dll");
-			String dstorage_path = bin_dir + String("/dstorage.dll");
-
-			std::wstring w_core_path(reinterpret_cast<const wchar_t *>(dstoragecore_path.utf16().get_data()));
-			std::wstring w_ds_path(reinterpret_cast<const wchar_t *>(dstorage_path.utf16().get_data()));
-
-			HMODULE core = LoadLibraryExW(w_core_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+			HMODULE core = load_runtime_module(bin_dir, "dstoragecore.dll");
 			if (!core) {
 				last_error_dir = bin_dir;
 				continue;
 			}
-			HMODULE dstorage = LoadLibraryExW(w_ds_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+			HMODULE dstorage = load_runtime_module(bin_dir, "dstorage.dll");
 			if (!dstorage) {
 				unload_runtime_modules(core, nullptr);
 				last_error_dir = bin_dir;
@@ -4616,6 +4635,17 @@ int Win32Backend::_debug_dstorage_config_apply_count() {
 	return s_dstorage_config_apply_count.load();
 #else
 	return 0;
+#endif
+}
+
+void Win32Backend::_debug_last_runtime_module_load_for_testing(String &r_path, uint32_t &r_flags) {
+	r_path = String();
+	r_flags = 0;
+#ifdef _WIN32
+	std::lock_guard<std::mutex> lock(s_runtime_load_record_mutex);
+	// wchar_t is 16-bit on Windows, so the recorded path is already UTF-16.
+	r_path = String::utf16(reinterpret_cast<const char16_t *>(s_last_runtime_load_path.c_str()));
+	r_flags = s_last_runtime_load_flags;
 #endif
 }
 
