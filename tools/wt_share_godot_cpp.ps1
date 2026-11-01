@@ -33,7 +33,10 @@
 
 .NOTES
     Safe to re-run. Real directories and real files already present in the
-    worktree are left alone - this only ever adds links where nothing exists.
+    worktree are left alone - this only ever adds links where nothing exists -
+    with one exception: a library link that no longer matches the primary's
+    bytes is refreshed (see the libraries section). That makes a re-run the
+    repair step after the primary relinks godot-cpp (issue #0216).
 #>
 [CmdletBinding()]
 param(
@@ -121,24 +124,91 @@ else {
 }
 
 # Libraries: hardlink every variant the primary has built, so whichever
-# target/dev_build the worktree asks for is present.
+# target/dev_build the worktree asks for is present, and refresh any link that
+# no longer carries the primary's bytes.
+#
+# The invariant is "the store mirrors the primary": the primary owns these
+# artifacts. SCons rebuilds a static library as a NEW file (unlink + create),
+# which silently severs an existing hardlink, so a relink in the primary leaves
+# the store - and every worktree linked through it - serving the previous bytes
+# (issue #0216). Nothing detects that on its own, so a re-run of this script is
+# the repair: a stale store entry is replaced with a fresh link to the primary's
+# file, then any stale worktree entry is repointed at the store. Replacing a
+# name never destroys data while another name still references the inode, so a
+# refresh that fails halfway loses nothing.
 $worktreeBin = Join-Path $worktree "godot-cpp\bin"
 New-Item -ItemType Directory -Force -Path $worktreeBin | Out-Null
+New-Item -ItemType Directory -Force -Path $store | Out-Null
 $linked = 0
+$refreshed = 0
+$refreshFailures = 0
+
+function Test-SameFile {
+    param([string]$Left, [string]$Right)
+    # Two names for one inode report the same size and the same write time; a
+    # relink in the primary rewrites both. Cheaper and more robust than hashing
+    # a 400+ MB library on every run.
+    $l = Get-Item -LiteralPath $Left -Force -ErrorAction SilentlyContinue
+    $r = Get-Item -LiteralPath $Right -Force -ErrorAction SilentlyContinue
+    if (-not $l -or -not $r) { return $false }
+    return ($l.Length -eq $r.Length) -and ($l.LastWriteTimeUtc -eq $r.LastWriteTimeUtc)
+}
+
+function Update-HardLink {
+    param([string]$LinkPath, [string]$TargetPath)
+    try {
+        if (Test-Path -LiteralPath $LinkPath) {
+            Remove-Item -LiteralPath $LinkPath -Force -ErrorAction Stop
+        }
+        New-Item -ItemType HardLink -Path $LinkPath -Target $TargetPath -ErrorAction Stop | Out-Null
+        return $true
+    }
+    catch {
+        # A build holding the file open is the expected cause; the old bytes stay
+        # reachable through whichever names still exist.
+        Write-Host ("[wt] could not refresh '" + $LinkPath + "' (a build may be using it): " + $_.Exception.Message)
+        return $false
+    }
+}
+
 if (Test-Path -LiteralPath $primaryBin -PathType Container) {
     foreach ($lib in @(Get-ChildItem -LiteralPath $primaryBin -Filter *.lib -File -ErrorAction SilentlyContinue)) {
         $storeLib = Join-Path $store $lib.Name
         if (-not (Test-Path -LiteralPath $storeLib)) {
             New-Item -ItemType HardLink -Path $storeLib -Target $lib.FullName | Out-Null
         }
+        elseif (-not (Test-SameFile -Left $storeLib -Right $lib.FullName)) {
+            if (Update-HardLink -LinkPath $storeLib -TargetPath $lib.FullName) {
+                $refreshed++
+                Write-Host "[wt] refreshed shared store entry '$($lib.Name)' from the primary"
+            }
+            else {
+                $refreshFailures++
+            }
+        }
         $worktreeLib = Join-Path $worktreeBin $lib.Name
         if (-not (Test-Path -LiteralPath $worktreeLib)) {
             New-Item -ItemType HardLink -Path $worktreeLib -Target $storeLib | Out-Null
             $linked++
         }
+        elseif (-not (Test-SameFile -Left $worktreeLib -Right $storeLib)) {
+            if (Update-HardLink -LinkPath $worktreeLib -TargetPath $storeLib) {
+                $refreshed++
+                Write-Host "[wt] refreshed worktree link '$($lib.Name)' to the shared store"
+            }
+            else {
+                $refreshFailures++
+            }
+        }
     }
 }
 Write-Host "[wt] hardlinked $linked godot-cpp librar(y|ies) into the worktree (0 extra bytes)"
+if ($refreshed -gt 0) {
+    Write-Host "[wt] refreshed $refreshed stale link(s) after a relink in the primary"
+}
+if ($refreshFailures -gt 0) {
+    Write-Host "[wt] WARNING: $refreshFailures link(s) could not be refreshed - re-run this script while nothing is building in the primary or this worktree."
+}
 
 if (-not (Get-ChildItem -LiteralPath $worktreeBin -Filter *.lib -File -ErrorAction SilentlyContinue)) {
     Write-Host "[wt] WARNING: no godot-cpp .lib available to link - the worktree will build godot-cpp itself unless GODOT_CPP_PREBUILT is set."

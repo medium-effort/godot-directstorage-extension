@@ -249,24 +249,38 @@ if _godot_cpp_prebuilt:
     # godot-cpp appends its library to LIBS even with build_library=no, so the
     # hardlinked file is what the extension links against. Verify it here: an
     # absent lib would otherwise surface as an unrelated LNK1104 much later.
+    #
+    # Introspection invocations (compiledb, -n, --clean, --help, --question) are
+    # exempt from the library check: they never compile or link, so a checkout can
+    # legitimately probe a variant the primary has not built. That is not
+    # hypothetical - the hardening gate (.vscode/check_build_flags.ps1) runs
+    # `scons compiledb` with SCons' default target=template_debug dev_build=no,
+    # so requiring the library would make the gate fail on a tree whose local
+    # builds all use dev_build=yes. The generated headers are still required,
+    # because every compile command in the database resolves through them.
     if not os.path.isdir(os.path.join("godot-cpp", "gen", "include")):
         print("[SCons] ERROR: GODOT_CPP_PREBUILT=1 but godot-cpp/gen/include is missing.")
-        print("[SCons] Re-run the worktree bootstrap (tools/wt_bootstrap_env.ps1) to link the shared generated headers.")
+        print("[SCons] Re-run tools/wt_share_godot_cpp.ps1 <primary> <worktree> to junction the shared generated tree.")
         Exit(1)
-    _prebuilt_libs = [lib for lib in env.get("LIBS", []) if "libgodot-cpp" in str(lib)]
-    _prebuilt_paths = []
-    for _lib in _prebuilt_libs:
-        _lib_path = _lib.get_abspath() if hasattr(_lib, "get_abspath") else str(_lib)
-        if not os.path.isfile(_lib_path):
-            print(f"[SCons] ERROR: GODOT_CPP_PREBUILT=1 but the prebuilt library is missing:\n[SCons]   {_lib_path}")
-            print("[SCons] Re-run the worktree bootstrap (tools/wt_bootstrap_env.ps1), or build godot-cpp here.")
+    if _non_build:
+        print("[SCons] prebuilt godot-cpp: library presence not checked for an introspection/non-build invocation.")
+    else:
+        _prebuilt_libs = [lib for lib in env.get("LIBS", []) if "libgodot-cpp" in str(lib)]
+        _prebuilt_paths = []
+        for _lib in _prebuilt_libs:
+            _lib_path = _lib.get_abspath() if hasattr(_lib, "get_abspath") else str(_lib)
+            if not os.path.isfile(_lib_path):
+                print(f"[SCons] ERROR: GODOT_CPP_PREBUILT=1 but the prebuilt library is missing:\n[SCons]   {_lib_path}")
+                print("[SCons] Build that target/dev_build variant in the primary worktree first, then re-run")
+                print("[SCons] tools/wt_share_godot_cpp.ps1 <primary> <worktree> to hardlink it here.")
+                print("[SCons] (tools/wt_bootstrap_env.ps1 only writes this worktree's .env - it cannot link a library.)")
+                Exit(1)
+            _prebuilt_paths.append(_lib_path)
+        if not _prebuilt_paths:
+            print("[SCons] ERROR: GODOT_CPP_PREBUILT=1 but godot-cpp appended no library to LIBS.")
             Exit(1)
-        _prebuilt_paths.append(_lib_path)
-    if not _prebuilt_paths:
-        print("[SCons] ERROR: GODOT_CPP_PREBUILT=1 but godot-cpp appended no library to LIBS.")
-        Exit(1)
-    for _lib_path in _prebuilt_paths:
-        print(f"[SCons] reusing prebuilt godot-cpp library: {_lib_path}")
+        for _lib_path in _prebuilt_paths:
+            print(f"[SCons] reusing prebuilt godot-cpp library: {_lib_path}")
 else:
     # Inverse safety check. A worktree provisioned for prebuilt mode has
     # godot-cpp/gen junctioned to the shared store and its libraries hardlinked
