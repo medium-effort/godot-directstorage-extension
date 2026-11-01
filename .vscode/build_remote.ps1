@@ -790,6 +790,36 @@ if ($ResetKeyHeader -and ($EncryptionKeyFile -or $EncryptionKey)) {
     Show-BuildFailure -Step "Validation" -Message "-ResetKeyHeader cannot be combined with key input arguments." -Code 1
 }
 
+# Provenance gate: the vendored crypto must match its pinned upstream release.
+# Runs in every mode, including -AuditOnly, because a drift is a property of the checkout rather
+# than of the deployed files. There is deliberately no override switch: an intentional local
+# patch has to update thirdparty/monocypher/VERSION, which is how the change becomes visible in
+# review. The checker's output is captured and re-emitted through Write-Status so that -Json mode
+# keeps machine-readable stdout (Write-Status routes to stderr there).
+$ProvenanceScript = Join-Path $WorkspaceRoot ".vscode\check_vendored_provenance.ps1"
+if (-not (Test-Path -LiteralPath $ProvenanceScript -PathType Leaf)) {
+    Show-BuildFailure -Step "Provenance" -Message ("Provenance checker missing: " + $ProvenanceScript + " - the vendored dependency pin would go unchecked.") -Code 1
+}
+$ProvenanceOutput = @(& $ProvenanceScript -Root $WorkspaceRoot 2>&1)
+$ProvenanceExit = $LASTEXITCODE
+$ProvenanceOk = ($ProvenanceExit -eq 0) -and (@($ProvenanceOutput | Where-Object { $_.ToString() -like '*match the pinned SHA-256*' }).Count -gt 0)
+foreach ($ProvenanceLine in $ProvenanceOutput) {
+    $ProvenanceText = $ProvenanceLine.ToString()
+    $ProvenanceColor = "DarkGray"
+    if ($ProvenanceText -match '^\[provenance\] ERROR:') {
+        $ProvenanceColor = "Red"
+    }
+    elseif ($ProvenanceText -match '^\[provenance\]') {
+        $ProvenanceColor = "Green"
+    }
+    if ($ProvenanceText.Trim()) {
+        Write-Status ("  " + $ProvenanceText) -ForegroundColor $ProvenanceColor
+    }
+}
+if (-not $ProvenanceOk) {
+    Show-BuildFailure -Step "Provenance" -Message "Vendored dependency provenance check failed (thirdparty/monocypher). Update thirdparty/monocypher/VERSION only after verifying the new bytes against the named upstream tag." -Code 1
+}
+
 # Audit-only mode: report deployment contents without compiling or syncing.
 if ($AuditOnly) {
     # Ensure fresh checkout has Branch B header even if SCons has not run, or reset header if -ResetKeyHeader (R7-03, R8-10)

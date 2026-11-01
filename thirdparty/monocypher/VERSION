@@ -1,0 +1,19 @@
+# Vendored dependency provenance record for thirdparty/monocypher.
+#
+# Format: '#' metadata comments plus sha256sum-compatible "<hex>  <path>" pairs, so the pins
+# can be re-verified without this repository's tooling, from this directory:
+#   sha256sum -c VERSION
+#
+# name: monocypher
+# upstream: https://github.com/LoupVaillant/Monocypher
+# tag: 4.0.2
+# tag-commit: 0d85f98c9d9b0227e42cf795cb527dff372b40a4
+# pinned: 2026-11-02
+# note: LICENSE is upstream LICENCE.md verbatim (renamed). monocypher.c and monocypher.h are
+#       byte-identical to upstream src/ at that tag, including the unexpanded
+#       "// Monocypher version __git__" banner that upstream ships in git. Do not edit them
+#       locally: re-vendor from a newer tag and update this file in the same change, so the
+#       diff shows the version bump.
+02174117935699d418443c75a558a287deb06ef8cf7c1adced61d9047d2f323d  monocypher.c
+fcaf6ed771358bb4f40fba016f6518ae86ec02b1b877d2cc35ad92d3a26fd7b3  monocypher.h
+a5781770269d2516e52ba4863f790c10a16da4089a1e81823aee19ff1e9026b0  LICENSE
