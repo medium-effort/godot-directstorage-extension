@@ -1411,7 +1411,7 @@ Then assert `.godot/extension_list.cfg` contains the `.gdextension`. The probe r
 `EditorExportPlatform` builds the pack wherever the preset's key is needed; with `encrypt_pck=true` and no key configured it writes a header-only pack and reports success. `EditorExportPlugin` exposes no abort, cancel or fail method and `_export_begin` returns void, so a plugin can refuse to inject bytes but cannot make the export fail.
 
 ### The Trap / Symptom
-Measured on 4.7.2 (`.agents/scratch/toc_key_pck_probe/`): missing key in `.godot/export_credentials.cfg`, `encrypt_pck=true` → pack of 112 bytes, exit status 0, no error. A release pipeline that trusts the exit code ships an empty pack.
+Measured on 4.7.2: missing key in `.godot/export_credentials.cfg`, `encrypt_pck=true` → pack of 112 bytes, exit status 0, no error. A release pipeline that trusts the exit code ships an empty pack.
 
 ### The Rule
 Never treat an export command's exit status as evidence that an encrypted pack is usable; assert the artifact's size and expected entries afterwards.
@@ -1789,7 +1789,7 @@ The obvious reading — "the scene I just changed corrupted the project" — is 
 ### The Rule
 Never debug scene or resource content for `editor_file_system.cpp:476 Condition "slices.size() < 7"`; it is a malformed record in `.godot/editor/filesystem_cache10`, so rescan or delete the cache instead.
 
-`ERR_CONTINUE` makes the damage cosmetic: one error per bad record, only on a full scan, and the scan that follows rewrites the file. Confirm by parsing the current cache (`.agents/scratch/analyze_fs_cache.ps1` — 233 records, 0 malformed in our case), or delete `.godot/editor/filesystem_cache10` to force a clean rebuild. Related: Q56 (another stale editor-cache trap), Q47.
+`ERR_CONTINUE` makes the damage cosmetic: one error per bad record, only on a full scan, and the scan that follows rewrites the file. Confirm by parsing the current cache (233 records, 0 malformed in our case), or delete `.godot/editor/filesystem_cache10` to force a clean rebuild. Related: Q56 (another stale editor-cache trap), Q47.
 
 ## 75. Slow Quit Is Scene Teardown Under Memory Pressure, Not Eviction
 
@@ -1848,5 +1848,5 @@ Gate on your own sentinel (`DSPKG_BOOT`, the scan output, or an `[ DONE ]` line)
 
 Upstream fix options, cheapest first: return early when `doc == nullptr` in `_gen_extensions_docs()` / `generate_doc()`; cancel the queued documentation callables in `EditorHelp::cleanup_doc()`; or do not defer doc work while the editor is quitting.
 
-Repro matrix and capture tooling: `.agents/scratch/import_crash_0169/` (`bisect_import_crash.ps1`, `matrix_addon_vs_autoload.ps1`, `probe_any_extension.ps1`, `dbg2_0169.py`, `resolve_rva.py`). Filed upstream-style report: `.agents/godot-bug-reports/gdextension-cold-import-teardown-access-violation.md`. Related: Q59 (CLI harness traps), Q56 (`--script` only loads extensions from `.godot/extension_list.cfg`).
+To reproduce, build a fresh project with no `.godot/`, add any `addons/<name>/<name>.gdextension` plus the library it names (nothing needs to be enabled, autoloaded or referenced by a scene), then run `godot --headless --path <project> --import --quit`: the first run exits `0xC0000005`, a second identical run exits `0`, and renaming the `.gdextension` away makes the first run exit `0`. The symbolized stack above comes from a custom `debug_symbols=yes dev_build=yes lto=none` build of the same commit with the debugger attached after the import starts - attaching from process start perturbs the teardown timing and can hide the fault. Related: Q59 (CLI harness traps), Q56 (`--script` only loads extensions from `.godot/extension_list.cfg`).
 
