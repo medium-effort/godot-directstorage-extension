@@ -222,6 +222,21 @@ powershell -ExecutionPolicy Bypass -File .vscode/build_remote.ps1 -Local -Target
 powershell -ExecutionPolicy Bypass -File .vscode/run_gdextest_local.ps1
 ```
 
+A brand-new worktree has no `project/.godot`, and the build's GDScript verification needs
+`project/.godot/extension_list.cfg` to resolve GDExtension classes. The verification step now imports
+the project once by itself, so the build repairs an unimported checkout instead of aborting. Run the
+same helper directly when you build with `-SkipVerify`, or before anything else that needs the classes:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/ensure_project_imported.ps1
+```
+
+About 6 seconds, and it writes the cfg. Without it a `-SkipVerify` build still succeeds while a later
+verified step fails with `Parse Error: Identifier "DSPkg" not declared` in `ds_dspkg_static.gd` — the
+branch is fine, the checkout has simply never been imported. `--path project --quit` (without
+`--editor`) does not import, and `-SkipVerify` skips the check altogether, so a green `-SkipVerify`
+build says nothing about GDScript validity.
+
 Measured expectations: about 40 s for the plain build, about 1.2 min with tests, and the headless suite
 reporting **168 passed / 0 failed / 30 skipped**. The skips are the D3D12/GPU gates, not failures.
 
@@ -241,6 +256,7 @@ wt switch --create <branch> --base=@ --yes
 cd .worktrees/<branch>
 
 # 2. edit, build, test inside the worktree
+#    first time only, and unnecessary with a verified build: tools/ensure_project_imported.ps1
 powershell -ExecutionPolicy Bypass -File .vscode/build_remote.ps1 -Local -Target template_debug
 powershell -ExecutionPolicy Bypass -File .vscode/run_gdextest_local.ps1        # after -IncludeTests
 
@@ -333,6 +349,9 @@ prune it when you change target sets. Removing a worktree deletes its links, nev
 | First worktree creation is slow and prints "Cloning into …" | submodule repositories are cloned per worktree | expected once per worktree; needs network |
 | `wt switch`, `git` or the hooks print red `NativeCommandError` text in PowerShell | PowerShell reports a native command's stderr that way; the commands still succeed | check `$LASTEXITCODE` (0) rather than the colour |
 | `wt remove` prints "Branch unmerged; to delete, run wt remove -D …" | branch deletion is judged against the default branch (`main`), and the work sits on `dspkg-encryption` | the worktree is already removed; finish with `wt remove -D <branch>` or `git branch -D <branch>` once the commits are on your branch |
+| `[BUILD FAILED] GDScript Verification`, `Identifier "DSPkg" not declared` | the checkout has no `.godot/extension_list.cfg`, so `--check-only` resolves no GDExtension classes | a verified build now imports the project itself; if it still fails, run `tools/ensure_project_imported.ps1`, confirm the cfg appears, then rebuild |
+| `godot --headless --path project --quit` never returns | `--quit` only ends the main loop after one iteration; it does not import | use `--headless --editor --quit-after 4 --path project` for the one-shot warm-up |
+| Deployment audit reports `dsgd_64.dll` missing | only `template_debug` was built, and the extension manifest declares both the debug and release libraries | expected for a single-target build; build `template_release` as well if the audit must be clean |
 
 ---
 
