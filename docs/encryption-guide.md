@@ -43,7 +43,10 @@ Read this before writing anything on a store page.
   archive is plaintext and no key is involved. That mode is for streaming, not for protection.
 
 What the key changes: the archive's entry table is unreadable outside the build it was exported for,
-and an archive that does not belong to that build is refused at boot.
+and an archive that does not belong to that build is refused at boot. A protected build enforces this
+rather than trusting the archive: an archive that is not encrypted is refused at open with
+`archive_unauthorized`, and the exporter's round-trip check applies the same rule to the archive it
+just wrote.
 
 ---
 

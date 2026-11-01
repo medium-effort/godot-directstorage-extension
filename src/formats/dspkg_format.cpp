@@ -4,6 +4,7 @@
 #include "monocypher.h"
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <algorithm>
 #include <cstring>
@@ -1265,6 +1266,28 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 	}
 
 	const bool is_encrypted = (loaded_header.version == DSPKG_VERSION_V4) && ((loaded_header.flags & DSPKG_FLAG_ENCRYPTED_TOC) != 0);
+
+	// The encryption requirement comes from the build, never from the file. A
+	// protected export publishes directstorage/export/protected into its own
+	// settings, and the header flag that would otherwise decide whether the TOC
+	// is authenticated is attacker-controlled: reading it alone lets a plaintext
+	// archive with a copied archive id open in a build that advertises an
+	// authenticated TOC. Source and editor builds never publish the setting, so
+	// they keep accepting plaintext archives.
+	bool require_encrypted_toc = false;
+	const ProjectSettings *ps = ProjectSettings::get_singleton();
+	if (ps != nullptr && ps->has_setting("directstorage/export/protected")) {
+		require_encrypted_toc = static_cast<bool>(ps->get_setting("directstorage/export/protected"));
+	}
+	if (require_encrypted_toc && !is_encrypted) {
+		// A v4 header that simply cleared the flag is a downgrade; anything older
+		// cannot carry the flag at all, so it is a mismatch rather than a
+		// downgrade. The two map to different sentinel reasons in ds_runtime.gd.
+		if (loaded_header.version == DSPKG_VERSION_V4) {
+			return fail(ERR_UNAUTHORIZED, "Protected build requires an authenticated TOC; archive is not encrypted.");
+		}
+		return fail(ERR_FILE_UNRECOGNIZED, "Protected build requires a v4 encrypted TOC; archive version is not acceptable.");
+	}
 
 	if (!is_encrypted && loaded_header.key_id != 0) {
 		return fail(ERR_FILE_CORRUPT, "Unencrypted archive header has non-zero key_id.");
