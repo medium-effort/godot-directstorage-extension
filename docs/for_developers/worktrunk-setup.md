@@ -259,6 +259,11 @@ equivalent. If the target moved since you branched, rebase first (`wt step rebas
 again — still linear, still no merge commit. Do **not** use `wt merge` when the commit must land as-is:
 it squashes and generates the message.
 
+After `wt remove`, expect a line like "Branch unmerged; to delete, run wt remove -D <branch>". That is
+not the removal failing: the worktree is already gone. Worktrunk only deletes a branch automatically
+when its content is in the **default branch** (`main`), and work branched from `dspkg-encryption` is not.
+Finish with `wt remove -D <branch>` or `git branch -D <branch>` once the commits are on your target.
+
 Agents should follow `.agents/skills/do-it-in-a-worktree/SKILL.md`, which carries the same steps plus
 the guardrails and failure signatures.
 
@@ -306,6 +311,7 @@ prune it when you change target sets. Removing a worktree deletes its links, nev
 | Cold `--import` aborts on first run | pre-existing engine issue (#0169) | rerun; the warm pass exits 0 |
 | First worktree creation is slow and prints "Cloning into …" | submodule repositories are cloned per worktree | expected once per worktree; needs network |
 | `wt switch`, `git` or the hooks print red `NativeCommandError` text in PowerShell | PowerShell reports a native command's stderr that way; the commands still succeed | check `$LASTEXITCODE` (0) rather than the colour |
+| `wt remove` prints "Branch unmerged; to delete, run wt remove -D …" | branch deletion is judged against the default branch (`main`), and the work sits on `dspkg-encryption` | the worktree is already removed; finish with `wt remove -D <branch>` or `git branch -D <branch>` once the commits are on your branch |
 
 ---
 
