@@ -265,6 +265,15 @@ public:
 	// toolchain (no ThreadSanitizer: MSVC plus prebuilt DirectStorage and
 	// godot-cpp binaries) can observe. Never bound in _bind_methods().
 	bool _debug_config_fields_are_atomic_for_testing() const;
+	// Test-only seam: pins the Win32 backend's per-queue completion counters so a
+	// fence wait can be stalled on demand (a genuinely never-retiring DMA would
+	// need a wedged device). Forwards to
+	// Win32Backend::_debug_set_queue_fence_counters_for_testing() under the
+	// lifecycle reader lock; a no-op when the backend is not Win32 or the context
+	// is down. Every queue must be reset to (0, 0) before shutdown_ds(): a pinned
+	// counter above what the real fence will reach makes drain_all_queues() spend
+	// its whole budget. Never bound in _bind_methods().
+	void _debug_set_backend_fence_counters_for_testing(int p_queue_index, uint64_t p_completion_value, uint64_t p_completed_value);
 #endif
 };
 

@@ -35,6 +35,7 @@
 #include <godot_cpp/classes/rd_texture_view.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
@@ -44,6 +45,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 #endif
@@ -2119,6 +2121,218 @@ GDEX_TEST_T(win32_remediation, second_instance_shutdown_preserves_first_instance
 #else
     (void)ctx;
     GDEX_SKIP("Instance-isolation seams are compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, fence_wait_does_not_hold_lifecycle_lock, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // DSContext::wait_for_completion() takes backend_lifecycle_mutex (shared) and
+    // then blocks in the backend fence wait for the caller's whole budget.
+    // shutdown_ds() needs that lock exclusively while holding init_mutex, so one
+    // stalled transfer parks a quit for the caller's timeout - and on this lock's
+    // writer-queueing rules it can park the eviction drain's reader behind the
+    // pending writer as well. This case stalls the fence through the counter seam
+    // and measures both halves.
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    if (ds == nullptr) {
+        GDEX_SKIP("DSContext singleton absent: real extension not loaded in this fixture.");
+    }
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    const bool was_initialized = ds->is_initialized();
+    if (!was_initialized && !ds->initialize_ds()) {
+        GDEX_SKIP("DSContext could not initialize on this machine.");
+    }
+    if (!ds->is_d3d12_backend()) {
+        GDEX_SKIP("D3D12 DirectStorage backend unavailable (headless or non-D3D12 driver).");
+    }
+
+    // A valid RID is all the reader probe needs: is_resource_in_flight() takes the
+    // lifecycle reader lock before consulting the backend, so the probe measures
+    // lock acquisition, not this RID's fate.
+    const godot::RID probe_rid = create_destination_texture(rd, 1);
+    GDEX_EXPECT_TRUE(probe_rid.is_valid());
+
+    // Above any counter a real transfer in this process can reach, so the backend's
+    // own fence never retires it; 4 s is a caller budget the tests never use.
+    constexpr uint64_t kStallFence = 1000000;
+    constexpr int64_t kStallBudgetMsec = 4000;
+
+    ctx.add_teardown([ds, was_initialized, rd, probe_rid]() {
+        // Unpin first: a pinned counter above what the real fence will reach makes
+        // drain_all_queues() spend its whole budget in any later shutdown. A no-op
+        // once the context is down.
+        for (int q = 0; q < 3; ++q) {
+            ds->_debug_set_backend_fence_counters_for_testing(q, 0, 0);
+        }
+        if (was_initialized) {
+            if (!ds->is_initialized()) {
+                ds->initialize_ds();
+            }
+        } else if (ds->is_initialized()) {
+            ds->shutdown_ds();
+        }
+        if (probe_rid.is_valid() && rd->texture_is_valid(probe_rid)) {
+            rd->free_rid(probe_rid);
+        }
+    });
+
+    bool pinned = false;
+    for (int attempt = 0; attempt < 3 && !pinned; ++attempt) {
+        for (int q = 0; q < 3; ++q) {
+            ds->_debug_set_backend_fence_counters_for_testing(q, kStallFence, 0);
+        }
+        pinned = ds->get_completion_fence() == kStallFence;
+        if (!pinned) {
+            godot::OS::get_singleton()->delay_msec(20);
+        }
+    }
+    GDEX_EXPECT_TRUE(pinned);
+    if (!pinned) {
+        return;
+    }
+
+    std::atomic<bool> wait_done{false};
+    bool wait_result = true;
+    int64_t wait_elapsed_msec = 0;
+    std::thread waiter([&]() {
+        const int64_t t0 = godot::Time::get_singleton()->get_ticks_msec();
+        wait_result = ds->wait_for_completion(static_cast<int>(kStallBudgetMsec));
+        wait_elapsed_msec = godot::Time::get_singleton()->get_ticks_msec() - t0;
+        wait_done.store(true, std::memory_order_release);
+    });
+
+    // The stall precondition: if the waiter already returned, the fixture did not
+    // stall and the measurements below cannot discriminate (FAIL, not SKIP).
+    for (int waited = 0; waited < 200 && !wait_done.load(std::memory_order_acquire); waited += 5) {
+        godot::OS::get_singleton()->delay_msec(5);
+    }
+    const bool stalled = !wait_done.load(std::memory_order_acquire);
+
+    // Unpin before shutdown so drain_all_queues() has nothing pinned to drain. The
+    // waiter is already inside its wait, so this does not release it.
+    for (int q = 0; q < 3; ++q) {
+        ds->_debug_set_backend_fence_counters_for_testing(q, 0, 0);
+    }
+
+    int64_t shutdown_elapsed_msec = 0;
+    std::atomic<bool> shutdown_done{false};
+    std::thread shutdown_thread([&]() {
+        const int64_t t0 = godot::Time::get_singleton()->get_ticks_msec();
+        ds->shutdown_ds();
+        shutdown_elapsed_msec = godot::Time::get_singleton()->get_ticks_msec() - t0;
+        shutdown_done.store(true, std::memory_order_release);
+    });
+    // Let shutdown set shut_down and queue on the exclusive lock before probing.
+    godot::OS::get_singleton()->delay_msec(50);
+
+    const int64_t reader_t0 = godot::Time::get_singleton()->get_ticks_msec();
+    (void)ds->is_resource_in_flight(probe_rid);
+    const int64_t reader_elapsed_msec = godot::Time::get_singleton()->get_ticks_msec() - reader_t0;
+
+    shutdown_thread.join();
+    waiter.join();
+
+    GDEX_EXPECT_TRUE(stalled);
+    // The discriminator: one stalled transfer must not delay shutdown beyond one
+    // wait slice. Without the slice this lands near the waiter's 4 s budget.
+    GDEX_FAIL_UNLESS(shutdown_elapsed_msec < 1500,
+            std::string("shutdown blocked for ") + std::to_string(shutdown_elapsed_msec) +
+            " ms behind a stalled fence wait (reader probe " + std::to_string(reader_elapsed_msec) +
+            " ms, waiter " + std::to_string(wait_elapsed_msec) + " ms)");
+    // The reader half: a queued writer must not park the eviction drain's reader.
+    GDEX_FAIL_UNLESS(reader_elapsed_msec < 1500,
+            std::string("is_resource_in_flight() blocked for ") + std::to_string(reader_elapsed_msec) +
+            " ms behind a queued shutdown writer");
+    GDEX_EXPECT_FALSE(wait_result);
+    GDEX_EXPECT_TRUE(wait_elapsed_msec >= 200);
+    GDEX_EXPECT_TRUE(ds->was_last_shutdown_clean());
+#else
+    (void)ctx;
+    GDEX_SKIP("The fence-counter seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, fence_wait_spends_the_whole_budget, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // Control half: bounding the lock hold must not shorten the caller's budget.
+    // A "fix" that returns after the first slice would pass the case above and
+    // fail here.
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    if (ds == nullptr) {
+        GDEX_SKIP("DSContext singleton absent: real extension not loaded in this fixture.");
+    }
+    const bool was_initialized = ds->is_initialized();
+    if (!was_initialized && !ds->initialize_ds()) {
+        GDEX_SKIP("DSContext could not initialize on this machine.");
+    }
+    if (!ds->is_d3d12_backend()) {
+        GDEX_SKIP("D3D12 DirectStorage backend unavailable (headless or non-D3D12 driver).");
+    }
+
+    constexpr uint64_t kStallFence = 1000000;
+    constexpr int64_t kBudgetMsec = 800;
+
+    ctx.add_teardown([ds, was_initialized]() {
+        for (int q = 0; q < 3; ++q) {
+            ds->_debug_set_backend_fence_counters_for_testing(q, 0, 0);
+        }
+        if (was_initialized) {
+            if (!ds->is_initialized()) {
+                ds->initialize_ds();
+            }
+        } else if (ds->is_initialized()) {
+            ds->shutdown_ds();
+        }
+    });
+
+    bool pinned = false;
+    for (int attempt = 0; attempt < 3 && !pinned; ++attempt) {
+        for (int q = 0; q < 3; ++q) {
+            ds->_debug_set_backend_fence_counters_for_testing(q, kStallFence, 0);
+        }
+        pinned = ds->get_completion_fence() == kStallFence;
+        if (!pinned) {
+            godot::OS::get_singleton()->delay_msec(20);
+        }
+    }
+    GDEX_EXPECT_TRUE(pinned);
+    if (!pinned) {
+        return;
+    }
+
+    const int64_t t0 = godot::Time::get_singleton()->get_ticks_msec();
+    const bool completed = ds->wait_for_completion(static_cast<int>(kBudgetMsec));
+    const int64_t elapsed_msec = godot::Time::get_singleton()->get_ticks_msec() - t0;
+
+    for (int q = 0; q < 3; ++q) {
+        ds->_debug_set_backend_fence_counters_for_testing(q, 0, 0);
+    }
+
+    GDEX_EXPECT_FALSE(completed);
+    GDEX_FAIL_UNLESS(elapsed_msec >= kBudgetMsec - 100,
+            std::string("a stalled fence wait returned after ") + std::to_string(elapsed_msec) +
+            " ms for an " + std::to_string(kBudgetMsec) + " ms budget");
+    GDEX_EXPECT_TRUE(elapsed_msec < 2000);
+    // The reset must reach the backend: whatever the fixture's residual fence is,
+    // it is no longer the pinned one.
+    GDEX_EXPECT_TRUE(ds->get_completion_fence() != kStallFence);
+#else
+    (void)ctx;
+    GDEX_SKIP("The fence-counter seam is compiled out of release builds.");
 #endif
 #else
     (void)ctx;

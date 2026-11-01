@@ -14,6 +14,7 @@
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
+#include <algorithm>
 #include <string>
 #include <type_traits>
 
@@ -24,6 +25,12 @@ namespace godot {
 #include <dxgi.h>
 Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device();
 #endif
+
+// Upper bound on how long one backend fence wait may hold the backend lifecycle
+// reader lock. Shutdown takes that lock exclusively, so this is the worst-case
+// delay a quit can suffer because of a single stalled transfer - and the same
+// bound applies to any reader queued behind the pending writer.
+static constexpr uint32_t COMPLETION_WAIT_SLICE_MS = 250;
 
 static bool validate_d3d12_rendering_device_active(const String &p_phase) {
 #ifdef _WIN32
@@ -717,19 +724,64 @@ bool DSContext::wait_for_completion(int p_timeout_msec) {
 	}
 
 #ifdef _WIN32
+	// backend_lifecycle_mutex is a reader/writer lock and shutdown_ds_locked()
+	// needs it exclusively before it can retire the backend. Holding it for the
+	// caller's whole budget turns a stalled fence into a shutdown stall of the
+	// same length, and parks every other reader (is_resource_in_flight() on the
+	// eviction drain) behind the pending writer. The wait is therefore sliced:
+	// each slice re-acquires the reader lock, re-tests the lifecycle flags and
+	// spends at most COMPLETION_WAIT_SLICE_MS inside the backend. The caller's
+	// total budget is unchanged; only the lock hold is bounded.
+	const uint64_t wait_start_msec = Time::get_singleton() ? static_cast<uint64_t>(Time::get_singleton()->get_ticks_msec()) : 0;
+	const uint64_t wait_deadline_msec = wait_start_msec + static_cast<uint64_t>(p_timeout_msec);
+
 	{
+		// Entry check keeps the diagnostic the unwrapped call reported: a caller
+		// that waits before initialize_ds() (or after shutdown_ds()) is a bug, not
+		// a teardown race, and must still hear about it.
 		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 		if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 			UtilityFunctions::push_error("[DirectStorage] Completion fence wait failed: context not initialized or already shut down.");
 			return false;
 		}
-		if (active_backend->get_name() == "Win32DirectStorage" &&
-				!active_backend->wait_for_completion(fence_value, static_cast<uint32_t>(p_timeout_msec))) {
-			UtilityFunctions::push_error("[DirectStorage] Completion fence wait timed out or failed.");
-			return false;
+		if (active_backend->get_name() != "Win32DirectStorage") {
+			// Fallback backends complete synchronously: nothing to wait on.
+			return true;
 		}
-		if (active_backend->get_name() == "Win32DirectStorage" &&
-				!validate_d3d12_rendering_device_active("DirectStorage completion")) {
+	}
+
+	for (;;) {
+		const uint64_t now_msec = Time::get_singleton() ? static_cast<uint64_t>(Time::get_singleton()->get_ticks_msec()) : 0;
+		const uint64_t remaining_msec = now_msec >= wait_deadline_msec ? 0 : wait_deadline_msec - now_msec;
+		const uint32_t slice_msec = static_cast<uint32_t>(std::min<uint64_t>(remaining_msec, COMPLETION_WAIT_SLICE_MS));
+		{
+			std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+			if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
+				// Shutdown won the lock between slices: there is no fence left to
+				// wait on and no budget left worth honouring. Not an error - this
+				// is how a stalled wait is meant to end.
+				return false;
+			}
+			if (active_backend->get_name() != "Win32DirectStorage") {
+				// Fallback backends complete synchronously: nothing to wait on.
+				return true;
+			}
+			if (active_backend->wait_for_completion(fence_value, slice_msec)) {
+				return validate_d3d12_rendering_device_active("DirectStorage completion");
+			}
+			if (slice_msec == COMPLETION_WAIT_SLICE_MS) {
+				// A full slice that returned early is a backend failure (device
+				// removed, SetEventOnCompletion refused), not a timeout: retrying
+				// would spin hot for the rest of the budget.
+				const uint64_t after_msec = Time::get_singleton() ? static_cast<uint64_t>(Time::get_singleton()->get_ticks_msec()) : 0;
+				if (after_msec >= now_msec && (after_msec - now_msec) < COMPLETION_WAIT_SLICE_MS / 2) {
+					UtilityFunctions::push_error("[DirectStorage] Completion fence wait failed.");
+					return false;
+				}
+			}
+		}
+		if (remaining_msec == 0) {
+			UtilityFunctions::push_error("[DirectStorage] Completion fence wait timed out.");
 			return false;
 		}
 	}
@@ -1764,6 +1816,25 @@ bool DSContext::_debug_config_fields_are_atomic_for_testing() const {
 			ds_is_atomic_type<decltype(disable_gpu_decompression)>::value &&
 			ds_is_atomic_type<decltype(auto_tune_for_integrated_gpu)>::value &&
 			ds_is_atomic_type<decltype(queue_capacity)>::value;
+}
+
+void DSContext::_debug_set_backend_fence_counters_for_testing(int p_queue_index, uint64_t p_completion_value, uint64_t p_completed_value) {
+#ifdef _WIN32
+	// Test-only seam, see the header. Takes the reader lock so it cannot pin
+	// counters while shutdown_ds_locked() is retiring the backend.
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
+		return;
+	}
+	if (active_backend->get_name() != "Win32DirectStorage") {
+		return;
+	}
+	static_cast<Win32Backend *>(active_backend)->_debug_set_queue_fence_counters_for_testing(p_queue_index, p_completion_value, p_completed_value);
+#else
+	(void)p_queue_index;
+	(void)p_completion_value;
+	(void)p_completed_value;
+#endif
 }
 #endif
 
