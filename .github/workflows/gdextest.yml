@@ -107,6 +107,9 @@ jobs:
           echo "GODOT=${GITHUB_WORKSPACE}/${BIN}" >> "$GITHUB_ENV"
 
       - name: Restore SCons cache
+        # id: the "Summarize SCons cache" step reports which key was actually
+        # used and whether it was built from the current inputs.
+        id: scons-cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.scons-cache
@@ -132,7 +135,14 @@ jobs:
         run: |
           set -o pipefail
           NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-          scons -j "$NPROC" target=editor tests=true 2>&1 | tee scons-build.log
+          # Record the wall time for the cache summary. The `|| STATUS=$?` keeps
+          # the timing line reachable under `bash -e` when SCons fails, and the
+          # explicit exit preserves the build's status for the job.
+          STARTED_AT=$SECONDS
+          BUILD_STATUS=0
+          scons -j "$NPROC" target=editor tests=true 2>&1 | tee scons-build.log || BUILD_STATUS=$?
+          echo "BUILD_SECONDS=$((SECONDS - STARTED_AT))" >> "$GITHUB_ENV"
+          exit "$BUILD_STATUS"
         env:
           GODOT: ${{ env.GODOT }}
           SCONS_CACHE: ${{ github.workspace }}/.scons-cache
@@ -147,8 +157,27 @@ jobs:
         if: '!cancelled()'
         with:
           path: ${{ github.workspace }}/.scons-cache
-          key: scons-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}-run-${{ github.run_id }}-${{ github.run_attempt }}
-          
+          # -sha- at the end names the commit that produced this cache entry, so a
+          # later run's restore log and cache summary can say where a reused (or
+          # stale) entry came from without querying the API.
+          key: scons-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}-run-${{ github.run_id }}-${{ github.run_attempt }}-sha-${{ github.sha }}
+
+      - name: Summarize SCons cache
+        # Runs on success too: a cold cache is invisible in a green job, and it is
+        # the difference between a 3-minute run and a 27-minute one. Reproduces
+        # from the already-uploaded scons-build.log, so it reports the truth even
+        # when actions/cache itself succeeded.
+        if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.scons-cache.outputs.cache-hit }}
+          CACHE_PRIMARY_KEY: ${{ steps.scons-cache.outputs.cache-primary-key }}
+          CACHE_MATCHED_KEY: ${{ steps.scons-cache.outputs.cache-matched-key }}
+        run: |
+          python .github/scripts/summarize_scons_cache.py \
+            --log scons-build.log \
+            ${{ steps.build.outcome == 'failure' && '--build-failed' || '' }}
+
       - name: Validate addon GDScripts
         id: gdscript
         shell: bash

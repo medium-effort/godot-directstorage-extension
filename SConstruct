@@ -1,8 +1,11 @@
 #!/usr/bin/env python
+import hashlib
+import json
 import os
 import re
 import shutil
 import sys
+import time
 
 import SCons.Script
 
@@ -566,6 +569,145 @@ if env["platform"] == "windows":
 # missing objects or libraries (libstdc++/libc are linked normally).
 if env["platform"] == "linux":
     env.Append(LINKFLAGS=["-Wl,--no-undefined"])
+
+
+# --- Build signature (SCons cache diagnostics) --------------------------------
+# SCons discards a cached object whenever the command that would rebuild it no
+# longer matches what was recorded. A changed compiler, flag or define therefore
+# invalidates EVERY object at once, and a warm ~3 minute CI job becomes a ~25
+# minute cold one (godot-cpp's ~1,100 generated translation units dominate).
+# SCons reports that per object, never globally, and --debug=explain needs one
+# line per rebuilt target to say it. Recording the inputs that decide the compile
+# command next to the shared object cache lets the next run diff them and print
+# one delta line per changed field, which is what the CI cache summary reports.
+#
+# The cache is restored before SCons starts, so the previous signature is already
+# on disk. Only real build invocations write it: a `compiledb` or -n run must not
+# claim to have produced objects it never built.
+def _build_signature_value(name):
+    try:
+        return str(env.subst("$" + name)).strip()
+    except Exception:
+        return ""
+
+
+def _build_signature_list(name):
+    value = env.get(name, [])
+    if isinstance(value, str):
+        value = [value]
+    try:
+        return sorted({str(item) for item in value})
+    except Exception:
+        return []
+
+
+def _build_signature_paths(name):
+    # Absolute paths differ per worktree and machine while the compile command is
+    # identical, so normalise to the project root and keep the interesting tail.
+    root = os.path.abspath(".")
+    entries = []
+    value = env.get(name, [])
+    if isinstance(value, str):
+        value = [value]
+    try:
+        for entry in value:
+            path = str(entry)
+            absolute = os.path.abspath(path)
+            if absolute == root or absolute.startswith(root + os.sep):
+                path = os.path.relpath(absolute, root)
+            entries.append(path.replace(os.sep, "/"))
+    except Exception:
+        return []
+    return sorted(set(entries))
+
+
+def _build_signature_fields():
+    return {
+        "platform": _build_signature_value("platform"),
+        "target": _build_signature_value("target"),
+        "arch": _build_signature_value("arch"),
+        "dev_build": _build_signature_value("dev_build"),
+        "tools": _build_signature_list("TOOLS"),
+        "cc": _build_signature_value("CC"),
+        "cxx": _build_signature_value("CXX"),
+        "ccflags": _build_signature_list("CCFLAGS"),
+        "cflags": _build_signature_list("CFLAGS"),
+        "cxxflags": _build_signature_list("CXXFLAGS"),
+        "defines": sorted(set(_build_signature_list("CPPDEFINES") + _build_signature_list("DEFINES"))),
+        "linkflags": _build_signature_list("LINKFLAGS"),
+        "cpppath": _build_signature_paths("CPPPATH"),
+    }
+
+
+def _report_build_signature():
+    cache_dir = os.environ.get("SCONS_CACHE", "").strip()
+    fields = _build_signature_fields()
+    signature = hashlib.sha1(json.dumps(fields, sort_keys=True).encode("utf-8")).hexdigest()
+    signature_path = os.path.join(cache_dir, "build-signature.json") if cache_dir else ""
+
+    previous = None
+    if signature_path and os.path.isfile(signature_path):
+        try:
+            # utf-8-sig: tolerate an editor/tool that rewrote the file with a BOM.
+            with open(signature_path, "r", encoding="utf-8-sig") as signature_file:
+                previous = json.load(signature_file)
+        except Exception:
+            previous = None
+
+    if not isinstance(previous, dict) or not isinstance(previous.get("fields"), dict):
+        print(f"[SCons] build-signature: {signature[:12]} (no previous signature in the cache)")
+    else:
+        previous_fields = previous["fields"]
+        changed = [
+            key
+            for key in sorted(set(fields) | set(previous_fields))
+            if fields.get(key) != previous_fields.get(key)
+        ]
+        deltas = []
+        for key in changed:
+            before = previous_fields.get(key)
+            after = fields.get(key)
+            if isinstance(before, list) and isinstance(after, list):
+                added = [value for value in after if value not in before]
+                removed = [value for value in before if value not in after]
+                change = " ".join([f"+{value}" for value in added] + [f"-{value}" for value in removed])
+                deltas.append(f"{key} {change}".strip() if change else f"{key} reordered")
+            else:
+                deltas.append(f"{key} {before!r} -> {after!r}")
+        stamp = previous.get("written_at", "unknown time")
+        if deltas:
+            print(f"[SCons] previous build-signature: {str(previous.get('signature', '?'))[:12]} ({stamp})")
+            print(f"[SCons] build-signature: {signature[:12]} (changed: {len(deltas)} field(s))")
+            if set(changed) <= {"linkflags"}:
+                # Object signatures do not include LINKFLAGS, so a link-only change
+                # relinks without recompiling; do not claim a cold build.
+                print("[SCons] Only link inputs changed: cached objects stay valid, only the link is redone.")
+            else:
+                print("[SCons] Objects cached under the old signature cannot be reused; expect recompilation.")
+            for delta in deltas:
+                print(f"[SCons] signature-delta: {delta}")
+        else:
+            print(f"[SCons] build-signature: {signature[:12]} (unchanged since {stamp})")
+
+    if not signature_path or _non_build:
+        return
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        payload = {
+            "signature": signature,
+            "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "fields": fields,
+        }
+        with open(signature_path, "w", encoding="utf-8") as signature_file:
+            json.dump(payload, signature_file, indent=1, sort_keys=True)
+    except Exception as error:
+        # A read-only or unwritable cache never fails the build: the signature is
+        # diagnostics, and the build itself does not depend on it.
+        print(f"[SCons] WARNING: could not record the build signature ({error}).")
+
+
+_report_build_signature()
+
 
 # Source files (GDExtension C++ code + GDeflate & libdeflate sources).
 # Keep the Windows backend out of non-Windows builds; its implementation uses
