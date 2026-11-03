@@ -162,22 +162,6 @@ jobs:
           # stale) entry came from without querying the API.
           key: scons-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}-run-${{ github.run_id }}-${{ github.run_attempt }}-sha-${{ github.sha }}
 
-      - name: Summarize SCons cache
-        # Runs on success too: a cold cache is invisible in a green job, and it is
-        # the difference between a 3-minute run and a 27-minute one. Reproduces
-        # from the already-uploaded scons-build.log, so it reports the truth even
-        # when actions/cache itself succeeded.
-        if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
-        shell: bash
-        env:
-          CACHE_HIT: ${{ steps.scons-cache.outputs.cache-hit }}
-          CACHE_PRIMARY_KEY: ${{ steps.scons-cache.outputs.cache-primary-key }}
-          CACHE_MATCHED_KEY: ${{ steps.scons-cache.outputs.cache-matched-key }}
-        run: |
-          python .github/scripts/summarize_scons_cache.py \
-            --log scons-build.log \
-            ${{ steps.build.outcome == 'failure' && '--build-failed' || '' }}
-
       - name: Validate addon GDScripts
         id: gdscript
         shell: bash
@@ -360,3 +344,20 @@ jobs:
           path: test-results.xml
           reporter: java-junit
           fail-on-error: false
+
+      - name: Summarize SCons cache
+        # Last on purpose: step summaries are concatenated in step order, so the
+        # verdict and the failure detail must be written first. This step is a
+        # cost note about the build, and it stays silent unless the cache cost the
+        # job real time (a cold rebuild) or the build failed.
+        if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.scons-cache.outputs.cache-hit }}
+          CACHE_PRIMARY_KEY: ${{ steps.scons-cache.outputs.cache-primary-key }}
+          CACHE_MATCHED_KEY: ${{ steps.scons-cache.outputs.cache-matched-key }}
+          CACHE_REF: ${{ github.ref_name }}
+        run: |
+          python .github/scripts/summarize_scons_cache.py \
+            --log scons-build.log \
+            ${{ steps.build.outcome == 'failure' && '--build-failed' || '' }}
