@@ -18,6 +18,7 @@ param(
     [switch]$KeepRemoteKeyHeader,
     [switch]$KeepLocalKeyHeader,
     [switch]$RequireManifest,
+    [switch]$DeployFromWorktree,
     [switch]$AuditOnly,
     [string[]]$AuditPath = @(),
     [switch]$Json
@@ -2257,6 +2258,22 @@ $EnableSyncVal = if ($env:ENABLE_POST_BUILD_ADDON_SYNC) { $env:ENABLE_POST_BUILD
     else { "1" }
 
 $ShouldSync = ($EnableSyncVal.Trim().ToLower() -notin @("0", "false", "no", "off"))
+
+# A linked worktree (`.git` is a file pointing at the primary's git dir) never
+# deploys implicitly. It is a scratch checkout: its HEAD is usually an
+# experiment, sometimes a test that is red on purpose, several worktrees can
+# build at the same time, and its .env is a copy generated once at creation.
+# Any of those publishing to the shared SYNC_* directories is a silent
+# last-writer-wins - and the cost is not a wrong DLL, it is a deliberately
+# broken build landing in someone else's integration project.
+# The .env value therefore stays configuration, not permission: a copied or
+# hand-edited .env must not be able to publish. Only the explicit switch can.
+$IsLinkedWorktree = Test-Path -LiteralPath (Join-Path $WorkspaceRoot ".git") -PathType Leaf
+$SyncEnabledByConfig = $ShouldSync
+# In a linked worktree the explicit switch is the only thing that decides: no
+# switch, no sync, whatever .env says. In the primary, .env keeps deciding.
+if ($IsLinkedWorktree) { $ShouldSync = [bool]$DeployFromWorktree }
+$SyncSkippedInWorktree = $IsLinkedWorktree -and -not $ShouldSync
 $copiedCount = 0
 
 if ($ShouldSync) {
@@ -2280,7 +2297,15 @@ if ($ShouldSync) {
     }
 }
 else {
-    Write-VerboseHost "Post-build addon sync is disabled (ENABLE_POST_BUILD_ADDON_SYNC=0)." -ForegroundColor DarkGray
+    if ($SyncSkippedInWorktree) {
+        $configuredTargets = @(Get-ConfiguredAddonDir)
+        $targetText = if ($configuredTargets.Count -gt 0) { $configuredTargets -join "; " } else { "none configured" }
+        $configNote = if ($SyncEnabledByConfig) { " (ENABLE_POST_BUILD_ADDON_SYNC is on in this worktree's .env, which does not grant permission)" } else { "" }
+        Write-Status ("[6/6] Post-build sync skipped: linked worktree, never deploys implicitly{0}. Targets left untouched: {1}. A build here is not a deployment: pass -DeployFromWorktree, or run .vscode/sync_addon.ps1, to publish deliberately." -f $configNote, $targetText) -ForegroundColor Yellow
+    }
+    else {
+        Write-VerboseHost "Post-build addon sync is disabled (ENABLE_POST_BUILD_ADDON_SYNC=0)." -ForegroundColor DarkGray
+    }
 }
 
 
@@ -2303,7 +2328,16 @@ $DefaultManifestPath = Join-Path $DefaultAddonDir "bin\build_manifest.json"
 if (-not (Test-Path -LiteralPath $DefaultManifestPath -PathType Leaf)) {
     Show-BuildFailure -Step "Audit" -Message ("build_manifest.json is missing from {0}\bin. It is the only record of the commit and key state behind these DLLs, and every compiling build writes it. Re-run the build; for a remote build, check that step [5/6] pulled it from Device B." -f $DefaultAddonDir) -Code 1
 }
-$DeployAuditTargets = @($DefaultAddonDir) + @(Get-ConfiguredAddonDir)
+$DeployAuditTargets = @($DefaultAddonDir)
+# Mirror directories are audited only by a run that can deliver to them. A
+# worktree build that skipped sync must not fail on - or report findings about -
+# artifacts another checkout deployed: a keyed binary left in the mirror is a
+# policy violation, and that verdict belongs to whoever produced it. The primary
+# keeps auditing its configured targets whether or not this run synced, which is
+# the long-standing behaviour there.
+if (-not $IsLinkedWorktree -or $ShouldSync) {
+    $DeployAuditTargets += @(Get-ConfiguredAddonDir)
+}
 $postBuildAudit = Invoke-DeployAudit -AddonDirs $DeployAuditTargets -Json:$Json -RequireManifest:([bool]($EffectiveKey -or $RequireManifest)) -AllowBakedKey:([bool]$EffectiveKey)
 if ($postBuildAudit.HasPolicyViolation) {
     Show-BuildFailure -Step "Audit" -Message "A deployed binary is not keyless. Every editor, template_debug and template_release binary must be stamped dspkg-key-id=none: distributed binaries must be keyless, so use a source build (-EncryptionKeyFile/-EncryptionKey) for a baked key." -Code 1
@@ -2325,7 +2359,9 @@ if (Test-Path -LiteralPath $freshnessScript) {
     }
 }
 
-$syncMsg = if ($ShouldSync -and $copiedCount -gt 0) { " (Synced $copiedCount file(s))" } else { "" }
+$syncMsg = if ($SyncSkippedInWorktree) { " (sync skipped: worktree build)" } `
+    elseif ($ShouldSync -and $copiedCount -gt 0) { " (Synced $copiedCount file(s))" } `
+    else { "" }
 Show-BuildSuccess -Message "All build and sync steps completed successfully!$syncMsg"
 
 

@@ -131,9 +131,18 @@ Copy-Item .env.example .env
 | `REMOTE_BUILD` | **The switch that decides where `build_remote.ps1` builds:** `0` builds on this device, `1` offloads the build to the remote host (`-Remote`/`-Local` override it per run). Worktrees require `0`. |
 | `PREVENT_BUILD_ON_THIS_DEVICE` | A hard lock on local `scons`, not a redirect: `1` makes any local SCons invocation exit with "Local builds are disabled on this device". It does not send builds to the remote host — `REMOTE_BUILD` does. Keep `0` for worktrees. |
 | `GODOT_CONSOLE_PATH` | absolute path to the Godot console executable |
-| `ENABLE_POST_BUILD_ADDON_SYNC` | `1` in the primary if you deploy to an integration project; the worktree hook forces `0` per worktree |
+| `ENABLE_POST_BUILD_ADDON_SYNC` | `1` in the primary if you deploy to an integration project; a worktree never deploys implicitly regardless of this value (see below) |
 | `SYNC_ADDON_DIR`, `SYNC_TEST_DIR` | only if you actually deploy there |
 | `DSPKG_ENCRYPTION_KEY_FILE` | leave empty unless you deliberately bake a fixed key |
+
+A worktree build never deploys. `build_remote.ps1` detects a linked worktree (`.git` is a file) and
+skips the `SYNC_*` step outright, so a red, reverted or deliberately broken test build in a worktree
+cannot overwrite the integration project the primary deploys to. The `.env` that the hook writes also
+sets `ENABLE_POST_BUILD_ADDON_SYNC=0`, but that is only configuration: copying a `.env` in, or editing
+the value, does not grant permission to publish. Deploying from a worktree is explicit - pass
+`-DeployFromWorktree` to the build, or run `.vscode/sync_addon.ps1`. The same rule covers the
+post-build audit: a worktree audits only the addon directory it just produced, because a keyed binary
+that another checkout left in the mirror would otherwise fail this build.
 
 Do not put a key assignment on a comment line: this workspace's IDE exports `.env` into every terminal
 and ignores `#` markers, so `# KEY=value` still becomes a live environment variable.
