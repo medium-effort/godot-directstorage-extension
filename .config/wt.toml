@@ -3,8 +3,11 @@
 # Hooks execute in Git Bash, so the commands are bash-compatible. pre-start hooks
 # block worktree creation, so the new tree is buildable the moment you cd into it:
 #
-#   1. submodule working trees - they live in the shared .git/modules, so this is
-#      a local checkout, not a network clone.
+#   1. submodule working trees, seeded from the primary's .git/modules (see
+#      tools/wt_bootstrap_submodules.ps1). A per-worktree store would otherwise be
+#      a fresh network clone every time, and a private submodule fails with
+#      GitHub's 404 "repository not found" whenever the shell has no credential
+#      for it - which reads like a wrong URL rather than a missing token.
 #   2. a worktree-local .env (see tools/wt_bootstrap_env.ps1) with the shared
 #      addon-sync target disabled and the shared SCons object cache wired up.
 #   3. one prebuilt godot-cpp, shared by hardlink/junction (see
@@ -34,8 +37,11 @@
 # with ACCURACY=DEFAULT and SLOPPY). Their value is CI/remote caching and
 # intra-worktree iteration, not parallel worktrees.
 
+# Note the difference from the two hooks below: this one is resolved from the new
+# worktree, not the primary, so the branch's own bootstrap tooling is what runs -
+# which is also what makes a change to that tooling testable before it lands.
 [[pre-start]]
-submodules = "git submodule update --init --recursive"
+submodules = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ worktree_path }}/tools/wt_bootstrap_submodules.ps1 {{ primary_worktree_path }} {{ worktree_path }}"
 
 [[pre-start]]
 godotcpp = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_share_godot_cpp.ps1 {{ primary_worktree_path }} {{ worktree_path }}"

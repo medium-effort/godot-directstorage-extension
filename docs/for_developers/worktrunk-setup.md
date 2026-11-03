@@ -42,11 +42,13 @@ Install these before touching worktrunk; the hooks assume all of them.
 | Visual Studio Build Tools with MSVC, C++20 | the SConstruct builds with MSVC on Windows | `where cl` inside a Developer prompt, or just build once |
 | Python 3.8+ and SCons | SCons drives the build; the scripts call `python`/`py` | `python --version`, `scons --version` |
 | Godot 4.7.2 **console** executable | headless test runs need the console build | `GODOT_CONSOLE_PATH` in `.env` |
-| Network access on first worktree | the first `git submodule update` clones submodule repositories (including a nested one) | — |
+| Network access when the primary has no module store | the pre-start hook seeds submodules from the primary's `.git/modules`; only paths it cannot provide are cloned, plus the nested `extern/godot-cpp` | — |
 | Optional: sccache | only for the opt-in intra-worktree compiler cache; not needed for any of the above | `sccache --version` |
 
-The submodule clone is a one-time cost per worktree, not per build: later builds reuse the working
-trees checked out there.
+The submodule checkout is a one-time cost per worktree, not per build: later builds reuse the working
+trees checked out there. Each worktree keeps its own `.git/worktrees/<branch>/modules` store (25-47 MB
+measured), and the pre-start hook fills it from the primary by local clone, so the private `libdeflate`
+fork needs neither the network nor a GitHub credential there.
 
 ---
 
@@ -355,7 +357,8 @@ prune it when you change target sets. Removing a worktree deletes its links, nev
 | `0 tests ran` with a valid filter | the test binary was not rebuilt | build with `-IncludeTests` before running the suite |
 | Suite never returns | native deadlock, not a test failure | bisect with `-Only`/`-Count`, keep the `--log-file` output |
 | Cold `--import` aborts on first run | pre-existing engine issue (#0169) | rerun; the warm pass exits 0 |
-| First worktree creation is slow and prints "Cloning into …" | submodule repositories are cloned per worktree | expected once per worktree; needs network |
+| Worktree creation prints "Cloning into …" | the primary has no module store for that submodule, or it is the nested `extern/godot-cpp`, which is always cloned | expected; needs the network, and a public upstream needs no credential |
+| Worktree creation fails with "repository not found" (HTTP 404) on `thirdparty/libdeflate` | the fork is private and the shell's active GitHub credential cannot see it — GitHub answers 404, not 401, so it reads like a wrong URL | check `gh auth status`: the active account's token decides. The hook normally seeds this from the primary's `.git/modules`, so a 404 here means the seeding path was bypassed or the primary has no module store |
 | `wt switch`, `git` or the hooks print red `NativeCommandError` text in PowerShell | PowerShell reports a native command's stderr that way; the commands still succeed | check `$LASTEXITCODE` (0) rather than the colour |
 | `wt remove` prints "Branch unmerged; to delete, run wt remove -D …" | branch deletion is judged against the default branch (`main`), and the work sits on `dspkg-encryption` | the worktree is already removed; finish with `wt remove -D <branch>` or `git branch -D <branch>` once the commits are on your branch |
 | `[BUILD FAILED] GDScript Verification`, `Identifier "DSPkg" not declared` | the checkout has no `.godot/extension_list.cfg`, so `--check-only` resolves no GDExtension classes | a verified build now imports the project itself; if it still fails, run `tools/ensure_project_imported.ps1`, confirm the cfg appears, then rebuild |
