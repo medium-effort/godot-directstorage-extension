@@ -231,7 +231,9 @@ Add `dev_build=yes` to a `template_debug` build for the development variant with
 | `dsgd_64.debug.dll` | editor and `template_debug` libraries |
 | `dsgd_64.dll` | `template_release` library |
 | `dstorage.dll`, `dstoragecore.dll` | copied from the vendored SDK next to the DLL |
-| `build_manifest.json` | build status, commit, sizes and the `dspkg-key-id` tag of each binary |
+| `build_manifest.json` | build status, commit, size, `sha256`, source snapshot id and the `dspkg-key-id` tag of each binary |
+
+`build_manifest.json` also records, per library, a `sha256` and a `source_id` (HEAD plus the working-tree diff of the paths that compile into a binary). At load time the extension compares the debug and release entries through those fields and prints one `[DirectStorage] Binary mismatch` warning when they came from different source states: the editor runs the debug binary while an export runs the release one, so a stale release binary is otherwise only visible after exporting. The check is silent when the manifest is missing, when an entry predates these fields, or when a file no longer matches its recorded hash — it never fails a boot and never guesses.
 
 The default build carries no archive key in the DLL: every export generates a fresh key and delivers it inside the encrypted PCK. A key compiled into the DLL is the legacy build with a baked key (`DSPKG_ENCRYPTION_KEY_FILE`), intended for experiments only — the build audit rejects it in editor, `template_debug` and `template_release` binaries.
 

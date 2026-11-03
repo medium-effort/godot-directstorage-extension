@@ -22,6 +22,7 @@ Usage (from SConstruct, after the naming constants and BUILD_START_TIME exist):
 """
 import atexit
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,17 @@ _LEGACY_PREFIXES = ("directstorage_accelerator.windows.", "libdirectstorage_acce
 
 _KEY_ID_RE = re.compile(r'DSPKG_KEY_ID_TAG\s+"dspkg-key-id=([0-9a-fA-F]{16})"')
 _KEY_TAG_RE = re.compile(rb"dspkg-key-id=([0-9a-fA-F]{16}|none)")
+
+# Paths whose content can reach a compiled binary. A source snapshot id covers
+# only these, so editing a GDScript file (which never enters a DLL) cannot make a
+# debug and a release binary look like builds of different source.
+_BINARY_SOURCE_PATHS = (
+    "src",
+    "SConstruct",
+    "site_scons",
+    "thirdparty/gdeflate",
+    "project/addons/directstorage_accelerator/directstorage_accelerator.gdextension",
+)
 
 _STATE = {}
 
@@ -75,6 +87,46 @@ def register(
         _STATE["registered"] = True
 
 
+def _sha256_file(path):
+    """Content hash of one binary, or None when it cannot be read."""
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def _binary_source_id():
+    """Identity of the source state that produced a binary, or None.
+
+    HEAD alone is not enough: a dirty tree compiles uncommitted code, and two
+    different dirty trees at the same commit must not compare equal. The diff is
+    restricted to paths that can reach a binary so a script-only edit does not
+    invalidate an otherwise matching pair. Untracked files contribute their path,
+    not their content (their content is not in `git diff`), which still notices a
+    file appearing or disappearing.
+    """
+    try:
+        def _git(*args):
+            return subprocess.check_output(
+                ["git", *args],
+                encoding="utf-8",
+                errors="replace",
+                stderr=subprocess.DEVNULL,
+            )
+
+        head = _git("rev-parse", "HEAD").strip()
+        payload = head + "\n"
+        payload += _git("diff", "HEAD", "--binary", "--", *_BINARY_SOURCE_PATHS)
+        payload += _git("status", "--porcelain", "--untracked-files=all", "--", *_BINARY_SOURCE_PATHS)
+        return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:16]
+    except Exception:
+        return None
+
+
 def _write():
     state = _STATE
     if not state:
@@ -109,6 +161,8 @@ def _write():
         is_dirty = len(status_out) > 0
     except Exception:
         pass
+
+    source_id = _binary_source_id()
 
     status = "FAILED" if failures else "SUCCESS"
 
@@ -157,11 +211,13 @@ def _write():
                 entry["exists"] = True
                 entry["size_bytes"] = st.st_size
                 entry["last_modified"] = mtime_dt.isoformat()
+                entry["sha256"] = _sha256_file(fpath)
             except Exception:
                 entry["exists"] = True
         else:
             entry["exists"] = False
             entry.pop("size_bytes", None)
+            entry.pop("sha256", None)
 
     # Update metadata specifically for the target compiled in the current SCons run
     # NOTE: target_type intentionally omits the .dev suffix - flat dsgd_64
@@ -188,6 +244,12 @@ def _write():
     curr_entry["last_build_status"] = status
     curr_entry["last_commit"] = commit_short
     curr_entry["last_built_at"] = build_finish_time.isoformat()
+    # Unix form exists so a runtime reader never has to parse an ISO string whose
+    # time zone belongs to a different machine.
+    curr_entry["last_built_unix"] = int(build_finish_time.timestamp())
+    curr_entry["last_dirty"] = is_dirty
+    if source_id:
+        curr_entry["source_id"] = source_id
     curr_entry["last_build_duration_seconds"] = duration_seconds
 
     # Per-target "built in this run" test instead of the run-global status: a

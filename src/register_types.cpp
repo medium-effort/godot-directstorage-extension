@@ -2,6 +2,7 @@
 #include "compression/gdeflate_compressor.h"
 #include "compression/gdeflate_decompressor.h"
 #include "compression/gdeflate_parallel.h"
+#include "core/ds_build_provenance.h"
 #include "core/ds_context.h"
 #include "core/ds_error_handler.h"
 #include "core/ds_profiler.h"
@@ -106,6 +107,13 @@ void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_lev
 
 	ds_resource_format_loader.instantiate();
 	ResourceLoader::get_singleton()->add_resource_format_loader(ds_resource_format_loader, true);
+
+	// One startup check, before the first asset can load: the editor and a debug
+	// player run the debug binary while an export runs the release one, so a
+	// stale release binary is otherwise invisible until an export behaves
+	// differently from what was tested. Silent unless the shipped manifest proves
+	// the two binaries were built from different sources.
+	ds_check_binary_provenance();
 }
 
 void uninitialize_directstorage_accelerator_module(ModuleInitializationLevel p_level) {
