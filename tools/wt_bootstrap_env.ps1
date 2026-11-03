@@ -32,12 +32,15 @@
     useful inside a single worktree; enable it manually if you want that.
 
 .PARAMETER PrimaryWorktreePath
-    Absolute path of the primary worktree. The hook passes
-    {{ primary_worktree_path }}.
+    Path of the primary worktree. The hook passes {{ primary_worktree_path }},
+    which is absolute. A relative path is accepted and canonicalized, because
+    every value derived from it (SCONS_CACHE, SCCACHE_DIR) is written to the
+    generated .env as an absolute path.
 
 .PARAMETER DestinationPath
     .env to write. Defaults to the current directory (the hook runs at the new
-    worktree's root).
+    worktree's root). A relative path is canonicalized against the current
+    directory.
 #>
 [CmdletBinding()]
 param(
@@ -48,8 +51,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$primaryRoot = $PrimaryWorktreePath.TrimEnd('\', '/')
+# Canonicalize both paths before deriving anything from them. SCONS_CACHE and
+# SCCACHE_DIR are absolute-intent values: godot-cpp hands SCONS_CACHE to
+# CacheDir(), and the root SConstruct joins "build-signature.json" onto it. A
+# relative value therefore means a different directory depending on who resolves
+# it, which either fails the build in CacheDir's mkdir or silently fragments the
+# shared cache (#0220). Resolve-Path also normalizes forward slashes and drops a
+# trailing separator, so the TrimEnd below only has to cover what it preserves.
+if (-not (Test-Path -LiteralPath $PrimaryWorktreePath -PathType Container)) {
+    Write-Error "Primary worktree not found at '$PrimaryWorktreePath'. Pass the path of the primary checkout (absolute, or relative to the current directory)."
+    exit 1
+}
+$primaryRoot = (Resolve-Path -LiteralPath $PrimaryWorktreePath).Path.TrimEnd('\', '/')
 $sourcePath = Join-Path $primaryRoot ".env"
+
+# The destination .env does not exist yet in a fresh worktree, so it cannot be
+# resolved by existence; this yields an absolute path without touching disk.
+$DestinationPath = [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestinationPath))
 
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
     Write-Error "Primary .env not found at '$sourcePath'. Copy .env.example to .env in the primary worktree before creating worktrees."
