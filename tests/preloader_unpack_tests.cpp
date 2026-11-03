@@ -214,15 +214,34 @@ GDEX_TEST(preloader_gpu, eligibility_matrix) {
 	v1.is_v2 = false;
 	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(v1));
 
-	// Float data format (maps to self, no sRGB counterpart path).
+	// Float data format (maps to self, no sRGB counterpart path): memory path.
 	godot::DSPreloader::Payload data = eligible;
 	data.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RF);
 	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(data));
 
-	// Single-channel block data (BC4 maps to self).
+	// Uncompressed single-channel data (R8 maps to self, no sRGB view): memory
+	// path, both because it is cheap to move and because it is plausible 2D/UI
+	// data with unverified DRD sampling.
+	godot::DSPreloader::Payload r8 = eligible;
+	r8.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_R8);
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(r8));
+
+	// Linear-only block formats carry 3D material data (normal / roughness /
+	// AO / height) and declare no shareable list - legal per Q44. They are
+	// eligible despite mapping to self, because the CPU route is the
+	// expensive one for these payloads.
 	godot::DSPreloader::Payload bc4 = eligible;
 	bc4.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGTC_R);
-	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(bc4));
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(bc4));
+
+	godot::DSPreloader::Payload bc5 = eligible;
+	bc5.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGTC_RG);
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(bc5));
+
+	// Linear color block data qualifies through its sRGB counterpart path.
+	godot::DSPreloader::Payload bc3 = eligible;
+	bc3.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_DXT5);
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(bc3));
 
 	// Already-sRGB base maps to self -> eligible.
 	godot::DSPreloader::Payload srgb = eligible;

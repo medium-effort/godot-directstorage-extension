@@ -74,7 +74,8 @@
 			<param index="0" name="paths" type="PackedStringArray" />
 			<param index="1" name="chunk_size" type="int" default="16" />
 			<param index="2" name="prefer_gpu" type="bool" default="true" />
-			<description>Enqueues texture [param paths] for direct-to-GPU VRAM DMA streaming prewarm in chunks of [param chunk_size] and returns the batch tag. Returns [code]0[/code] when the native singletons or the stream driver autoload ([code]DSRuntime[/code]) are unavailable.</description>
+			<description>Enqueues texture [param paths] for direct-to-GPU VRAM DMA streaming prewarm in chunks of [param chunk_size] and returns the batch tag. Returns [code]0[/code] when the native singletons or the stream driver autoload ([code]DSRuntime[/code]) are unavailable.
+			[b]Note:[/b] A texture is eligible for the GPU path when its payload carries v2 per-mip footprint metadata, it was not imported with [code]compatibility/as_image_texture[/code], and its format is either a color format with an sRGB counterpart (BC1, BC2, BC3, BC7, the RGBA8/BGRA8 family) or one of the linear block formats used by 3D material data (BC4, BC5 - normal, roughness, AO and height maps). Uncompressed and float data formats (R8, RG8, RGB8, the R16 family, float formats, BC6H) always stay on the memory path and arrive as [ImageTexture] even when GPU prewarm is active.</description>
 		</method>
 	</methods>
 	<constants>

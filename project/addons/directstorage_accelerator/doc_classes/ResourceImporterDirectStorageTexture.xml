@@ -32,6 +32,7 @@
 		<member name="compatibility/as_image_texture" type="bool" setter="" getter="" default="false">
 			Forces the texture to load into CPU memory as an [ImageTexture] even when GPU streaming prewarm ([method DSPreloader.prewarm_gpu_async]) is active.
 			[b]Note:[/b] Standard runtime loads ([ResourceLoader]) and CPU prewarm ([method DSPreloader.prewarm_async]) already create [ImageTexture] resources automatically. This setting is specifically needed for projects using D3D12 GPU prewarm when an asset requires CPU pixel access—such as [Light3D] projectors ([member Light3D.light_projector]), [Decal] textures, or scripts calling [method Texture2D.get_image]—preventing engine atlas warnings and readback stalls.
+			[b]Note:[/b] Some formats never take the GPU prewarm path regardless of this setting: uncompressed and float data formats (R8, RG8, RGB8, the R16 family, float formats, BC6H) are always prewarmed into [ImageTexture]. Color formats with an sRGB counterpart (BC1, BC2, BC3, BC7, the RGBA8/BGRA8 family) and the linear block formats used by 3D material data (BC4, BC5 - which includes normal maps) do use the GPU path.
 		</member>
 	</members>
 </class>

@@ -142,9 +142,11 @@ public:
 	static uint64_t prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size = 16, bool p_prefer_gpu = true);
 
 	// True for payloads the GPU path accepts: v2 footprint metadata,
-	// worker-safe exclusion (as_image_texture == false), and a
-	// color-sampled format (linear formats carry an sRGB counterpart path,
-	// already-sRGB map to self; float/BC4/BC5/BC6H data formats are out).
+	// worker-safe exclusion (as_image_texture == false), and a format the GPU
+	// path uploads - an sRGB-pairable color format, or a linear-only block
+	// format that carries 3D material data (BC4/BC5). Uncompressed and float
+	// data formats (R8/RG8/RGB8, the R16 family, floats, BC6H) stay on the
+	// memory path.
 	static bool is_gpu_prewarm_eligible(const Payload &p_payload);
 
 	// True when a GPU prewarm can actually run: initialized D3D12 backend

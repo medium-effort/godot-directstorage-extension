@@ -311,9 +311,18 @@ static func is_gpu_prewarm_available() -> bool:
 
 ## Enqueues [param paths] for GPU-accelerated asynchronous streaming prewarm and returns
 ## the stream tag. When running under the D3D12 rendering driver with GPU decompression enabled,
-## eligible color textures are allocated directly as [Texture2DRD] resources on the render thread
+## eligible textures are allocated directly as [Texture2DRD] resources on the render thread
 ## and filled via DirectStorage DMA decompression straight into VRAM. Ineligible textures or
 ## non-D3D12 platforms automatically fall back to the CPU [ImageTexture] memory stream path.
+##
+## A texture is eligible when its payload carries v2 per-mip footprint metadata, it was not
+## imported with [code]compatibility/as_image_texture[/code], and its format is a color format
+## with an sRGB counterpart (BC1, BC2, BC3, BC7, the RGBA8/BGRA8 family) or one of the linear
+## block formats used by 3D material data (BC4, BC5 - normal, roughness, AO and height maps).
+## Uncompressed and float data formats (R8, RG8, RGB8, the R16 family, float formats, BC6H)
+## always stay on the memory path, so those arrive as [ImageTexture] even when GPU prewarm is
+## active.
+##
 ## Textures are allocated in render-thread chunks of [param chunk_size] to bound frame time.
 ## Returns 0 when native singletons or the stream driver are unavailable.
 static func prewarm_gpu_async(paths: PackedStringArray, chunk_size: int = 16, prefer_gpu: bool = true) -> int:

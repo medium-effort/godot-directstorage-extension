@@ -833,6 +833,30 @@ bool DSPreloader::main_or_render_thread() {
 	return Thread::is_main_thread();
 }
 
+// A format the GPU prewarm path accepts. Color formats qualify through the
+// sRGB pairing the texture-create path already declares (Q44 shareable-format
+// list: base + counterpart, or no list at all). Linear-only *block* formats
+// carry 3D material data (normal, roughness, AO, height) and have no sRGB view
+// at all, so both paths declare no shareable list - which Q44 explicitly
+// allows for exactly these formats. They are worth the GPU path because their
+// CPU route is the expensive one: a 4K BC5 normal map is ~21 MiB of CPU
+// GDeflate + unpad + engine upload per texture. Uncompressed and float data
+// formats (R8/RG8/RGB8, the R16 family, floats, BC6H) stay on the memory path:
+// they are cheap to move, are plausible 2D/UI data, and 2D DRD sampling is not
+// re-verified yet (.agents/plans/finished_plans/prewarm_owned_gpu_path_plan.md,
+// "2D vs 3D asset policy").
+static bool ds_prewarm_format_eligible(int p_rd_format) {
+	if (DSTex::is_rd_format_srgb(p_rd_format)) {
+		return true;
+	}
+	const int srgb_format = DSTex::get_srgb_rd_format(p_rd_format);
+	if (srgb_format != RenderingDevice::DATA_FORMAT_MAX && srgb_format != p_rd_format) {
+		return true;
+	}
+	return p_rd_format == RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK ||
+			p_rd_format == RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK;
+}
+
 bool DSPreloader::is_gpu_prewarm_eligible(const Payload &p_payload) {
 	if (!p_payload.is_v2) {
 		return false;
@@ -846,17 +870,8 @@ bool DSPreloader::is_gpu_prewarm_eligible(const Payload &p_payload) {
 	if (p_payload.pixel_format >= (uint32_t)RenderingDevice::DATA_FORMAT_MAX) {
 		return false;
 	}
-	// Color-sampled formats only: linear color formats carry an sRGB
-	// counterpart path and already-sRGB formats map to self; float and
-	// single/dual-channel data formats (which map to themselves) and
-	// unknown formats (MAX) are out.
-	if (DSTex::is_rd_format_srgb(static_cast<int>(p_payload.pixel_format))) {
-		// Already-sRGB color base: GPU uploads it directly.
-	} else {
-		const int srgb_fmt = DSTex::get_srgb_rd_format(static_cast<int>(p_payload.pixel_format));
-		if (srgb_fmt == RenderingDevice::DATA_FORMAT_MAX || srgb_fmt == static_cast<int>(p_payload.pixel_format)) {
-			return false;
-		}
+	if (!ds_prewarm_format_eligible(static_cast<int>(p_payload.pixel_format))) {
+		return false;
 	}
 	const int64_t mips = (int64_t)p_payload.mip_count;
 	if (p_payload.mip_offsets.size() < mips || p_payload.mip_sizes.size() < mips ||
