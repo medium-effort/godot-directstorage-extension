@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 30 October 2026
+Last updated: 3 November 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1849,4 +1849,51 @@ Gate on your own sentinel (`DSPKG_BOOT`, the scan output, or an `[ DONE ]` line)
 Upstream fix options, cheapest first: return early when `doc == nullptr` in `_gen_extensions_docs()` / `generate_doc()`; cancel the queued documentation callables in `EditorHelp::cleanup_doc()`; or do not defer doc work while the editor is quitting.
 
 To reproduce, build a fresh project with no `.godot/`, add any `addons/<name>/<name>.gdextension` plus the library it names (nothing needs to be enabled, autoloaded or referenced by a scene), then run `godot --headless --path <project> --import --quit`: the first run exits `0xC0000005`, a second identical run exits `0`, and renaming the `.gdextension` away makes the first run exit `0`. The symbolized stack above comes from a custom `debug_symbols=yes dev_build=yes lto=none` build of the same commit with the debugger attached after the import starts - attaching from process start perturbs the teardown timing and can hide the fault. Related: Q59 (CLI harness traps), Q56 (`--script` only loads extensions from `.godot/extension_list.cfg`).
+
+## 77. `_process(delta)` Is Not the Frame Duration; Long Frames Are Cut
+
+### The Engine Reality
+The delta handed to `Node._process()` is not the real frame duration. `Main::iteration()` builds it from `MainTimerSync::advance()` (`main/main.cpp:4938`), and the decisive cut is `main/main.cpp:4955-4959`: when `fixed_fps == -1` and a frame needed more physics steps than `physics/common/max_physics_steps_per_frame` (default 8, `main/main.cpp:2253`), it subtracts `(physics_steps - max_physics_steps) * physics_step` from the step - a 5 s frame reaches `_process()` as ~0.15 s. That time is discarded, not deferred: `time_deficit` (`main_timer_sync.cpp:441`, `:498`) is computed from the pre-subtraction value, so nothing repays it on later frames. The three `advance_checked()` clamps do not bind in that case: `:455` runs only when `get_average_physics_steps()` reports more than 3 consistent frames (after a long frame `advance_core` has already rewritten `typical_physics_steps` to the observed ~299 steps, which makes it bail at `i == 1`), `:461` is a `+/- physics_jitter_fix * physics_step` band (default 0.5 -> +/- 8.3 ms, `main/main.cpp:2254`) around the raw value, and `:464`'s upper bound is the raw value itself. The observable ceiling is therefore about `(max_physics_steps + leftover) * physics_step` = 133-150 ms at 60 Hz, independent of how long the frame really was.
+
+### The Trap / Symptom
+A background teardown drain (3302 nodes, 971 MiB of VRAM released) reported both of these in the same run:
+
+```text
+[Transition] level teardown drained in 11.76 s (0.87 s of release work, ...)
+[Transition] drain pacing: frames 48 | 68.8 objects/frame | frame ms median 8.7, p95 126.3, max 135.8
+```
+
+48 frames times the recorded 135.8 ms maximum is 6.5 s, so roughly 5 s of stall never appeared in any sample - and 135.8 ms is 133.3 ms (8 x 16.67) plus a 2.5 ms remainder, i.e. the `max_physics_steps_per_frame` ceiling, not the real frame. Two consequences, both real:
+
+- A frame-budget controller that sized its per-frame work from `delta` believed every frame was ~9 ms and grew its batch to 68.8 objects/frame, which really cost ~245 ms each. The menu froze 2-3 times for the whole 11.76 s drain instead of staying smooth.
+- The demo's benchmark hitch tracker built every `FREEZE (>100 ms)` entry from `delta`, so it systematically under-reported the worst frames. The only reason the earlier 12 s freeze was ever measured is that the exit benchmark probed it with explicit `Time.get_ticks_usec()` timestamps instead.
+
+General detection heuristic: if the sum of the recorded frame times is smaller than the wall-clock duration of the same window, the samples are clamped, not missing.
+
+### The Rule
+Never measure a frame's duration, or sum deltas over a window, from `_process(delta)`; the step is vsync-smoothed and physics-clamped, and any frame needing more than `physics/common/max_physics_steps_per_frame` (default 8) has the excess subtracted and discarded. Measure with `Time.get_ticks_usec()` between frames.
+
+```gdscript
+func _process(_delta: float) -> void:
+	var now := Time.get_ticks_usec()
+	var frame_ms := 0.0
+	if _last_frame_usec > 0:
+		frame_ms = float(now - _last_frame_usec) / 1000.0
+	_last_frame_usec = now
+```
+
+Re-arm `_last_frame_usec = 0` whenever the sampler restarts (benchmark start, drain start) so a long idle gap is not attributed to the first frame, and drop the first interval when the restart point is not itself a frame boundary - `main.gd` arms its drain clock inside the scene swap, so interval #1 covers only the remainder of that swap (which includes the incoming scene's `_ready()`) and must not seed the menu baseline, or the baseline stays artificially low for the whole drain. Use `delta` only for things that genuinely want smoothing (animation, EMA baselines). Implemented in `tps-demo/main/main.gd` (`_measure_drain_frame()`, `_drain_last_tick_usec`, `_record_drain_frame()`) and `tps-demo/menu/settings.gd` (`_last_frame_usec`). Any per-frame budget expressed in milliseconds (Q13, Q41) must use the same measurement or it will overshoot by the same factor. Related: Q75 (the teardown this was measured on), Q41 (frame hitching from batch sizes).
+
+## 78. `RENDER_VIDEO_MEM_USED` Is a Stale Per-Frame Throttling Signal
+
+### The Engine Reality
+`Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED)` is refreshed after the draw, so a value read in `_process()` describes the previous frame's state, not the current one. Destroying nodes in `_process` queues `free_rid` work that the render thread executes inside the same frame's draw, which means the byte drop caused by this frame's batch is only visible to a sample taken one frame later - and is mixed with whatever the new scene allocated in between.
+
+### The Trap / Symptom
+A teardown throttle written as "release at most `TEARDOWN_VRAM_CAP_MIB = 4.0` MiB per frame", gated on `last_sample - current_sample >= cap`, actually released 975 MiB across ~104 frames, i.e. **9.4 MiB per frame - 2.3x over its own cap**. The under-read meant the gate rarely tripped, so the real control was the unrelated 32-objects-per-frame limit, and each frame's draw carried ~134 ms of render-thread destruction. The same counter produced the nonsense `released ... in 0.000 s = 0.0 MiB/s` line in the exit benchmark, because the frame-1 sample still read the pre-teardown value.
+
+### The Rule
+Never throttle per-frame GPU work on `Performance.get_monitor(RENDER_VIDEO_MEM_USED)` read in `_process`; the counter is refreshed after the draw, so a per-frame delta under-reads and a byte cap behaves like a much larger one - and the release itself is spent by the render thread inside that same draw, after your throttling decision.
+
+Sample it only at window boundaries (drain start, drain end, menu arrival) for reporting, where the level-minus-menu delta is valid, and drive any pacing from measured frame time instead (Q77). Implemented in `tps-demo/main/main.gd`: `_drain_vram_start_mib` / `_menu_vram_mib` are boundary samples for the report, while `DRAIN_TARGET_FRAME_MSEC` pacing sizes the batch from real frame duration. Related: Q77 (the pacing that replaced it), Q75 (memory-pressure teardown), Q35 (eviction/capacity accounting).
 
