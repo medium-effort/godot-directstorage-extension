@@ -362,6 +362,7 @@ prune it when you change target sets. Removing a worktree deletes its links, nev
 | `godot --headless --path project --quit` never returns | `--quit` only ends the main loop after one iteration; it does not import | use `--headless --editor --quit-after 4 --path project` for the one-shot warm-up |
 | Deployment audit reports `dsgd_64.dll` missing | only `template_debug` was built, and the extension manifest declares both the debug and release libraries | expected for a single-target build; build `template_release` as well if the audit must be clean |
 | `✗ Syncing the <target> worktree failed; the ref change was rolled back`, with `git update-index -q --refresh failed (exit code 128)` | a git operation in the target's worktree died and left `.git/index.lock` behind, or one is still running | nothing landed: the ref was rolled back. A zero-byte lock from an old run (no live `git` process older than your command) is stale — move it to the Recycle Bin, confirm `git update-index -q --refresh` exits 0 in the target, then retry the push. Never move the ref by force to work around it |
+| `✗ Can't push to local <target> branch: it has newer commits` | another session landed on the target while you were working | `wt step rebase <target>`, then push again — still linear, still no merge commit. Do not force the ref to catch up |
 
 ---
 
