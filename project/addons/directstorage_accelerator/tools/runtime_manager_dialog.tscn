@@ -4,10 +4,10 @@
 
 [node name="RuntimeManagerDialog" type="Window"]
 title = "Manage DirectStorage Runtime"
-size = Vector2i(600, 340)
+size = Vector2i(640, 380)
 visible = false
 transient = true
-min_size = Vector2i(520, 300)
+min_size = Vector2i(560, 340)
 script = ExtResource("1_runtime")
 
 [node name="Background" type="Panel" parent="."]
@@ -50,6 +50,12 @@ popup/item_1/id = 1
 unique_name_in_owner = true
 layout_mode = 2
 text = "Install"
+
+[node name="SourceLabel" type="Label" parent="Layout"]
+modulate = Color(1, 1, 1, 0.75)
+layout_mode = 2
+text = "Install downloads dstorage.dll and dstoragecore.dll from Microsoft's official NuGet package (Microsoft.Direct3D.DirectStorage) on nuget.org. The package is checked against Microsoft's published SHA-512, and its license is shown before anything is installed."
+autowrap_mode = 3
 
 [node name="RestartButton" type="Button" parent="Layout"]
 unique_name_in_owner = true

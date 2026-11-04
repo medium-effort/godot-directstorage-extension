@@ -23,6 +23,10 @@ extends Node
 ## the staged files while nothing holds them.
 
 signal install_finished(version: String, error: int, message: String)
+## Emitted after a package is downloaded and verified but before its payload is
+## installed. The integration must show the exact license from that package and
+## call accept_license() or decline_license().
+signal license_required(version: String, license_text: String)
 
 const ADDON_BIN: String = "res://addons/directstorage_accelerator/bin"
 const VERSIONS_PATH: String = ADDON_BIN + "/.versions"
@@ -67,6 +71,9 @@ const VERSIONS: Dictionary = {
 }
 
 var _http: HTTPRequest = null
+var _license_version: String = ""
+var _license_nupkg: String = ""
+var _license_meta: Dictionary = {}
 
 
 ## Starts an asynchronous download and install. Always ends with
@@ -80,6 +87,9 @@ func install(version: String) -> void:
 		return
 	if _http != null:
 		_finish(version, ERR_BUSY, "An install is already in progress.")
+		return
+	if not _license_version.is_empty():
+		_finish(version, ERR_BUSY, "A license decision is pending.")
 		return
 
 	var meta: Dictionary = VERSIONS[version]
@@ -284,17 +294,66 @@ func _on_download_completed(result: int, response_code: int, _headers: PackedStr
 		_finish(version, ERR_FILE_CORRUPT, "Package SHA-512 does not match Microsoft's published hash; download discarded.")
 		return
 
+	# The license is shown before anything is installed, and it is the exact
+	# LICENSE.txt from the verified package, not a copy bundled in the addon.
+	var zip := ZIPReader.new()
+	if zip.open(nupkg) != OK:
+		_remove_download(nupkg)
+		_finish(version, ERR_FILE_CORRUPT, "Could not reopen the verified package to read its license.")
+		return
+	if not zip.file_exists("LICENSE.txt"):
+		zip.close()
+		_remove_download(nupkg)
+		_finish(version, ERR_FILE_CORRUPT, "Package has no LICENSE.txt; refusing to install it.")
+		return
+	var license_text := zip.read_file("LICENSE.txt").get_string_from_utf8()
+	zip.close()
+	if license_text.strip_edges().is_empty():
+		_remove_download(nupkg)
+		_finish(version, ERR_FILE_CORRUPT, "Package license is empty; refusing to install it.")
+		return
+
+	_license_version = version
+	_license_nupkg = nupkg
+	_license_meta = meta
+	license_required.emit(version, license_text)
+
+
+## Continues an install after the user accepted the shown license.
+func accept_license() -> void:
+	if _license_version.is_empty():
+		_finish("", ERR_UNAUTHORIZED, "No license decision is pending.")
+		return
+	var version := _license_version
+	var nupkg := _license_nupkg
+	_clear_license()
 	var extract_error := _extract_package(nupkg, version)
 	if extract_error != OK:
 		_remove_download(nupkg)
 		_finish(version, extract_error, "Package extraction failed: %s" % error_string(extract_error))
 		return
-
 	_remove_download(nupkg)
 	if not _write_json(PENDING_PATH, {"version": version}):
 		_finish(version, ERR_FILE_CANT_WRITE, "Package is verified but the stage marker could not be written.")
 		return
 	_finish(version, OK, "DirectStorage %s is staged. Restart the editor to apply it." % version)
+
+
+## Discards a downloaded package after the user declined its license.
+func decline_license() -> void:
+	if _license_version.is_empty():
+		return
+	var version := _license_version
+	var nupkg := _license_nupkg
+	_clear_license()
+	_remove_download(nupkg)
+	_finish(version, ERR_UNAUTHORIZED, "DirectStorage license declined; nothing was installed.")
+
+
+func _clear_license() -> void:
+	_license_version = ""
+	_license_nupkg = ""
+	_license_meta = {}
 
 
 static func _extract_package(nupkg: String, version: String) -> int:

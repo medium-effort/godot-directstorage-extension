@@ -17,6 +17,7 @@ const INSTALLER_SCRIPT = preload("res://addons/directstorage_accelerator/scripts
 
 const DRIVER_SETTING: String = "rendering/rendering_device/driver.windows"
 const METHOD_SETTING: String = "rendering/renderer/rendering_method"
+const LICENSE_DIALOG_SCENE_PATH: String = "res://addons/directstorage_accelerator/tools/runtime_license_dialog.tscn"
 
 ## Display order of the two published packages the addon currently supports.
 const UI_VERSIONS := [
@@ -33,12 +34,14 @@ const UI_VERSIONS := [
 @onready var _close_button: Button = %CloseButton
 
 var _installer: Node = null
+var _license_dialog: Window = null
 
 
 func _ready() -> void:
 	_installer = INSTALLER_SCRIPT.new()
 	add_child(_installer)
 	_installer.install_finished.connect(_on_install_finished)
+	_installer.license_required.connect(_on_license_required)
 	_version_option.item_selected.connect(_on_version_selected)
 	_install_button.pressed.connect(_on_install_pressed)
 	_restart_button.pressed.connect(_on_restart_pressed)
@@ -68,7 +71,7 @@ func _refresh() -> void:
 	if pending.is_empty():
 		_status_label.text = "Select a version, then install. Microsoft's SHA-512 is verified before extraction."
 	else:
-		_status_label.text = "DirectStorage %s is staged. Restart the editor to apply it." % pending
+		_status_label.text = "DirectStorage %s is staged. Select it, then restart to apply it." % pending
 
 	var driver := RenderingServer.get_current_rendering_driver_name()
 	if is_instance_valid(_d3d12_button):
@@ -91,19 +94,23 @@ func _update_actions(state: Dictionary) -> void:
 	_install_button.text = "Reinstall" if (version == active or downloaded) else "Install"
 	_install_button.disabled = false
 
-	if not pending.is_empty():
-		_restart_button.text = "Restart editor to apply"
+	# The restart action follows the selection, not just the global pending
+	# state: selecting the active version must not offer to apply a different
+	# staged version behind the user's back.
+	if not pending.is_empty() and version == pending:
+		_restart_button.text = "Restart editor to apply %s" % version
 		_restart_button.disabled = false
-	elif downloaded and version != active:
-		# Already on disk: switch to it without downloading again.
+	elif version == active:
+		_restart_button.text = "Already the currently active runtime"
+		_restart_button.disabled = true
+	elif downloaded:
+		# Already on disk: switch to it without downloading again. If another
+		# version was staged, this replaces the stage with the selected one.
 		_restart_button.text = "Switch to %s and restart" % version
 		_restart_button.disabled = false
 	else:
+		_restart_button.text = "Install first to apply"
 		_restart_button.disabled = true
-		if version == active:
-			_restart_button.text = "Already the currently active runtime"
-		else:
-			_restart_button.text = "Install first to apply"
 
 
 func _selected_version() -> String:
@@ -127,25 +134,85 @@ func _on_install_pressed() -> void:
 
 
 func _on_install_finished(_version: String, error: int, message: String) -> void:
+	_close_license_dialog()
 	_install_button.disabled = false
 	_refresh()
+	call_deferred("_raise_manager")
 	if error != OK:
-		_status_label.text = "Install failed: " + message
+		# A declined license is a user choice, not an install failure.
+		_status_label.text = message if error == ERR_UNAUTHORIZED else "Install failed: " + message
+
+
+func _on_license_required(version: String, license_text: String) -> void:
+	_close_license_dialog()
+	var dialog_scene := ResourceLoader.load(LICENSE_DIALOG_SCENE_PATH, "PackedScene", ResourceLoader.CACHE_MODE_IGNORE) as PackedScene
+	if dialog_scene == null:
+		_installer.decline_license()
+		_status_label.text = "License dialog is missing; the install was cancelled."
+		return
+	_license_dialog = dialog_scene.instantiate() as Window
+	_license_dialog.connect("accepted", _on_license_accepted)
+	_license_dialog.connect("declined", _on_license_declined)
+	var base := EditorInterface.get_base_control()
+	if base != null:
+		base.add_child(_license_dialog)
+	else:
+		add_child(_license_dialog)
+	_license_dialog.call("show_license", version, license_text)
+
+
+func _on_license_accepted() -> void:
+	_close_license_dialog()
+	_installer.accept_license()
+	call_deferred("_raise_manager")
+
+
+func _on_license_declined() -> void:
+	_close_license_dialog()
+	_installer.decline_license()
+	call_deferred("_raise_manager")
+
+
+func _close_license_dialog() -> void:
+	if is_instance_valid(_license_dialog):
+		# Hide immediately so the transient/exclusive state is cleared before the
+		# deferred free; otherwise the manager window can stay behind or hidden.
+		_license_dialog.hide()
+		_license_dialog.queue_free()
+		_license_dialog = null
+
+
+## Bring the manager back after the license window closes.
+func _raise_manager() -> void:
+	if not is_inside_tree():
+		return
+	# Unconditional: if the editor hid the window (visible == false) this shows
+	# it again, and if it is merely behind, popup_centered() raises it.
+	popup_centered()
+	grab_focus()
+
+
+func _exit_tree() -> void:
+	_close_license_dialog()
 
 
 func _on_restart_pressed() -> void:
-	# A cached version can be switched to without downloading it again; that is
-	# the "restart before installing" path for an already-downloaded package.
 	var state: Dictionary = INSTALLER_SCRIPT.get_state()
 	var version := _selected_version()
 	var active := String(state.get("active", ""))
+	var pending := String(state.get("pending", ""))
 	var cached: PackedStringArray = state.get("cached", PackedStringArray())
-	if String(state.get("pending", "")).is_empty() and cached.has(version) and version != active:
+	if version == pending:
+		# The selected version is the staged one; restart applies it.
+		EditorInterface.restart_editor()
+		return
+	if cached.has(version) and version != active:
+		# Switching to a cached version replaces any other staged version.
 		var error := INSTALLER_SCRIPT.activate_cached(version)
 		if error != OK:
 			_status_label.text = "Could not stage %s: %s" % [version, error_string(error)]
 			return
-	EditorInterface.restart_editor()
+		EditorInterface.restart_editor()
 
 
 func _on_d3d12_pressed() -> void:
