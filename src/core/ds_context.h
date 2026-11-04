@@ -197,6 +197,9 @@ public:
 	// reports UMA == TRUE (shared system memory architecture).
 	bool is_uma() const;
 	Dictionary get_capability_report() const;
+	// Installed-runtime identity and feature probes without the GPU queries in
+	// get_capability_report(). Returns {} off Windows.
+	Dictionary get_runtime_info() const;
 	Dictionary get_request_execution_report(Ref<DSRequest> p_request) const;
 	DSRequest::DSDestinationType get_actual_destination_type(Ref<DSRequest> p_request) const;
 	String get_actual_backend(Ref<DSRequest> p_request) const;

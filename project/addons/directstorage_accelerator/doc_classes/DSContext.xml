@@ -99,6 +99,10 @@
 			<return type="Dictionary" />
 			<description>Returns a comprehensive [Dictionary] detailing the active backend, Direct3D 12 device status, GPU decompression support tier, GPU decompression enabled status, queue capacity, staging buffer configuration, and DXGI adapter identity ([code]adapter_name[/code], [code]adapter_vendor[/code], [code]dedicated_vram_mb[/code], [code]shared_system_mb[/code], [code]software_adapter[/code], [code]integrated_gpu_guess[/code]).</description>
 		</method>
+		<method name="get_runtime_info" qualifiers="const">
+			<return type="Dictionary" />
+			<description>Returns the installed DirectStorage runtime identity and feature probes without any GPU query: [code]version[/code] (e.g. "1.3.2506.2501", or "Unavailable"), [code]version_major[/code], [code]version_minor[/code], [code]version_build[/code], [code]version_revision[/code], [code]loaded[/code] (whether dstorage.dll and dstoragecore.dll are mapped), and a [code]capabilities[/code] dictionary with [code]zstd[/code], [code]zstd_probed[/code], [code]gacl[/code], [code]enqueue_requests[/code], [code]configuration2[/code] and [code]creator_id[/code].</description>
+		</method>
 		<method name="get_gpu_adapter_info" qualifiers="const">
 			<return type="Dictionary" />
 			<description>Returns identity details for the exact graphics device in use (matched by adapter LUID, so multi-GPU PCs report the right one): [code]available[/code], [code]adapter_name[/code] (e.g. "AMD Radeon(TM) Graphics"), [code]adapter_vendor[/code], [code]vendor_id[/code], [code]device_id[/code], [code]dedicated_vram_mb[/code] (the GPU's own private memory; tiny or zero on integrated graphics), [code]shared_system_mb[/code] (ordinary RAM the GPU may borrow), [code]software_adapter[/code] (true for Microsoft WARP emulation, i.e. no real GPU), and [code]integrated_gpu_guess[/code] (true when dedicated memory is under 1 GiB — the sign of graphics that share system RAM). [code]available[/code] is [code]false[/code] off Windows or without an active D3D12 device.</description>

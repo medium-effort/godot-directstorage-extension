@@ -627,6 +627,14 @@ Dictionary DSContext::get_capability_report() const {
 	return report;
 }
 
+Dictionary DSContext::get_runtime_info() const {
+#ifdef _WIN32
+	return Win32Backend::get_runtime_info();
+#else
+	return Dictionary();
+#endif
+}
+
 Dictionary DSContext::get_request_execution_report(Ref<DSRequest> p_request) const {
 	Dictionary report;
 	report["actual_destination_type"] = -1;
@@ -1862,6 +1870,7 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_integrated_gpu"), &DSContext::is_integrated_gpu);
 	ClassDB::bind_method(D_METHOD("is_uma"), &DSContext::is_uma);
 	ClassDB::bind_method(D_METHOD("get_capability_report"), &DSContext::get_capability_report);
+	ClassDB::bind_method(D_METHOD("get_runtime_info"), &DSContext::get_runtime_info);
 	ClassDB::bind_method(D_METHOD("is_current_drive_supported"), &DSContext::is_current_drive_supported);
 	ClassDB::bind_method(D_METHOD("is_path_supported", "path"), &DSContext::is_path_supported);
 	ClassDB::bind_method(D_METHOD("get_drive_info", "path"), &DSContext::get_drive_info, DEFVAL("res://"));

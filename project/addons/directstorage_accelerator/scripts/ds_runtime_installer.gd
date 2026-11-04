@@ -173,7 +173,43 @@ static func activate_cached(version: String) -> int:
 
 
 static func get_active_version() -> String:
+	# Prefer what the DLLs actually are: .runtime.json only records installs
+	# made through this service, so a pre-existing flat runtime would otherwise
+	# read as "not installed".
+	var installed := get_installed_version()
+	if not installed.is_empty():
+		return installed
 	return String(_read_json(ACTIVE_PATH).get("active", ""))
+
+
+## Reads the installed dstoragecore.dll version through DSContext and maps it
+## to a known package key. Returns "" when no runtime is present.
+static func get_installed_version() -> String:
+	if not ClassDB.class_exists("DSContext"):
+		return ""
+	var context = Engine.get_singleton("DSContext")
+	if context == null or not context.has_method("get_runtime_info"):
+		return ""
+	var info: Dictionary = context.get_runtime_info()
+	var raw := String(info.get("version", ""))
+	if raw.is_empty() or raw == "Unavailable":
+		return ""
+	return _match_known_version(raw)
+
+
+## Maps a DLL file version to a known package key. Microsoft's packages carry
+## the release in major.minor (1.3.x.x is the 1.3.0 package, 1.4.x.x is the
+## 1.4 preview); build/revision are unrelated dates. Multiple packages sharing
+## a major.minor would need a build-prefix table here.
+static func _match_known_version(raw: String) -> String:
+	var parts := raw.split(".")
+	if parts.size() >= 2:
+		var major_minor := "%s.%s" % [parts[0], parts[1]]
+		for key in VERSIONS:
+			var known := String(key).split(".")
+			if known.size() >= 2 and "%s.%s" % [known[0], known[1]] == major_minor:
+				return String(key)
+	return raw
 
 
 static func get_pending_version() -> String:
