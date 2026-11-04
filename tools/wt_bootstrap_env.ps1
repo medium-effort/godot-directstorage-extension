@@ -69,6 +69,17 @@ $sourcePath = Join-Path $primaryRoot ".env"
 # resolved by existence; this yields an absolute path without touching disk.
 $DestinationPath = [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestinationPath))
 
+# Refuse to write into the primary. This script exists to generate a worktree-local
+# .env whose overrides (addon sync off, shared SCons cache, prebuilt godot-cpp) must
+# never land in the primary's own .env - that would silently stop the primary from
+# deploying. Every caller passes the paths explicitly, so this only fires when the
+# wrong destination was given.
+$destinationRoot = Split-Path -Path $DestinationPath -Parent
+if ($destinationRoot -and $destinationRoot.TrimEnd('\', '/') -ieq $primaryRoot) {
+    Write-Host "[wt] refusing to write '$DestinationPath': that is the primary worktree's .env. This script generates a worktree-local .env; pass -DestinationPath <new-worktree>/.env." -ForegroundColor Red
+    exit 1
+}
+
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
     Write-Error "Primary .env not found at '$sourcePath'. Copy .env.example to .env in the primary worktree before creating worktrees."
     exit 1

@@ -47,4 +47,4 @@ submodules = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ worktree_pa
 godotcpp = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_share_godot_cpp.ps1 {{ primary_worktree_path }} {{ worktree_path }}"
 
 [[pre-start]]
-env = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_bootstrap_env.ps1 {{ primary_worktree_path }} -GodotCppPrebuilt"
+env = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_bootstrap_env.ps1 {{ primary_worktree_path }} -DestinationPath {{ worktree_path }}/.env -GodotCppPrebuilt"
