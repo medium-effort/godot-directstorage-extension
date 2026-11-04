@@ -347,6 +347,13 @@ public:
 	// the executable directory covers exported games, where Godot's
 	// GDExtension exporter places all DLLs flat next to the game binary.
 	static PackedStringArray get_runtime_search_dirs();
+	// Version and feature information for the DirectStorage runtime installed
+	// next to the addon. Reports what is on disk or already loaded; it never
+	// loads a module, so a capability report can call it without side effects.
+	// Keys: version (String), version_major/minor/build/revision (int),
+	// loaded (bool), capabilities (Dictionary: zstd, zstd_probed, gacl,
+	// enqueue_requests, configuration2, creator_id).
+	static Dictionary get_runtime_info();
 
 #if defined(_WIN32)
 	// Loads one DirectStorage runtime DLL ("dstoragecore.dll" or "dstorage.dll")

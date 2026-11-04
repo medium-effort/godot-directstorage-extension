@@ -22,6 +22,7 @@
 
 #ifdef _WIN32
 #include <winioctl.h>
+#include <winver.h>
 #include <dxgi.h>
 #if defined(_MSC_VER)
 #include <delayimp.h>
@@ -2293,6 +2294,133 @@ PackedStringArray Win32Backend::get_runtime_search_dirs() {
 	return dirs;
 }
 
+namespace {
+
+// Reads the VS_FIXEDFILEINFO version resource of a DLL. Returns false when the
+// file carries none; a locally rebuilt runtime is still reported by path, just
+// without numeric parts.
+bool read_dll_file_version(const std::wstring &p_path, uint16_t &r_major, uint16_t &r_minor, uint16_t &r_build, uint16_t &r_revision) {
+	DWORD ignored = 0;
+	const DWORD size = GetFileVersionInfoSizeW(p_path.c_str(), &ignored);
+	if (size == 0) {
+		return false;
+	}
+	std::vector<BYTE> buffer(size);
+	if (!GetFileVersionInfoW(p_path.c_str(), 0, size, buffer.data())) {
+		return false;
+	}
+	VS_FIXEDFILEINFO *info = nullptr;
+	UINT info_size = 0;
+	if (!VerQueryValueW(buffer.data(), L"\\", reinterpret_cast<LPVOID *>(&info), &info_size) || info == nullptr || info_size < sizeof(VS_FIXEDFILEINFO)) {
+		return false;
+	}
+	if (info->dwSignature != 0xfeef04bd) {
+		return false;
+	}
+	r_major = static_cast<uint16_t>(HIWORD(info->dwFileVersionMS));
+	r_minor = static_cast<uint16_t>(LOWORD(info->dwFileVersionMS));
+	r_build = static_cast<uint16_t>(HIWORD(info->dwFileVersionLS));
+	r_revision = static_cast<uint16_t>(LOWORD(info->dwFileVersionLS));
+	return true;
+}
+
+// The dstoragecore.dll this process is using: the loaded module when present,
+// otherwise the first search directory that holds the file. Never loads a
+// module, so the capability report stays side-effect free.
+bool resolve_runtime_core_path(std::wstring &r_path) {
+	HMODULE core = GetModuleHandleW(L"dstoragecore.dll");
+	if (core != nullptr) {
+		wchar_t module_path[MAX_PATH * 4];
+		const DWORD capacity = static_cast<DWORD>(sizeof(module_path) / sizeof(module_path[0]));
+		const DWORD length = GetModuleFileNameW(core, module_path, capacity);
+		if (length > 0 && length < capacity) {
+			r_path.assign(module_path, length);
+			return true;
+		}
+	}
+	PackedStringArray dirs = Win32Backend::get_runtime_search_dirs();
+	for (int i = 0; i < dirs.size(); i++) {
+		const String candidate = dirs[i] + "/dstoragecore.dll";
+		if (FileAccess::file_exists(candidate)) {
+			r_path.assign(reinterpret_cast<const wchar_t *>(candidate.utf16().get_data()));
+			return true;
+		}
+	}
+	return false;
+}
+
+} // namespace
+
+Dictionary Win32Backend::get_runtime_info() {
+	Dictionary info;
+	info["version"] = "Unavailable";
+	info["version_major"] = static_cast<int64_t>(0);
+	info["version_minor"] = static_cast<int64_t>(0);
+	info["version_build"] = static_cast<int64_t>(0);
+	info["version_revision"] = static_cast<int64_t>(0);
+	info["loaded"] = false;
+
+	uint16_t major = 0;
+	uint16_t minor = 0;
+	uint16_t build = 0;
+	uint16_t revision = 0;
+	std::wstring core_path;
+	bool has_version = false;
+	if (resolve_runtime_core_path(core_path)) {
+		has_version = read_dll_file_version(core_path, major, minor, build, revision);
+	}
+	if (has_version) {
+		info["version"] = String::num_int64(major) + "." + String::num_int64(minor) + "." + String::num_int64(build) + "." + String::num_int64(revision);
+		info["version_major"] = static_cast<int64_t>(major);
+		info["version_minor"] = static_cast<int64_t>(minor);
+		info["version_build"] = static_cast<int64_t>(build);
+		info["version_revision"] = static_cast<int64_t>(revision);
+	}
+
+	HMODULE core = GetModuleHandleW(L"dstoragecore.dll");
+	HMODULE dstorage = GetModuleHandleW(L"dstorage.dll");
+	info["loaded"] = core != nullptr && dstorage != nullptr;
+
+	// 1.3 introduced IDStorageQueue3 (EnqueueRequests); 1.4 introduced Zstd and
+	// GACL. The version compare is the fallback; the live probes below are
+	// authoritative when the shim is actually loaded.
+	const bool at_least_1_3 = has_version && (major > 1 || (major == 1 && minor >= 3));
+	const bool at_least_1_4 = has_version && (major > 1 || (major == 1 && minor >= 4));
+
+	bool configuration2 = false;
+	if (dstorage != nullptr) {
+		configuration2 = GetProcAddress(dstorage, "DStorageSetConfiguration2") != nullptr;
+	}
+
+	bool zstd = at_least_1_4;
+	bool zstd_probed = false;
+	if (dstorage != nullptr && (at_least_1_4 || configuration2)) {
+		using CreateCompressionCodecFunction = HRESULT(WINAPI *)(DSTORAGE_COMPRESSION_FORMAT, UINT32, REFIID, void **);
+		CreateCompressionCodecFunction create_codec = reinterpret_cast<CreateCompressionCodecFunction>(GetProcAddress(dstorage, "DStorageCreateCompressionCodec"));
+		if (create_codec != nullptr) {
+			IDStorageCompressionCodec *codec = nullptr;
+			// 2 is DSTORAGE_COMPRESSION_FORMAT_ZSTD in the 1.4 header. The
+			// literal keeps this translation unit compiling against 1.3.
+			const HRESULT hr = create_codec(static_cast<DSTORAGE_COMPRESSION_FORMAT>(2), 0, __uuidof(IDStorageCompressionCodec), reinterpret_cast<void **>(&codec));
+			zstd = SUCCEEDED(hr) && codec != nullptr;
+			zstd_probed = true;
+			if (codec != nullptr) {
+				codec->Release();
+			}
+		}
+	}
+
+	Dictionary capabilities;
+	capabilities["zstd"] = zstd;
+	capabilities["zstd_probed"] = zstd_probed;
+	capabilities["gacl"] = zstd && at_least_1_4;
+	capabilities["enqueue_requests"] = at_least_1_3;
+	capabilities["configuration2"] = configuration2;
+	capabilities["creator_id"] = configuration2;
+	info["capabilities"] = capabilities;
+	return info;
+}
+
 bool Win32Backend::probe_system_support() {
 	Dictionary drive_info = get_drive_info_for_path("res://");
 	if (!drive_info.get("directstorage_supported", false)) {
@@ -2318,6 +2446,7 @@ void Win32Backend::apply_dstorage_configuration() {}
 void Win32Backend::notify_runtime_modules_released() {}
 bool Win32Backend::probe_system_support() { return false; }
 PackedStringArray Win32Backend::get_runtime_search_dirs() { return PackedStringArray(); }
+Dictionary Win32Backend::get_runtime_info() { return Dictionary(); }
 #endif
 
 bool Win32Backend::is_available() const {

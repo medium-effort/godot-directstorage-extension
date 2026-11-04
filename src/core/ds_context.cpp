@@ -593,6 +593,19 @@ Dictionary DSContext::get_capability_report() const {
 	String queue_type = "none";
 #endif
 	report["directstorage_version"] = directstorage_version;
+	// The header's DSTORAGE_SDK_VERSION is what this binary was built against;
+	// runtime_version is the dstoragecore.dll actually installed/loaded. They
+	// diverge as soon as the addon ships a 1.3 binary next to a 1.4 runtime.
+#ifdef _WIN32
+	Dictionary runtime = Win32Backend::get_runtime_info();
+	report["runtime_version"] = runtime.get("version", "Unavailable");
+	report["runtime_loaded"] = runtime.get("loaded", false);
+	report["runtime_capabilities"] = runtime.get("capabilities", Dictionary());
+#else
+	report["runtime_version"] = "Unavailable";
+	report["runtime_loaded"] = false;
+	report["runtime_capabilities"] = Dictionary();
+#endif
 	report["gpu_decompression_available"] = gpu_tier > 0;
 	report["gpu_decompression_enabled"] = gpu_tier > 0 && !disable_gpu_decompression.load();
 	report["gpu_decompression_tier"] = gpu_tier;

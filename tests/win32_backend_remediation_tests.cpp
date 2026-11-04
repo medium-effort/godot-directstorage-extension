@@ -2457,4 +2457,99 @@ GDEX_TEST_T(win32_remediation, fence_wait_spends_the_whole_budget, TAG_INTEGRATI
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, runtime_info_reports_installed_runtime, TAG_UNIT) {
+#ifdef _WIN32
+    (void)ctx;
+    // The capability report must distinguish the SDK header this binary was
+    // built against from the dstoragecore.dll actually present. Reading it is
+    // read-only: it must not load a runtime that is not already loaded.
+    const godot::Dictionary info = godot::Win32Backend::get_runtime_info();
+    GDEX_EXPECT_TRUE(info.has("version"));
+    GDEX_EXPECT_TRUE(info.has("version_major"));
+    GDEX_EXPECT_TRUE(info.has("version_minor"));
+    GDEX_EXPECT_TRUE(info.has("loaded"));
+    GDEX_EXPECT_TRUE(info.has("capabilities"));
+
+    const godot::Dictionary caps = info["capabilities"];
+    GDEX_EXPECT_TRUE(caps.has("zstd"));
+    GDEX_EXPECT_TRUE(caps.has("zstd_probed"));
+    GDEX_EXPECT_TRUE(caps.has("gacl"));
+    GDEX_EXPECT_TRUE(caps.has("enqueue_requests"));
+    GDEX_EXPECT_TRUE(caps.has("configuration2"));
+    GDEX_EXPECT_TRUE(caps.has("creator_id"));
+
+    const bool loaded_before = info["loaded"];
+    const bool zstd = caps["zstd"];
+    const bool zstd_probed = caps["zstd_probed"];
+    const bool gacl = caps["gacl"];
+    const bool enqueue_requests = caps["enqueue_requests"];
+    const int64_t major = info["version_major"];
+    const int64_t minor = info["version_minor"];
+    const godot::String version = info["version"];
+
+    if (version == "Unavailable") {
+        GDEX_SKIP("No DirectStorage runtime with a version resource is staged in this fixture.");
+    }
+    GDEX_EXPECT_TRUE(major >= 1);
+    GDEX_EXPECT_TRUE(minor >= 0);
+
+    // Capability flags must agree with the version they were derived from. The
+    // Zstd probe is authoritative when it ran; otherwise the version decides.
+    const bool at_least_1_3 = major > 1 || (major == 1 && minor >= 3);
+    const bool at_least_1_4 = major > 1 || (major == 1 && minor >= 4);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(enqueue_requests), static_cast<int64_t>(at_least_1_3));
+    if (!zstd_probed) {
+        GDEX_EXPECT_EQ(static_cast<int64_t>(zstd), static_cast<int64_t>(at_least_1_4));
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(gacl), static_cast<int64_t>(zstd && at_least_1_4));
+
+    // Reading the report must not have loaded the runtime modules.
+    const godot::Dictionary after = godot::Win32Backend::get_runtime_info();
+    GDEX_EXPECT_EQ(static_cast<int64_t>(static_cast<bool>(after["loaded"])), static_cast<int64_t>(loaded_before));
+
+    // The context report carries the same values, so GDScript has one source.
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    GDEX_ASSERT_TRUE(ds != nullptr);
+    const godot::Dictionary report = ds->get_capability_report();
+    GDEX_EXPECT_TRUE(report.has("runtime_version"));
+    GDEX_EXPECT_TRUE(report.has("runtime_loaded"));
+    GDEX_EXPECT_TRUE(report.has("runtime_capabilities"));
+    GDEX_EXPECT_TRUE(godot::String(report["runtime_version"]) == version);
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, runtime_info_probes_loaded_runtime, TAG_INTEGRATION) {
+#ifdef _WIN32
+    (void)ctx;
+    // The Zstd probe only runs once the DirectStorage shim is live, so this case
+    // pins the loaded path: version, loaded flag, and probe/version agreement.
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    const godot::Dictionary info = godot::Win32Backend::get_runtime_info();
+    GDEX_EXPECT_TRUE(static_cast<bool>(info["loaded"]));
+    const godot::Dictionary caps = info["capabilities"];
+    const int64_t major = info["version_major"];
+    const int64_t minor = info["version_minor"];
+    const bool at_least_1_4 = major > 1 || (major == 1 && minor >= 4);
+    // 1.3 exposes no 1.4-only export, so the probe must not run there; on 1.4 it
+    // must run and agree with the version. Either way Zstd follows the probe.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(static_cast<bool>(caps["zstd_probed"])), static_cast<int64_t>(at_least_1_4));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(static_cast<bool>(caps["zstd"])), static_cast<int64_t>(at_least_1_4));
+    GDEX_EXPECT_TRUE(static_cast<bool>(caps["enqueue_requests"]));
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 

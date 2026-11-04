@@ -550,7 +550,7 @@ if env["platform"] == "windows":
         print("[SCons] or run the VS Code task 'Fetch DirectStorage Runtime'.")
         Exit(1)
     env.Append(LIBPATH=["thirdparty/directstorage/lib/x64"])
-    env.Append(LIBS=["dstorage.lib", "d3d12.lib", "dxgi.lib"])
+    env.Append(LIBS=["dstorage.lib", "d3d12.lib", "dxgi.lib", "version.lib"])
     if "msvc" in env["TOOLS"]:
         env.Append(LINKFLAGS=["/DELAYLOAD:dstorage.dll", "delayimp.lib", "/ignore:4099"])
         # Replace /std:c++17 with /std:c++20 to eliminate MSVC warning D9025
