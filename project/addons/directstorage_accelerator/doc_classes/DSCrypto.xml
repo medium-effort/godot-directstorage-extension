@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSCrypto" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Native cryptographic helpers used by the runtime installer.
+	</brief_description>
+	<description>
+		Provides cryptographic primitives that Godot's scripting layer does not expose, starting with SHA-512 over a file. SHA-512 is the hash NuGet publishes for package integrity through [code]packageHash[/code]; [HashingContext] only offers MD5, SHA-1 and SHA-256. On Windows the digest is computed with CNG (bcrypt); on other platforms [method sha512_file] returns an empty array because the DirectStorage runtime installer is Windows-only. Publisher-identity checks (Authenticode) can be added here later without changing the installer API.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="sha512_file" qualifiers="static">
+			<return type="PackedByteArray" />
+			<param index="0" name="path" type="String" />
+			<description>Returns the raw 64-byte SHA-512 digest of [param path]. Returns an empty array when the file cannot be read or no SHA-512 backend is available.</description>
+		</method>
+	</methods>
+</class>

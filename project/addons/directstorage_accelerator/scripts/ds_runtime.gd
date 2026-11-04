@@ -1,5 +1,7 @@
 extends Node
 
+const RUNTIME_INSTALLER_SCRIPT = preload("res://addons/directstorage_accelerator/scripts/ds_runtime_installer.gd")
+
 ## DirectStorage Runtime Coordinator & Watchdog Autoload
 ##
 ## Author: MediumEffort
@@ -170,6 +172,9 @@ func _ready() -> void:
 					return
 
 	if ClassDB.class_exists("DSContext"):
+		# Apply a staged runtime before the first DirectStorage call. No-op
+		# outside the editor and when nothing is pending.
+		RUNTIME_INSTALLER_SCRIPT.apply_pending()
 		var ctx = Engine.get_singleton("DSContext")
 		if ctx:
 			ctx.initialize_ds()

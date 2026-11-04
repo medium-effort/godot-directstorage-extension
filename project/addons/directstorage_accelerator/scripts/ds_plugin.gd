@@ -14,11 +14,15 @@ const LEGACY_AUTOLOAD_NAME: String = "DSBatchManager"
 const VERIFY_MENU_ITEM: String = "Verify exported pack (DSPkg)…"
 const VERIFY_DIALOG_SCENE: String = "uid://bdepjlb375cg5"
 const VERIFY_DIALOG_SCENE_PATH: String = "res://addons/directstorage_accelerator/tools/dspkg_pack_scan_dialog.tscn"
+const RUNTIME_MENU_ITEM: String = "DirectStorage runtime…"
+const RUNTIME_DIALOG_SCENE_PATH: String = "res://addons/directstorage_accelerator/tools/runtime_manager_dialog.tscn"
+const RUNTIME_INSTALLER_SCRIPT = preload("res://addons/directstorage_accelerator/scripts/ds_runtime_installer.gd")
 
 var _importer: EditorImportPlugin = null
 var _export_plugin: EditorExportPlugin = null
 var _checked_scenes: Dictionary = {}
 var _verify_dialog: Window = null
+var _runtime_dialog: Window = null
 
 
 ## Registers the autoload, import plugin, export plugin, and DirectStorage
@@ -31,6 +35,12 @@ var _verify_dialog: Window = null
 ## both paths. Unregistration lives in `_disable_plugin()`, the one callback
 ## the engine fires for a user-initiated disable alone (see `_exit_tree()`).
 func _enter_tree() -> void:
+	# A staged runtime swap has to land before the first DirectStorage call:
+	# only then are the flat DLLs unloaded and replaceable on Windows. This is
+	# a no-op when nothing is pending.
+	if Engine.is_editor_hint():
+		_apply_pending_runtime()
+
 	# Purge legacy autoload if present from older addon versions
 	_sync_autoload(LEGACY_AUTOLOAD_NAME, "")
 	_sync_autoload(AUTOLOAD_NAME, AUTOLOAD_PATH)
@@ -67,6 +77,7 @@ func _enter_tree() -> void:
 
 	if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
 		add_tool_menu_item(VERIFY_MENU_ITEM, _on_verify_exported_pack)
+		add_tool_menu_item(RUNTIME_MENU_ITEM, _on_runtime_menu)
 
 	if not scene_changed.is_connected(_on_scene_changed):
 		scene_changed.connect(_on_scene_changed)
@@ -100,10 +111,14 @@ func _exit_tree() -> void:
 
 	if Engine.is_editor_hint() and EditorInterface.get_editor_main_screen() != null:
 		remove_tool_menu_item(VERIFY_MENU_ITEM)
+		remove_tool_menu_item(RUNTIME_MENU_ITEM)
 
 	if is_instance_valid(_verify_dialog):
 		_verify_dialog.queue_free()
 		_verify_dialog = null
+	if is_instance_valid(_runtime_dialog):
+		_runtime_dialog.queue_free()
+		_runtime_dialog = null
 
 	if scene_changed.is_connected(_on_scene_changed):
 		scene_changed.disconnect(_on_scene_changed)
@@ -255,3 +270,33 @@ func _on_verify_exported_pack() -> void:
 		return
 	base.add_child(dialog)
 	dialog.popup_centered()
+
+
+## Applies a staged runtime before the first DirectStorage call. Windows keeps
+## loaded modules locked, so an install only stages the files; this is where the
+## swap actually happens on the next editor start.
+func _apply_pending_runtime() -> void:
+	var error: int = RUNTIME_INSTALLER_SCRIPT.apply_pending()
+	if error != OK:
+		push_warning(
+			"[DirectStorage] A staged runtime update could not be applied (%s); it will be retried on the next editor start." % error_string(error)
+		)
+
+
+## Opens the runtime manager dialog, reusing the window between invocations and
+## parenting it to the themed editor base Control (same reason as the pack scan
+## dialog).
+func _on_runtime_menu() -> void:
+	if not is_instance_valid(_runtime_dialog):
+		var dialog_scene := load(RUNTIME_DIALOG_SCENE_PATH) as PackedScene
+		if dialog_scene == null:
+			push_error("[DirectStorage] Runtime manager dialog missing at " + RUNTIME_DIALOG_SCENE_PATH)
+			return
+		_runtime_dialog = dialog_scene.instantiate() as Window
+		var base := EditorInterface.get_base_control()
+		if base == null:
+			EditorInterface.popup_dialog_centered(_runtime_dialog)
+			return
+		base.add_child(_runtime_dialog)
+	if _runtime_dialog.has_method("open"):
+		_runtime_dialog.call("open")
