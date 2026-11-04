@@ -37,6 +37,7 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <set>
 #include <utility>
 #include <algorithm>
@@ -218,6 +219,17 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 	if (header.is_empty() || !header.has("mip_count")) {
 		return false;
 	}
+	// Chunked v3 payloads are not contiguous; the staging splitter must not
+	// treat a chunk table sum as one source range.
+	if (header.has("chunked") && static_cast<bool>(header["chunked"])) {
+		return false;
+	}
+	if ((int)header.get("compression_format", (int)DSCompressionFormat::GDEFLATE) != (int)DSCompressionFormat::GDEFLATE ||
+			(int)header.get("gacl_transform", (int)DSGaclTransform::NONE) != (int)DSGaclTransform::NONE) {
+		// The splitter emits GDeflate children; Zstd/GACL payloads must wait for
+		// Step 4's request fields.
+		return false;
+	}
 	uint32_t mip_count = header["mip_count"];
 	if (mip_count == 0) {
 		return false;
@@ -284,22 +296,51 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 		}
 		DSTexHeader header = {};
 		std::memcpy(&header, header_data.ptr(), sizeof(header));
-		if (header.magic != 0x58455444 || header.version != 2 || header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT ||
-				header.compressed_size == 0 || header.original_size == 0 || header.reserved != 0 ||
+		if (header.magic != 0x58455444 || (header.version != 2 && header.version != 3) ||
+				header.mip_count == 0 || header.mip_count > DSTEX_MAX_MIP_COUNT ||
+				header.compressed_size == 0 || header.original_size == 0 ||
+				(header.flags & ~(DSTEX_FLAG_SRGB | DSTEX_FLAG_AS_IMAGE_TEXTURE)) != 0 ||
 				!dstex_sizes_are_sane(header.width, header.height, header.original_size, header.compressed_size) ||
 				header.mip_count > (std::numeric_limits<uint64_t>::max() - sizeof(DSTexHeader)) / sizeof(DSTexMipEntryV2)) {
 			return false;
 		}
 
-		uint64_t entries_end = sizeof(DSTexHeader) + static_cast<uint64_t>(header.mip_count) * sizeof(DSTexMipEntryV2);
+		const bool is_v3 = header.version == 3;
+		uint64_t capabilities = 0;
+		if (!is_v3) {
+			if (header.reserved != 0) {
+				return false;
+			}
+		} else {
+			capabilities = header.reserved;
+			if ((capabilities & ~DSTEX_CAP_KNOWN_MASK) != 0) {
+				return false;
+			}
+			const DSCompressionFormat format = DSTex::get_compression_format(capabilities);
+			const DSGaclTransform gacl = DSTex::get_gacl_transform(capabilities);
+			if (!ds_compression_format_is_valid(static_cast<uint8_t>(format)) ||
+					!ds_gacl_transform_is_valid(static_cast<uint8_t>(gacl)) ||
+					!DSTex::gacl_transform_matches_pixel_format(gacl, static_cast<int>(header.pixel_format)) ||
+					(gacl != DSGaclTransform::NONE && format == DSCompressionFormat::NONE)) {
+				return false;
+			}
+			if (format == DSCompressionFormat::NONE && header.compressed_size != header.original_size) {
+				return false;
+			}
+			// Step 3 GPU staging decodes only one GDeflate frame per mip. Zstd,
+			// GACL-shuffled and chunked payloads must fail closed until Step 4
+			// wires their request/destination paths.
+			if (format != DSCompressionFormat::GDEFLATE || gacl != DSGaclTransform::NONE) {
+				return false;
+			}
+		}
+
 		uint64_t file_length = static_cast<uint64_t>(file->get_length());
-		if (entries_end > file_length || header.compressed_size > file_length - entries_end) {
+		uint64_t mip_table_end = sizeof(DSTexHeader) + static_cast<uint64_t>(header.mip_count) * sizeof(DSTexMipEntryV2);
+		if (mip_table_end > file_length) {
 			return false;
 		}
 		r_entries.resize(header.mip_count);
-		uint64_t compressed_size = 0;
-		uint64_t uncompressed_size = 0;
-		uint64_t previous_end = entries_end;
 		for (uint32_t mip_index = 0; mip_index < header.mip_count; mip_index++) {
 			PackedByteArray entry_data = file->get_buffer(sizeof(DSTexMipEntryV2));
 			if (entry_data.size() != static_cast<int64_t>(sizeof(DSTexMipEntryV2))) {
@@ -308,18 +349,150 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 			}
 			std::memcpy(&r_entries.write[mip_index], entry_data.ptr(), sizeof(DSTexMipEntryV2));
 			const DSTexMipEntryV2 &entry = r_entries[mip_index];
-			uint64_t entry_end = 0;
-			if (entry.offset < previous_end || entry.offset > file_length || entry.compressed_size == 0 ||
-					entry.compressed_size > file_length - entry.offset || entry.offset > UINT64_MAX - entry.compressed_size ||
-					entry.reserved != 0 || entry.uncompressed_size == 0 || entry.row_pitch == 0 || entry.row_pitch % 256 != 0 ||
-					compressed_size > UINT64_MAX - entry.compressed_size || uncompressed_size > UINT64_MAX - entry.uncompressed_size) {
+			if (!is_v3 && entry.reserved != 0) {
 				r_entries.clear();
 				return false;
 			}
-			entry_end = entry.offset + entry.compressed_size;
+			if (is_v3 && (entry.chunk_count == 0 || entry.chunk_count > DSTEX_MAX_CHUNKS_PER_MIP)) {
+				r_entries.clear();
+				return false;
+			}
+			if (is_v3 && (entry.row_pitch == 0 || entry.row_pitch % 256 != 0 ||
+					entry.uncompressed_size == 0 ||
+					entry.uncompressed_size % entry.row_pitch != 0)) {
+				// row_pitch == 0 must short-circuit before the modulo above; the
+				// v3 chunk loop divides by this value.
+				r_entries.clear();
+				return false;
+			}
+		}
+
+		if (is_v3) {
+			for (uint32_t mip_index = 0; mip_index < header.mip_count; mip_index++) {
+				if (r_entries[mip_index].chunk_count > 1) {
+					// Chunk tables need chunk-destination requests; Step 3 has no
+					// path for them, so never hand them to the un-chunked GPU
+					// staging logic.
+					r_entries.clear();
+					return false;
+				}
+			}
+		}
+
+		// Same structural contract as DSTex::read_header/preloader: each mip
+		// footprint must match the declared layout and the table must add up to
+		// the header totals.
+		if (!DSTex::mip_table_is_sane(header, r_entries.ptr())) {
+			r_entries.clear();
+			return false;
+		}
+
+		// v3 chunk tables follow the whole mip table. They are part of the TOC
+		// envelope, so entries_end must include them before any payload starts.
+		std::vector<std::vector<DSChunkEntry>> chunk_tables;
+		uint64_t total_chunk_entries = 0;
+		if (is_v3) {
+			chunk_tables.resize(header.mip_count);
+			for (uint32_t mip_index = 0; mip_index < header.mip_count; mip_index++) {
+				const uint32_t chunk_count = r_entries[mip_index].chunk_count;
+				if (chunk_count > 1) {
+					if (total_chunk_entries > std::numeric_limits<uint64_t>::max() - chunk_count) {
+						r_entries.clear();
+						return false;
+					}
+					total_chunk_entries += chunk_count;
+				}
+			}
+		}
+		uint64_t chunk_table_end = 0;
+		if (total_chunk_entries > (std::numeric_limits<uint64_t>::max() - mip_table_end) / sizeof(DSChunkEntry)) {
+			r_entries.clear();
+			return false;
+		}
+		chunk_table_end = mip_table_end + total_chunk_entries * sizeof(DSChunkEntry);
+		if (chunk_table_end > file_length) {
+			r_entries.clear();
+			return false;
+		}
+
+		if (is_v3) {
+			const DSCompressionFormat format = DSTex::get_compression_format(capabilities);
+			bool any_chunked = false;
+			for (uint32_t mip_index = 0; mip_index < header.mip_count; mip_index++) {
+				const DSTexMipEntryV2 &mip_entry = r_entries[mip_index];
+				const uint32_t chunk_count = mip_entry.chunk_count;
+				if (chunk_count == 1) {
+					continue;
+				}
+				any_chunked = true;
+				chunk_tables[mip_index].resize(chunk_count);
+				uint64_t sum_compressed = 0;
+				uint64_t sum_uncompressed = 0;
+				for (uint32_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+					PackedByteArray chunk_data = file->get_buffer(sizeof(DSChunkEntry));
+					if (chunk_data.size() != static_cast<int64_t>(sizeof(DSChunkEntry))) {
+						r_entries.clear();
+						return false;
+					}
+					DSChunkEntry &chunk = chunk_tables[mip_index][chunk_index];
+					std::memcpy(&chunk, chunk_data.ptr(), sizeof(DSChunkEntry));
+					if (chunk.compressed_size == 0 || chunk.uncompressed_size == 0 ||
+							chunk.uncompressed_size % mip_entry.row_pitch != 0 ||
+							chunk.offset > file_length ||
+							chunk.compressed_size > file_length - chunk.offset ||
+							chunk.offset % (chunk_index == 0 ? 512 : 8) != 0 ||
+							(chunk_index == 0 && chunk.offset != mip_entry.offset) ||
+							(format == DSCompressionFormat::NONE && chunk.compressed_size != chunk.uncompressed_size)) {
+						r_entries.clear();
+						return false;
+					}
+					sum_compressed += chunk.compressed_size;
+					sum_uncompressed += chunk.uncompressed_size;
+				}
+				if (sum_compressed != mip_entry.compressed_size ||
+						sum_uncompressed != mip_entry.uncompressed_size) {
+					r_entries.clear();
+					return false;
+				}
+			}
+			if (any_chunked != ((capabilities & DSTEX_CAP_CHUNKED) != 0)) {
+				r_entries.clear();
+				return false;
+			}
+		}
+
+		uint64_t compressed_size = 0;
+		uint64_t uncompressed_size = 0;
+		uint64_t previous_end = chunk_table_end;
+		for (uint32_t mip_index = 0; mip_index < header.mip_count; mip_index++) {
+			const DSTexMipEntryV2 &entry = r_entries[mip_index];
+			if (entry.compressed_size == 0 || entry.uncompressed_size == 0 ||
+					entry.row_pitch == 0 || entry.row_pitch % 256 != 0 ||
+					entry.offset % 512 != 0 ||
+					entry.offset > file_length ||
+					entry.compressed_size > file_length - entry.offset ||
+					compressed_size > UINT64_MAX - entry.compressed_size ||
+					uncompressed_size > UINT64_MAX - entry.uncompressed_size) {
+				r_entries.clear();
+				return false;
+			}
+			if (entry.offset < previous_end) {
+				r_entries.clear();
+				return false;
+			}
+			if (!is_v3 || entry.chunk_count == 1) {
+				previous_end = entry.offset + entry.compressed_size;
+			} else {
+				for (const DSChunkEntry &chunk : chunk_tables[mip_index]) {
+					if (chunk.offset < previous_end) {
+						r_entries.clear();
+						return false;
+					}
+					previous_end = chunk.offset + chunk.compressed_size;
+				}
+			}
 			compressed_size += entry.compressed_size;
 			uncompressed_size += entry.uncompressed_size;
-			previous_end = entry_end;
 		}
 		if (compressed_size != header.compressed_size || uncompressed_size != header.original_size) {
 			r_entries.clear();
@@ -364,6 +537,17 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 		// back to the safe error path in enqueue_request, no crash.
 		Vector<DSPkgMipEntry> package_entries;
 		if (!dspkg_cache.package->get_mip_entries_for_offset(p_offset, package_entries) || package_entries.is_empty()) {
+			return false;
+		}
+		uint8_t entry_format = 0;
+		uint8_t entry_gacl = 0;
+		bool entry_chunked = false;
+		if (!dspkg_cache.package->get_entry_features_for_offset(p_offset, entry_format, entry_gacl, entry_chunked) ||
+				entry_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE) ||
+				entry_gacl != static_cast<uint8_t>(DSGaclTransform::NONE) ||
+				entry_chunked) {
+			// The un-chunked GPU staging path can only submit one GDeflate stream
+			// per mip. Zstd/GACL/chunked entries fail closed until Step 4.
 			return false;
 		}
 		r_entries.resize(package_entries.size());

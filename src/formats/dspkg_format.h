@@ -11,6 +11,8 @@
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 
+#include "ds_format_common.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -22,19 +24,28 @@ constexpr uint16_t DSPKG_VERSION_LEGACY = 1;
 constexpr uint16_t DSPKG_VERSION_GPU_METADATA = 2;
 constexpr uint16_t DSPKG_VERSION_ENTRY_FLAGS = 3;
 constexpr uint16_t DSPKG_VERSION_V4 = 4;
+constexpr uint16_t DSPKG_VERSION_V5 = 5;
 
 constexpr uint16_t DSPKG_FLAG_GPU_MIP_METADATA = (1 << 0);
 constexpr uint16_t DSPKG_FLAG_ENCRYPTED_TOC = (1 << 1);
+constexpr uint16_t DSPKG_FLAG_EXTENSION_TABLE = (1 << 2);
 
 constexpr uint64_t DSPKG_ENTRY_PREFIX_SIZE = 10;
 constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE_LEGACY = 40;
 constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE_V3 = 44;
+constexpr uint64_t DSPKG_ENTRY_FIELDS_SIZE_V5 = 56;
 constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE_LEGACY = 50;
 constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE_V3 = 54;
+constexpr uint64_t DSPKG_FIXED_ENTRY_SIZE_V5 = 66;
 
 constexpr uint64_t DSPKG_MAX_TOC_SIZE = 16ULL * 1024ULL * 1024ULL;
+constexpr uint64_t DSPKG_MAX_TOC_SIZE_V5 = 64ULL * 1024ULL * 1024ULL;
+constexpr uint64_t DSPKG_MAX_ENTRY_METADATA = 64ULL * 1024ULL;
+constexpr uint64_t DSPKG_MAX_ENTRY_EXTENSIONS = 64ULL * 1024ULL;
+constexpr uint32_t DSPKG_MAX_CHUNKS_PER_MIP = 4096;
 constexpr uint64_t DSPKG_HEADER_SIZE_LEGACY = 28;
 constexpr uint64_t DSPKG_HEADER_SIZE_V4 = 64;
+constexpr uint64_t DSPKG_HEADER_SIZE_V5 = 96;
 constexpr uint64_t DSPKG_ENCRYPTION_MAC_SIZE = 16;
 constexpr uint64_t DSPKG_ENCRYPTION_SALT_SIZE = 16;
 constexpr uint64_t DSPKG_ENCRYPTION_NONCE_SIZE = 24;
@@ -63,12 +74,56 @@ static_assert(offsetof(DSPkgHeader, key_id) == 52, "key_id offset mismatch");
 static_assert(offsetof(DSPkgHeader, reserved) == 60, "reserved offset mismatch");
 
 #pragma pack(push, 1)
+struct DSPkgHeaderV5 {
+	uint32_t magic;
+	uint16_t version;
+	uint16_t flags;
+	uint32_t entry_count;
+	uint64_t data_offset;
+	uint64_t archive_fingerprint;
+	uint32_t compression_codec;
+	uint8_t archive_salt[16];
+	uint32_t min_reader_version;
+	uint64_t key_id;
+	uint32_t reserved0;
+	uint16_t header_size;
+	uint16_t toc_entry_size;
+	uint64_t capabilities;
+	uint64_t extension_offset;
+	uint32_t extension_size;
+	uint64_t reserved2;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(DSPkgHeaderV5) == 96, "DSPkgHeaderV5 must be exactly 96 bytes");
+static_assert(offsetof(DSPkgHeaderV5, magic) == 0, "magic offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, version) == 4, "version offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, flags) == 6, "flags offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, entry_count) == 8, "entry_count offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, data_offset) == 12, "data_offset offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, archive_fingerprint) == 20, "archive_fingerprint offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, compression_codec) == 28, "compression_codec offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, archive_salt) == 32, "archive_salt offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, min_reader_version) == 48, "min_reader_version offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, key_id) == 52, "key_id offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, reserved0) == 60, "reserved0 offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, header_size) == 64, "header_size offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, toc_entry_size) == 66, "toc_entry_size offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, capabilities) == 68, "capabilities offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, extension_offset) == 76, "extension_offset offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, extension_size) == 84, "extension_size offset mismatch");
+static_assert(offsetof(DSPkgHeaderV5, reserved2) == 88, "reserved2 offset mismatch");
+
+#pragma pack(push, 1)
 struct DSPkgMipEntry {
 	uint64_t offset;            // byte offset from archive start to compressed mip data
 	uint32_t compressed_size;   // compressed mip payload size
 	uint32_t uncompressed_size; // D3D12 footprint size in bytes
 	uint32_t row_pitch;         // D3D12 256-byte aligned row pitch
-	uint32_t reserved;          // reserved alignment padding
+	union {
+		uint32_t reserved;    // v1-v4: must be zero
+		uint32_t chunk_count; // v5: 1 = inline, >1 = chunk table follows
+	};
 };
 #pragma pack(pop)
 
@@ -85,11 +140,33 @@ struct DSPkgEntry {
 	uint32_t pixel_format = 0;
 	uint32_t mip_count = 0;
 	uint32_t flags = 0;
+	uint8_t entry_kind = 0;
+	uint8_t compression_format = 0;
+	uint8_t gacl_transform = 0;
+	uint8_t descriptor_flags = 0;
+	uint32_t metadata_size = 0;
+	uint32_t extensions_size = 0;
+	bool chunked = false;
+	uint32_t total_chunk_count = 0;
 	PackedInt64Array mip_offsets;
 	PackedInt32Array mip_sizes;
 	PackedInt32Array mip_uncompressed_sizes;
 	PackedInt32Array mip_row_pitches;
+	PackedInt32Array mip_chunk_counts;
+	PackedInt64Array chunk_offsets;
+	PackedInt32Array chunk_compressed_sizes;
+	PackedInt32Array chunk_uncompressed_sizes;
 	bool has_gpu_metadata = false;
+};
+
+// Value stored in the reader's absolute-offset index. The mip geometry is what
+// the GPU path needs; the feature fields let a consumer fail closed before it
+// treats a Zstd/GACL/chunked payload as one GDeflate stream.
+struct DSPkgOffsetEntry {
+	Vector<DSPkgMipEntry> mips;
+	uint8_t compression_format = static_cast<uint8_t>(DSCompressionFormat::GDEFLATE);
+	uint8_t gacl_transform = static_cast<uint8_t>(DSGaclTransform::NONE);
+	bool chunked = false;
 };
 
 // Builder staging entry: metadata captured by add_texture() only. The payload
@@ -144,9 +221,14 @@ private:
 	// Reader state
 	String opened_path;
 	DSPkgHeader loaded_header{};
+	uint16_t loaded_header_size = DSPKG_HEADER_SIZE_V4;
+	uint16_t loaded_toc_entry_size = DSPKG_FIXED_ENTRY_SIZE_V3;
+	uint64_t loaded_capabilities = 0;
+	uint64_t loaded_extension_offset = 0;
+	uint32_t loaded_extension_size = 0;
 	HashMap<String, DSPkgEntry> entries_by_path;
 	HashMap<uint64_t, Vector<DSPkgEntry>> entries_by_hash;
-	HashMap<uint64_t, Vector<DSPkgMipEntry>> entries_by_offset;
+	HashMap<uint64_t, DSPkgOffsetEntry> entries_by_offset;
 	bool is_opened = false;
 
 	const DSPkgEntry *find_entry_for_path(const String &p_resource_path) const;
@@ -197,6 +279,7 @@ public:
 	Dictionary get_entry_info(const String &p_resource_path) const;
 	bool get_mip_entries_for_path(const String &p_path, Vector<DSPkgMipEntry> &r_entries) const;
 	bool get_mip_entries_for_offset(uint64_t p_offset, Vector<DSPkgMipEntry> &r_entries) const;
+	bool get_entry_features_for_offset(uint64_t p_offset, uint8_t &r_compression_format, uint8_t &r_gacl_transform, bool &r_chunked) const;
 	Array get_mip_entries_for_offset(uint64_t p_offset) const;
 	int get_entry_count() const;
 	Array get_entries() const;

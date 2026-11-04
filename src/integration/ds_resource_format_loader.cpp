@@ -950,6 +950,22 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 					DSTex::is_rd_format_srgb(pixel_format);
 			uint32_t mip_count = entry_info["mip_count"];
 			bool is_v2 = entry_info.has("has_gpu_metadata") ? (bool)entry_info["has_gpu_metadata"] : false;
+			int entry_kind = entry_info.has("entry_kind") ? (int)entry_info["entry_kind"] : 0;
+			int compression_format = entry_info.has("compression_format") ? (int)entry_info["compression_format"] : 1;
+			int gacl_transform = entry_info.has("gacl_transform") ? (int)entry_info["gacl_transform"] : 0;
+			bool chunked = entry_info.has("chunked") ? (bool)entry_info["chunked"] : false;
+			if (entry_kind != static_cast<int>(DSPkgEntryKind::TEXTURE)) {
+				UtilityFunctions::push_error("DSResourceFormatLoader: DSPkg entry is not a texture: ", target_path);
+				return Variant();
+			}
+			// The CPU/ImageTexture and pre-Step-4 GPU paths only decode GDeflate,
+			// non-shuffled, single-frame payloads. Fail closed instead of
+			// misreading Zstd/GACL bytes or ignoring chunks.
+			if (compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) ||
+					gacl_transform != static_cast<int>(DSGaclTransform::NONE) || chunked) {
+				UtilityFunctions::push_error("DSResourceFormatLoader: DSPkg entry uses Zstd/GACL/chunked payloads that require the GPU path or Step 5 CPU support: ", target_path);
+				return Variant();
+			}
 			PackedInt64Array mip_offsets = entry_info.has("mip_offsets") ? (PackedInt64Array)entry_info["mip_offsets"] : PackedInt64Array();
 			PackedInt32Array mip_sizes = entry_info.has("mip_sizes") ? (PackedInt32Array)entry_info["mip_sizes"] : PackedInt32Array();
 			PackedInt32Array mip_uncompressed_sizes = entry_info.has("mip_uncompressed_sizes") ? (PackedInt32Array)entry_info["mip_uncompressed_sizes"] : PackedInt32Array();
@@ -980,13 +996,34 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		uint32_t mip_count = header["mip_count"];
 		uint64_t original_size = header["original_size"];
 		uint64_t compressed_size = header["compressed_size"];
-		bool is_v2 = header.has("version") && (int)header["version"] == 2;
+		const int header_version = header.has("version") ? (int)header["version"] : 1;
+		bool is_v2 = header_version == 2 || header_version == 3;
+		if (header_version == 3) {
+			const int compression_format = header.has("compression_format") ? (int)header["compression_format"] : 0;
+			const int gacl_transform = header.has("gacl_transform") ? (int)header["gacl_transform"] : 0;
+			const bool chunked = header.has("chunked") ? (bool)header["chunked"] : false;
+			if (compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) ||
+					gacl_transform != static_cast<int>(DSGaclTransform::NONE) || chunked) {
+				UtilityFunctions::push_error("DSResourceFormatLoader: DSTex v3 uses Zstd/GACL/chunked payloads that require the GPU path or Step 5 CPU support: ", p_path);
+				return Variant();
+			}
+		}
 		PackedInt64Array mip_offsets = header.has("mip_offsets") ? (PackedInt64Array)header["mip_offsets"] : PackedInt64Array();
 		PackedInt32Array mip_sizes = header.has("mip_sizes") ? (PackedInt32Array)header["mip_sizes"] : PackedInt32Array();
 		PackedInt32Array mip_uncompressed_sizes = header.has("mip_uncompressed_sizes") ? (PackedInt32Array)header["mip_uncompressed_sizes"] : PackedInt32Array();
 		PackedInt32Array mip_row_pitches = header.has("mip_row_pitches") ? (PackedInt32Array)header["mip_row_pitches"] : PackedInt32Array();
 
 		uint64_t data_offset = sizeof(DSTexHeader) + ((is_v2 ? sizeof(DSTexMipEntryV2) : sizeof(DSTexMipEntry)) * mip_count);
+		if (header_version == 3) {
+			PackedInt32Array chunk_counts = header.has("mip_chunk_counts") ? (PackedInt32Array)header["mip_chunk_counts"] : PackedInt32Array();
+			uint64_t total_chunk_entries = 0;
+			for (int i = 0; i < chunk_counts.size(); ++i) {
+				if (chunk_counts[i] > 1) {
+					total_chunk_entries += static_cast<uint64_t>(chunk_counts[i]);
+				}
+			}
+			data_offset += total_chunk_entries * sizeof(DSChunkEntry);
+		}
 		if (is_v2) {
 			data_offset = (data_offset + 511) & ~uint64_t(511);
 		}

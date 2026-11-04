@@ -1,6 +1,8 @@
 #ifndef DSTEX_FORMAT_H
 #define DSTEX_FORMAT_H
 
+#include "ds_format_common.h"
+
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
@@ -19,10 +21,13 @@ enum DSTexFlags {
 	DSTEX_FLAG_AS_IMAGE_TEXTURE = 1 << 1,
 };
 
+constexpr uint16_t DSTEX_VERSION_V2 = 2;
+constexpr uint16_t DSTEX_VERSION_V3 = 3;
+
 #pragma pack(push, 1)
 struct DSTexHeader {
 	uint32_t magic;           // 0x58455444 ("DTEX" little-endian)
-	uint16_t version;         // 1
+	uint16_t version;         // 1, 2, or 3
 	uint16_t flags;           // bit 0: sRGB, bit 1: as ImageTexture (projector/decal compatible)
 	uint32_t width;
 	uint32_t height;
@@ -30,7 +35,7 @@ struct DSTexHeader {
 	uint32_t mip_count;
 	uint64_t original_size;   // uncompressed total bytes
 	uint64_t compressed_size; // compressed total bytes
-	uint64_t reserved;        // 0
+	uint64_t reserved;        // v1/v2: 0; v3: capability word
 };
 
 struct DSTexMipEntry {
@@ -43,7 +48,10 @@ struct DSTexMipEntryV2 {
 	uint32_t compressed_size;   // compressed mip payload size
 	uint32_t uncompressed_size; // footprint-aligned uncompressed size in bytes
 	uint32_t row_pitch;         // D3D12 256-byte aligned row pitch
-	uint32_t reserved;          // reserved alignment padding
+	union {
+		uint32_t reserved;    // v1/v2: must be zero
+		uint32_t chunk_count; // v3: 1 = inline, >1 = chunk table follows
+	};
 };
 #pragma pack(pop)
 
@@ -60,6 +68,7 @@ static_assert(sizeof(DSTexMipEntryV2) == 24, "DSTexMipEntryV2 must be 24 bytes")
 static constexpr uint32_t DSTEX_MAX_MIP_COUNT = 16;
 static constexpr uint32_t DSTEX_MAX_DIMENSION = 16384;
 static constexpr uint64_t DSTEX_MAX_TOTAL_BYTES = 512ULL * 1024ULL * 1024ULL;
+static constexpr uint32_t DSTEX_MAX_CHUNKS_PER_MIP = 4096;
 
 // Generous upper bound: 16 bytes/px (RGBA32F) x 2 for mips + footprint padding.
 // The padding term is load-bearing, not slack: every mip row is rounded up to a
@@ -124,6 +133,16 @@ public:
 	static int rd_format_to_godot_format(int p_rd_format);
 	static bool is_rd_format_srgb(int p_rd_format);
 	static int get_srgb_rd_format(int p_rd_format);
+
+	// v3 capability helpers.
+	static DSCompressionFormat get_compression_format(uint64_t p_capabilities);
+	static DSGaclTransform get_gacl_transform(uint64_t p_capabilities);
+	static bool is_chunked(uint64_t p_capabilities);
+	static bool gacl_transform_matches_pixel_format(DSGaclTransform p_transform, int p_rd_format);
+	// Shared v2/v3 mip-table structural check: per-mip footprint must match the
+	// declared layout and the table must add up to the header totals. Used by
+	// DSTex, DSPreloader and Win32Backend so all three reject the same files.
+	static bool mip_table_is_sane(const DSTexHeader &p_header, const DSTexMipEntryV2 *p_entries);
 };
 
 } // namespace godot

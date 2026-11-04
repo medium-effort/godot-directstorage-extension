@@ -25,6 +25,15 @@ constexpr uint32_t D3D12_TEXTURE_DATA_PITCH_ALIGNMENT = 256;
 constexpr uint32_t D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT = 512;
 
 static const uint8_t DOMAIN_SEPARATOR[8] = {'D', 'S', 'P', 'K', 'G', 'v', '4', 0x01};
+// v5 uses a distinct separator so a v4 and a v5 ciphertext are never
+// interchangeable under the same key/salt.
+static const uint8_t DOMAIN_SEPARATOR_V5[8] = {'D', 'S', 'P', 'K', 'G', 'v', '5', 0x01};
+
+// Upper bound for one v5 spill entry (10 prefix + 65535 path + 56 fixed fields
+// + 64 KiB metadata + 64 KiB entry TLV + 16 mip entries + 16*4096 chunk
+// entries = 1,245,633 bytes). Rounded up to 2 MiB so the reader can reject an
+// implausible TOC before allocating or decrypting it.
+constexpr uint64_t DSPKG_MAX_SERIALIZED_ENTRY_SIZE_V5 = 2ULL * 1024ULL * 1024ULL;
 
 // Archive-key delivery contract: the exporter injects this PCK entry as
 // magic16 || key32. The magic is derived from a public label instead of being
@@ -181,11 +190,14 @@ public:
 	bool has_remaining(uint64_t bytes) const { return !has_error && (cursor + bytes <= size) && (cursor + bytes >= cursor); }
 	uint64_t get_cursor() const { return cursor; }
 	uint64_t get_size() const { return size; }
+	const uint8_t *get_data() const { return buffer; }
 	bool is_ok() const { return !has_error; }
 	uint64_t get_64() { if (!has_remaining(8)) { has_error = true; return 0; } uint64_t val; memcpy(&val, buffer + cursor, 8); cursor += 8; return val; }
 	uint32_t get_32() { if (!has_remaining(4)) { has_error = true; return 0; } uint32_t val; memcpy(&val, buffer + cursor, 4); cursor += 4; return val; }
 	uint16_t get_16() { if (!has_remaining(2)) { has_error = true; return 0; } uint16_t val; memcpy(&val, buffer + cursor, 2); cursor += 2; return val; }
+	uint8_t get_8() { if (!has_remaining(1)) { has_error = true; return 0; } uint8_t val; memcpy(&val, buffer + cursor, 1); cursor += 1; return val; }
 	bool get_buffer(uint8_t *dst, uint64_t bytes) { if (!has_remaining(bytes)) { has_error = true; return false; } memcpy(dst, buffer + cursor, bytes); cursor += bytes; return true; }
+	bool skip(uint64_t bytes) { if (!has_remaining(bytes)) { has_error = true; return false; } cursor += bytes; return true; }
 };
 
 class TOCBufferWriter {
@@ -225,6 +237,94 @@ bool checked_multiply(uint64_t p_left, uint64_t p_right, uint64_t &r_result) {
 		return false;
 	}
 	r_result = p_left * p_right;
+	return true;
+}
+
+struct DSPkgTlvSummary {
+	bool has_crypto = false;
+	bool has_provenance = false;
+	bool has_archive_set = false;
+	bool has_delta = false;
+};
+
+// Validates one TLV table (header extension or entry extensions). The encoding
+// is tag:u32 || size:u32 || payload[size] padded to 8 bytes. Tables must be
+// fully consumed: no trailing partial record and no extra zero bytes beyond a
+// record's own alignment padding.
+bool validate_tlv_table(const uint8_t *p_data, uint64_t p_size, uint64_t p_max_total,
+		const char *p_context, DSPkgTlvSummary &r_summary, String &r_error) {
+	if (p_size == 0) {
+		return true;
+	}
+	if (p_size > p_max_total) {
+		r_error = String(p_context) + " TLV table exceeds its size limit.";
+		return false;
+	}
+	std::vector<uint32_t> seen_tags;
+	uint64_t cursor = 0;
+	while (cursor < p_size) {
+		if (p_size - cursor < DS_TLV_HEADER_SIZE) {
+			r_error = String(p_context) + " TLV header extends past the table.";
+			return false;
+		}
+		uint32_t tag = 0;
+		uint32_t payload_size = 0;
+		memcpy(&tag, p_data + cursor, 4);
+		memcpy(&payload_size, p_data + cursor + 4, 4);
+		if (tag == 0) {
+			r_error = String(p_context) + " TLV tag 0 is invalid.";
+			return false;
+		}
+		if (payload_size > DS_TLV_MAX_PAYLOAD) {
+			r_error = String(p_context) + " TLV payload exceeds the per-record limit.";
+			return false;
+		}
+		uint64_t record_size = 0;
+		uint64_t padded_size = 0;
+		if (!checked_add(DS_TLV_HEADER_SIZE, payload_size, record_size) ||
+				!align_up(record_size, 8, padded_size)) {
+			r_error = String(p_context) + " TLV record size overflow.";
+			return false;
+		}
+		if (record_size > p_size - cursor || padded_size > p_size - cursor) {
+			r_error = String(p_context) + " TLV record extends past the table.";
+			return false;
+		}
+		for (uint64_t pad = record_size; pad < padded_size; ++pad) {
+			if (p_data[cursor + pad] != 0) {
+				r_error = String(p_context) + " TLV padding bytes must be zero.";
+				return false;
+			}
+		}
+		if (std::find(seen_tags.begin(), seen_tags.end(), tag) != seen_tags.end()) {
+			r_error = String(p_context) + " TLV contains a duplicate tag.";
+			return false;
+		}
+		seen_tags.push_back(tag);
+		switch (tag) {
+			case DS_TLV_TAG_CRYPTO:
+				r_summary.has_crypto = true;
+				break;
+			case DS_TLV_TAG_PROVENANCE:
+				r_summary.has_provenance = true;
+				break;
+			case DS_TLV_TAG_ARCHIVE_SET:
+				r_summary.has_archive_set = true;
+				break;
+			case DS_TLV_TAG_DELTA:
+				r_summary.has_delta = true;
+				break;
+			default:
+				// Unknown tags are skipped, but their bounds and padding were
+				// validated above.
+				break;
+		}
+		cursor += padded_size;
+	}
+	if (cursor != p_size) {
+		r_error = String(p_context) + " TLV table was not consumed exactly.";
+		return false;
+	}
 	return true;
 }
 
@@ -1180,6 +1280,11 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 	is_opened = false;
 	opened_path = "";
 	loaded_header = DSPkgHeader{};
+	loaded_header_size = DSPKG_HEADER_SIZE_V4;
+	loaded_toc_entry_size = DSPKG_FIXED_ENTRY_SIZE_V3;
+	loaded_capabilities = 0;
+	loaded_extension_offset = 0;
+	loaded_extension_size = 0;
 
 	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ);
 	if (file.is_null() || !file->is_open()) {
@@ -1199,6 +1304,11 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		is_opened = false;
 		opened_path = "";
 		loaded_header = DSPkgHeader{};
+		loaded_header_size = DSPKG_HEADER_SIZE_V4;
+		loaded_toc_entry_size = DSPKG_FIXED_ENTRY_SIZE_V3;
+		loaded_capabilities = 0;
+		loaded_extension_offset = 0;
+		loaded_extension_size = 0;
 		file->close();
 		if (p_error == ERR_UNAUTHORIZED) {
 			std::lock_guard<std::mutex> lock(s_unauth_log_mutex);
@@ -1230,11 +1340,49 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		return fail(ERR_FILE_UNRECOGNIZED, "Invalid magic number in archive.");
 	}
 
-	if (loaded_header.version != 1 && loaded_header.version != 2 && loaded_header.version != 3 && loaded_header.version != 4) {
+	if (loaded_header.version != 1 && loaded_header.version != 2 && loaded_header.version != 3 &&
+			loaded_header.version != DSPKG_VERSION_V4 && loaded_header.version != DSPKG_VERSION_V5) {
 		return fail(ERR_FILE_UNRECOGNIZED, "Unsupported archive version.");
 	}
 
-	if (loaded_header.version == DSPKG_VERSION_V4) {
+	const bool is_v5 = loaded_header.version == DSPKG_VERSION_V5;
+	PackedByteArray v5_header_bytes;
+	DSPkgHeaderV5 header_v5{};
+
+	if (is_v5) {
+		// header_size lives at offset 64 in the v5 header, so read just enough
+		// to validate it before reading the rest. Bytes 0..63 keep the v4 field
+		// layout, which is what loaded_header continues to carry.
+		if (file_len < DSPKG_HEADER_SIZE_V4 + 2) {
+			return fail(ERR_FILE_CORRUPT, "Archive file too small for v5 header.");
+		}
+		file->seek(DSPKG_HEADER_SIZE_V4);
+		PackedByteArray hs_bytes = file->get_buffer(2);
+		if (hs_bytes.size() < 2) {
+			return fail(ERR_FILE_CORRUPT, "Failed to read v5 header_size.");
+		}
+		uint16_t v5_header_size = 0;
+		memcpy(&v5_header_size, hs_bytes.ptr(), 2);
+		if (v5_header_size < DSPKG_HEADER_SIZE_V5 || v5_header_size > 4096 ||
+				v5_header_size % 8 != 0) {
+			return fail(ERR_FILE_CORRUPT, "v5 header_size is out of range or misaligned.");
+		}
+		if (file_len < v5_header_size) {
+			return fail(ERR_FILE_CORRUPT, "Archive file too small for the complete v5 header.");
+		}
+		file->seek(0);
+		v5_header_bytes = file->get_buffer(v5_header_size);
+		if (v5_header_bytes.size() < v5_header_size) {
+			return fail(ERR_FILE_CORRUPT, "Failed to read complete v5 header bytes.");
+		}
+		memcpy(&loaded_header, v5_header_bytes.ptr(), DSPKG_HEADER_SIZE_V4);
+		memcpy(&header_v5, v5_header_bytes.ptr(), sizeof(DSPkgHeaderV5));
+		loaded_header_size = v5_header_size;
+		loaded_toc_entry_size = header_v5.toc_entry_size;
+		loaded_capabilities = header_v5.capabilities;
+		loaded_extension_offset = header_v5.extension_offset;
+		loaded_extension_size = header_v5.extension_size;
+	} else if (loaded_header.version == DSPKG_VERSION_V4) {
 		if (file_len < DSPKG_HEADER_SIZE_V4) {
 			return fail(ERR_FILE_CORRUPT, "Archive file too small for v4 header.");
 		}
@@ -1244,28 +1392,20 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 			return fail(ERR_FILE_CORRUPT, "Failed to read complete v4 header bytes.");
 		}
 		memcpy(reinterpret_cast<uint8_t *>(&loaded_header) + DSPKG_HEADER_SIZE_LEGACY, extra.ptr(), v4_extra_size);
-		if (loaded_header.min_reader_version > DSPKG_VERSION_V4) {
-			return fail(ERR_FILE_UNRECOGNIZED, "Archive requires newer reader version.");
-		}
-		if (loaded_header.compression_codec != 0) {
-			return fail(ERR_FILE_UNRECOGNIZED, "Unsupported compression codec.");
-		}
-		if (loaded_header.reserved[0] != 0 || loaded_header.reserved[1] != 0 || loaded_header.reserved[2] != 0 || loaded_header.reserved[3] != 0) {
-			return fail(ERR_FILE_CORRUPT, "Reserved header bytes must be zero.");
-		}
 	}
 
 	const bool is_v3_or_higher = (loaded_header.version >= DSPKG_VERSION_ENTRY_FLAGS);
 	const bool has_gpu_metadata = (loaded_header.version == DSPKG_VERSION_GPU_METADATA || is_v3_or_higher) && ((loaded_header.flags & DSPKG_FLAG_GPU_MIP_METADATA) != 0);
 
-	if ((loaded_header.version == DSPKG_VERSION_GPU_METADATA && loaded_header.flags != DSPKG_FLAG_GPU_MIP_METADATA) ||
-		(loaded_header.version == DSPKG_VERSION_LEGACY && loaded_header.flags != 0) ||
-		(loaded_header.version == DSPKG_VERSION_ENTRY_FLAGS && (loaded_header.flags & ~DSPKG_FLAG_GPU_MIP_METADATA) != 0) ||
-		(loaded_header.version == DSPKG_VERSION_V4 && (loaded_header.flags & ~(DSPKG_FLAG_GPU_MIP_METADATA | DSPKG_FLAG_ENCRYPTED_TOC)) != 0)) {
-		return fail(ERR_FILE_CORRUPT, "Invalid flags in header.");
-	}
+	const bool is_encrypted = (loaded_header.version == DSPKG_VERSION_V4 || is_v5) &&
+			((loaded_header.flags & DSPKG_FLAG_ENCRYPTED_TOC) != 0);
 
-	const bool is_encrypted = (loaded_header.version == DSPKG_VERSION_V4) && ((loaded_header.flags & DSPKG_FLAG_ENCRYPTED_TOC) != 0);
+	// Framing check only: the MAC lives at header_size, so the envelope must
+	// leave room for it. Semantic header fields are validated after the MAC.
+	if (is_v5 && is_encrypted &&
+			(static_cast<uint64_t>(loaded_header_size) + DSPKG_ENCRYPTION_MAC_SIZE > loaded_header.data_offset)) {
+		return fail(ERR_FILE_CORRUPT, "v5 encrypted header envelope overlaps data_offset.");
+	}
 
 	// The encryption requirement comes from the build, never from the file. A
 	// protected export publishes directstorage/export/protected into its own
@@ -1280,40 +1420,42 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		require_encrypted_toc = static_cast<bool>(ps->get_setting("directstorage/export/protected"));
 	}
 	if (require_encrypted_toc && !is_encrypted) {
-		// A v4 header that simply cleared the flag is a downgrade; anything older
-		// cannot carry the flag at all, so it is a mismatch rather than a
+		// A v4/v5 header that simply cleared the flag is a downgrade; anything
+		// older cannot carry the flag at all, so it is a mismatch rather than a
 		// downgrade. The two map to different sentinel reasons in ds_runtime.gd.
-		if (loaded_header.version == DSPKG_VERSION_V4) {
+		if (loaded_header.version == DSPKG_VERSION_V4 || is_v5) {
 			return fail(ERR_UNAUTHORIZED, "Protected build requires an authenticated TOC; archive is not encrypted.");
 		}
-		return fail(ERR_FILE_UNRECOGNIZED, "Protected build requires a v4 encrypted TOC; archive version is not acceptable.");
+		return fail(ERR_FILE_UNRECOGNIZED, "Protected build requires a v4/v5 encrypted TOC; archive version is not acceptable.");
 	}
 
-	if (!is_encrypted && loaded_header.key_id != 0) {
-		return fail(ERR_FILE_CORRUPT, "Unencrypted archive header has non-zero key_id.");
-	}
 	if (is_encrypted && loaded_header.key_id == 0) {
-		return fail(ERR_FILE_CORRUPT, "Encrypted archive header has zero key_id.");
+		return fail(ERR_UNAUTHORIZED, "Encrypted archive header has zero key_id.");
 	}
 
-	const uint64_t toc_start = (loaded_header.version != DSPKG_VERSION_V4) ? DSPKG_HEADER_SIZE_LEGACY :
-		(is_encrypted ? (DSPKG_HEADER_SIZE_V4 + DSPKG_ENCRYPTION_MAC_SIZE) : DSPKG_HEADER_SIZE_V4);
-
-	// Pairing is a single archive id. A caller that expects an id (non-zero)
-	// requires an exact match: an archive carrying id 0 is not a wildcard and is
-	// rejected, because a zeroed header field must never satisfy a build that
-	// expects a real id. Passing 0 as the expected id is the tooling/no-pairing
-	// path and skips the check.
-	if (p_expected_id != 0 && p_expected_id != loaded_header.archive_fingerprint) {
-		return fail(ERR_FILE_UNRECOGNIZED, String("Archive id does not match this build (archive id: 0x") + String::num_uint64(loaded_header.archive_fingerprint, 16) + ", expected: 0x" + String::num_uint64(p_expected_id, 16) + ").");
+	uint64_t toc_start = DSPKG_HEADER_SIZE_LEGACY;
+	if (is_v5) {
+		if (static_cast<uint64_t>(loaded_header_size) > loaded_header.data_offset) {
+			return fail(ERR_FILE_CORRUPT, "v5 header_size exceeds data_offset.");
+		}
+		toc_start = static_cast<uint64_t>(loaded_header_size) +
+				(is_encrypted ? DSPKG_ENCRYPTION_MAC_SIZE : 0);
+	} else if (loaded_header.version == DSPKG_VERSION_V4) {
+		toc_start = DSPKG_HEADER_SIZE_V4 + (is_encrypted ? DSPKG_ENCRYPTION_MAC_SIZE : 0);
 	}
 
-	const uint64_t entry_fields_size = is_v3_or_higher ? DSPKG_ENTRY_FIELDS_SIZE_V3 : DSPKG_ENTRY_FIELDS_SIZE_LEGACY;
-	const uint64_t fixed_entry_size = is_v3_or_higher ? DSPKG_FIXED_ENTRY_SIZE_V3 : DSPKG_FIXED_ENTRY_SIZE_LEGACY;
-
+	// Pre-MAC TOC bounds. Use the fixed minimum entry size, not the
+	// unauthenticated toc_entry_size, so no semantic header field drives the
+	// allocation before the MAC verifies. The extension-size cap is needed for
+	// the plausible-bound arithmetic.
+	if (is_v5 && loaded_extension_size > DS_HEADER_TLV_MAX_TOTAL) {
+		return fail(ERR_FILE_CORRUPT, "v5 header extension size is invalid.");
+	}
+	const uint64_t pre_mac_entry_size = is_v5 ? DSPKG_FIXED_ENTRY_SIZE_V5 :
+			(is_v3_or_higher ? DSPKG_FIXED_ENTRY_SIZE_V3 : DSPKG_FIXED_ENTRY_SIZE_LEGACY);
 	uint64_t min_table_size = 0;
 	uint64_t min_data_offset = 0;
-	if (!checked_multiply(loaded_header.entry_count, fixed_entry_size, min_table_size) ||
+	if (!checked_multiply(loaded_header.entry_count, pre_mac_entry_size, min_table_size) ||
 		!checked_add(toc_start, min_table_size, min_data_offset)) {
 		return fail(ERR_FILE_CORRUPT, "Entry table size overflow.");
 	}
@@ -1324,7 +1466,24 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		return fail(ERR_FILE_CORRUPT, "Encrypted archive has an empty TOC envelope.");
 	}
 	const uint64_t toc_len = loaded_header.data_offset - toc_start;
-	if (loaded_header.version == DSPKG_VERSION_V4 || is_encrypted) {
+	if (is_v5) {
+		// Enforce both bounds before allocating or decrypting the TOC: the flat
+		// cap alone lets a one-entry archive with data_offset = 32 MiB force a
+		// 32 MiB allocation.
+		if (toc_len > DSPKG_MAX_TOC_SIZE_V5) {
+			return fail(ERR_FILE_CORRUPT, "v5 TOC envelope exceeds the 64 MiB limit.");
+		}
+		uint64_t max_serialized = 0;
+		uint64_t max_toc = 0;
+		if (!checked_multiply(loaded_header.entry_count, DSPKG_MAX_SERIALIZED_ENTRY_SIZE_V5, max_serialized) ||
+				!checked_add(max_serialized, loaded_extension_size, max_serialized) ||
+				!align_up(max_serialized, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, max_toc)) {
+			return fail(ERR_FILE_CORRUPT, "v5 TOC bound overflow.");
+		}
+		if (toc_len > max_toc) {
+			return fail(ERR_FILE_CORRUPT, "v5 TOC length exceeds plausible bounds.");
+		}
+	} else if (loaded_header.version == DSPKG_VERSION_V4 || is_encrypted) {
 		if (toc_len > DSPKG_MAX_TOC_SIZE) {
 			return fail(ERR_FILE_CORRUPT, "TOC envelope exceeds maximum size limit (16 MiB).");
 		}
@@ -1351,8 +1510,9 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 			wipe_key_bytes(candidate_key);
 			return fail(ERR_UNAUTHORIZED, "Archive encryption key ID mismatch.");
 		}
-		if (file->get_position() != DSPKG_HEADER_SIZE_V4) {
-			file->seek(DSPKG_HEADER_SIZE_V4);
+		const uint64_t mac_offset = is_v5 ? loaded_header_size : DSPKG_HEADER_SIZE_V4;
+		if (file->get_position() != mac_offset) {
+			file->seek(mac_offset);
 		}
 		PackedByteArray mac_bytes = file->get_buffer(DSPKG_ENCRYPTION_MAC_SIZE);
 		if (mac_bytes.size() < DSPKG_ENCRYPTION_MAC_SIZE) {
@@ -1369,12 +1529,15 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		}
 		uint8_t nonce[DSPKG_ENCRYPTION_NONCE_SIZE] = {0};
 		memcpy(nonce, loaded_header.archive_salt, 16);
-		memcpy(nonce + 16, DOMAIN_SEPARATOR, 8);
+		memcpy(nonce + 16, is_v5 ? DOMAIN_SEPARATOR_V5 : DOMAIN_SEPARATOR, 8);
 
 		plaintext_toc.resize(toc_len);
+		const uint8_t *aad = is_v5 ? v5_header_bytes.ptr() :
+				reinterpret_cast<const uint8_t *>(&loaded_header);
+		const uint64_t aad_len = is_v5 ? loaded_header_size : sizeof(DSPkgHeader);
 		int unlock_res = crypto_aead_unlock(
 			plaintext_toc.ptrw(), mac_bytes.ptr(), candidate_key.data(), nonce,
-			reinterpret_cast<const uint8_t *>(&loaded_header), sizeof(DSPkgHeader),
+			aad, aad_len,
 			ciphertext.ptr(), toc_len
 		);
 		if (unlock_res != 0) {
@@ -1398,6 +1561,94 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		}
 	}
 
+	// Header semantics are validated only after the encrypted TOC MAC has
+	// verified. For plaintext archives there is no MAC, so this is the first
+	// semantic pass either way. Only framing/DoS bounds and key selection ran
+	// before the AEAD above.
+	auto validate_header_semantics = [&]() -> Error {
+		if (is_v5) {
+			if (header_v5.toc_entry_size < DSPKG_FIXED_ENTRY_SIZE_V5 ||
+					header_v5.toc_entry_size > 1024) {
+				return fail(ERR_FILE_CORRUPT, "v5 toc_entry_size is out of range.");
+			}
+			if (header_v5.reserved0 != 0 || header_v5.reserved2 != 0) {
+				return fail(ERR_FILE_CORRUPT, "Reserved v5 header fields must be zero.");
+			}
+			if (header_v5.compression_codec != 0) {
+				return fail(ERR_FILE_CORRUPT, "v5 header compression_codec must be zero.");
+			}
+			if (header_v5.min_reader_version < DSPKG_VERSION_V5) {
+				return fail(ERR_FILE_CORRUPT, "v5 min_reader_version must be at least 5.");
+			}
+			if (header_v5.min_reader_version > DSPKG_VERSION_V5) {
+				return fail(ERR_FILE_UNRECOGNIZED, "Archive requires newer reader version.");
+			}
+			if ((header_v5.capabilities & ~DSPKG_CAP_KNOWN_MASK) != 0) {
+				return fail(ERR_FILE_UNRECOGNIZED, "Archive requires unsupported feature bits.");
+			}
+			if (header_v5.extension_size % 8 != 0) {
+				return fail(ERR_FILE_CORRUPT, "v5 header extension size is invalid.");
+			}
+			if (header_v5.extension_size == 0) {
+				if (header_v5.extension_offset != 0) {
+					return fail(ERR_FILE_CORRUPT, "v5 extension_offset must be zero when extension_size is zero.");
+				}
+			} else if (header_v5.extension_offset == 0 || header_v5.extension_offset % 8 != 0) {
+				return fail(ERR_FILE_CORRUPT, "v5 extension_offset is invalid.");
+			}
+			const bool declares_extension = (loaded_header.flags & DSPKG_FLAG_EXTENSION_TABLE) != 0;
+			if (declares_extension != (loaded_extension_size > 0)) {
+				return fail(ERR_FILE_CORRUPT, "v5 extension flag does not match extension_size.");
+			}
+			if (loaded_header.data_offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT != 0) {
+				return fail(ERR_FILE_CORRUPT, "v5 data_offset must be 512-byte aligned.");
+			}
+			if (!is_encrypted) {
+				for (int i = 0; i < 16; ++i) {
+					if (loaded_header.archive_salt[i] != 0) {
+						return fail(ERR_FILE_CORRUPT, "Unencrypted v5 archive has a non-zero archive_salt.");
+					}
+				}
+			}
+		} else if (loaded_header.version == DSPKG_VERSION_V4) {
+			if (loaded_header.min_reader_version > DSPKG_VERSION_V4) {
+				return fail(ERR_FILE_UNRECOGNIZED, "Archive requires newer reader version.");
+			}
+			if (loaded_header.compression_codec != 0) {
+				return fail(ERR_FILE_UNRECOGNIZED, "Unsupported compression codec.");
+			}
+			if (loaded_header.reserved[0] != 0 || loaded_header.reserved[1] != 0 ||
+					loaded_header.reserved[2] != 0 || loaded_header.reserved[3] != 0) {
+				return fail(ERR_FILE_CORRUPT, "Reserved header bytes must be zero.");
+			}
+		}
+
+		if ((loaded_header.version == DSPKG_VERSION_GPU_METADATA && loaded_header.flags != DSPKG_FLAG_GPU_MIP_METADATA) ||
+				(loaded_header.version == DSPKG_VERSION_LEGACY && loaded_header.flags != 0) ||
+				(loaded_header.version == DSPKG_VERSION_ENTRY_FLAGS && (loaded_header.flags & ~DSPKG_FLAG_GPU_MIP_METADATA) != 0) ||
+				(loaded_header.version == DSPKG_VERSION_V4 && (loaded_header.flags & ~(DSPKG_FLAG_GPU_MIP_METADATA | DSPKG_FLAG_ENCRYPTED_TOC)) != 0) ||
+				(is_v5 && (loaded_header.flags & ~(DSPKG_FLAG_GPU_MIP_METADATA | DSPKG_FLAG_ENCRYPTED_TOC | DSPKG_FLAG_EXTENSION_TABLE)) != 0)) {
+			return fail(ERR_FILE_CORRUPT, "Invalid flags in header.");
+		}
+		if (!is_encrypted && loaded_header.key_id != 0) {
+			return fail(ERR_FILE_CORRUPT, "Unencrypted archive header has non-zero key_id.");
+		}
+		// Pairing is authenticated by the MAC for encrypted archives.
+		if (p_expected_id != 0 && p_expected_id != loaded_header.archive_fingerprint) {
+			return fail(ERR_FILE_UNRECOGNIZED, String("Archive id does not match this build (archive id: 0x") + String::num_uint64(loaded_header.archive_fingerprint, 16) + ", expected: 0x" + String::num_uint64(p_expected_id, 16) + ").");
+		}
+		return OK;
+	};
+	Error semantics_error = validate_header_semantics();
+	if (semantics_error != OK) {
+		return semantics_error;
+	}
+
+	const uint64_t entry_fields_size = is_v5 ? DSPKG_ENTRY_FIELDS_SIZE_V5 :
+			(is_v3_or_higher ? DSPKG_ENTRY_FIELDS_SIZE_V3 : DSPKG_ENTRY_FIELDS_SIZE_LEGACY);
+	const uint64_t fixed_entry_size = is_v5 ? loaded_toc_entry_size :
+			(is_v3_or_higher ? DSPKG_FIXED_ENTRY_SIZE_V3 : DSPKG_FIXED_ENTRY_SIZE_LEGACY);
+
 	TOCBufferReader reader(plaintext_toc.ptr(), plaintext_toc.size());
 
 	// Absolute end of the previous entry's payload. finalize() writes entries in
@@ -1405,6 +1656,14 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 	// ordered and disjoint; this is the boundary every following entry must
 	// start at or after.
 	uint64_t previous_payload_end = loaded_header.data_offset;
+
+	bool used_zstd = false;
+	bool used_gacl = false;
+	bool used_chunked = false;
+	bool used_mesh = false;
+	bool used_content_hash = false;
+	DSPkgTlvSummary entry_tlv_summary;
+	DSPkgTlvSummary header_tlv_summary;
 
 	for (uint32_t i = 0; i < loaded_header.entry_count; ++i) {
 		if (!reader.has_remaining(DSPKG_ENTRY_PREFIX_SIZE)) {
@@ -1445,9 +1704,90 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		entry.mip_count = reader.get_32();
 		entry.flags = is_v3_or_higher ? reader.get_32() : 0;
 
-		if (entry.width == 0 || entry.height == 0 || entry.mip_count == 0 ||
-			entry.mip_count > DSTEX_MAX_MIP_COUNT ||
-			!dstex_sizes_are_sane(entry.width, entry.height, entry.original_size, entry.compressed_size)) {
+		if (is_v5) {
+			entry.entry_kind = reader.get_8();
+			entry.compression_format = reader.get_8();
+			entry.gacl_transform = reader.get_8();
+			entry.descriptor_flags = reader.get_8();
+			entry.metadata_size = reader.get_32();
+			entry.extensions_size = reader.get_32();
+			if (!reader.is_ok()) {
+				return fail(ERR_FILE_CORRUPT, "Entry v5 descriptor extends past TOC buffer.");
+			}
+			// Future v5.x readers may append fixed fields; toc_entry_size covers
+			// them without changing the fields we decode.
+			if (loaded_toc_entry_size > DSPKG_FIXED_ENTRY_SIZE_V5 &&
+					!reader.skip(loaded_toc_entry_size - DSPKG_FIXED_ENTRY_SIZE_V5)) {
+				return fail(ERR_FILE_CORRUPT, "Entry trailing fixed fields extend past TOC buffer.");
+			}
+		} else {
+			entry.entry_kind = static_cast<uint8_t>(DSPkgEntryKind::TEXTURE);
+			entry.compression_format = static_cast<uint8_t>(DSCompressionFormat::GDEFLATE);
+			entry.gacl_transform = static_cast<uint8_t>(DSGaclTransform::NONE);
+		}
+
+		if (is_v5) {
+			if (!ds_entry_kind_is_valid(entry.entry_kind)) {
+				return fail(ERR_FILE_UNRECOGNIZED, "Unsupported entry kind.");
+			}
+			if (!ds_compression_format_is_valid(entry.compression_format)) {
+				return fail(ERR_FILE_UNRECOGNIZED, "Unsupported entry compression format.");
+			}
+			if (!ds_gacl_transform_is_valid(entry.gacl_transform)) {
+				return fail(ERR_FILE_UNRECOGNIZED, "Unsupported entry GACL transform.");
+			}
+			if ((entry.descriptor_flags & ~1U) != 0) {
+				return fail(ERR_FILE_CORRUPT, "Entry descriptor_flags has reserved bits set.");
+			}
+			if (entry.metadata_size > DSPKG_MAX_ENTRY_METADATA ||
+					entry.extensions_size > DSPKG_MAX_ENTRY_EXTENSIONS ||
+					entry.extensions_size % 8 != 0) {
+				return fail(ERR_FILE_CORRUPT, "Entry metadata or extension size is invalid.");
+			}
+			if (entry.entry_kind == static_cast<uint8_t>(DSPkgEntryKind::TEXTURE)) {
+				if ((entry.flags & ~3U) != 0) {
+					return fail(ERR_FILE_CORRUPT, "Texture entry flags have reserved bits set.");
+				}
+				if (entry.width == 0 || entry.height == 0 || entry.mip_count == 0 ||
+						entry.mip_count > DSTEX_MAX_MIP_COUNT ||
+						!dstex_sizes_are_sane(entry.width, entry.height, entry.original_size, entry.compressed_size)) {
+					return fail(ERR_FILE_CORRUPT, "Invalid entry dimensions or mip count.");
+				}
+				if (entry.metadata_size != 0) {
+					return fail(ERR_FILE_CORRUPT, "Texture entry metadata_size must be zero.");
+				}
+				if (!has_gpu_metadata) {
+					return fail(ERR_FILE_CORRUPT, "Texture entry has no mip table.");
+				}
+			} else {
+				if (entry.width != 0 || entry.height != 0 || entry.pixel_format != 0 ||
+						entry.mip_count != 0 || entry.flags != 0) {
+					return fail(ERR_FILE_CORRUPT, "Mesh/blob/audio entry carries texture fields.");
+				}
+				if (entry.metadata_size == 0) {
+					return fail(ERR_FILE_CORRUPT, "Mesh/blob/audio entry metadata is missing.");
+				}
+				if (entry.entry_kind == static_cast<uint8_t>(DSPkgEntryKind::AUDIO) &&
+						entry.compression_format != static_cast<uint8_t>(DSCompressionFormat::NONE)) {
+					return fail(ERR_FILE_CORRUPT, "Audio entry must use compression_format NONE.");
+				}
+			}
+			if (entry.compression_format == static_cast<uint8_t>(DSCompressionFormat::NONE) &&
+					entry.compressed_size != entry.original_size) {
+				return fail(ERR_FILE_CORRUPT, "NONE-compressed entry sizes must match.");
+			}
+			if (entry.gacl_transform != static_cast<uint8_t>(DSGaclTransform::NONE)) {
+				if (entry.entry_kind != static_cast<uint8_t>(DSPkgEntryKind::TEXTURE) ||
+						entry.compression_format == static_cast<uint8_t>(DSCompressionFormat::NONE) ||
+						!DSTex::gacl_transform_matches_pixel_format(
+								static_cast<DSGaclTransform>(entry.gacl_transform),
+								static_cast<int>(entry.pixel_format))) {
+					return fail(ERR_FILE_CORRUPT, "GACL transform does not match the entry pixel format.");
+				}
+			}
+		} else if (entry.width == 0 || entry.height == 0 || entry.mip_count == 0 ||
+				entry.mip_count > DSTEX_MAX_MIP_COUNT ||
+				!dstex_sizes_are_sane(entry.width, entry.height, entry.original_size, entry.compressed_size)) {
 			return fail(ERR_FILE_CORRUPT, "Invalid entry dimensions or mip count.");
 		}
 
@@ -1473,7 +1813,43 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		}
 		previous_payload_end = abs_payload_end;
 
-		if (has_gpu_metadata) {
+		if (is_v5) {
+			// Entry payload sections after the fixed fields: metadata, then the
+			// entry TLV, then (for textures) the mip table and chunk tables.
+			if (entry.metadata_size > 0 && !reader.skip(entry.metadata_size)) {
+				return fail(ERR_FILE_CORRUPT, "Entry metadata extends past TOC buffer.");
+			}
+			if (entry.extensions_size > 0) {
+				DSPkgTlvSummary summary;
+				String tlv_error;
+				const uint8_t *tlv_data = reader.get_data() + reader.get_cursor();
+				if (!validate_tlv_table(tlv_data, entry.extensions_size,
+							DS_ENTRY_TLV_MAX_TOTAL, "Entry", summary, tlv_error)) {
+					return fail(ERR_FILE_CORRUPT, tlv_error);
+				}
+				if (!reader.skip(entry.extensions_size)) {
+					return fail(ERR_FILE_CORRUPT, "Entry extension table extends past TOC buffer.");
+				}
+				entry_tlv_summary.has_crypto = entry_tlv_summary.has_crypto || summary.has_crypto;
+				entry_tlv_summary.has_provenance = entry_tlv_summary.has_provenance || summary.has_provenance;
+				entry_tlv_summary.has_archive_set = entry_tlv_summary.has_archive_set || summary.has_archive_set;
+				entry_tlv_summary.has_delta = entry_tlv_summary.has_delta || summary.has_delta;
+			}
+			if (entry.compression_format == static_cast<uint8_t>(DSCompressionFormat::ZSTD)) {
+				used_zstd = true;
+			}
+			if (entry.gacl_transform != static_cast<uint8_t>(DSGaclTransform::NONE)) {
+				used_gacl = true;
+			}
+			if (entry.entry_kind == static_cast<uint8_t>(DSPkgEntryKind::MESH)) {
+				used_mesh = true;
+			}
+			if ((entry.descriptor_flags & 1U) != 0) {
+				used_content_hash = true;
+			}
+		}
+
+		if (has_gpu_metadata && entry.entry_kind == static_cast<uint8_t>(DSPkgEntryKind::TEXTURE)) {
 			uint64_t metadata_size = 0;
 			if (!checked_multiply(entry.mip_count, sizeof(DSPkgMipEntry), metadata_size) ||
 				!reader.has_remaining(metadata_size)) {
@@ -1483,6 +1859,9 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 			entry.mip_sizes.resize(entry.mip_count);
 			entry.mip_uncompressed_sizes.resize(entry.mip_count);
 			entry.mip_row_pitches.resize(entry.mip_count);
+			if (is_v5) {
+				entry.mip_chunk_counts.resize(entry.mip_count);
+			}
 			uint64_t footprint_size = 0;
 			uint64_t compressed_mip_size = 0;
 			uint64_t previous_mip_end = abs_payload_offset;
@@ -1491,15 +1870,29 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 				uint32_t mip_compressed = reader.get_32();
 				uint32_t mip_uncompressed = reader.get_32();
 				uint32_t mip_row_pitch = reader.get_32();
-				uint32_t mip_reserved = reader.get_32();
+				uint32_t mip_tail = reader.get_32();
+				uint32_t mip_chunk_count = 1;
+				if (is_v5) {
+					mip_chunk_count = mip_tail;
+					if (mip_chunk_count == 0 || mip_chunk_count > DSPKG_MAX_CHUNKS_PER_MIP) {
+						return fail(ERR_FILE_CORRUPT, "Invalid v5 mip chunk_count.");
+					}
+					entry.mip_chunk_counts[mip] = static_cast<int32_t>(mip_chunk_count);
+					if (mip_chunk_count > 1) {
+						used_chunked = true;
+					}
+				} else if (mip_tail != 0) {
+					return fail(ERR_FILE_CORRUPT, "Mip reserved field must be zero.");
+				}
 				entry.mip_offsets[mip] = static_cast<int64_t>(mip_offset);
 				entry.mip_sizes[mip] = static_cast<int32_t>(mip_compressed);
 				entry.mip_uncompressed_sizes[mip] = static_cast<int32_t>(mip_uncompressed);
 				entry.mip_row_pitches[mip] = static_cast<int32_t>(mip_row_pitch);
 				uint64_t mip_end = 0;
-				if (mip_compressed == 0 || mip_reserved != 0 ||
+				if (mip_compressed == 0 ||
 					!checked_add(mip_offset, mip_compressed, mip_end) ||
-					mip_offset < previous_mip_end || mip_end > abs_payload_end ||
+					(!is_v5 && mip_offset < previous_mip_end) ||
+					mip_end > abs_payload_end ||
 					!checked_add(compressed_mip_size, mip_compressed, compressed_mip_size) ||
 					(mip_uncompressed > 0 &&
 						(mip_row_pitch == 0 || mip_row_pitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT != 0)) ||
@@ -1515,14 +1908,86 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 				}
 				previous_mip_end = mip_end;
 			}
-			if (compressed_mip_size > entry.compressed_size) {
-				return fail(ERR_FILE_CORRUPT, "Entry mip sizes exceed compressed size.");
-			}
-			if (entry.mip_count == 1 && compressed_mip_size != entry.compressed_size) {
-				return fail(ERR_FILE_CORRUPT, "Entry mip size does not match compressed size.");
-			}
-			if (entry.mip_count > 1 && previous_mip_end != abs_payload_end) {
-				return fail(ERR_FILE_CORRUPT, "Last mip does not end at entry compressed payload boundary.");
+
+			if (is_v5) {
+				// Chunk tables follow the whole mip table, in mip order.
+				uint64_t previous_chunk_end = abs_payload_offset;
+				for (uint32_t mip = 0; mip < entry.mip_count; ++mip) {
+					const uint32_t chunk_count = static_cast<uint32_t>(entry.mip_chunk_counts[mip]);
+					const uint32_t row_pitch = static_cast<uint32_t>(entry.mip_row_pitches[mip]);
+					const uint64_t mip_offset = static_cast<uint64_t>(entry.mip_offsets[mip]);
+					const uint64_t mip_compressed = static_cast<uint64_t>(static_cast<uint32_t>(entry.mip_sizes[mip]));
+					const uint64_t mip_uncompressed = static_cast<uint64_t>(static_cast<uint32_t>(entry.mip_uncompressed_sizes[mip]));
+					if (chunk_count == 1) {
+						if (mip_offset < previous_chunk_end || mip_offset + mip_compressed > abs_payload_end) {
+							return fail(ERR_FILE_CORRUPT, "v5 mip payload overlaps or exceeds entry bounds.");
+						}
+						if (entry.compression_format == static_cast<uint8_t>(DSCompressionFormat::NONE) &&
+								mip_compressed != mip_uncompressed) {
+							return fail(ERR_FILE_CORRUPT, "NONE-compressed mip sizes must match.");
+						}
+						previous_chunk_end = mip_offset + mip_compressed;
+						continue;
+					}
+					if (row_pitch == 0 || mip_uncompressed % row_pitch != 0) {
+						return fail(ERR_FILE_CORRUPT, "v5 chunked mip is not a whole number of rows.");
+					}
+					uint64_t sum_compressed = 0;
+					uint64_t sum_uncompressed = 0;
+					for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+						if (!reader.has_remaining(sizeof(DSChunkEntry))) {
+							return fail(ERR_FILE_CORRUPT, "v5 chunk table extends past TOC buffer.");
+						}
+						uint64_t chunk_offset = reader.get_64();
+						uint32_t chunk_compressed = reader.get_32();
+						uint32_t chunk_uncompressed = reader.get_32();
+						uint64_t chunk_end = 0;
+						if (chunk_compressed == 0 || chunk_uncompressed == 0 ||
+								chunk_uncompressed % row_pitch != 0 ||
+								!checked_add(chunk_offset, chunk_compressed, chunk_end) ||
+								chunk_offset < previous_chunk_end || chunk_end > abs_payload_end ||
+								!checked_add(sum_compressed, chunk_compressed, sum_compressed) ||
+								!checked_add(sum_uncompressed, chunk_uncompressed, sum_uncompressed)) {
+							return fail(ERR_FILE_CORRUPT, "Invalid v5 chunk entry.");
+						}
+						if (chunk_index == 0 && chunk_offset != mip_offset) {
+							return fail(ERR_FILE_CORRUPT, "v5 first chunk must match the mip offset.");
+						}
+						if (chunk_offset % (chunk_index == 0 ? D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT : 8) != 0) {
+							return fail(ERR_FILE_CORRUPT, "v5 chunk offset alignment mismatch.");
+						}
+						if (entry.compression_format == static_cast<uint8_t>(DSCompressionFormat::NONE) &&
+								chunk_compressed != chunk_uncompressed) {
+							return fail(ERR_FILE_CORRUPT, "NONE-compressed chunk sizes must match.");
+						}
+						entry.chunk_offsets.push_back(static_cast<int64_t>(chunk_offset));
+						entry.chunk_compressed_sizes.push_back(static_cast<int32_t>(chunk_compressed));
+						entry.chunk_uncompressed_sizes.push_back(static_cast<int32_t>(chunk_uncompressed));
+						previous_chunk_end = chunk_end;
+					}
+					if (sum_compressed != mip_compressed || sum_uncompressed != mip_uncompressed) {
+						return fail(ERR_FILE_CORRUPT, "v5 chunk sums do not match the mip.");
+					}
+				}
+				entry.total_chunk_count = static_cast<uint32_t>(entry.chunk_compressed_sizes.size());
+				entry.chunked = entry.total_chunk_count > 0;
+				// entry.compressed_size is the payload span (it includes the
+				// 512-byte placement padding between mips, exactly like v4),
+				// so only the final payload end can be compared to it.
+				if (compressed_mip_size > entry.compressed_size ||
+						previous_chunk_end != abs_payload_end) {
+					return fail(ERR_FILE_CORRUPT, "v5 entry payload does not match its mip/chunk table.");
+				}
+			} else {
+				if (compressed_mip_size > entry.compressed_size) {
+					return fail(ERR_FILE_CORRUPT, "Entry mip sizes exceed compressed size.");
+				}
+				if (entry.mip_count == 1 && compressed_mip_size != entry.compressed_size) {
+					return fail(ERR_FILE_CORRUPT, "Entry mip size does not match compressed size.");
+				}
+				if (entry.mip_count > 1 && previous_mip_end != abs_payload_end) {
+					return fail(ERR_FILE_CORRUPT, "Last mip does not end at entry compressed payload boundary.");
+				}
 			}
 			entry.has_gpu_metadata = footprint_size > 0;
 			if (entry.has_gpu_metadata && footprint_size != entry.original_size) {
@@ -1537,12 +2002,20 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 					m_e.compressed_size = static_cast<uint32_t>(entry.mip_sizes[mip]);
 					m_e.uncompressed_size = static_cast<uint32_t>(entry.mip_uncompressed_sizes[mip]);
 					m_e.row_pitch = static_cast<uint32_t>(entry.mip_row_pitches[mip]);
-					m_e.reserved = 0;
+					m_e.chunk_count = is_v5 ? static_cast<uint32_t>(entry.mip_chunk_counts[mip]) : 1;
+					if (!is_v5) {
+						m_e.reserved = 0;
+					}
 				}
 				if (entries_by_offset.has(abs_payload_offset)) {
 					return fail(ERR_FILE_CORRUPT, "Duplicate entry payload offset in archive.");
 				}
-				entries_by_offset[abs_payload_offset] = mip_vector;
+				DSPkgOffsetEntry offset_entry;
+				offset_entry.mips = mip_vector;
+				offset_entry.compression_format = entry.compression_format;
+				offset_entry.gacl_transform = entry.gacl_transform;
+				offset_entry.chunked = entry.chunked;
+				entries_by_offset[abs_payload_offset] = offset_entry;
 			}
 		}
 
@@ -1551,6 +2024,75 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		}
 		entries_by_path[entry.path] = entry;
 		entries_by_hash[entry.path_hash].push_back(entry);
+	}
+
+	if (is_v5) {
+		const uint64_t entries_end_abs = toc_start + reader.get_cursor();
+		if (entries_end_abs > loaded_header.data_offset) {
+			return fail(ERR_FILE_CORRUPT, "v5 entry table extends past data_offset.");
+		}
+		const uint64_t toc_buffer_size = plaintext_toc.size();
+		if (loaded_extension_size > 0) {
+			uint64_t aligned_entries_end = 0;
+			uint64_t extension_end = 0;
+			if (!align_up(entries_end_abs, 8, aligned_entries_end) ||
+					loaded_extension_offset < aligned_entries_end ||
+					!checked_add(loaded_extension_offset, loaded_extension_size, extension_end) ||
+					extension_end > loaded_header.data_offset ||
+					loaded_extension_offset < toc_start) {
+				return fail(ERR_FILE_CORRUPT, "v5 header extension placement is invalid.");
+			}
+			const uint64_t extension_index = loaded_extension_offset - toc_start;
+			if (extension_index < reader.get_cursor() ||
+					extension_index > toc_buffer_size ||
+					loaded_extension_size > toc_buffer_size - extension_index) {
+				return fail(ERR_FILE_CORRUPT, "v5 header extension is outside the TOC envelope.");
+			}
+			for (uint64_t p = reader.get_cursor(); p < extension_index; ++p) {
+				if (plaintext_toc.ptr()[p] != 0) {
+					return fail(ERR_FILE_CORRUPT, "v5 TOC alignment padding must be zero.");
+				}
+			}
+			String tlv_error;
+			if (!validate_tlv_table(plaintext_toc.ptr() + extension_index, loaded_extension_size,
+						DS_HEADER_TLV_MAX_TOTAL, "Header", header_tlv_summary, tlv_error)) {
+				return fail(ERR_FILE_CORRUPT, tlv_error);
+			}
+			for (uint64_t p = extension_index + loaded_extension_size; p < toc_buffer_size; ++p) {
+				if (plaintext_toc.ptr()[p] != 0) {
+					return fail(ERR_FILE_CORRUPT, "v5 TOC trailing padding must be zero.");
+				}
+			}
+		} else {
+			if (loaded_extension_offset != 0) {
+				return fail(ERR_FILE_CORRUPT, "v5 extension_offset must be zero when extension_size is zero.");
+			}
+			for (uint64_t p = reader.get_cursor(); p < toc_buffer_size; ++p) {
+				if (plaintext_toc.ptr()[p] != 0) {
+					return fail(ERR_FILE_CORRUPT, "v5 TOC padding must be zero.");
+				}
+			}
+		}
+
+		const bool has_crypto_tlv = header_tlv_summary.has_crypto || entry_tlv_summary.has_crypto;
+		const bool has_archive_set_tlv = header_tlv_summary.has_archive_set || entry_tlv_summary.has_archive_set;
+		struct CapabilityUse {
+			uint64_t bit;
+			bool used;
+		} capability_uses[] = {
+			{ DSPKG_CAP_ZSTD, used_zstd },
+			{ DSPKG_CAP_GACL, used_gacl },
+			{ DSPKG_CAP_CHUNKED, used_chunked },
+			{ DSPKG_CAP_CONTENT_HASH, used_content_hash },
+			{ DSPKG_CAP_MESH, used_mesh },
+			{ DSPKG_CAP_CRYPTO_V2, has_crypto_tlv },
+			{ DSPKG_CAP_MULTI_ARCHIVE, has_archive_set_tlv },
+		};
+		for (const CapabilityUse &use : capability_uses) {
+			if (((loaded_capabilities & use.bit) != 0) != use.used) {
+				return fail(ERR_FILE_CORRUPT, "v5 capabilities do not match the archive contents.");
+			}
+		}
 	}
 
 	if (is_encrypted && plaintext_toc.size() > 0) {
@@ -1588,6 +2130,21 @@ Dictionary DSPkg::read_texture(const String &p_resource_path) const {
 	if (!payload_sizes_are_supported(entry)) {
 		UtilityFunctions::push_error("DSPkg: Entry payload size is no longer supported.");
 		return result;
+	}
+	if (loaded_header.version == DSPKG_VERSION_V5) {
+		if (entry.entry_kind != static_cast<uint8_t>(DSPkgEntryKind::TEXTURE)) {
+			UtilityFunctions::push_error("DSPkg: Entry is not a texture: ", p_resource_path);
+			return result;
+		}
+		// The CPU/read_texture path only decodes GDeflate, single-frame,
+		// non-shuffled payloads until Step 5. Never reinterpret Zstd/GACL bytes
+		// as GDeflate and never ignore a chunk table.
+		if (entry.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE) ||
+				entry.gacl_transform != static_cast<uint8_t>(DSGaclTransform::NONE) ||
+				entry.chunked) {
+			UtilityFunctions::push_error("DSPkg: v5 Zstd/GACL/chunked entries require the GPU path or Step 5 CPU support: ", p_resource_path);
+			return result;
+		}
 	}
 
 	Ref<FileAccess> file = FileAccess::open(opened_path, FileAccess::READ);
@@ -1673,6 +2230,7 @@ Dictionary DSPkg::get_entry_info(const String &p_resource_path) const {
 
 	result["archive_path"] = opened_path;
 	result["path"] = entry.path;
+	result["format_version"] = loaded_header.version;
 	result["data_offset"] = data_offset;
 	result["compressed_size"] = entry.compressed_size;
 	result["original_size"] = entry.original_size;
@@ -1681,6 +2239,20 @@ Dictionary DSPkg::get_entry_info(const String &p_resource_path) const {
 	result["pixel_format"] = entry.pixel_format;
 	result["mip_count"] = entry.mip_count;
 	result["flags"] = entry.flags;
+	result["entry_kind"] = loaded_header.version == DSPKG_VERSION_V5 ?
+			static_cast<int>(entry.entry_kind) : static_cast<int>(DSPkgEntryKind::TEXTURE);
+	result["compression_format"] = loaded_header.version == DSPKG_VERSION_V5 ?
+			static_cast<int>(entry.compression_format) : static_cast<int>(DSCompressionFormat::GDEFLATE);
+	result["gacl_transform"] = loaded_header.version == DSPKG_VERSION_V5 ?
+			static_cast<int>(entry.gacl_transform) : static_cast<int>(DSGaclTransform::NONE);
+	result["descriptor_flags"] = loaded_header.version == DSPKG_VERSION_V5 ?
+			static_cast<int>(entry.descriptor_flags) : 0;
+	result["metadata_size"] = loaded_header.version == DSPKG_VERSION_V5 ?
+			static_cast<int64_t>(entry.metadata_size) : 0;
+	result["extensions_size"] = loaded_header.version == DSPKG_VERSION_V5 ?
+			static_cast<int64_t>(entry.extensions_size) : 0;
+	result["capabilities"] = loaded_header.version == DSPKG_VERSION_V5 ?
+			static_cast<int64_t>(loaded_capabilities) : 0;
 	result["has_gpu_metadata"] = entry.has_gpu_metadata;
 	result["is_srgb"] = ((entry.flags & 1U) != 0) || DSTex::is_rd_format_srgb(entry.pixel_format);
 	result["as_image_texture"] = (entry.flags & 2U) != 0;
@@ -1688,6 +2260,26 @@ Dictionary DSPkg::get_entry_info(const String &p_resource_path) const {
 	result["mip_sizes"] = entry.mip_sizes;
 	result["mip_uncompressed_sizes"] = entry.mip_uncompressed_sizes;
 	result["mip_row_pitches"] = entry.mip_row_pitches;
+	if (loaded_header.version == DSPKG_VERSION_V5) {
+		result["mip_chunk_counts"] = entry.mip_chunk_counts;
+		result["chunk_offsets"] = entry.chunk_offsets;
+		result["chunk_compressed_sizes"] = entry.chunk_compressed_sizes;
+		result["chunk_uncompressed_sizes"] = entry.chunk_uncompressed_sizes;
+		result["chunked"] = entry.chunked;
+		result["total_chunk_count"] = static_cast<int64_t>(entry.total_chunk_count);
+	} else {
+		PackedInt32Array chunk_counts;
+		chunk_counts.resize(entry.mip_count);
+		for (uint32_t mip = 0; mip < entry.mip_count; ++mip) {
+			chunk_counts[mip] = 1;
+		}
+		result["mip_chunk_counts"] = chunk_counts;
+		result["chunk_offsets"] = PackedInt64Array();
+		result["chunk_compressed_sizes"] = PackedInt32Array();
+		result["chunk_uncompressed_sizes"] = PackedInt32Array();
+		result["chunked"] = false;
+		result["total_chunk_count"] = static_cast<int64_t>(entry.mip_count);
+	}
 
 	return result;
 }
@@ -1721,7 +2313,9 @@ bool DSPkg::get_mip_entries_for_path(const String &p_path, Vector<DSPkgMipEntry>
 			entry->mip_offsets.size() != static_cast<int64_t>(entry->mip_count) ||
 			entry->mip_sizes.size() != static_cast<int64_t>(entry->mip_count) ||
 			entry->mip_uncompressed_sizes.size() != static_cast<int64_t>(entry->mip_count) ||
-			entry->mip_row_pitches.size() != static_cast<int64_t>(entry->mip_count)) {
+			entry->mip_row_pitches.size() != static_cast<int64_t>(entry->mip_count) ||
+			(loaded_header.version == DSPKG_VERSION_V5 &&
+					entry->mip_chunk_counts.size() != static_cast<int64_t>(entry->mip_count))) {
 		return false;
 	}
 
@@ -1732,7 +2326,11 @@ bool DSPkg::get_mip_entries_for_path(const String &p_path, Vector<DSPkgMipEntry>
 		mip_entry.compressed_size = static_cast<uint32_t>(entry->mip_sizes[mip]);
 		mip_entry.uncompressed_size = static_cast<uint32_t>(entry->mip_uncompressed_sizes[mip]);
 		mip_entry.row_pitch = static_cast<uint32_t>(entry->mip_row_pitches[mip]);
-		mip_entry.reserved = 0;
+		if (loaded_header.version == DSPKG_VERSION_V5) {
+			mip_entry.chunk_count = static_cast<uint32_t>(entry->mip_chunk_counts[mip]);
+		} else {
+			mip_entry.reserved = 0;
+		}
 	}
 	return true;
 }
@@ -1742,11 +2340,26 @@ bool DSPkg::get_mip_entries_for_offset(uint64_t p_offset, Vector<DSPkgMipEntry> 
 	if (!is_opened) {
 		return false;
 	}
-	const Vector<DSPkgMipEntry> *found = entries_by_offset.getptr(p_offset);
+	const DSPkgOffsetEntry *found = entries_by_offset.getptr(p_offset);
 	if (found == nullptr) {
 		return false;
 	}
-	r_entries = *found;
+	r_entries = found->mips;
+	return true;
+}
+
+bool DSPkg::get_entry_features_for_offset(uint64_t p_offset, uint8_t &r_compression_format,
+		uint8_t &r_gacl_transform, bool &r_chunked) const {
+	if (!is_opened) {
+		return false;
+	}
+	const DSPkgOffsetEntry *found = entries_by_offset.getptr(p_offset);
+	if (found == nullptr) {
+		return false;
+	}
+	r_compression_format = found->compression_format;
+	r_gacl_transform = found->gacl_transform;
+	r_chunked = found->chunked;
 	return true;
 }
 
@@ -1763,6 +2376,8 @@ Array DSPkg::get_mip_entries_for_offset(uint64_t p_offset) const {
 		mip_dict["compressed_size"] = static_cast<int64_t>(mip_entry.compressed_size);
 		mip_dict["uncompressed_size"] = static_cast<int64_t>(mip_entry.uncompressed_size);
 		mip_dict["row_pitch"] = static_cast<int64_t>(mip_entry.row_pitch);
+		mip_dict["chunk_count"] = loaded_header.version == DSPKG_VERSION_V5 ?
+				static_cast<int64_t>(mip_entry.chunk_count) : 1;
 		result.append(mip_dict);
 	}
 	return result;

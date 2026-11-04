@@ -197,6 +197,16 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 	if (info.is_empty()) {
 		return false;
 	}
+	// Preload stages GDeflate requests only. A v5 entry that needs Zstd, GACL
+	// or chunk reassembly must fail closed here rather than be prewarmed with
+	// the wrong codec/destination shape.
+	if ((int)info.get("entry_kind", 0) != static_cast<int>(DSPkgEntryKind::TEXTURE) ||
+			(int)info.get("compression_format", 1) != static_cast<int>(DSCompressionFormat::GDEFLATE) ||
+			(int)info.get("gacl_transform", 0) != static_cast<int>(DSGaclTransform::NONE) ||
+			(bool)info.get("chunked", false)) {
+		UtilityFunctions::push_error("DirectStorage Preloader: Entry requires the GPU path or Step 5 CPU support; preload skipped: " + p_engine_path);
+		return false;
+	}
 	r_out.engine_path = p_engine_path;
 	// Single-lookup Dictionary reads: get() costs one hash probe where
 	// has()+operator[] cost two for every optional key.
@@ -322,6 +332,49 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 		UtilityFunctions::push_error("DSTex: Invalid magic number.");
 		return false;
 	}
+	if (header.version < 1 || header.version > 3) {
+		UtilityFunctions::push_error("DSTex: Unsupported texture version.");
+		return false;
+	}
+	if ((header.flags & ~(DSTEX_FLAG_SRGB | DSTEX_FLAG_AS_IMAGE_TEXTURE)) != 0) {
+		UtilityFunctions::push_error("DSTex: Reserved texture flags must be zero.");
+		return false;
+	}
+	if (header.version <= 2 && header.reserved != 0) {
+		UtilityFunctions::push_error("DSTex: v1/v2 reserved field must be zero.");
+		return false;
+	}
+	if (header.version == 3) {
+		const uint64_t capabilities = header.reserved;
+		if ((capabilities & ~DSTEX_CAP_KNOWN_MASK) != 0) {
+			UtilityFunctions::push_error("DSTex: Unknown v3 capability bits.");
+			return false;
+		}
+		const DSCompressionFormat format = DSTex::get_compression_format(capabilities);
+		const DSGaclTransform gacl = DSTex::get_gacl_transform(capabilities);
+		if (!ds_compression_format_is_valid(static_cast<uint8_t>(format)) ||
+				!ds_gacl_transform_is_valid(static_cast<uint8_t>(gacl)) ||
+				!DSTex::gacl_transform_matches_pixel_format(gacl, static_cast<int>(header.pixel_format)) ||
+				(gacl != DSGaclTransform::NONE && format == DSCompressionFormat::NONE)) {
+			UtilityFunctions::push_error("DSTex: Invalid v3 capability word.");
+			return false;
+		}
+		if (format != DSCompressionFormat::GDEFLATE || gacl != DSGaclTransform::NONE) {
+			UtilityFunctions::push_error("DSTex: Preload requires a GDeflate payload without GACL until Step 5.");
+			return false;
+		}
+		if ((capabilities & DSTEX_CAP_CHUNKED) != 0) {
+			// The header cache is a single header + mip-table read; chunk tables
+			// are not available here, and the capability must be set iff a mip is
+			// actually chunked.
+			UtilityFunctions::push_error("DSTex: Preload does not support chunked v3 payloads until Step 5.");
+			return false;
+		}
+		if (format == DSCompressionFormat::NONE && header.compressed_size != header.original_size) {
+			UtilityFunctions::push_error("DSTex: NONE-compressed header sizes must match.");
+			return false;
+		}
+	}
 	if (header.width == 0 || header.height == 0) {
 		UtilityFunctions::push_error("DSTex: Invalid texture dimensions.");
 		return false;
@@ -366,43 +419,76 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 	filled.open_failed = false;
 
 	if (header.version == 1) {
+		uint64_t previous_end = sizeof(DSTexHeader) +
+				static_cast<uint64_t>(header.mip_count) * sizeof(DSTexMipEntry);
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntry mip_entry;
 			memcpy(&mip_entry, table_ptr + i * sizeof(DSTexMipEntry), sizeof(DSTexMipEntry));
 			if (mip_entry.offset > file_len || mip_entry.size > file_len - mip_entry.offset ||
-					(mip_entry.size != 0 && mip_entry.offset + mip_entry.size < mip_entry.offset)) {
-				UtilityFunctions::push_error("DSTex: Mip entry exceeds file bounds or overflows.");
+					(mip_entry.size != 0 && mip_entry.offset + mip_entry.size < mip_entry.offset) ||
+					mip_entry.offset < previous_end) {
+				UtilityFunctions::push_error("DSTex: Mip entry exceeds file bounds, overlaps, or starts inside the tables.");
 				return false;
 			}
+			previous_end = mip_entry.offset + mip_entry.size;
 			filled.mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			filled.mip_sizes[i] = static_cast<int32_t>(mip_entry.size);
 		}
-	} else if (header.version == 2) {
+	} else if (header.version == 2 || header.version == 3) {
 		// Each table entry is a uint32 and there are at most 16 of them, so the
 		// sums cannot overflow uint64 and need no guard of their own.
-		uint64_t sum_compressed = 0;
-		uint64_t sum_uncompressed = 0;
+		DSTexMipEntryV2 entries[DSTEX_MAX_MIP_COUNT];
+		uint64_t previous_end = sizeof(DSTexHeader) +
+				static_cast<uint64_t>(header.mip_count) * sizeof(DSTexMipEntryV2);
+		previous_end = (previous_end + 511) & ~uint64_t(511);
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntryV2 mip_entry;
 			memcpy(&mip_entry, table_ptr + i * sizeof(DSTexMipEntryV2), sizeof(DSTexMipEntryV2));
 			if (mip_entry.offset > file_len || mip_entry.compressed_size > file_len - mip_entry.offset ||
-					(mip_entry.compressed_size != 0 && mip_entry.offset + mip_entry.compressed_size < mip_entry.offset)) {
-				UtilityFunctions::push_error("DSTex: Mip entry exceeds file bounds or overflows.");
+					(mip_entry.compressed_size != 0 && mip_entry.offset + mip_entry.compressed_size < mip_entry.offset) ||
+					mip_entry.offset < previous_end) {
+				UtilityFunctions::push_error("DSTex: Mip entry exceeds file bounds, overlaps, or starts inside the tables.");
 				return false;
 			}
-			sum_compressed += mip_entry.compressed_size;
-			sum_uncompressed += mip_entry.uncompressed_size;
+			previous_end = mip_entry.offset + mip_entry.compressed_size;
+			if (header.version == 2 && mip_entry.reserved != 0) {
+				UtilityFunctions::push_error("DSTex: v2 mip reserved field must be zero.");
+				return false;
+			}
+			if (header.version == 3) {
+				if (mip_entry.chunk_count == 0 || mip_entry.chunk_count > DSTEX_MAX_CHUNKS_PER_MIP) {
+					UtilityFunctions::push_error("DSTex: Invalid v3 chunk count.");
+					return false;
+				}
+				if (mip_entry.chunk_count > 1) {
+					// The preloader's header cache is a single bulk read of the
+					// header + mip table; chunk tables are not available here.
+					UtilityFunctions::push_error("DSTex: Preload does not support chunked v3 payloads until Step 5.");
+					return false;
+				}
+				if (mip_entry.offset % 512 != 0 ||
+						mip_entry.row_pitch == 0 || mip_entry.row_pitch % 256 != 0) {
+					UtilityFunctions::push_error("DSTex: Invalid v3 mip alignment.");
+					return false;
+				}
+				if (DSTex::get_compression_format(header.reserved) == DSCompressionFormat::NONE &&
+						mip_entry.compressed_size != mip_entry.uncompressed_size) {
+					UtilityFunctions::push_error("DSTex: NONE-compressed mip sizes must match.");
+					return false;
+				}
+			}
+			entries[i] = mip_entry;
 			filled.mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			filled.mip_sizes[i] = static_cast<int32_t>(mip_entry.compressed_size);
 			filled.mip_uncompressed_sizes[i] = static_cast<int32_t>(mip_entry.uncompressed_size);
 			filled.mip_row_pitches[i] = static_cast<int32_t>(mip_entry.row_pitch);
 		}
 		// The archive reader (DSPkg::open) and the Win32 enqueue path both require
-		// the mip table to add up to the header totals. Without it a header can
-		// declare a sane total while its mips declare gigabytes, which is what
-		// expand_requests() would allocate from.
-		if (sum_compressed != header.compressed_size || sum_uncompressed != header.original_size) {
-			UtilityFunctions::push_error("DSTex: Mip sizes do not match the header totals.");
+		// the mip table to add up to the header totals, and the per-mip footprint
+		// to match the declared layout. Without it a header can declare a sane
+		// total while its mips lie about their shape.
+		if (!DSTex::mip_table_is_sane(header, entries)) {
+			UtilityFunctions::push_error("DSTex: Mip table does not match the header totals or the declared mip layout.");
 			return false;
 		}
 	} else {
@@ -453,7 +539,7 @@ void DSPreloader::payload_from_header(const String &p_engine_path, const String 
 	r_out.mip_count = p_header.mip_count;
 	r_out.original_size = p_header.original_size;
 	r_out.compressed_size = p_header.compressed_size;
-	r_out.is_v2 = p_header.version == 2;
+	r_out.is_v2 = p_header.version >= 2;
 	// Bulk mip-table copy: one resize (single zero-fill alloc) + one memcpy
 	// per table instead of 4*mip_count bounds-checked operator[] pairs. Array SHAPES unchanged — v1 keeps all
 	// four tables sized mip_count (zero-filled tail, exactly as the element

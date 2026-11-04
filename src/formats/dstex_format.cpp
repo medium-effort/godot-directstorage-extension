@@ -140,7 +140,7 @@ DSTexMipLayout DSTex::get_mip_layout(uint32_t p_width, uint32_t p_height, int p_
 //      more than px*32 for small or narrow textures, while the exact per-level
 //      comparison still rejects a table that does not describe the declared
 //      dimensions.
-static bool ds_v2_mip_table_is_sane(const DSTexHeader &p_header, const DSTexMipEntryV2 *p_entries) {
+bool DSTex::mip_table_is_sane(const DSTexHeader &p_header, const DSTexMipEntryV2 *p_entries) {
 	const int img_fmt = DSTex::rd_format_to_godot_format(static_cast<int>(p_header.pixel_format));
 	const bool check_layout = img_fmt != Image::FORMAT_MAX;
 	uint32_t w = p_header.width;
@@ -167,6 +167,168 @@ static bool ds_v2_mip_table_is_sane(const DSTexHeader &p_header, const DSTexMipE
 	}
 	return sum_compressed == p_header.compressed_size && sum_uncompressed == p_header.original_size;
 }
+
+// Payload spans must be ordered, non-overlapping, and start at or after the
+// aligned end of the header + mip table. This mirrors the Win32 enqueue path and
+// prevents an offset-0 or overlapping mip from aliasing the container metadata.
+static bool ds_v2_mip_payload_order_is_sane(const DSTexHeader &p_header, const DSTexMipEntryV2 *p_entries, String &r_error) {
+	uint64_t first_payload = sizeof(DSTexHeader) +
+			static_cast<uint64_t>(p_header.mip_count) * sizeof(DSTexMipEntryV2);
+	if (!align_up(first_payload, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, first_payload)) {
+		r_error = "DSTex: Mip table end alignment overflow.";
+		return false;
+	}
+	uint64_t previous_end = first_payload;
+	for (uint32_t i = 0; i < p_header.mip_count; ++i) {
+		const DSTexMipEntryV2 &entry = p_entries[i];
+		if (entry.offset < previous_end ||
+				entry.offset > UINT64_MAX - entry.compressed_size) {
+			r_error = "DSTex: Mip payloads overlap or start inside the header/tables.";
+			return false;
+		}
+		previous_end = entry.offset + entry.compressed_size;
+	}
+	return true;
+}
+
+static bool ds_v1_mip_payload_order_is_sane(const DSTexHeader &p_header, const DSTexMipEntry *p_entries, String &r_error) {
+	uint64_t previous_end = sizeof(DSTexHeader) +
+			static_cast<uint64_t>(p_header.mip_count) * sizeof(DSTexMipEntry);
+	for (uint32_t i = 0; i < p_header.mip_count; ++i) {
+		const DSTexMipEntry &entry = p_entries[i];
+		if (entry.offset < previous_end || entry.offset > UINT64_MAX - entry.size) {
+			r_error = "DSTex: v1 mip payloads overlap or start inside the header/tables.";
+			return false;
+		}
+		previous_end = entry.offset + entry.size;
+	}
+	return true;
+}
+
+// Reads the v3 chunk tables that follow the mip table, validates them, and
+// returns the flat chunk arrays. The caller must have positioned the file at
+// sizeof(DSTexHeader) + mip_count * sizeof(DSTexMipEntryV2).
+static bool ds_parse_v3_chunks(Ref<FileAccess> p_file, const DSTexHeader &p_header,
+		const DSTexMipEntryV2 *p_entries, PackedInt32Array &r_chunk_counts,
+		PackedInt64Array &r_offsets, PackedInt32Array &r_compressed,
+		PackedInt32Array &r_uncompressed, bool &r_chunked, String &r_error) {
+	const uint64_t file_len = p_file->get_length();
+	r_chunked = false;
+	uint64_t previous_chunk_end = 0;
+	for (uint32_t mip = 0; mip < p_header.mip_count; ++mip) {
+		const DSTexMipEntryV2 &mip_entry = p_entries[mip];
+		const uint32_t chunk_count = mip_entry.chunk_count;
+		if (chunk_count == 0 || chunk_count > DSTEX_MAX_CHUNKS_PER_MIP) {
+			r_error = "DSTex: Invalid v3 chunk count.";
+			return false;
+		}
+		if (mip_entry.offset % 512 != 0) {
+			r_error = "DSTex: v3 mip offset must be 512-byte aligned.";
+			return false;
+		}
+		r_chunk_counts.push_back(static_cast<int32_t>(chunk_count));
+		if (chunk_count == 1) {
+			continue;
+		}
+		r_chunked = true;
+		if (mip_entry.row_pitch == 0 || mip_entry.uncompressed_size % mip_entry.row_pitch != 0) {
+			r_error = "DSTex: v3 chunked mip is not a whole number of rows.";
+			return false;
+		}
+		uint64_t sum_compressed = 0;
+		uint64_t sum_uncompressed = 0;
+		for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+			if (p_file->get_position() > file_len ||
+					file_len - p_file->get_position() < sizeof(DSChunkEntry)) {
+				r_error = "DSTex: v3 chunk table extends past file.";
+				return false;
+			}
+			PackedByteArray bytes = p_file->get_buffer(sizeof(DSChunkEntry));
+			if (bytes.size() != static_cast<int64_t>(sizeof(DSChunkEntry))) {
+				r_error = "DSTex: Failed to read v3 chunk entry.";
+				return false;
+			}
+			DSChunkEntry chunk;
+			memcpy(&chunk, bytes.ptr(), sizeof(chunk));
+			if (chunk.compressed_size == 0 || chunk.uncompressed_size == 0 ||
+					chunk.uncompressed_size % mip_entry.row_pitch != 0) {
+				r_error = "DSTex: Invalid v3 chunk size or row alignment.";
+				return false;
+			}
+			if (DSTex::get_compression_format(p_header.reserved) == DSCompressionFormat::NONE &&
+					chunk.compressed_size != chunk.uncompressed_size) {
+				r_error = "DSTex: NONE-compressed chunk sizes must match.";
+				return false;
+			}
+			if (chunk.offset > file_len || chunk.compressed_size > file_len - chunk.offset) {
+				r_error = "DSTex: v3 chunk exceeds file bounds.";
+				return false;
+			}
+			if (chunk_index == 0 && chunk.offset != mip_entry.offset) {
+				r_error = "DSTex: v3 first chunk must match the mip offset.";
+				return false;
+			}
+			if (chunk.offset % (chunk_index == 0 ? 512 : 8) != 0) {
+				r_error = "DSTex: v3 chunk offset alignment mismatch.";
+				return false;
+			}
+			if (chunk.offset < previous_chunk_end) {
+				r_error = "DSTex: v3 chunks overlap.";
+				return false;
+			}
+			previous_chunk_end = chunk.offset + chunk.compressed_size;
+			sum_compressed += chunk.compressed_size;
+			sum_uncompressed += chunk.uncompressed_size;
+			r_offsets.push_back(static_cast<int64_t>(chunk.offset));
+			r_compressed.push_back(static_cast<int32_t>(chunk.compressed_size));
+			r_uncompressed.push_back(static_cast<int32_t>(chunk.uncompressed_size));
+		}
+		if (sum_compressed != mip_entry.compressed_size || sum_uncompressed != mip_entry.uncompressed_size) {
+			r_error = "DSTex: v3 chunk sums do not match the mip.";
+			return false;
+		}
+	}
+	if ((DSTex::is_chunked(p_header.reserved)) != r_chunked) {
+		r_error = "DSTex: v3 CAP_CHUNKED does not match the mip table.";
+		return false;
+	}
+	uint64_t first_payload = p_file->get_position();
+	if (!align_up(first_payload, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, first_payload)) {
+		r_error = "DSTex: v3 payload alignment overflow.";
+		return false;
+	}
+	uint64_t previous_end = first_payload;
+	int64_t chunk_cursor = 0;
+	for (uint32_t mip = 0; mip < p_header.mip_count; ++mip) {
+		const DSTexMipEntryV2 &mip_entry = p_entries[mip];
+		if (mip_entry.chunk_count == 1) {
+			if (mip_entry.offset < previous_end ||
+					mip_entry.offset > UINT64_MAX - mip_entry.compressed_size) {
+				r_error = "DSTex: v3 mip payloads overlap or start inside the chunk tables.";
+				return false;
+			}
+			previous_end = mip_entry.offset + mip_entry.compressed_size;
+			continue;
+		}
+		for (uint32_t chunk_index = 0; chunk_index < mip_entry.chunk_count; ++chunk_index) {
+			const uint64_t chunk_offset = static_cast<uint64_t>(r_offsets[chunk_cursor]);
+			const uint32_t chunk_compressed = static_cast<uint32_t>(r_compressed[chunk_cursor]);
+			if (chunk_offset < previous_end ||
+					chunk_offset > UINT64_MAX - chunk_compressed) {
+				r_error = "DSTex: v3 chunk payloads overlap or start inside the chunk tables.";
+				return false;
+			}
+			previous_end = chunk_offset + chunk_compressed;
+			++chunk_cursor;
+		}
+	}
+	if (chunk_cursor != r_offsets.size()) {
+		r_error = "DSTex: v3 chunk cursor did not consume the table.";
+		return false;
+	}
+	return true;
+}
+
 
 PackedByteArray DSTex::unpad_footprint_mip(const PackedByteArray &p_footprint, uint32_t p_width, uint32_t p_height, int p_image_format) {
 	if (p_footprint.size() == 0 || p_width == 0 || p_height == 0) {
@@ -483,6 +645,41 @@ int DSTex::get_srgb_rd_format(int p_rd_format) {
 	}
 }
 
+DSCompressionFormat DSTex::get_compression_format(uint64_t p_capabilities) {
+	return static_cast<DSCompressionFormat>(p_capabilities & DSTEX_CAP_COMPRESSION_MASK);
+}
+
+DSGaclTransform DSTex::get_gacl_transform(uint64_t p_capabilities) {
+	return static_cast<DSGaclTransform>((p_capabilities & DSTEX_CAP_GACL_MASK) >> DSTEX_CAP_GACL_SHIFT);
+}
+
+bool DSTex::is_chunked(uint64_t p_capabilities) {
+	return (p_capabilities & DSTEX_CAP_CHUNKED) != 0;
+}
+
+bool DSTex::gacl_transform_matches_pixel_format(DSGaclTransform p_transform, int p_rd_format) {
+	switch (p_transform) {
+		case DSGaclTransform::NONE:
+			return true;
+		case DSGaclTransform::BC1:
+			return p_rd_format == RenderingDevice::DATA_FORMAT_BC1_RGB_UNORM_BLOCK ||
+					p_rd_format == RenderingDevice::DATA_FORMAT_BC1_RGB_SRGB_BLOCK ||
+					p_rd_format == RenderingDevice::DATA_FORMAT_BC1_RGBA_UNORM_BLOCK ||
+					p_rd_format == RenderingDevice::DATA_FORMAT_BC1_RGBA_SRGB_BLOCK;
+		case DSGaclTransform::BC3:
+			return p_rd_format == RenderingDevice::DATA_FORMAT_BC3_UNORM_BLOCK ||
+					p_rd_format == RenderingDevice::DATA_FORMAT_BC3_SRGB_BLOCK;
+		case DSGaclTransform::BC4:
+			// SNORM is not mapped by rd_format_to_godot_format yet; keep the
+			// accepted set aligned with the engine conversion.
+			return p_rd_format == RenderingDevice::DATA_FORMAT_BC4_UNORM_BLOCK;
+		case DSGaclTransform::BC5:
+			return p_rd_format == RenderingDevice::DATA_FORMAT_BC5_UNORM_BLOCK;
+		default:
+			return false;
+	}
+}
+
 Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level, bool p_is_srgb, bool p_as_image_texture) {
 	if (p_raw_data.size() == 0 || p_width <= 0 || p_height <= 0 || p_mip_count <= 0 || p_mip_count > static_cast<int>(DSTEX_MAX_MIP_COUNT)) {
 		return ERR_INVALID_PARAMETER;
@@ -632,6 +829,45 @@ Dictionary DSTex::read_header(const String &p_path) {
 		return result;
 	}
 
+	if (header.version != 1 && header.version != 2 && header.version != 3) {
+		UtilityFunctions::push_error("DSTex: Unsupported texture version.");
+		return result;
+	}
+	if ((header.flags & ~(DSTEX_FLAG_SRGB | DSTEX_FLAG_AS_IMAGE_TEXTURE)) != 0) {
+		UtilityFunctions::push_error("DSTex: Reserved texture flags must be zero.");
+		return result;
+	}
+	if (header.version <= 2 && header.reserved != 0) {
+		UtilityFunctions::push_error("DSTex: v1/v2 reserved field must be zero.");
+		return result;
+	}
+	if (header.version == 3) {
+		const uint64_t capabilities = header.reserved;
+		if ((capabilities & ~DSTEX_CAP_KNOWN_MASK) != 0) {
+			UtilityFunctions::push_error("DSTex: Unknown v3 capability bits.");
+			return result;
+		}
+		const DSCompressionFormat format = get_compression_format(capabilities);
+		const DSGaclTransform gacl = get_gacl_transform(capabilities);
+		if (!ds_compression_format_is_valid(static_cast<uint8_t>(format)) ||
+				!ds_gacl_transform_is_valid(static_cast<uint8_t>(gacl))) {
+			UtilityFunctions::push_error("DSTex: Invalid v3 compression format or GACL transform.");
+			return result;
+		}
+		if (!gacl_transform_matches_pixel_format(gacl, static_cast<int>(header.pixel_format))) {
+			UtilityFunctions::push_error("DSTex: GACL transform does not match the pixel format family.");
+			return result;
+		}
+		if (gacl != DSGaclTransform::NONE && format == DSCompressionFormat::NONE) {
+			UtilityFunctions::push_error("DSTex: GACL requires a compressed payload.");
+			return result;
+		}
+		if (format == DSCompressionFormat::NONE && header.compressed_size != header.original_size) {
+			UtilityFunctions::push_error("DSTex: NONE-compressed header sizes must match.");
+			return result;
+		}
+	}
+
 	if (header.width == 0 || header.height == 0) {
 		UtilityFunctions::push_error("DSTex: Invalid texture dimensions.");
 		return Dictionary();
@@ -676,12 +912,18 @@ Dictionary DSTex::read_header(const String &p_path) {
 	PackedInt32Array mip_sizes;
 	PackedInt32Array mip_uncompressed_sizes;
 	PackedInt32Array mip_row_pitches;
+	PackedInt32Array mip_chunk_counts;
+	PackedInt64Array chunk_offsets;
+	PackedInt32Array chunk_compressed_sizes;
+	PackedInt32Array chunk_uncompressed_sizes;
+	bool chunked = false;
 	mip_offsets.resize(header.mip_count);
 	mip_sizes.resize(header.mip_count);
 	mip_uncompressed_sizes.resize(header.mip_count);
 	mip_row_pitches.resize(header.mip_count);
 	if (header.version == 1) {
 		uint64_t file_len = file->get_length();
+		DSTexMipEntry v1_entries[DSTEX_MAX_MIP_COUNT];
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntry mip_entry;
 			PackedByteArray mip_bytes = file->get_buffer(sizeof(DSTexMipEntry));
@@ -696,10 +938,17 @@ Dictionary DSTex::read_header(const String &p_path) {
 				file->close();
 				return Dictionary();
 			}
+			v1_entries[i] = mip_entry;
 			mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			mip_sizes[i] = static_cast<int32_t>(mip_entry.size);
 		}
-	} else if (header.version == 2) {
+		String order_error;
+		if (!ds_v1_mip_payload_order_is_sane(header, v1_entries, order_error)) {
+			UtilityFunctions::push_error(order_error);
+			file->close();
+			return Dictionary();
+		}
+	} else if (header.version == 2 || header.version == 3) {
 		uint64_t file_len = file->get_length();
 		DSTexMipEntryV2 entries[DSTEX_MAX_MIP_COUNT];
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
@@ -716,16 +965,61 @@ Dictionary DSTex::read_header(const String &p_path) {
 				file->close();
 				return Dictionary();
 			}
+			if (header.version == 2 && mip_entry.reserved != 0) {
+				UtilityFunctions::push_error("DSTex: v2 mip reserved field must be zero.");
+				file->close();
+				return Dictionary();
+			}
+			if (header.version == 3) {
+				if (mip_entry.chunk_count == 0 || mip_entry.chunk_count > DSTEX_MAX_CHUNKS_PER_MIP) {
+					UtilityFunctions::push_error("DSTex: Invalid v3 chunk count.");
+					file->close();
+					return Dictionary();
+				}
+				if (mip_entry.offset % 512 != 0) {
+					UtilityFunctions::push_error("DSTex: v3 mip offset must be 512-byte aligned.");
+					file->close();
+					return Dictionary();
+				}
+				if (mip_entry.row_pitch == 0 || mip_entry.row_pitch % 256 != 0) {
+					UtilityFunctions::push_error("DSTex: v3 mip row pitch must be 256-byte aligned.");
+					file->close();
+					return Dictionary();
+				}
+				if (get_compression_format(header.reserved) == DSCompressionFormat::NONE &&
+						mip_entry.compressed_size != mip_entry.uncompressed_size) {
+					UtilityFunctions::push_error("DSTex: NONE-compressed mip sizes must match.");
+					file->close();
+					return Dictionary();
+				}
+			}
 			entries[i] = mip_entry;
 			mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			mip_sizes[i] = static_cast<int32_t>(mip_entry.compressed_size);
 			mip_uncompressed_sizes[i] = static_cast<int32_t>(mip_entry.uncompressed_size);
 			mip_row_pitches[i] = static_cast<int32_t>(mip_entry.row_pitch);
 		}
-		if (!ds_v2_mip_table_is_sane(header, entries)) {
+		if (!DSTex::mip_table_is_sane(header, entries)) {
 			UtilityFunctions::push_error("DSTex: Mip table does not match the header totals or the declared mip layout.");
 			file->close();
 			return Dictionary();
+		}
+		if (header.version == 2) {
+			String order_error;
+			if (!ds_v2_mip_payload_order_is_sane(header, entries, order_error)) {
+				UtilityFunctions::push_error(order_error);
+				file->close();
+				return Dictionary();
+			}
+		}
+		if (header.version == 3) {
+			String chunk_error;
+			if (!ds_parse_v3_chunks(file, header, entries, mip_chunk_counts, chunk_offsets,
+						chunk_compressed_sizes, chunk_uncompressed_sizes, chunked, chunk_error)) {
+				UtilityFunctions::push_error(chunk_error);
+				file->close();
+				return Dictionary();
+			}
 		}
 	} else {
 		UtilityFunctions::push_error("DSTex: Unsupported texture version.");
@@ -736,6 +1030,18 @@ Dictionary DSTex::read_header(const String &p_path) {
 	result["mip_sizes"] = mip_sizes;
 	result["mip_uncompressed_sizes"] = mip_uncompressed_sizes;
 	result["mip_row_pitches"] = mip_row_pitches;
+	result["mip_chunk_counts"] = mip_chunk_counts;
+	result["chunk_offsets"] = chunk_offsets;
+	result["chunk_compressed_sizes"] = chunk_compressed_sizes;
+	result["chunk_uncompressed_sizes"] = chunk_uncompressed_sizes;
+	result["chunked"] = chunked;
+	result["capabilities"] = header.version == 3 ? header.reserved : 0;
+	result["compression_format"] = header.version == 3 ?
+			static_cast<int>(get_compression_format(header.reserved)) :
+			static_cast<int>(DSCompressionFormat::GDEFLATE);
+	result["gacl_transform"] = header.version == 3 ?
+			static_cast<int>(get_gacl_transform(header.reserved)) :
+			static_cast<int>(DSGaclTransform::NONE);
 
 	file->close();
 	return result;
@@ -764,6 +1070,45 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	if (header.magic != 0x58455444) {
 		UtilityFunctions::push_error("DSTex: Invalid magic number.");
 		return result;
+	}
+
+	if (header.version != 1 && header.version != 2 && header.version != 3) {
+		UtilityFunctions::push_error("DSTex: Unsupported texture version.");
+		return result;
+	}
+	if ((header.flags & ~(DSTEX_FLAG_SRGB | DSTEX_FLAG_AS_IMAGE_TEXTURE)) != 0) {
+		UtilityFunctions::push_error("DSTex: Reserved texture flags must be zero.");
+		return result;
+	}
+	if (header.version <= 2 && header.reserved != 0) {
+		UtilityFunctions::push_error("DSTex: v1/v2 reserved field must be zero.");
+		return result;
+	}
+	if (header.version == 3) {
+		const uint64_t capabilities = header.reserved;
+		if ((capabilities & ~DSTEX_CAP_KNOWN_MASK) != 0) {
+			UtilityFunctions::push_error("DSTex: Unknown v3 capability bits.");
+			return result;
+		}
+		const DSCompressionFormat format = get_compression_format(capabilities);
+		const DSGaclTransform gacl = get_gacl_transform(capabilities);
+		if (!ds_compression_format_is_valid(static_cast<uint8_t>(format)) ||
+				!ds_gacl_transform_is_valid(static_cast<uint8_t>(gacl))) {
+			UtilityFunctions::push_error("DSTex: Invalid v3 compression format or GACL transform.");
+			return result;
+		}
+		if (!gacl_transform_matches_pixel_format(gacl, static_cast<int>(header.pixel_format))) {
+			UtilityFunctions::push_error("DSTex: GACL transform does not match the pixel format family.");
+			return result;
+		}
+		if (gacl != DSGaclTransform::NONE && format == DSCompressionFormat::NONE) {
+			UtilityFunctions::push_error("DSTex: GACL requires a compressed payload.");
+			return result;
+		}
+		if (format == DSCompressionFormat::NONE && header.compressed_size != header.original_size) {
+			UtilityFunctions::push_error("DSTex: NONE-compressed header sizes must match.");
+			return result;
+		}
 	}
 
 	if (header.width == 0 || header.height == 0) {
@@ -804,6 +1149,14 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	header_dict["original_size"] = header.original_size;
 	header_dict["compressed_size"] = header.compressed_size;
 	header_dict["reserved"] = header.reserved;
+	header_dict["capabilities"] = header.version == 3 ? header.reserved : 0;
+	header_dict["compression_format"] = header.version == 3 ?
+			static_cast<int>(get_compression_format(header.reserved)) :
+			static_cast<int>(DSCompressionFormat::GDEFLATE);
+	header_dict["gacl_transform"] = header.version == 3 ?
+			static_cast<int>(get_gacl_transform(header.reserved)) :
+			static_cast<int>(DSGaclTransform::NONE);
+	header_dict["chunked"] = header.version == 3 ? is_chunked(header.reserved) : false;
 	header_dict["is_srgb"] = (header.flags & DSTEX_FLAG_SRGB) != 0 || is_rd_format_srgb(static_cast<int>(header.pixel_format));
 	header_dict["as_image_texture"] = (header.flags & DSTEX_FLAG_AS_IMAGE_TEXTURE) != 0;
 
@@ -817,6 +1170,7 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	mip_row_pitches.resize(header.mip_count);
 
 	if (header.version == 1) {
+		DSTexMipEntry v1_entries[DSTEX_MAX_MIP_COUNT];
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntry mip_entry;
 			PackedByteArray mip_bytes = file->get_buffer(sizeof(DSTexMipEntry));
@@ -825,10 +1179,17 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 				return Dictionary();
 			}
 			memcpy(&mip_entry, mip_bytes.ptr(), sizeof(DSTexMipEntry));
+			v1_entries[i] = mip_entry;
 			mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			mip_sizes[i] = static_cast<int32_t>(mip_entry.size);
 		}
-	} else if (header.version == 2) {
+		String order_error;
+		if (!ds_v1_mip_payload_order_is_sane(header, v1_entries, order_error)) {
+			UtilityFunctions::push_error(order_error);
+			file->close();
+			return Dictionary();
+		}
+	} else if (header.version == 2 || header.version == 3) {
 		DSTexMipEntryV2 entries[DSTEX_MAX_MIP_COUNT];
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
 			DSTexMipEntryV2 mip_entry;
@@ -838,16 +1199,75 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 				return Dictionary();
 			}
 			memcpy(&mip_entry, mip_bytes.ptr(), sizeof(DSTexMipEntryV2));
+			if (header.version == 2 && mip_entry.reserved != 0) {
+				UtilityFunctions::push_error("DSTex: v2 mip reserved field must be zero.");
+				file->close();
+				return Dictionary();
+			}
+			if (header.version == 3 && (mip_entry.chunk_count == 0 ||
+					mip_entry.chunk_count > DSTEX_MAX_CHUNKS_PER_MIP)) {
+				UtilityFunctions::push_error("DSTex: Invalid v3 chunk count.");
+				file->close();
+				return Dictionary();
+			}
+			if (header.version == 3 && mip_entry.offset % 512 != 0) {
+				UtilityFunctions::push_error("DSTex: v3 mip offset must be 512-byte aligned.");
+				file->close();
+				return Dictionary();
+			}
+			if (header.version == 3 && (mip_entry.row_pitch == 0 || mip_entry.row_pitch % 256 != 0)) {
+				UtilityFunctions::push_error("DSTex: v3 mip row pitch must be 256-byte aligned.");
+				file->close();
+				return Dictionary();
+			}
+			if (header.version == 3 &&
+					get_compression_format(header.reserved) == DSCompressionFormat::NONE &&
+					mip_entry.compressed_size != mip_entry.uncompressed_size) {
+				UtilityFunctions::push_error("DSTex: NONE-compressed mip sizes must match.");
+				file->close();
+				return Dictionary();
+			}
 			entries[i] = mip_entry;
 			mip_offsets[i] = static_cast<int64_t>(mip_entry.offset);
 			mip_sizes[i] = static_cast<int32_t>(mip_entry.compressed_size);
 			mip_uncompressed_sizes[i] = static_cast<int32_t>(mip_entry.uncompressed_size);
 			mip_row_pitches[i] = static_cast<int32_t>(mip_entry.row_pitch);
 		}
-		if (!ds_v2_mip_table_is_sane(header, entries)) {
+		if (!DSTex::mip_table_is_sane(header, entries)) {
 			UtilityFunctions::push_error("DSTex: Mip table does not match the header totals or the declared mip layout.");
 			file->close();
 			return Dictionary();
+		}
+		if (header.version == 2) {
+			String order_error;
+			if (!ds_v2_mip_payload_order_is_sane(header, entries, order_error)) {
+				UtilityFunctions::push_error(order_error);
+				file->close();
+				return Dictionary();
+			}
+		}
+		if (header.version == 3) {
+			PackedInt32Array chunk_counts;
+			PackedInt64Array chunk_offsets;
+			PackedInt32Array chunk_compressed;
+			PackedInt32Array chunk_uncompressed;
+			bool chunked = false;
+			String chunk_error;
+			if (!ds_parse_v3_chunks(file, header, entries, chunk_counts, chunk_offsets,
+						chunk_compressed, chunk_uncompressed, chunked, chunk_error)) {
+				UtilityFunctions::push_error(chunk_error);
+				file->close();
+				return Dictionary();
+			}
+			// The CPU/ImageTexture path cannot decode Zstd, GACL-shuffled data or
+			// chunked mips until Step 5; fail closed instead of misreading them.
+			const DSCompressionFormat format = get_compression_format(header.reserved);
+			const DSGaclTransform gacl = get_gacl_transform(header.reserved);
+			if (format != DSCompressionFormat::GDEFLATE || gacl != DSGaclTransform::NONE || chunked) {
+				UtilityFunctions::push_error("DSTex: v3 Zstd/GACL/chunked payloads require the GPU path or Step 5 CPU support.");
+				file->close();
+				return Dictionary();
+			}
 		}
 	} else {
 		UtilityFunctions::push_error("DSTex: Unsupported texture version.");
@@ -914,7 +1334,7 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	result["mip_sizes"] = mip_sizes;
 	result["mip_uncompressed_sizes"] = mip_uncompressed_sizes;
 	result["mip_row_pitches"] = mip_row_pitches;
-	if (header.version == 2) {
+	if (header.version == 2 || header.version == 3) {
 		result["mip_data"] = mip_data;
 	}
 
