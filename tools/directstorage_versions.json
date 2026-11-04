@@ -1,0 +1,16 @@
+{
+  "1.3.0": {
+    "url": "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.directstorage/1.3.0/microsoft.direct3d.directstorage.1.3.0.nupkg",
+    "sha512": "WJqDGU6eBWVFI7nKEEAZgtI126qZHIU1gH1bn4Udh3KBQX15oCEPd7RsD2URT4BfShLwS3vbPeigD+IMeN73kQ==",
+    "size": 2816824,
+    "preview": false,
+    "import_lib": true
+  },
+  "1.4.0-preview2-2606.904": {
+    "url": "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.directstorage/1.4.0-preview2-2606.904/microsoft.direct3d.directstorage.1.4.0-preview2-2606.904.nupkg",
+    "sha512": "ZFmyER/khXZDthj9oVuytkIUg72QAmuTHLxqtqVLAx4Bp/Wo1TP0Oq9DFHXk/SbdYHxEFlrX8lFLJnCYU0jULw==",
+    "size": 3986072,
+    "preview": true,
+    "import_lib": false
+  }
+}

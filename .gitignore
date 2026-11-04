@@ -36,6 +36,18 @@ project/addons/directstorage_accelerator/bin/*.dll.old
 project/addons/directstorage_accelerator/bin/~*
 
 # ==============================================================================
+# DirectStorage SDK Runtime & Import Library (fetched, never committed)
+# ==============================================================================
+# The headers stay committed (MIT). These files are covered by the Microsoft
+# package EULA; dstorage.lib is not in the package's distributable_files.txt.
+# Fetch them with tools/fetch_directstorage.ps1 (or the VS Code task
+# "Fetch DirectStorage Runtime").
+thirdparty/directstorage/bin/x64/*.dll
+thirdparty/directstorage/lib/x64/*.lib
+project/addons/directstorage_accelerator/bin/dstorage.dll
+project/addons/directstorage_accelerator/bin/dstoragecore.dll
+
+# ==============================================================================
 # Godot Runtime Cache, Imports & Project Outputs
 # ==============================================================================
 .godot/

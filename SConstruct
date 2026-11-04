@@ -533,6 +533,22 @@ env.Append(CPPPATH=include_paths)
 
 # Windows platform setup for DirectStorage SDK & MSVC compiler flags
 if env["platform"] == "windows":
+    # The DirectStorage import library is EULA-bound: the package's
+    # distributable_files.txt lists only dstorage.dll and dstoragecore.dll, and
+    # native/lib/ is not covered by the MIT header license. It is therefore
+    # fetched (tools/fetch_directstorage.ps1) and never committed. Check it before
+    # the library is registered so a clean checkout fails with the fetch command
+    # instead of a later LNK1104. Introspection invocations (compiledb, -n,
+    # --clean, --help, --question) never link and are exempt, which also keeps the
+    # hardening gate's `scons compiledb` runnable without the SDK.
+    _directstorage_lib = "thirdparty/directstorage/lib/x64/dstorage.lib"
+    if not _non_build and not os.path.isfile(_directstorage_lib):
+        print("[SCons] ERROR: DirectStorage import library is missing:")
+        print(f"[SCons]   {_directstorage_lib}")
+        print("[SCons] It is EULA-bound and is not committed to the repository. Fetch the pinned SDK:")
+        print("[SCons]   powershell -NoProfile -ExecutionPolicy Bypass -File tools/fetch_directstorage.ps1")
+        print("[SCons] or run the VS Code task 'Fetch DirectStorage Runtime'.")
+        Exit(1)
     env.Append(LIBPATH=["thirdparty/directstorage/lib/x64"])
     env.Append(LIBS=["dstorage.lib", "d3d12.lib", "dxgi.lib"])
     if "msvc" in env["TOOLS"]:
@@ -853,14 +869,23 @@ env.Depends(library, gen_header_file)
 
 targets = [library]
 
-# Copy DirectStorage runtime redistributable DLLs into output directory on Windows
+# Copy DirectStorage runtime redistributable DLLs into output directory on Windows.
+# The DLLs are fetched with the SDK (they are not committed), and they are only
+# needed at runtime, never to link. When they are absent the build still succeeds
+# and the directstorage test suites skip until the fetch task is run.
 if env["platform"] == "windows":
     ds_dlls = [
-        "thirdparty/directstorage/bin/x64/dstorage.dll",
-        "thirdparty/directstorage/bin/x64/dstoragecore.dll",
+        path for path in (
+            "thirdparty/directstorage/bin/x64/dstorage.dll",
+            "thirdparty/directstorage/bin/x64/dstoragecore.dll",
+        ) if os.path.isfile(path)
     ]
-    installed_dlls = env.Install(output_dir, ds_dlls)
-    targets.append(installed_dlls)
+    if ds_dlls:
+        installed_dlls = env.Install(output_dir, ds_dlls)
+        targets.append(installed_dlls)
+    else:
+        print("[SCons] NOTE: DirectStorage runtime DLLs are not fetched; skipping the bin/ copy.")
+        print("[SCons]       Run tools/fetch_directstorage.ps1 (or the 'Fetch DirectStorage Runtime' task) to enable the DirectStorage suites.")
 
 # --- gdextest integration (test-only build target) ---
 # Build with: scons tests=true

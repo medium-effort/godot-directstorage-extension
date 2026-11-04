@@ -12,6 +12,15 @@ The importer converts `.png`, `.jpg`, `.jpeg`, and `.webp` sources into `.dstex`
 
 During export, imported `.dstex` files are bundled into `res://textures.dspkg` (version 3 or version 4 with encrypted TOC) along with per-entry GPU mip metadata and entry flags. The runtime resource loader resolves texture paths directly from that archive without requiring individual `.dstex` files in the exported PCK.
 
+## Runtime Install & License
+
+The DirectStorage runtime (`dstorage.dll`, `dstoragecore.dll`) is not bundled with this addon. Enable the plugin, then open **Tools > DSGD Tools... > Manage DirectStorage Runtime...** to download a pinned official Microsoft package, review its license, and choose the active version.
+
+- The license shown is the exact `LICENSE.txt` from the verified package (SHA-512 checked against Microsoft's published hash). Nothing is installed until you accept it.
+- Installation is editor-only and staged: the new DLL pair is applied on the next editor or game start. Windows locks loaded modules, and one process cannot mix two DirectStorage versions.
+- Pick the 1.4 preview to test its newer capabilities, then switch back to the 1.3 stable runtime if the preview regresses or an asset is incompatible. Restart after switching.
+- Runtime DLLs must be installed before exporting; the export dependencies reference them.
+
 ## Direct GPU Decompression & Fallback
 
 When running on Windows with a Direct3D 12 `RenderingDevice` (`--rendering-driver d3d12`), DirectStorage decompresses GDeflate mip streams directly into GPU VRAM as `Texture2DRD` resources via compute shaders. If GPU decompression is disabled, unsupported, or if legacy version 1 assets are loaded, the system automatically falls back to multi-threaded CPU software decompression (`ImageTexture`).

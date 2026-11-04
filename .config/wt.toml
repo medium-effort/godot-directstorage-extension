@@ -16,6 +16,11 @@
 #      writes a real file into the tree. Measured: a built worktree drops from
 #      ~1,040 MB to ~149 MB, at ~20 s extra build time (52 s vs 32 s).
 #      Remove this block to go back to compiling godot-cpp per worktree.
+#   4. the DirectStorage import library + runtime DLLs (see
+#      tools/wt_bootstrap_directstorage.ps1). They are EULA-bound and gitignored,
+#      so a fresh worktree cannot link without them. Copying ~1.7 MB from the
+#      primary is faster than re-fetching and never opens a license window during
+#      worktree creation; the hook fails if the primary has not fetched the SDK.
 #
 # Every other piece of build state is private per worktree by construction:
 # .sconsign.dblite, the .obj files written next to their sources,
@@ -45,6 +50,12 @@ submodules = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ worktree_pa
 
 [[pre-start]]
 godotcpp = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_share_godot_cpp.ps1 {{ primary_worktree_path }} {{ worktree_path }}"
+
+# Resolved from the new worktree, like the submodule hook: the tool travels with
+# the branch being checked out, so changes to it are testable before they land.
+# Both paths are passed explicitly because the script must never infer the primary.
+[[pre-start]]
+directstorage = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ worktree_path }}/tools/wt_bootstrap_directstorage.ps1 {{ primary_worktree_path }} {{ worktree_path }}"
 
 [[pre-start]]
 env = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_bootstrap_env.ps1 {{ primary_worktree_path }} -DestinationPath {{ worktree_path }}/.env -GodotCppPrebuilt"

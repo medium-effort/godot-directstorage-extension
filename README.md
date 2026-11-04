@@ -209,16 +209,28 @@ The extension is built with SCons against the vendored SDKs, so there is no pack
 
 Vendored and already in the repository — nothing to download or install:
 
-- `thirdparty/directstorage/` — DirectStorage SDK headers, `dstorage.lib`, and the `dstorage.dll` / `dstoragecore.dll` runtime redistributables.
+- `thirdparty/directstorage/include/` — DirectStorage SDK headers (`dstorage.h`, `dstorageerr.h`), MIT-licensed (see `thirdparty/directstorage/LICENSE-CODE.txt`).
 - `thirdparty/gdeflate/`, `thirdparty/libdeflate/`, `thirdparty/monocypher/` — compression and crypto sources compiled into the DLL.
 - `godot-cpp/` — submodule. Its static library is compiled into `godot-cpp/bin/` by the same SCons run as the extension, so no prebuilt bindings are required.
 - `extern/gdextest/` — submodule, needed only for the native test suite.
+
+Fetched once per checkout — EULA-bound, not committed:
+
+- `thirdparty/directstorage/lib/x64/dstorage.lib`, `thirdparty/directstorage/bin/x64/dstorage.dll` and `dstoragecore.dll` come from the pinned official NuGet package. The package's `distributable_files.txt` lists only the two runtime DLLs, and the import library is not in that list, so neither is redistributed from this repository.
+- Run the fetch before the first Windows build:
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools/fetch_directstorage.ps1
+  ```
+  It verifies Microsoft's published SHA-512, shows the exact package `LICENSE.txt` in a separate PowerShell window, and records accept/decline per version in `.cache/directstorage/licenses.json`. In VS Code, run the **Fetch DirectStorage Runtime** task and pick `1.3.0` (build baseline) or `1.4.0-preview2-2606.904`. A declined license installs nothing; `-ResetLicense` asks again, and `-Decision Accept` is the explicit CI seam.
+- `SCons` and `.vscode/build_remote.ps1` only check that the import library exists and fail closed with that fetch command. They never download the package or accept the license on your behalf. The runtime DLLs are optional for linking: without them the build succeeds and the DirectStorage test suites skip.
+- A new worktree seeds `thirdparty/directstorage/{lib,bin}` from the primary through its pre-start hook, so it does not fetch again.
 
 ### 8.2 First build
 
 ```powershell
 git submodule update --init --recursive
 python -m pip install --upgrade "scons>=4.11"
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/fetch_directstorage.ps1
 
 scons platform=windows target=template_debug
 scons platform=windows target=template_release
@@ -230,7 +242,7 @@ Add `dev_build=yes` to a `template_debug` build for the development variant with
 | :--- | :--- |
 | `dsgd_64.debug.dll` | editor and `template_debug` libraries |
 | `dsgd_64.dll` | `template_release` library |
-| `dstorage.dll`, `dstoragecore.dll` | copied from the vendored SDK next to the DLL |
+| `dstorage.dll`, `dstoragecore.dll` | copied from the fetched SDK next to the DLL |
 | `build_manifest.json` | build status, commit, size, `sha256`, source snapshot id and the `dspkg-key-id` tag of each binary |
 
 `build_manifest.json` also records, per library, a `sha256` and a `source_id` (HEAD plus the working-tree diff of the paths that compile into a binary). At load time the extension compares the debug and release entries through those fields and prints one `[DirectStorage] Binary mismatch` warning when they came from different source states: the editor runs the debug binary while an export runs the release one, so a stale release binary is otherwise only visible after exporting. The check is silent when the manifest is missing, when an entry predates these fields, or when a file no longer matches its recorded hash — it never fails a boot and never guesses.
@@ -259,7 +271,7 @@ Pipeline behaviour is read from `.env` (gitignored). Copy [`.env.example`](.env.
 
 ### 8.5 Deploying a build
 
-Building and deploying are separate steps. `SCons` only produces artifacts: the flat `dsgd_64*.dll` binaries plus `build_manifest.json` in `project/addons/directstorage_accelerator/bin/`, next to the DirectStorage runtime DLLs it installs from `thirdparty/directstorage/bin/x64/`. Running `scons` by hand therefore never writes into another project.
+Building and deploying are separate steps. `SCons` only produces artifacts: the flat `dsgd_64*.dll` binaries plus `build_manifest.json` in `project/addons/directstorage_accelerator/bin/`, next to the DirectStorage runtime DLLs it copies from the fetched `thirdparty/directstorage/bin/x64/`. Running `scons` by hand therefore never writes into another project.
 
 Deployment is one implementation, [`tools/sync_artifacts.py`](tools/sync_artifacts.py), invoked by the pipeline:
 

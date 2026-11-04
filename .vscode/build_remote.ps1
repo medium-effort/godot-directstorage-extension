@@ -964,6 +964,20 @@ if (-not $AuditOnly) {
     }
 }
 
+# DirectStorage SDK gate: the import library is EULA-bound (the package's
+# distributable_files.txt lists only dstorage.dll and dstoragecore.dll) and is no
+# longer committed. SConstruct checks it too, but this runs before the remote tar
+# so Device B is never handed a tree that cannot link. It deliberately never
+# downloads and never accepts the license: the VS Code fetch task is the
+# interactive path, CI passes -Decision Accept explicitly, and a build script that
+# accepted a EULA on the user's behalf would be both surprising and unauditable.
+if (-not $AuditOnly) {
+    $DirectStorageLib = Join-Path $WorkspaceRoot "thirdparty\directstorage\lib\x64\dstorage.lib"
+    if (-not (Test-Path -LiteralPath $DirectStorageLib -PathType Leaf)) {
+        Show-BuildFailure -Step "DirectStorage SDK" -Message ("DirectStorage import library is missing: " + $DirectStorageLib + ". It is EULA-bound and is not committed to this repository. Fetch the pinned SDK first:`n  powershell -NoProfile -ExecutionPolicy Bypass -File tools\fetch_directstorage.ps1`n(or run the VS Code task 'Fetch DirectStorage Runtime'). This build script never downloads or accepts the license for you.") -Code 1
+    }
+}
+
 $ResolvedKeyFile = ""
 $KeyFileRelWin = ""
 $EffectiveKey = ""
