@@ -160,8 +160,20 @@ foreach ($file in $scriptFiles) {
         Write-Host "Checking: $relFromProj" -ForegroundColor DarkGray
     }
 
-    $rawOutput = & $resolvedGodot --path $absProjectDir --headless --check-only --script $relFromProj 2>&1
-    $exitCode = $LASTEXITCODE
+    # Native stderr (plugin warnings, driver notices) must not abort the check.
+    # Under $ErrorActionPreference = "Stop", a redirected native stderr write
+    # becomes a terminating NativeCommandError before $LASTEXITCODE is read, so
+    # the whole script exits 1 without ever reporting a parse verdict. The verdict
+    # is the exit code plus the SCRIPT ERROR / Parse Error text below; warnings are
+    # not parse failures.
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $rawOutput = & $resolvedGodot --path $absProjectDir --headless --check-only --script $relFromProj 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousEap
+    }
     $outString = ($rawOutput | Out-String).Trim()
 
     $hasParseError = ($exitCode -ne 0) -or ($outString -match 'SCRIPT ERROR' -or $outString -match 'Parse Error')
