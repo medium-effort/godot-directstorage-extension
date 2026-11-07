@@ -645,15 +645,23 @@ GDEX_TEST_T(preloader_validation, v2_mip_sums_must_match_header, TAG_UNIT) {
 	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::validate(payload));
 }
 
+static godot::PackedByteArray make_v3_from_base(const godot::PackedByteArray &p_v2_bytes, uint64_t p_capabilities, uint32_t p_chunk_count = 1) {
+	godot::PackedByteArray v3_bytes;
+	v3_bytes.resize(p_v2_bytes.size() + 16);
+	std::memcpy(v3_bytes.ptrw(), p_v2_bytes.ptr(), 48);
+	std::memset(v3_bytes.ptrw() + 48, 0, 16);
+	std::memcpy(v3_bytes.ptrw() + 64, p_v2_bytes.ptr() + 48, p_v2_bytes.size() - 48);
+	put_u32(v3_bytes, 4, 3);
+	put_u64(v3_bytes, 40, p_capabilities);
+	put_u32(v3_bytes, 64 + 20, p_chunk_count);
+	return v3_bytes;
+}
+
 GDEX_TEST_T(preloader_validation, v3_chunked_capability_without_chunked_mip_rejected, TAG_UNIT) {
 	GDEX_ASSERT_TRUE(write_valid_base(kValidBase1, 1));
 	track_cleanup(ctx, { kValidBase1, kPatchChunkCap });
 
-	godot::PackedByteArray bytes = read_bytes(kValidBase1);
-	GDEX_ASSERT_FALSE(bytes.is_empty());
-	put_u32(bytes, 4, 3); // version = 3, flags = 0
-	put_u64(bytes, 40, static_cast<uint64_t>(godot::DSCompressionFormat::GDEFLATE) | godot::DSTEX_CAP_CHUNKED);
-	put_u32(bytes, 48 + 20, 1); // chunk_count = 1: the capability is the only chunked marker
+	godot::PackedByteArray bytes = make_v3_from_base(read_bytes(kValidBase1), static_cast<uint64_t>(godot::DSCompressionFormat::GDEFLATE) | godot::DSTEX_CAP_CHUNKED, 1);
 	GDEX_ASSERT_TRUE(write_bytes(kPatchChunkCap, bytes));
 
 	godot::DSPreloader::PayloadHeader base_header;
@@ -667,13 +675,9 @@ GDEX_TEST_T(preloader_validation, v3_mip_footprint_mismatch_rejected, TAG_UNIT) 
 	GDEX_ASSERT_TRUE(write_valid_base(kValidBase1, 1));
 	track_cleanup(ctx, { kValidBase1, kPatchV3Footprint });
 
-	godot::PackedByteArray bytes = read_bytes(kValidBase1);
-	GDEX_ASSERT_FALSE(bytes.is_empty());
-	put_u32(bytes, 4, 3); // version = 3, flags = 0
-	put_u64(bytes, 40, static_cast<uint64_t>(godot::DSCompressionFormat::GDEFLATE));
-	put_u32(bytes, 48 + 20, 1); // chunk_count = 1
+	godot::PackedByteArray bytes = make_v3_from_base(read_bytes(kValidBase1), static_cast<uint64_t>(godot::DSCompressionFormat::GDEFLATE), 1);
 	put_u64(bytes, 24, 512);    // header original_size
-	put_u32(bytes, 48 + 12, 512); // mip uncompressed_size; sums still match
+	put_u32(bytes, 64 + 12, 512); // mip uncompressed_size; sums still match
 	GDEX_ASSERT_TRUE(write_bytes(kPatchV3Footprint, bytes));
 
 	godot::DSPreloader::PayloadHeader patched_header;
@@ -684,12 +688,8 @@ GDEX_TEST_T(preloader_validation, v3_mip_offset_inside_tables_rejected, TAG_UNIT
 	GDEX_ASSERT_TRUE(write_valid_base(kValidBase1, 1));
 	track_cleanup(ctx, { kValidBase1, kPatchV3Offset });
 
-	godot::PackedByteArray bytes = read_bytes(kValidBase1);
-	GDEX_ASSERT_FALSE(bytes.is_empty());
-	put_u32(bytes, 4, 3); // version = 3, flags = 0
-	put_u64(bytes, 40, static_cast<uint64_t>(godot::DSCompressionFormat::GDEFLATE));
-	put_u32(bytes, 48 + 20, 1); // chunk_count = 1
-	put_u64(bytes, 48, 0); // mip offset aliases the header
+	godot::PackedByteArray bytes = make_v3_from_base(read_bytes(kValidBase1), static_cast<uint64_t>(godot::DSCompressionFormat::GDEFLATE), 1);
+	put_u64(bytes, 64, 0); // mip offset aliases the header
 	GDEX_ASSERT_TRUE(write_bytes(kPatchV3Offset, bytes));
 
 	godot::DSPreloader::PayloadHeader patched_header;

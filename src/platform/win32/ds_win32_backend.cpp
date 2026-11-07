@@ -312,6 +312,24 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 				return false;
 			}
 		} else {
+			if (file->get_length() < sizeof(DSTexHeaderV3)) {
+				return false;
+			}
+			PackedByteArray ext_data = file->get_buffer(sizeof(DSTexHeaderV3Ext));
+			if (ext_data.size() != static_cast<int64_t>(sizeof(DSTexHeaderV3Ext))) {
+				return false;
+			}
+			DSTexHeaderV3Ext v3_ext = {};
+			std::memcpy(&v3_ext, ext_data.ptr(), sizeof(v3_ext));
+			if (v3_ext.reserved0 != 0) {
+				return false;
+			}
+			if (v3_ext.logical_width > header.width || v3_ext.logical_height > header.height) {
+				return false;
+			}
+			if (v3_ext.depth_or_layers > 1) {
+				return false; // Fail closed until 3D/array textures are wired to GPU DMA
+			}
 			capabilities = header.reserved;
 			if ((capabilities & ~DSTEX_CAP_KNOWN_MASK) != 0) {
 				return false;
@@ -336,7 +354,8 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 		}
 
 		uint64_t file_length = static_cast<uint64_t>(file->get_length());
-		uint64_t mip_table_end = sizeof(DSTexHeader) + static_cast<uint64_t>(header.mip_count) * sizeof(DSTexMipEntryV2);
+		uint64_t header_size = dstex_header_size(header.version);
+		uint64_t mip_table_end = header_size + static_cast<uint64_t>(header.mip_count) * sizeof(DSTexMipEntryV2);
 		if (mip_table_end > file_length) {
 			return false;
 		}

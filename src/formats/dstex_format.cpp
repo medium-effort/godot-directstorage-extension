@@ -172,7 +172,7 @@ bool DSTex::mip_table_is_sane(const DSTexHeader &p_header, const DSTexMipEntryV2
 // aligned end of the header + mip table. This mirrors the Win32 enqueue path and
 // prevents an offset-0 or overlapping mip from aliasing the container metadata.
 static bool ds_v2_mip_payload_order_is_sane(const DSTexHeader &p_header, const DSTexMipEntryV2 *p_entries, String &r_error) {
-	uint64_t first_payload = sizeof(DSTexHeader) +
+	uint64_t first_payload = dstex_header_size(p_header.version) +
 			static_cast<uint64_t>(p_header.mip_count) * sizeof(DSTexMipEntryV2);
 	if (!align_up(first_payload, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, first_payload)) {
 		r_error = "DSTex: Mip table end alignment overflow.";
@@ -841,7 +841,25 @@ Dictionary DSTex::read_header(const String &p_path) {
 		UtilityFunctions::push_error("DSTex: v1/v2 reserved field must be zero.");
 		return result;
 	}
+	DSTexHeaderV3Ext v3_ext = {};
 	if (header.version == 3) {
+		if (file->get_length() < sizeof(DSTexHeaderV3)) {
+			UtilityFunctions::push_error("DSTex: File too small for v3 header.");
+			return result;
+		}
+		PackedByteArray ext_bytes = file->get_buffer(sizeof(DSTexHeaderV3Ext));
+		if (ext_bytes.size() < static_cast<int64_t>(sizeof(DSTexHeaderV3Ext))) {
+			return result;
+		}
+		memcpy(&v3_ext, ext_bytes.ptr(), sizeof(DSTexHeaderV3Ext));
+		if (v3_ext.reserved0 != 0) {
+			UtilityFunctions::push_error("DSTex: v3 header reserved field must be zero.");
+			return result;
+		}
+		if (v3_ext.logical_width > header.width || v3_ext.logical_height > header.height) {
+			UtilityFunctions::push_error("DSTex: v3 logical dimensions exceed storage dimensions.");
+			return result;
+		}
 		const uint64_t capabilities = header.reserved;
 		if ((capabilities & ~DSTEX_CAP_KNOWN_MASK) != 0) {
 			UtilityFunctions::push_error("DSTex: Unknown v3 capability bits.");
@@ -888,8 +906,9 @@ Dictionary DSTex::read_header(const String &p_path) {
 			UtilityFunctions::push_error("DSTex: Mip table size overflow.");
 			return Dictionary();
 		}
-		uint64_t required = sizeof(DSTexHeader) + mip_table_size;
-		if (required < sizeof(DSTexHeader) || required > file_len) {
+		uint64_t header_size = dstex_header_size(header.version);
+		uint64_t required = header_size + mip_table_size;
+		if (required < header_size || required > file_len) {
 			UtilityFunctions::push_error("DSTex: Mip table exceeds file bounds.");
 			return Dictionary();
 		}
@@ -905,6 +924,9 @@ Dictionary DSTex::read_header(const String &p_path) {
 	result["original_size"] = header.original_size;
 	result["compressed_size"] = header.compressed_size;
 	result["reserved"] = header.reserved;
+	result["logical_width"] = (header.version == 3 && v3_ext.logical_width > 0) ? v3_ext.logical_width : header.width;
+	result["logical_height"] = (header.version == 3 && v3_ext.logical_height > 0) ? v3_ext.logical_height : header.height;
+	result["depth_or_layers"] = (header.version == 3 && v3_ext.depth_or_layers > 0) ? v3_ext.depth_or_layers : 1u;
 	result["is_srgb"] = (header.flags & DSTEX_FLAG_SRGB) != 0 || is_rd_format_srgb(static_cast<int>(header.pixel_format));
 	result["as_image_texture"] = (header.flags & DSTEX_FLAG_AS_IMAGE_TEXTURE) != 0;
 
@@ -1084,7 +1106,25 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 		UtilityFunctions::push_error("DSTex: v1/v2 reserved field must be zero.");
 		return result;
 	}
+	DSTexHeaderV3Ext v3_ext = {};
 	if (header.version == 3) {
+		if (file->get_length() < sizeof(DSTexHeaderV3)) {
+			UtilityFunctions::push_error("DSTex: File too small for v3 header.");
+			return result;
+		}
+		PackedByteArray ext_bytes = file->get_buffer(sizeof(DSTexHeaderV3Ext));
+		if (ext_bytes.size() < static_cast<int64_t>(sizeof(DSTexHeaderV3Ext))) {
+			return result;
+		}
+		memcpy(&v3_ext, ext_bytes.ptr(), sizeof(DSTexHeaderV3Ext));
+		if (v3_ext.reserved0 != 0) {
+			UtilityFunctions::push_error("DSTex: v3 header reserved field must be zero.");
+			return result;
+		}
+		if (v3_ext.logical_width > header.width || v3_ext.logical_height > header.height) {
+			UtilityFunctions::push_error("DSTex: v3 logical dimensions exceed storage dimensions.");
+			return result;
+		}
 		const uint64_t capabilities = header.reserved;
 		if ((capabilities & ~DSTEX_CAP_KNOWN_MASK) != 0) {
 			UtilityFunctions::push_error("DSTex: Unknown v3 capability bits.");
@@ -1131,8 +1171,9 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 			UtilityFunctions::push_error("DSTex: Mip table size overflow.");
 			return Dictionary();
 		}
-		uint64_t required = sizeof(DSTexHeader) + mip_table_size;
-		if (required < sizeof(DSTexHeader) || required > file_len) {
+		uint64_t header_size = dstex_header_size(header.version);
+		uint64_t required = header_size + mip_table_size;
+		if (required < header_size || required > file_len) {
 			UtilityFunctions::push_error("DSTex: Mip table exceeds file bounds.");
 			return Dictionary();
 		}
@@ -1149,6 +1190,9 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 	header_dict["original_size"] = header.original_size;
 	header_dict["compressed_size"] = header.compressed_size;
 	header_dict["reserved"] = header.reserved;
+	header_dict["logical_width"] = (header.version == 3 && v3_ext.logical_width > 0) ? v3_ext.logical_width : header.width;
+	header_dict["logical_height"] = (header.version == 3 && v3_ext.logical_height > 0) ? v3_ext.logical_height : header.height;
+	header_dict["depth_or_layers"] = (header.version == 3 && v3_ext.depth_or_layers > 0) ? v3_ext.depth_or_layers : 1u;
 	header_dict["capabilities"] = header.version == 3 ? header.reserved : 0;
 	header_dict["compression_format"] = header.version == 3 ?
 			static_cast<int>(get_compression_format(header.reserved)) :

@@ -1013,7 +1013,7 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		PackedInt32Array mip_uncompressed_sizes = header.has("mip_uncompressed_sizes") ? (PackedInt32Array)header["mip_uncompressed_sizes"] : PackedInt32Array();
 		PackedInt32Array mip_row_pitches = header.has("mip_row_pitches") ? (PackedInt32Array)header["mip_row_pitches"] : PackedInt32Array();
 
-		uint64_t data_offset = sizeof(DSTexHeader) + ((is_v2 ? sizeof(DSTexMipEntryV2) : sizeof(DSTexMipEntry)) * mip_count);
+		uint64_t data_offset = dstex_header_size(header_version) + ((is_v2 ? sizeof(DSTexMipEntryV2) : sizeof(DSTexMipEntry)) * mip_count);
 		if (header_version == 3) {
 			PackedInt32Array chunk_counts = header.has("mip_chunk_counts") ? (PackedInt32Array)header["mip_chunk_counts"] : PackedInt32Array();
 			uint64_t total_chunk_entries = 0;

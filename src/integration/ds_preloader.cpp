@@ -313,7 +313,7 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 	// 48 + 16 * 24 = MAX_BULK, so the buffer always spans the table
 	// whenever required <= file_len.)
 	constexpr uint64_t MAX_TABLE = (uint64_t)DSTEX_MAX_MIP_COUNT * sizeof(DSTexMipEntryV2);
-	constexpr uint64_t MAX_BULK = sizeof(DSTexHeader) + MAX_TABLE;
+	constexpr uint64_t MAX_BULK = sizeof(DSTexHeaderV3) + MAX_TABLE;
 	uint64_t want = file_len < MAX_BULK ? file_len : MAX_BULK;
 	PackedByteArray bulk = file->get_buffer((int64_t)want);
 	file->close();
@@ -344,7 +344,24 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 		UtilityFunctions::push_error("DSTex: v1/v2 reserved field must be zero.");
 		return false;
 	}
+	DSTexHeaderV3Ext v3_ext = {};
 	if (header.version == 3) {
+		if (bulk.size() < static_cast<int64_t>(sizeof(DSTexHeaderV3))) {
+			return false;
+		}
+		memcpy(&v3_ext, bulk.ptr() + sizeof(DSTexHeader), sizeof(DSTexHeaderV3Ext));
+		if (v3_ext.reserved0 != 0) {
+			UtilityFunctions::push_error("DSTex: v3 header reserved field must be zero.");
+			return false;
+		}
+		if (v3_ext.logical_width > header.width || v3_ext.logical_height > header.height) {
+			UtilityFunctions::push_error("DSTex: v3 logical dimensions exceed storage dimensions.");
+			return false;
+		}
+		if (v3_ext.depth_or_layers > 1) {
+			UtilityFunctions::push_error("DSTex: Preload does not support 3D/array textures until wired.");
+			return false;
+		}
 		const uint64_t capabilities = header.reserved;
 		if ((capabilities & ~DSTEX_CAP_KNOWN_MASK) != 0) {
 			UtilityFunctions::push_error("DSTex: Unknown v3 capability bits.");
@@ -394,8 +411,9 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 			UtilityFunctions::push_error("DSTex: Mip table size overflow.");
 			return false;
 		}
-		uint64_t required = sizeof(DSTexHeader) + mip_table_size;
-		if (required < sizeof(DSTexHeader) || required > file_len) {
+		uint64_t header_size = dstex_header_size(header.version);
+		uint64_t required = header_size + mip_table_size;
+		if (required < header_size || required > file_len) {
 			UtilityFunctions::push_error("DSTex: Mip table exceeds file bounds.");
 			return false;
 		}
@@ -403,7 +421,7 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 			return false; // Short bulk read; treat as I/O miss.
 		}
 	}
-	const uint8_t *table_ptr = bulk.ptr() + sizeof(DSTexHeader);
+	const uint8_t *table_ptr = bulk.ptr() + dstex_header_size(header.version);
 
 	PayloadHeader filled;
 	filled.width = header.width;

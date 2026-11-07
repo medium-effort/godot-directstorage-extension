@@ -24,6 +24,9 @@ enum DSTexFlags {
 constexpr uint16_t DSTEX_VERSION_V2 = 2;
 constexpr uint16_t DSTEX_VERSION_V3 = 3;
 
+constexpr uint64_t DSTEX_HEADER_SIZE_V2 = 48;
+constexpr uint64_t DSTEX_HEADER_SIZE_V3 = 64;
+
 #pragma pack(push, 1)
 struct DSTexHeader {
 	uint32_t magic;           // 0x58455444 ("DTEX" little-endian)
@@ -37,6 +40,21 @@ struct DSTexHeader {
 	uint64_t compressed_size; // compressed total bytes
 	uint64_t reserved;        // v1/v2: 0; v3: capability word
 };
+static_assert(sizeof(DSTexHeader) == 48, "DSTexHeader base must be 48 bytes");
+
+struct DSTexHeaderV3Ext {
+	uint32_t logical_width;   // NPOT display width (0 = match storage width)
+	uint32_t logical_height;  // NPOT display height (0 = match storage height)
+	uint32_t depth_or_layers; // 3D depth or 2D array layers (0 or 1 = standard 2D)
+	uint32_t reserved0;       // reserved; must be zero
+};
+static_assert(sizeof(DSTexHeaderV3Ext) == 16, "DSTexHeaderV3Ext must be 16 bytes");
+
+struct DSTexHeaderV3 {
+	DSTexHeader base;
+	DSTexHeaderV3Ext ext;
+};
+static_assert(sizeof(DSTexHeaderV3) == 64, "DSTexHeaderV3 must be 64 bytes");
 
 struct DSTexMipEntry {
 	uint64_t offset; // byte offset from file start
@@ -54,6 +72,10 @@ struct DSTexMipEntryV2 {
 	};
 };
 #pragma pack(pop)
+
+inline uint64_t dstex_header_size(uint16_t p_version) {
+	return (p_version == DSTEX_VERSION_V3) ? sizeof(DSTexHeaderV3) : sizeof(DSTexHeader);
+}
 
 static_assert(sizeof(DSTexMipEntryV2) == 24, "DSTexMipEntryV2 must be 24 bytes");
 

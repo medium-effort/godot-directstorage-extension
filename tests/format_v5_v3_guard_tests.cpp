@@ -287,7 +287,45 @@ struct V3Spec {
 	bool use_capability_override = false;
 	uint64_t capability_override = 0;
 	uint32_t pixel_format = static_cast<uint32_t>(godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+	uint32_t logical_width = 0;
+	uint32_t logical_height = 0;
+	uint32_t depth_or_layers = 0;
+	uint32_t reserved0 = 0;
 };
+
+godot::PackedByteArray build_v2(uint64_t p_header_reserved = 0, uint32_t p_mip_reserved = 0, uint16_t p_flags = 0) {
+	const uint32_t uncompressed = PAYLOAD_ROW_BYTES;
+	const uint64_t mip_table_end = sizeof(godot::DSTexHeader) + sizeof(godot::DSTexMipEntryV2);
+	const uint64_t data_offset = align_up_test(mip_table_end, ALIGN_512);
+	const uint64_t file_size = data_offset + uncompressed;
+
+	godot::PackedByteArray bytes;
+	bytes.resize(static_cast<int64_t>(file_size));
+	std::memset(bytes.ptrw(), 0, static_cast<size_t>(file_size));
+
+	w32(bytes, 0, 0x58455444u);
+	w16(bytes, 4, 2);
+	w16(bytes, 6, p_flags);
+	w32(bytes, 8, 4);
+	w32(bytes, 12, 1);
+	w32(bytes, 16, static_cast<uint32_t>(godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM));
+	w32(bytes, 20, 1);
+	w64(bytes, 24, uncompressed);
+	w64(bytes, 32, uncompressed);
+	w64(bytes, 40, p_header_reserved);
+
+	uint64_t cursor = sizeof(godot::DSTexHeader);
+	w64(bytes, cursor, data_offset);
+	w32(bytes, cursor + 8, uncompressed);
+	w32(bytes, cursor + 12, uncompressed);
+	w32(bytes, cursor + 16, MIP_ROW_PITCH);
+	w32(bytes, cursor + 20, p_mip_reserved);
+
+	for (uint64_t i = 0; i < uncompressed; ++i) {
+		bytes.set(static_cast<int64_t>(data_offset + i), static_cast<uint8_t>((i * 17 + 3) & 0xFF));
+	}
+	return bytes;
+}
 
 godot::PackedByteArray build_v3(const V3Spec &p_spec) {
 	const uint32_t uncompressed = PAYLOAD_ROW_BYTES * p_spec.chunk_count;
@@ -301,7 +339,7 @@ godot::PackedByteArray build_v3(const V3Spec &p_spec) {
 	}
 
 	const bool chunked = p_spec.chunk_count > 1;
-	const uint64_t mip_table_end = sizeof(godot::DSTexHeader) + sizeof(godot::DSTexMipEntryV2);
+	const uint64_t mip_table_end = sizeof(godot::DSTexHeaderV3) + sizeof(godot::DSTexMipEntryV2);
 	const uint64_t chunk_table_end = mip_table_end +
 			(chunked ? static_cast<uint64_t>(p_spec.chunk_count) * sizeof(godot::DSChunkEntry) : 0);
 	const uint64_t data_offset = align_up_test(chunk_table_end, ALIGN_512);
@@ -321,8 +359,12 @@ godot::PackedByteArray build_v3(const V3Spec &p_spec) {
 	w64(bytes, 24, uncompressed);
 	w64(bytes, 32, uncompressed);
 	w64(bytes, 40, capabilities);
+	w32(bytes, 48, p_spec.logical_width);
+	w32(bytes, 52, p_spec.logical_height);
+	w32(bytes, 56, p_spec.depth_or_layers);
+	w32(bytes, 60, p_spec.reserved0);
 
-	uint64_t cursor = sizeof(godot::DSTexHeader);
+	uint64_t cursor = sizeof(godot::DSTexHeaderV3);
 	w64(bytes, cursor, data_offset);
 	w32(bytes, cursor + 8, uncompressed);
 	w32(bytes, cursor + 12, uncompressed);
@@ -366,8 +408,12 @@ godot::PackedByteArray build_v3_two_mip_mixed(bool p_overlap) {
 	w64(bytes, 24, total_payload);
 	w64(bytes, 32, total_payload);
 	w64(bytes, 40, static_cast<uint64_t>(godot::DSCompressionFormat::GDEFLATE) | godot::DSTEX_CAP_CHUNKED);
+	w32(bytes, 48, 0); // logical_width
+	w32(bytes, 52, 0); // logical_height
+	w32(bytes, 56, 0); // depth_or_layers
+	w32(bytes, 60, 0); // reserved0
 
-	uint64_t cursor = sizeof(godot::DSTexHeader);
+	uint64_t cursor = sizeof(godot::DSTexHeaderV3);
 	// mip 0: chunked, 4x2 -> 512 bytes.
 	w64(bytes, cursor, data_offset);
 	w32(bytes, cursor + 8, 512);
@@ -1208,9 +1254,7 @@ GDEX_TEST_T(dstex_v3, chunked_mip_without_capability_rejected, TAG_INTEGRATION) 
 
 GDEX_TEST_T(dstex_v3, v2_nonzero_header_reserved_rejected, TAG_INTEGRATION) {
 	const godot::String path = scratch_path("v2_reserved_header.dstex");
-	godot::PackedByteArray bytes = build_v3(V3Spec());
-	w16(bytes, 4, 2);
-	w64(bytes, 40, 1); // v2 reserved header word
+	godot::PackedByteArray bytes = build_v2(1, 0); // v2 reserved header word = 1
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
 	GDEX_EXPECT_TRUE(dstex->read_header(path).is_empty());
@@ -1219,11 +1263,7 @@ GDEX_TEST_T(dstex_v3, v2_nonzero_header_reserved_rejected, TAG_INTEGRATION) {
 
 GDEX_TEST_T(dstex_v3, v2_nonzero_mip_reserved_rejected, TAG_INTEGRATION) {
 	const godot::String path = scratch_path("v2_reserved_mip.dstex");
-	V3Spec spec;
-	spec.compression_format = 0; // NONE keeps the header capability word zero
-	godot::PackedByteArray bytes = build_v3(spec);
-	w16(bytes, 4, 2);
-	w32(bytes, sizeof(godot::DSTexHeader) + 20, 1); // v2 mip reserved
+	godot::PackedByteArray bytes = build_v2(0, 1); // v2 mip reserved = 1
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
 	GDEX_EXPECT_TRUE(dstex->read_header(path).is_empty());
@@ -1235,7 +1275,7 @@ GDEX_TEST_T(dstex_v3, chunk_row_alignment_rejected, TAG_INTEGRATION) {
 	V3Spec spec;
 	spec.chunk_count = 2;
 	godot::PackedByteArray bytes = build_v3(spec);
-	const uint64_t chunk_table = sizeof(godot::DSTexHeader) + sizeof(godot::DSTexMipEntryV2);
+	const uint64_t chunk_table = sizeof(godot::DSTexHeaderV3) + sizeof(godot::DSTexMipEntryV2);
 	w32(bytes, chunk_table + 16 + 12, 300);
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
@@ -1248,7 +1288,7 @@ GDEX_TEST_T(dstex_v3, chunk_sum_mismatch_rejected, TAG_INTEGRATION) {
 	V3Spec spec;
 	spec.chunk_count = 2;
 	godot::PackedByteArray bytes = build_v3(spec);
-	const uint64_t chunk_table = sizeof(godot::DSTexHeader) + sizeof(godot::DSTexMipEntryV2);
+	const uint64_t chunk_table = sizeof(godot::DSTexHeaderV3) + sizeof(godot::DSTexMipEntryV2);
 	w32(bytes, chunk_table + 16 + 8, 128);
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
@@ -1260,8 +1300,8 @@ GDEX_TEST_T(dstex_v3, mip_offset_not_512_aligned_rejected, TAG_INTEGRATION) {
 	const godot::String path = scratch_path("mip_align_v3.dstex");
 	godot::PackedByteArray bytes = build_v3(V3Spec());
 	uint64_t original_offset = 0;
-	std::memcpy(&original_offset, bytes.ptr() + sizeof(godot::DSTexHeader), sizeof(original_offset));
-	w64(bytes, sizeof(godot::DSTexHeader), original_offset + 8);
+	std::memcpy(&original_offset, bytes.ptr() + sizeof(godot::DSTexHeaderV3), sizeof(original_offset));
+	w64(bytes, sizeof(godot::DSTexHeaderV3), original_offset + 8);
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
 	GDEX_EXPECT_TRUE(dstex->read_header(path).is_empty());
@@ -1271,7 +1311,7 @@ GDEX_TEST_T(dstex_v3, mip_offset_not_512_aligned_rejected, TAG_INTEGRATION) {
 GDEX_TEST_T(dstex_v3, mip_offset_inside_tables_rejected, TAG_INTEGRATION) {
 	const godot::String path = scratch_path("mip_inside_tables.dstex");
 	godot::PackedByteArray bytes = build_v3(V3Spec());
-	w64(bytes, sizeof(godot::DSTexHeader), 0);
+	w64(bytes, sizeof(godot::DSTexHeaderV3), 0);
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
 	GDEX_EXPECT_TRUE(dstex->read_header(path).is_empty());
@@ -1302,7 +1342,7 @@ GDEX_TEST_T(win32_dstex_mip, v3_chunked_row_pitch_zero_rejected, TAG_INTEGRATION
 	V3Spec spec;
 	spec.chunk_count = 2;
 	godot::PackedByteArray bytes = build_v3(spec);
-	w32(bytes, sizeof(godot::DSTexHeader) + 16, 0); // mip[0].row_pitch
+	w32(bytes, sizeof(godot::DSTexHeaderV3) + 16, 0); // mip[0].row_pitch
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Win32Backend backend;
 	godot::Vector<godot::DSTexMipEntryV2> entries;
@@ -1317,7 +1357,7 @@ GDEX_TEST_T(win32_dstex_mip, v3_unchunked_row_pitch_zero_rejected, TAG_INTEGRATI
 #if defined(_WIN32) && (defined(DEBUG_ENABLED) || defined(DEV_ENABLED))
 	const godot::String path = scratch_path("be_row_zero_unchunked.dstex");
 	godot::PackedByteArray bytes = build_v3(V3Spec());
-	w32(bytes, sizeof(godot::DSTexHeader) + 16, 0);
+	w32(bytes, sizeof(godot::DSTexHeaderV3) + 16, 0);
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Win32Backend backend;
 	godot::Vector<godot::DSTexMipEntryV2> entries;
@@ -1394,11 +1434,7 @@ GDEX_TEST_T(win32_dstex_mip, v3_gacl_rejected, TAG_INTEGRATION) {
 GDEX_TEST_T(win32_dstex_mip, v2_reserved_flags_rejected, TAG_INTEGRATION) {
 #if defined(_WIN32) && (defined(DEBUG_ENABLED) || defined(DEV_ENABLED))
 	const godot::String path = scratch_path("be_v2_flags.dstex");
-	godot::PackedByteArray bytes = build_v3(V3Spec());
-	w16(bytes, 4, 2); // version 2
-	w64(bytes, 40, 0); // v2 reserved header word
-	w32(bytes, sizeof(godot::DSTexHeader) + 20, 0); // v2 mip reserved
-	w16(bytes, 6, 4); // reserved texture flag bit
+	godot::PackedByteArray bytes = build_v2(0, 0, 4); // flag 4 = reserved
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Win32Backend backend;
 	godot::Vector<godot::DSTexMipEntryV2> entries;
@@ -1412,11 +1448,7 @@ GDEX_TEST_T(win32_dstex_mip, v2_reserved_flags_rejected, TAG_INTEGRATION) {
 GDEX_TEST_T(win32_dstex_mip, v2_reserved_mip_rejected, TAG_INTEGRATION) {
 #if defined(_WIN32) && (defined(DEBUG_ENABLED) || defined(DEV_ENABLED))
 	const godot::String path = scratch_path("be_v2_mip_reserved.dstex");
-	godot::PackedByteArray bytes = build_v3(V3Spec());
-	w16(bytes, 4, 2); // version 2
-	w64(bytes, 40, 0); // v2 reserved header word
-	w16(bytes, 6, 0);
-	w32(bytes, sizeof(godot::DSTexHeader) + 20, 1); // v2 mip reserved
+	godot::PackedByteArray bytes = build_v2(0, 1, 0); // mip reserved = 1
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
 	godot::Win32Backend backend;
 	godot::Vector<godot::DSTexMipEntryV2> entries;
@@ -1430,13 +1462,72 @@ GDEX_TEST_T(win32_dstex_mip, v2_reserved_mip_rejected, TAG_INTEGRATION) {
 GDEX_TEST_T(win32_dstex_mip, v2_footprint_mismatch_rejected, TAG_INTEGRATION) {
 #if defined(_WIN32) && (defined(DEBUG_ENABLED) || defined(DEV_ENABLED))
 	const godot::String path = scratch_path("be_v2_footprint.dstex");
-	godot::PackedByteArray bytes = build_v3(V3Spec());
-	w16(bytes, 4, 2); // version 2
-	w64(bytes, 40, 0); // v2 reserved header word
-	w32(bytes, sizeof(godot::DSTexHeader) + 20, 0); // v2 mip reserved
+	godot::PackedByteArray bytes = build_v2(0, 0, 0);
 	w64(bytes, 24, 512); // header original_size
 	w32(bytes, sizeof(godot::DSTexHeader) + 12, 512); // mip uncompressed_size
 	GDEX_ASSERT_TRUE(write_bytes(path, bytes));
+	godot::Win32Backend backend;
+	godot::Vector<godot::DSTexMipEntryV2> entries;
+	GDEX_EXPECT_FALSE(backend._debug_get_texture_mip_entries_for_testing(path, 0, entries));
+	remove_file(path);
+#else
+	GDEX_SKIP("Windows-only backend parser");
+#endif
+}
+
+GDEX_TEST_T(dstex_v3, logical_dimensions_parsed, TAG_INTEGRATION) {
+	const godot::String path = scratch_path("logical_dims_v3.dstex");
+	V3Spec spec;
+	spec.logical_width = 3;
+	spec.logical_height = 1;
+	GDEX_ASSERT_TRUE(write_bytes(path, build_v3(spec)));
+	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
+	godot::Dictionary header = dstex->read_header(path);
+	GDEX_ASSERT_FALSE(header.is_empty());
+	GDEX_EXPECT_EQ(static_cast<int>(header["width"]), 4);
+	GDEX_EXPECT_EQ(static_cast<int>(header["height"]), 1);
+	GDEX_EXPECT_EQ(static_cast<int>(header["logical_width"]), 3);
+	GDEX_EXPECT_EQ(static_cast<int>(header["logical_height"]), 1);
+	GDEX_EXPECT_EQ(static_cast<int>(header["depth_or_layers"]), 1);
+	remove_file(path);
+}
+
+GDEX_TEST_T(dstex_v3, logical_width_exceeds_storage_rejected, TAG_INTEGRATION) {
+	const godot::String path = scratch_path("bad_log_w_v3.dstex");
+	V3Spec spec;
+	spec.logical_width = 5; // storage width is 4
+	GDEX_ASSERT_TRUE(write_bytes(path, build_v3(spec)));
+	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
+	GDEX_EXPECT_TRUE(dstex->read_header(path).is_empty());
+	remove_file(path);
+}
+
+GDEX_TEST_T(dstex_v3, logical_height_exceeds_storage_rejected, TAG_INTEGRATION) {
+	const godot::String path = scratch_path("bad_log_h_v3.dstex");
+	V3Spec spec;
+	spec.logical_height = 2; // storage height is 1
+	GDEX_ASSERT_TRUE(write_bytes(path, build_v3(spec)));
+	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
+	GDEX_EXPECT_TRUE(dstex->read_header(path).is_empty());
+	remove_file(path);
+}
+
+GDEX_TEST_T(dstex_v3, reserved0_nonzero_rejected, TAG_INTEGRATION) {
+	const godot::String path = scratch_path("bad_res0_v3.dstex");
+	V3Spec spec;
+	spec.reserved0 = 1;
+	GDEX_ASSERT_TRUE(write_bytes(path, build_v3(spec)));
+	godot::Ref<godot::DSTex> dstex = make_dstex_reader();
+	GDEX_EXPECT_TRUE(dstex->read_header(path).is_empty());
+	remove_file(path);
+}
+
+GDEX_TEST_T(dstex_v3, depth_or_layers_greater_than_1_fails_closed, TAG_INTEGRATION) {
+#if defined(_WIN32) && (defined(DEBUG_ENABLED) || defined(DEV_ENABLED))
+	const godot::String path = scratch_path("layers_v3.dstex");
+	V3Spec spec;
+	spec.depth_or_layers = 4;
+	GDEX_ASSERT_TRUE(write_bytes(path, build_v3(spec)));
 	godot::Win32Backend backend;
 	godot::Vector<godot::DSTexMipEntryV2> entries;
 	GDEX_EXPECT_FALSE(backend._debug_get_texture_mip_entries_for_testing(path, 0, entries));
