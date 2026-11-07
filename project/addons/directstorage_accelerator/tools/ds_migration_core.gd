@@ -73,6 +73,32 @@ static func _atomic_write_bytes(res_path: String, data: PackedByteArray) -> int:
 	return da.rename(tmp_res.get_file(), res_path.get_file())
 
 
+## True when p is a canonical res:// path with no traversal segment.
+static func _is_canonical_res_path(p: String) -> bool:
+	if p.is_empty() or not p.begins_with("res://"):
+		return false
+	if p.contains("\\"):
+		return false
+	for seg in p.trim_prefix("res://").split("/", true):
+		if seg.is_empty() or seg == "." or seg == "..":
+			return false
+	return p.simplify_path() == p
+
+
+## Returns the validated .import destination for a backup manifest entry, or "" when the
+## entry does not describe "<res:// project image>.import".
+static func _validate_restore_target(src_res: String, imp_res: String) -> String:
+	if not _is_canonical_res_path(src_res):
+		return ""
+	if not src_res.get_extension().to_lower() in SUPPORTED_EXTS:
+		return ""
+	if imp_res != src_res + ".import":
+		return ""
+	if not _is_canonical_res_path(imp_res):
+		return ""
+	return imp_res
+
+
 static func _load_import(imp_res: String) -> ConfigFile:
 	var cp := ConfigFile.new()
 	if cp.load(imp_res) != OK:
@@ -630,15 +656,28 @@ static func restore_from_zip(zip_res_path: String) -> Dictionary:
 
 	for entry in manifest["entries"]:
 		var src_res := str(entry.get("source", ""))
-		var imp_res := str(entry.get("import", src_res + ".import"))
+		var imp_res := _validate_restore_target(src_res, str(entry.get("import", src_res + ".import")))
+		if imp_res.is_empty():
+			results.append({
+				"source": src_res,
+				"status": "failed",
+				"reason": "Rejected manifest entry: destination is not a project image .import sidecar",
+			})
+			continue
 		var zip_entry := str(entry.get("zip_entry", ""))
 
-		# Safety: check if source image was modified since backup
-		if FileAccess.file_exists(src_res):
-			var cur_src := _read_bytes(src_res)
-			if _sha256_bytes(cur_src) != str(entry.get("source_sha256", "")):
-				results.append({"source": src_res, "status": "skipped", "reason": "Source image modified since backup"})
-				continue
+		# A source that no longer exists cannot be proven unmodified: skip, never restore blind.
+		if not FileAccess.file_exists(src_res):
+			results.append({
+				"source": src_res,
+				"status": "skipped",
+				"reason": "Source image missing since backup",
+			})
+			continue
+		var cur_src := _read_bytes(src_res)
+		if _sha256_bytes(cur_src) != str(entry.get("source_sha256", "")):
+			results.append({"source": src_res, "status": "skipped", "reason": "Source image modified since backup"})
+			continue
 
 		var original_import_bytes := reader.read_file(zip_entry)
 		if original_import_bytes.is_empty():
