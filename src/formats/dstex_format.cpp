@@ -385,6 +385,214 @@ void DSTex::normalize_image(const Ref<Image> &p_image) {
 	}
 }
 
+// Channel ids mirror ResourceImporterTexture::ChannelRemap (REMAP_R..REMAP_1).
+enum DSRemapChannel {
+	DS_REMAP_R = 0,
+	DS_REMAP_G = 1,
+	DS_REMAP_B = 2,
+	DS_REMAP_A = 3,
+	DS_REMAP_INV_R = 4,
+	DS_REMAP_INV_G = 5,
+	DS_REMAP_INV_B = 6,
+	DS_REMAP_INV_A = 7,
+	DS_REMAP_UNUSED = 8,
+	DS_REMAP_0 = 9,
+	DS_REMAP_1 = 10,
+};
+
+// Component mask for the early-out, mirroring Image::get_format_component_mask
+// (R=1, G=2, B=4, A=8). Only the importer's LDR formats need exact masks; all
+// other formats report full RGBA so the remap runs rather than being skipped.
+static uint32_t ds_remap_channel_mask(int p_format) {
+	switch (p_format) {
+		case Image::FORMAT_L8:
+		case Image::FORMAT_R8:
+			return 0x1;
+		case Image::FORMAT_LA8:
+		case Image::FORMAT_RG8:
+			return 0x1 | 0x2;
+		case Image::FORMAT_RGB8:
+			return 0x1 | 0x2 | 0x4;
+		default:
+			return 0x1 | 0x2 | 0x4 | 0x8;
+	}
+}
+
+void DSTex::remap_channels(const Ref<Image> &p_image, int p_red, int p_green, int p_blue, int p_alpha) {
+	if (p_image.is_null() || p_image->is_empty() || p_image->is_compressed()) {
+		return;
+	}
+	int remaps[4] = { p_red, p_green, p_blue, p_alpha };
+	for (int i = 0; i < 4; ++i) {
+		if (remaps[i] < DS_REMAP_R || remaps[i] > DS_REMAP_1) {
+			UtilityFunctions::push_error("DSTex: Channel remap option out of range (0-10).");
+			return;
+		}
+	}
+
+	const int image_format = p_image->get_format();
+	// HDR inversion is not meaningful on unsigned-normalized math; the engine
+	// demotes inverted remaps rather than applying (1.0 - channel) to floats.
+	if (image_format >= Image::FORMAT_RF && image_format <= Image::FORMAT_RGBE9995) {
+		bool demoted = false;
+		for (int i = 0; i < 4; ++i) {
+			switch (remaps[i]) {
+				case DS_REMAP_INV_R:
+					remaps[i] = DS_REMAP_R;
+					demoted = true;
+					break;
+				case DS_REMAP_INV_G:
+					remaps[i] = DS_REMAP_G;
+					demoted = true;
+					break;
+				case DS_REMAP_INV_B:
+					remaps[i] = DS_REMAP_B;
+					demoted = true;
+					break;
+				case DS_REMAP_INV_A:
+					remaps[i] = DS_REMAP_A;
+					demoted = true;
+					break;
+				default:
+					break;
+			}
+		}
+		if (demoted) {
+			UtilityFunctions::push_warning("DSTex: Inverted channel remap on an HDR image was changed to its uninverted equivalent.");
+		}
+	}
+
+	// Unused resolves per channel so the conversion loop below stays branchless.
+	for (int i = 0; i < 4; ++i) {
+		if (remaps[i] == DS_REMAP_UNUSED) {
+			remaps[i] = (i == 3) ? DS_REMAP_1 : DS_REMAP_0;
+		}
+	}
+
+	const uint32_t channel_mask = ds_remap_channel_mask(image_format);
+	const bool has_channel_r = (channel_mask & 0x1) != 0;
+	const bool has_channel_g = (channel_mask & 0x2) != 0;
+	const bool has_channel_b = (channel_mask & 0x4) != 0;
+	const bool has_channel_a = (channel_mask & 0x8) != 0;
+	const bool remap_r = remaps[0] != DS_REMAP_R ? !(!has_channel_r && remaps[0] == DS_REMAP_0) : false;
+	const bool remap_g = remaps[1] != DS_REMAP_G ? !(!has_channel_g && remaps[1] == DS_REMAP_0) : false;
+	const bool remap_b = remaps[2] != DS_REMAP_B ? !(!has_channel_b && remaps[2] == DS_REMAP_0) : false;
+	const bool remap_a = remaps[3] != DS_REMAP_A ? !(!has_channel_a && remaps[3] == DS_REMAP_1) : false;
+	if (!(remap_r || remap_g || remap_b || remap_a)) {
+		return;
+	}
+
+	// Expand the channel count when the remap needs channels the format lacks.
+	const bool needs_rg = remap_g || has_channel_g;
+	const bool needs_rgb = remap_b || has_channel_b;
+	const bool needs_rgba = remap_a || has_channel_a;
+	switch (image_format) {
+		case Image::FORMAT_R8:
+		case Image::FORMAT_RG8:
+		case Image::FORMAT_RGB8: {
+			if (needs_rgba) {
+				p_image->convert(Image::FORMAT_RGBA8);
+			} else if (needs_rgb) {
+				p_image->convert(Image::FORMAT_RGB8);
+			} else if (needs_rg) {
+				p_image->convert(Image::FORMAT_RG8);
+			}
+		} break;
+		case Image::FORMAT_RH:
+		case Image::FORMAT_RGH:
+		case Image::FORMAT_RGBH: {
+			if (needs_rgba) {
+				p_image->convert(Image::FORMAT_RGBAH);
+			} else if (needs_rgb) {
+				p_image->convert(Image::FORMAT_RGBH);
+			} else if (needs_rg) {
+				p_image->convert(Image::FORMAT_RGH);
+			}
+		} break;
+		case Image::FORMAT_RF:
+		case Image::FORMAT_RGF:
+		case Image::FORMAT_RGBF: {
+			if (needs_rgba) {
+				p_image->convert(Image::FORMAT_RGBAF);
+			} else if (needs_rgb) {
+				p_image->convert(Image::FORMAT_RGBF);
+			} else if (needs_rg) {
+				p_image->convert(Image::FORMAT_RGF);
+			}
+		} break;
+		case Image::FORMAT_L8: {
+			const bool uniform_rgb = (remaps[0] == remaps[1] && remaps[1] == remaps[2]) || !(remap_r || remap_g || remap_b);
+			if (uniform_rgb) {
+				if (needs_rgba) {
+					p_image->convert(Image::FORMAT_LA8);
+				}
+			} else {
+				if (needs_rgba) {
+					p_image->convert(Image::FORMAT_RGBA8);
+				} else {
+					p_image->convert(Image::FORMAT_RGB8);
+				}
+				UtilityFunctions::push_warning("DSTex: Unable to expand L8 channels non-uniformly; converted with a fallback format.");
+			}
+		} break;
+		case Image::FORMAT_LA8: {
+			const bool uniform_rgb = (remaps[0] == remaps[1] && remaps[1] == remaps[2]) || !(remap_r || remap_g || remap_b);
+			if (!uniform_rgb) {
+				p_image->convert(Image::FORMAT_RGBA8);
+				UtilityFunctions::push_warning("DSTex: Unable to expand LA8 channels non-uniformly; converted with a fallback format.");
+			}
+		} break;
+		default: {
+		} break;
+	}
+
+	const int width = p_image->get_width();
+	const int height = p_image->get_height();
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			const Color src = p_image->get_pixel(x, y);
+			Color dst;
+			for (int i = 0; i < 4; ++i) {
+				switch (remaps[i]) {
+					case DS_REMAP_R:
+						dst[i] = src.r;
+						break;
+					case DS_REMAP_G:
+						dst[i] = src.g;
+						break;
+					case DS_REMAP_B:
+						dst[i] = src.b;
+						break;
+					case DS_REMAP_A:
+						dst[i] = src.a;
+						break;
+					case DS_REMAP_INV_R:
+						dst[i] = 1.0f - src.r;
+						break;
+					case DS_REMAP_INV_G:
+						dst[i] = 1.0f - src.g;
+						break;
+					case DS_REMAP_INV_B:
+						dst[i] = 1.0f - src.b;
+						break;
+					case DS_REMAP_INV_A:
+						dst[i] = 1.0f - src.a;
+						break;
+					case DS_REMAP_0:
+						dst[i] = 0.0f;
+						break;
+					case DS_REMAP_1:
+						dst[i] = 1.0f;
+						break;
+					default:
+						break;
+				}
+			}
+			p_image->set_pixel(x, y, dst);
+		}
+	}
+}
+
 void DSTex::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level", "is_srgb", "as_image_texture", "logical_width", "logical_height", "depth_or_layers"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1), DEFVAL(false), DEFVAL(false), DEFVAL(0), DEFVAL(0), DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("read_header", "path"), &DSTex::read_header);
@@ -397,6 +605,7 @@ void DSTex::_bind_methods() {
 	ClassDB::bind_static_method("DSTex", D_METHOD("is_rd_format_srgb", "rd_format"), &DSTex::is_rd_format_srgb);
 	ClassDB::bind_static_method("DSTex", D_METHOD("get_srgb_rd_format", "rd_format"), &DSTex::get_srgb_rd_format);
 	ClassDB::bind_static_method("DSTex", D_METHOD("normalize_image", "image"), &DSTex::normalize_image);
+	ClassDB::bind_static_method("DSTex", D_METHOD("remap_channels", "image", "red", "green", "blue", "alpha"), &DSTex::remap_channels);
 }
 
 DSTex::DSTex() {

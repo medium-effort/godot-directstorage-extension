@@ -25,6 +25,13 @@ const NORMAL_MAP_ENABLED := 1
 const CHANNEL_PACK_SRGB_FRIENDLY := 0
 const CHANNEL_PACK_OPTIMIZED := 1
 
+# Mirror ResourceImporterTexture::ChannelRemap (REMAP_R..REMAP_1) for the
+# process/channel_remap/* options.
+const CHANNEL_REMAP_RED := 0
+const CHANNEL_REMAP_GREEN := 1
+const CHANNEL_REMAP_BLUE := 2
+const CHANNEL_REMAP_ALPHA := 3
+
 # Keys introduced by the color-option split. Their presence in an asset's .import file
 # means the user (or a previous import with the new options) already owns the channel settings,
 # so the legacy compression/source shim must not override them.
@@ -44,6 +51,7 @@ const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "c
 ## - [b]compression/gdeflate_level[/b]: GDeflate compression level (1-12).
 ## - [b]mipmaps/generate[/b]: Generate a full mip chain.
 ## - [b]process/size_limit[/b]: Resize the longer edge before mip generation.
+## - [b]process/channel_remap/red|green|blue|alpha[/b]: Swizzle, invert, or replace channels (e.g. pack PBR masks, flip normal-map Y).
 ## - [b]process/fix_alpha_border[/b], [b]process/premult_alpha[/b]: 2D alpha fixes.
 ## - [b]compatibility/as_image_texture[/b]: Force the CPU ImageTexture path.
 ##
@@ -167,6 +175,30 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 			"default_value": 0,
 			"property_hint": PROPERTY_HINT_RANGE,
 			"hint_string": "0,16384,1",
+		},
+		{
+			"name": "process/channel_remap/red",
+			"default_value": CHANNEL_REMAP_RED,
+			"property_hint": PROPERTY_HINT_ENUM,
+			"hint_string": "Red,Green,Blue,Alpha,Inverted Red,Inverted Green,Inverted Blue,Inverted Alpha,Unused,Zero,One",
+		},
+		{
+			"name": "process/channel_remap/green",
+			"default_value": CHANNEL_REMAP_GREEN,
+			"property_hint": PROPERTY_HINT_ENUM,
+			"hint_string": "Red,Green,Blue,Alpha,Inverted Red,Inverted Green,Inverted Blue,Inverted Alpha,Unused,Zero,One",
+		},
+		{
+			"name": "process/channel_remap/blue",
+			"default_value": CHANNEL_REMAP_BLUE,
+			"property_hint": PROPERTY_HINT_ENUM,
+			"hint_string": "Red,Green,Blue,Alpha,Inverted Red,Inverted Green,Inverted Blue,Inverted Alpha,Unused,Zero,One",
+		},
+		{
+			"name": "process/channel_remap/alpha",
+			"default_value": CHANNEL_REMAP_ALPHA,
+			"property_hint": PROPERTY_HINT_ENUM,
+			"hint_string": "Red,Green,Blue,Alpha,Inverted Red,Inverted Green,Inverted Blue,Inverted Alpha,Unused,Zero,One",
 		},
 		{
 			"name": "process/fix_alpha_border",
@@ -402,6 +434,14 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		if target_width != aligned_width or target_height != aligned_height:
 			img.resize(target_width, target_height, Image.INTERPOLATE_CUBIC)
 			push_warning("[DirectStorage Importer] Asset '%s' dimensions %dx%d are not a multiple of 4; block compression stores them as %dx%d." % [source_file, aligned_width, aligned_height, target_width, target_height])
+
+	# Godot remaps channels right after the size-limit resize; do the same so
+	# packed PBR masks and normal-map swizzles apply before normalization.
+	ClassDB.class_call_static("DSTex", "remap_channels", img,
+			int(options.get("process/channel_remap/red", CHANNEL_REMAP_RED)),
+			int(options.get("process/channel_remap/green", CHANNEL_REMAP_GREEN)),
+			int(options.get("process/channel_remap/blue", CHANNEL_REMAP_BLUE)),
+			int(options.get("process/channel_remap/alpha", CHANNEL_REMAP_ALPHA)))
 
 	# Godot normalizes the base level only after a size-limit resize; do it for
 	# every normal map so the source normals are unit length before mips.

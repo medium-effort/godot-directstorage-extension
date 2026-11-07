@@ -181,3 +181,84 @@ GDEX_TEST(dstex, normalize_image) {
     // Alpha is not a vector component and must survive normalization.
     GDEX_EXPECT_NEAR(c.a, 0.5f, 2e-3f);
 }
+
+// Phase 3 item 3: DSTex::remap_channels mirrors
+// ResourceImporterTexture::_remap_channels (REMAP_R..REMAP_1 = 0..10).
+GDEX_TEST(dstex, remap_channels_swap_red_blue) {
+    godot::Ref<godot::Image> image = godot::Image::create(2, 2, false, godot::Image::FORMAT_RGBA8);
+    GDEX_EXPECT_TRUE(image.is_valid());
+    image->set_pixel(0, 0, godot::Color(0.1f, 0.2f, 0.3f, 0.4f));
+    image->set_pixel(1, 1, godot::Color(0.5f, 0.6f, 0.7f, 0.8f));
+
+    // Blue, Green, Red, Alpha: swap R and B, keep G and A.
+    godot::DSTex::remap_channels(image, 2, 1, 0, 3);
+
+    const godot::Color a = image->get_pixel(0, 0);
+    GDEX_EXPECT_NEAR(a.r, 0.3f, 2e-3f);
+    GDEX_EXPECT_NEAR(a.g, 0.2f, 2e-3f);
+    GDEX_EXPECT_NEAR(a.b, 0.1f, 2e-3f);
+    GDEX_EXPECT_NEAR(a.a, 0.4f, 2e-3f);
+    const godot::Color b = image->get_pixel(1, 1);
+    GDEX_EXPECT_NEAR(b.r, 0.7f, 2e-3f);
+    GDEX_EXPECT_NEAR(b.b, 0.5f, 2e-3f);
+}
+
+GDEX_TEST(dstex, remap_channels_invert_zero_one) {
+    godot::Ref<godot::Image> image = godot::Image::create(1, 1, false, godot::Image::FORMAT_RGBA8);
+    GDEX_EXPECT_TRUE(image.is_valid());
+    image->set_pixel(0, 0, godot::Color(0.25f, 0.5f, 0.75f, 1.0f));
+
+    // Inverted Red, Zero, One, Alpha. Epsilon is wide because the value
+    // quantizes twice (store 0.25, then store the inversion).
+    godot::DSTex::remap_channels(image, 4, 9, 10, 3);
+
+    const godot::Color c = image->get_pixel(0, 0);
+    GDEX_EXPECT_NEAR(c.r, 0.75f, 5e-3f);
+    GDEX_EXPECT_NEAR(c.g, 0.0f, 5e-3f);
+    GDEX_EXPECT_NEAR(c.b, 1.0f, 5e-3f);
+    GDEX_EXPECT_NEAR(c.a, 1.0f, 5e-3f);
+}
+
+GDEX_TEST(dstex, remap_channels_identity_is_noop) {
+    godot::Ref<godot::Image> image = godot::Image::create(2, 2, false, godot::Image::FORMAT_RGBA8);
+    GDEX_EXPECT_TRUE(image.is_valid());
+    image->set_pixel(0, 0, godot::Color(0.1f, 0.2f, 0.3f, 0.4f));
+
+    godot::DSTex::remap_channels(image, 0, 1, 2, 3);
+
+    GDEX_EXPECT_EQ((int64_t)image->get_format(), (int64_t)godot::Image::FORMAT_RGBA8);
+    const godot::Color c = image->get_pixel(0, 0);
+    GDEX_EXPECT_NEAR(c.r, 0.1f, 2e-3f);
+    GDEX_EXPECT_NEAR(c.g, 0.2f, 2e-3f);
+    GDEX_EXPECT_NEAR(c.b, 0.3f, 2e-3f);
+    GDEX_EXPECT_NEAR(c.a, 0.4f, 2e-3f);
+}
+
+GDEX_TEST(dstex, remap_channels_r8_identity_keeps_format) {
+    // The early-out must not expand single-channel formats on identity:
+    // R8 assets stay R8 (the importer relies on this for mode-1 payloads).
+    godot::Ref<godot::Image> image = godot::Image::create(4, 4, false, godot::Image::FORMAT_R8);
+    GDEX_EXPECT_TRUE(image.is_valid());
+
+    godot::DSTex::remap_channels(image, 0, 1, 2, 3);
+
+    GDEX_EXPECT_EQ((int64_t)image->get_format(), (int64_t)godot::Image::FORMAT_R8);
+}
+
+GDEX_TEST(dstex, remap_channels_r8_to_rg_on_demand) {
+    // Requesting green output from an R8 image expands channels like the engine
+    // (R8 -> RG8, not RGBA8); the pixel loop then reads the expanded image.
+    godot::Ref<godot::Image> image = godot::Image::create(2, 2, false, godot::Image::FORMAT_R8);
+    GDEX_EXPECT_TRUE(image.is_valid());
+    image->set_pixel(0, 0, godot::Color(0.5f, 0.0f, 0.0f, 1.0f));
+
+    // Red, Red, Zero, One: green reads red.
+    godot::DSTex::remap_channels(image, 0, 0, 9, 10);
+
+    GDEX_EXPECT_EQ((int64_t)image->get_format(), (int64_t)godot::Image::FORMAT_RG8);
+    const godot::Color c = image->get_pixel(0, 0);
+    GDEX_EXPECT_NEAR(c.r, 0.5f, 2e-3f);
+    GDEX_EXPECT_NEAR(c.g, 0.5f, 2e-3f);
+    GDEX_EXPECT_NEAR(c.b, 0.0f, 2e-3f);
+    GDEX_EXPECT_NEAR(c.a, 1.0f, 2e-3f);
+}

@@ -52,6 +52,18 @@
 		<member name="process/size_limit" type="int" setter="" getter="" default="0">
 			If greater than [code]0[/code], resize the image so its longer edge is at most this many pixels before mip generation and compression. [code]0[/code] applies only the 16384-pixel container cap. Useful for mobile targets (4096/8192) and to avoid oversized staging buffers.
 		</member>
+		<member name="process/channel_remap/red" type="int" setter="" getter="" default="0">
+			Selects the source for the red output channel: Red, Green, Blue, Alpha, Inverted Red/Green/Blue/Alpha, Unused, Zero, or One. Use this with the green/blue/alpha siblings to pack PBR masks into one texture or to flip the green channel of normal maps exported with the opposite Y convention. Applied before normalization and mip generation via [method DSTex.remap_channels].
+		</member>
+		<member name="process/channel_remap/green" type="int" setter="" getter="" default="1">
+			Selects the source for the green output channel. See [code]process/channel_remap/red[/code].
+		</member>
+		<member name="process/channel_remap/blue" type="int" setter="" getter="" default="2">
+			Selects the source for the blue output channel. See [code]process/channel_remap/red[/code].
+		</member>
+		<member name="process/channel_remap/alpha" type="int" setter="" getter="" default="3">
+			Selects the source for the alpha output channel. See [code]process/channel_remap/red[/code].
+		</member>
 		<member name="process/fix_alpha_border" type="bool" setter="" getter="" default="false">
 			If [code]true[/code], put surrounding color into the transparent border of RGBA8 images before compression, reducing bilinear-filter halos. Enabled by the CPU/ImageTexture (2D) preset.
 		</member>

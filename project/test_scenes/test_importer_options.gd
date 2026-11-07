@@ -59,6 +59,10 @@ func _run() -> void:
 	_check(int(d3d["compression/color_space"]) == 1, "color space defaults to sRGB")
 	_check(int(d3d["compress/normal_map"]) == 0, "normal map processing defaults to disabled")
 	_check(int(d3d["compress/channel_pack"]) == 0, "channel packing defaults to sRGB friendly")
+	_check(int(d3d["process/channel_remap/red"]) == 0, "channel remap red defaults to Red")
+	_check(int(d3d["process/channel_remap/green"]) == 1, "channel remap green defaults to Green")
+	_check(int(d3d["process/channel_remap/blue"]) == 2, "channel remap blue defaults to Blue")
+	_check(int(d3d["process/channel_remap/alpha"]) == 3, "channel remap alpha defaults to Alpha")
 	_check(int(d3d["compression/mode"]) == 0, "3D preset compresses")
 	_check(bool(d3d["mipmaps/generate"]) == true, "3D preset generates mipmaps")
 	_check(bool(d3d["process/fix_alpha_border"]) == false, "3D preset leaves alpha borders alone")
@@ -141,6 +145,23 @@ func _run() -> void:
 	if not la8.is_empty():
 		var format := int(la8["header"]["pixel_format"])
 		_check(format == RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM or format == RenderingDevice.DATA_FORMAT_R8G8B8A8_SRGB, "LA8 becomes RGBA8 (alpha preserved)")
+
+	# Channel remap: swap red and blue on an uncompressed import, then decode.
+	# The gradient fixture has r=0.0, b=0.25 at (0,0); swapped it is r=0.25, b=0.0.
+	var remap_fixture := TMP_DIR + "/remap.png"
+	_make_png(remap_fixture, 4, 4, Image.FORMAT_RGBA8, false)
+	_cleanup.append(remap_fixture)
+	var remapped := _import_fixture(remap_fixture, "remap", _with(d2d, {
+		"process/channel_remap/red": 2,
+		"process/channel_remap/blue": 0,
+		"mipmaps/generate": false,
+	}))
+	if not remapped.is_empty():
+		var remap_image := _decode_uncompressed(remapped, 4, 4)
+		_check(remap_image != null and not remap_image.is_empty(), "remapped payload decodes")
+		if remap_image != null and not remap_image.is_empty():
+			var pixel := remap_image.get_pixel(0, 0)
+			_check(absf(pixel.r - 0.25) < 0.02 and absf(pixel.b - 0.0) < 0.02, "channel remap swaps red and blue")
 
 	var normal_fixture := TMP_DIR + "/normal.png"
 	_make_normal_png(normal_fixture, 8, 8)
@@ -272,6 +293,33 @@ func _import_fixture(source: String, tag: String, options: Dictionary) -> Dictio
 		return {}
 	header["_path"] = generated[0]
 	return {"header": header, "path": generated[0]}
+
+
+func _decode_uncompressed(result: Dictionary, width: int, height: int) -> Image:
+	# Decodes a single-mip uncompressed RGBA8 payload: decompress the GDeflate
+	# mip, unpad the 256-byte footprint rows, and rebuild the natural image.
+	var header: Dictionary = result["header"]
+	var path: String = result["path"]
+	var bytes := FileAccess.get_file_as_bytes(path)
+	if bytes.is_empty() or not header.has("mip_offsets"):
+		return null
+	var offset := int(header["mip_offsets"][0])
+	var size := int(header["mip_sizes"][0])
+	var uncompressed := int(header["mip_uncompressed_sizes"][0])
+	var row_pitch := int(header["mip_row_pitches"][0])
+	var payload := bytes.slice(offset, offset + size)
+	var decompressor = ClassDB.instantiate("GDeflateDecompressor")
+	var footprint: PackedByteArray = decompressor.decompress(payload, uncompressed)
+	var row_bytes := width * 4
+	var row_count := height
+	if footprint.size() != uncompressed or row_pitch < row_bytes:
+		return null
+	var natural := PackedByteArray()
+	natural.resize(row_bytes * row_count)
+	for row in row_count:
+		for byte in row_bytes:
+			natural[row * row_bytes + byte] = footprint[row * row_pitch + byte]
+	return Image.create_from_data(width, height, false, Image.FORMAT_RGBA8, natural)
 
 
 func check_normal_base(result: Dictionary) -> void:

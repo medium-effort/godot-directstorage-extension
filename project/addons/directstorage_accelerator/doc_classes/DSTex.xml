@@ -50,6 +50,15 @@
 			<param index="0" name="image" type="Image" />
 			<description>Normalizes the RGB of every base-level pixel in [param image] as a tangent-space normal (the (R*2-1, G*2-1, B*2-1) vector is scaled to unit length and encoded back). Alpha is preserved. This mirrors [method Image.normalize] (which is not exposed to scripting) and operates on the base level only; generate mipmaps afterwards if the texture needs a chain.</description>
 		</method>
+		<method name="remap_channels" qualifiers="static">
+			<return type="void" />
+			<param index="0" name="image" type="Image" />
+			<param index="1" name="red" type="int" />
+			<param index="2" name="green" type="int" />
+			<param index="3" name="blue" type="int" />
+			<param index="4" name="alpha" type="int" />
+			<description>Remaps the channels of every base-level pixel in [param image], mirroring [ResourceImporterTexture]'s channel remap (which is not exposed to scripting). Each channel argument is 0-10: Red, Green, Blue, Alpha, Inverted Red/Green/Blue/Alpha, Unused, Zero, One. The identity mapping (0, 1, 2, 3) on a full-channel image is a no-op. Operates on the base level only; call before mip generation.</description>
+		</method>
 		<method name="rd_format_to_godot_format" qualifiers="static">
 			<return type="int" />
 			<param index="0" name="rd_format" type="int" />

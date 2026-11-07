@@ -153,6 +153,13 @@ public:
 	/// Image::normalize() (which godot-cpp does not expose). Operates on the base
 	/// level only; the importer calls it before mip generation.
 	static void normalize_image(const Ref<Image> &p_image);
+	/// Remaps image channels per output channel, matching
+	/// ResourceImporterTexture::_remap_channels() (which godot-cpp does not
+	/// expose). Each of p_red/p_green/p_blue/p_alpha is 0-10: Red, Green,
+	/// Blue, Alpha, Inverted Red/Green/Blue/Alpha, Unused, Zero, One.
+	/// Identity (0, 1, 2, 3) on a full-channel image is a no-op. Operates on
+	/// the base level only; the importer calls it before mip generation.
+	static void remap_channels(const Ref<Image> &p_image, int p_red, int p_green, int p_blue, int p_alpha);
 
 	static bool is_format_supported(int p_image_format);
 	static int godot_format_to_rd_format(int p_image_format, bool p_is_srgb = false);
