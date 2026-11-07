@@ -278,6 +278,10 @@ public:
 public:
 	void _set_archive_salt_for_testing(const PackedByteArray &p_salt);
 	void _set_write_truncate_for_testing(int64_t p_bytes);
+	// Test-only, non-binding: high-water mark of the bytes the encrypted TOC path
+	// holds before the MAC verifies. Debug/editor builds only, never bound.
+	static void _reset_preauth_toc_probe_for_testing();
+	static uint64_t _get_preauth_toc_peak_bytes_for_testing();
 #endif
 
 	// Archive Reader

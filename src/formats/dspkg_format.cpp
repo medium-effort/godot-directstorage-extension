@@ -7,6 +7,7 @@
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -640,6 +641,26 @@ void DSPkg::_set_archive_salt_for_testing(const PackedByteArray &p_salt) {
 
 void DSPkg::_set_write_truncate_for_testing(int64_t p_bytes) {
 	m_test_write_truncate_after_bytes = p_bytes;
+}
+
+namespace {
+// open() can run on loader/preloader worker threads, so the probe is atomic.
+std::atomic<uint64_t> s_preauth_toc_peak_bytes{0};
+
+void dspkg_note_preauth_toc_bytes(uint64_t p_live) {
+	uint64_t prev = s_preauth_toc_peak_bytes.load(std::memory_order_relaxed);
+	while (p_live > prev &&
+			!s_preauth_toc_peak_bytes.compare_exchange_weak(prev, p_live, std::memory_order_relaxed)) {
+	}
+}
+} // namespace
+
+void DSPkg::_reset_preauth_toc_probe_for_testing() {
+	s_preauth_toc_peak_bytes.store(0, std::memory_order_relaxed);
+}
+
+uint64_t DSPkg::_get_preauth_toc_peak_bytes_for_testing() {
+	return s_preauth_toc_peak_bytes.load(std::memory_order_relaxed);
 }
 #endif
 
@@ -1688,23 +1709,31 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		if (file->get_position() != toc_start) {
 			file->seek(toc_start);
 		}
-		PackedByteArray ciphertext = file->get_buffer(toc_len);
-		if (ciphertext.size() < toc_len) {
+		// Authenticate and decrypt in one buffer. crypto_aead_unlock() verifies the
+		// whole tag before it writes any plaintext (crypto_aead_read() in the
+		// vendored Monocypher), and ChaCha20 is a byte-wise XOR, so input and
+		// output may alias. One envelope-sized allocation instead of two keeps a
+		// hostile archive's pre-authentication footprint at toc_len.
+		plaintext_toc = file->get_buffer(toc_len);
+		if (plaintext_toc.size() < toc_len) {
 			wipe_key_bytes(candidate_key);
 			return fail(ERR_FILE_CORRUPT, "Failed to read complete TOC ciphertext.");
 		}
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		dspkg_note_preauth_toc_bytes(toc_len);
+#endif
 		uint8_t nonce[DSPKG_ENCRYPTION_NONCE_SIZE] = {0};
 		memcpy(nonce, loaded_header.archive_salt, 16);
 		memcpy(nonce + 16, is_v5 ? DOMAIN_SEPARATOR_V5 : DOMAIN_SEPARATOR, 8);
 
-		plaintext_toc.resize(toc_len);
 		const uint8_t *aad = is_v5 ? v5_header_bytes.ptr() :
 				reinterpret_cast<const uint8_t *>(&loaded_header);
 		const uint64_t aad_len = is_v5 ? loaded_header_size : sizeof(DSPkgHeader);
+		uint8_t *toc_bytes = plaintext_toc.ptrw();
 		int unlock_res = crypto_aead_unlock(
-			plaintext_toc.ptrw(), mac_bytes.ptr(), candidate_key.data(), nonce,
+			toc_bytes, mac_bytes.ptr(), candidate_key.data(), nonce,
 			aad, aad_len,
-			ciphertext.ptr(), toc_len
+			toc_bytes, toc_len
 		);
 		if (unlock_res != 0) {
 			wipe_key_bytes(candidate_key);
