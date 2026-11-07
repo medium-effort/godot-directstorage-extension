@@ -49,6 +49,7 @@
 #include "../core/ds_request.h"
 #include "../formats/dspkg_format.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -175,7 +176,11 @@ public:
 	// is in flight (the batch manager calls it from its per-frame hook).
 	// When p_max_items > 0, at most p_max_items textures are processed in this call.
 	// When p_max_usec > 0, processing yields as soon as elapsed microseconds exceed the budget.
-	static int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, uint32_t p_max_usec = 0);
+	// Defaults to a 4000 us slice so a caller that passes nothing cannot build a
+	// 64 MiB texture inline (~20-27 ms measured); pass 0 explicitly for the legacy
+	// unbounded behaviour. CPU entries that do not fit a non-zero budget are built
+	// on WorkerThreadPool instead of the calling thread.
+	static int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, uint32_t p_max_usec = 4000);
 
 	// Diagnostic: number of tracked textures with at least one
 	// unfinished request. p_tag == 0 counts all tags.
@@ -224,6 +229,7 @@ public:
 #endif
 
 	friend struct PreloaderUnpackTest;
+	friend struct PrewarmBudgetTest;
 
 private:
 	struct Tracked {
@@ -238,6 +244,22 @@ private:
 		RID gpu_tex_rid;
 		bool is_gpu = false;
 		bool gpu_failed = false;
+		// Set while this CPU entry is being built by an offloaded worker task.
+		// The entry stays in `pending` (so the unbuilt counts stay honest) but
+		// the tag scan and every poll skip it, so it cannot be taken twice.
+		bool build_in_flight = false;
+	};
+
+	// One CPU build handed to WorkerThreadPool because it did not fit the
+	// calling thread's slice. Owned by State::build_jobs until a poll or
+	// shutdown reaps the finished task. The entry keeps the request Refs alive
+	// while the worker builds, so a completion thread can never free them
+	// mid-build.
+	struct BuildJob {
+		int64_t id = 0;
+		Tracked entry;
+		uint64_t generation = 0;
+		std::atomic<bool> done{false};
 	};
 
 	// One GPU chunk: pending-table ids + payloads, allocated + enqueued +
@@ -255,6 +277,16 @@ private:
 	struct State {
 		std::mutex mutex;
 		std::condition_variable pending_cv;
+		// Offloaded CPU builds: WorkerThreadPool task id -> owned job.
+		// in_flight_builds is the drain counter; never call
+		// WorkerThreadPool::is_task_completed() after wait_for_task_completion()
+		// (the id is retired and the call errors with "Invalid Task ID").
+		std::unordered_map<int64_t, BuildJob *> build_jobs;
+		int in_flight_builds = 0;
+		// Incremented by shutdown(); a job captured an older generation must not
+		// store into the cache of the next session (teardown of one test's cache
+		// must not poison the next test's offloaded builds).
+		uint64_t shutdown_generation = 0;
 		std::unordered_map<int64_t, Tracked> pending;
 		HashMap<String, int> pending_paths;
 		int64_t next_id = 1;
@@ -356,6 +388,18 @@ private:
 	static void alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSContext *p_ctx, uint64_t p_tag, const GpuChunkItem &p_item);
 	static void mark_gpu_item_failed(int64_t p_pending_id);
 	static void complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_cache, int &r_stored);
+	// CPU completion body shared by the inline slice and the offloaded task.
+	// r_stored is true only when the cache accepted the texture; r_entry_bytes
+	// is the slice byte charge (charged whenever a texture was built).
+	static void complete_cpu_entry(const Tracked &p_entry, DSTextureCache *p_cache, int &r_stored, uint64_t &r_entry_bytes);
+	// pending_paths decrement + pending_cv notify; caller holds State::mutex.
+	static void unblock_pending_paths_locked(const Tracked &p_entry);
+	// WorkerThreadPool native task: builds and stores one CPU entry, then
+	// retires it from `pending`. Safe on any pool thread (ImageTexture path).
+	static void run_offloaded_cpu_build(void *p_user);
+	// Caller holds State::mutex. Returns false when no pool is available, in
+	// which case the caller builds inline (progress beats a strict bound).
+	static bool offload_cpu_build_locked(int64_t p_id);
 	static void pump_gpu_orphans();
 };
 

@@ -89,8 +89,8 @@
 			<return type="int" />
 			<param index="0" name="tag" type="int" default="0" />
 			<param index="1" name="max_items" type="int" default="0" />
-			<param index="2" name="max_usec" type="int" default="0" />
-			<description>Builds finished prewarm textures and stores them in the cache under their engine path. Only requests matching [param tag] are processed; pass [code]0[/code] (the default) to poll every tag. When [param max_items] is greater than [code]0[/code], at most that many textures are built by this call. When [param max_usec] is greater than [code]0[/code], building yields once elapsed microseconds exceed the budget, keeping per-frame ingestion cost bounded. Returns the number of textures stored by this call. Failed or cancelled requests are skipped here and load normally later through the regular loader.</description>
+			<param index="2" name="max_usec" type="int" default="4000" />
+			<description>Builds finished prewarm textures and stores them in the cache under their engine path. Only requests matching [param tag] are processed; pass [code]0[/code] (the default) to poll every tag. When [param max_items] is greater than [code]0[/code], at most that many textures are built by this call. When [param max_usec] is greater than [code]0[/code], building yields once elapsed microseconds exceed the budget, keeping per-frame ingestion cost bounded. Entries whose estimated cost does not fit the remaining budget are built on a worker thread instead of the calling thread, so a slice stays inside its budget even for its first entry; pass [code]0[/code] explicitly for the legacy unbounded behaviour. Returns the number of textures stored by this call. Failed or cancelled requests are skipped here and load normally later through the regular loader.</description>
 		</method>
 		<method name="prewarm_async">
 			<return type="int" />

@@ -982,6 +982,7 @@ Benchmarking loading screen frame times on real hardware (e.g. NVIDIA GTX 1050 T
    - Large 4K textures yield after just 1 texture (~8 ms elapsed), leaving ample headroom for 60 FPS rendering.
    - Small 256x256 textures batch multiple items within the same 4 ms budget.
    - Main-thread frame time never exceeds 16.6 ms, completely eliminating frame stutters.
+   - An entry that does not fit the remaining budget is no longer built inline at all: CPU builds are handed to `WorkerThreadPool` (measured 20-27 ms for a 4096x4096 RGBA8 payload, so a 2-4 ms slice cannot contain one). The first item is no longer exempt from the budget; only constant-cost GPU entries are.
 
 2. **Instant Package Manifest Lookup (<0.5 ms)**:
    In exported builds where `textures.dspkg` is deployed, the archive already contains the pre-indexed list of all bundled textures. Querying `dspkg.get_entries()` directly against the requested coverage directories discovers all dependencies in **<0.5 ms**, completely bypassing the 100+ ms binary scene crawl.

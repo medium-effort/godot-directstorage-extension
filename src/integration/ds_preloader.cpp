@@ -20,6 +20,7 @@
 #include <godot_cpp/classes/texture2drd.hpp>
 #include <godot_cpp/classes/thread.hpp>
 #include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/classes/worker_thread_pool.hpp>
 #include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
@@ -1497,6 +1498,29 @@ static uint64_t estimate_payload_bytes(const DSPreloader::Payload &p_meta) {
 	return bytes;
 }
 
+// Measured at 368f5cb: a 4096x4096 RGBA8 v2 payload (64 MiB natural) costs
+// 20.3-26.9 ms in build_texture() on the gdextest host, and 24 ms warm on a
+// GTX 1050 Ti windowed run (14.1 ms for the 64 MiB resize + 8.35 ms for
+// ImageTexture::create_from_image; Image::create_from_data is copy-on-write).
+// 26.9 ms / 64 MiB = 420 us/MiB, x1.25 safety = 525. The previous 50 us/MiB
+// (~20 GB/s) was 6-8x low and let 20-27 ms builds pass a 2-4 ms budget check
+// (GODOT_QUIRKS.md quirk 41). Over-estimating is the safe direction: it only
+// offloads more builds, never fewer.
+static constexpr uint64_t kCpuBuildUsecPerMiB = 525;
+
+// Byte charge for one CPU entry, shared by the inline slice and the offloaded
+// task: estimate_payload_bytes() unless the metadata carries no sizes, in
+// which case the destination buffers are summed (pre-extraction behaviour).
+static uint64_t cpu_entry_bytes(const DSPreloader::Payload &p_meta, const std::vector<PackedByteArray> &p_buffers) {
+	uint64_t bytes = estimate_payload_bytes(p_meta);
+	if (bytes == 0) {
+		for (size_t b = 0; b < p_buffers.size(); ++b) {
+			bytes += static_cast<uint64_t>(p_buffers[b].size());
+		}
+	}
+	return bytes;
+}
+
 void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_cache, int &r_stored) {
 	DSContext *ctx = DSContext::get_singleton();
 	bool is_cancelled = (ctx != nullptr && ctx->is_tag_cancelled(p_entry.tag));
@@ -1569,6 +1593,108 @@ void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 		return;
 	}
 	r_stored++;
+}
+
+bool DSPreloader::offload_cpu_build_locked(int64_t p_id) {
+	State &s = state();
+	std::unordered_map<int64_t, Tracked>::iterator it = s.pending.find(p_id);
+	if (it == s.pending.end() || it->second.build_in_flight || it->second.is_gpu) {
+		return false;
+	}
+	WorkerThreadPool *pool = WorkerThreadPool::get_singleton();
+	if (pool == nullptr) {
+		return false;
+	}
+	BuildJob *job = new BuildJob();
+	job->id = p_id;
+	job->entry = it->second;
+	job->generation = s.shutdown_generation;
+	it->second.build_in_flight = true;
+	const int64_t task = pool->add_native_task(&DSPreloader::run_offloaded_cpu_build, job, false, "DS CPU build");
+	if (task == static_cast<int64_t>(WorkerThreadPool::INVALID_TASK_ID)) {
+		it->second.build_in_flight = false;
+		delete job;
+		return false;
+	}
+	s.build_jobs[task] = job;
+	s.in_flight_builds++;
+	return true;
+}
+
+void DSPreloader::run_offloaded_cpu_build(void *p_user) {
+	BuildJob *job = static_cast<BuildJob *>(p_user);
+	DSTextureCache *cache = DSTextureCache::get_singleton();
+	bool stale = false;
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		// A shutdown between posting and execution means this build belongs to a
+		// session whose cache is being (or has been) torn down: drop it. The
+		// generation check also makes a deliberately leaked task harmless.
+		stale = (job->generation != state().shutdown_generation);
+	}
+	if (!stale && cache != nullptr) {
+		int stored = 0;
+		uint64_t entry_bytes = 0;
+		complete_cpu_entry(job->entry, cache, stored, entry_bytes);
+	}
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		s.pending.erase(job->id);
+		unblock_pending_paths_locked(job->entry);
+		s.in_flight_builds--;
+		job->done.store(true);
+	}
+}
+
+void DSPreloader::unblock_pending_paths_locked(const Tracked &p_entry) {
+	State &s = state();
+	if (!p_entry.meta.engine_path.is_empty()) {
+		auto it_p = s.pending_paths.find(p_entry.meta.engine_path);
+		if (it_p != s.pending_paths.end()) {
+			it_p->value--;
+			if (it_p->value <= 0) {
+				s.pending_paths.erase(p_entry.meta.engine_path);
+			}
+		}
+	}
+	if (!p_entry.meta.payload_key.is_empty() && p_entry.meta.payload_key != p_entry.meta.engine_path) {
+		auto it_p = s.pending_paths.find(p_entry.meta.payload_key);
+		if (it_p != s.pending_paths.end()) {
+			it_p->value--;
+			if (it_p->value <= 0) {
+				s.pending_paths.erase(p_entry.meta.payload_key);
+			}
+		}
+	}
+	s.pending_cv.notify_all();
+}
+
+void DSPreloader::complete_cpu_entry(const Tracked &p_entry, DSTextureCache *p_cache, int &r_stored, uint64_t &r_entry_bytes) {
+	r_stored = 0;
+	r_entry_bytes = 0;
+	std::vector<PackedByteArray> buffers;
+	for (int r = 0; r < p_entry.requests.size(); ++r) {
+		if (p_entry.requests[r].is_null() || p_entry.requests[r]->get_status() != DSRequest::STATUS_COMPLETED) {
+			UtilityFunctions::print_verbose("DSPreloader: Prewarm texture '", p_entry.meta.engine_path, "' did not complete; dropping (sync load remains available).");
+			return;
+		}
+		buffers.push_back(p_entry.requests[r]->get_destination_buffer());
+	}
+	Ref<Texture2D> tex = build_texture(p_entry.meta, buffers);
+	if (!tex.is_valid()) {
+		UtilityFunctions::push_warning("DSPreloader: Failed to build prewarmed texture for ", p_entry.meta.engine_path, ".");
+		return;
+	}
+	const String alias = (p_entry.meta.payload_key != p_entry.meta.engine_path) ? p_entry.meta.payload_key : String();
+	// Report the decision: a refused store (cache disabled or raced) keeps
+	// nothing resident, so it must not count as stored.
+	if (p_cache->store(p_entry.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias)) {
+		r_stored = 1;
+	} else {
+		UtilityFunctions::print_verbose("DSPreloader: cache refused prewarmed texture '", p_entry.meta.engine_path, "'; not counted as stored.");
+	}
+	r_entry_bytes = cpu_entry_bytes(p_entry.meta, buffers);
 }
 
 bool DSPreloader::is_terminal(const Ref<DSRequest> &p_request, uint64_t p_timeout_usec) {
@@ -1745,6 +1871,29 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 		return 0;
 	}
 
+	// Reap offloaded builds that finished since the last poll. Their store
+	// already happened on the worker; this only frees the job so build_jobs
+	// stays bounded. Deleting outside the lock keeps the job's Tracked
+	// destructor (request Refs) off the pending lock.
+	{
+		std::vector<BuildJob *> finished;
+		{
+			std::lock_guard<std::mutex> lock(state().mutex);
+			State &s = state();
+			for (std::unordered_map<int64_t, BuildJob *>::iterator it = s.build_jobs.begin(); it != s.build_jobs.end();) {
+				if (it->second->done.load()) {
+					finished.push_back(it->second);
+					it = s.build_jobs.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+		for (size_t i = 0; i < finished.size(); ++i) {
+			delete finished[i];
+		}
+	}
+
 	uint64_t start_usec = (p_max_usec > 0 && Time::get_singleton()) ? Time::get_singleton()->get_ticks_usec() : 0;
 	int stored = 0;
 	// Items consumed by this slice. Drives the item/byte budgets because `stored`
@@ -1772,6 +1921,11 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 		for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
 			const Tracked &cand = it->second;
 			if (p_tag != 0 && cand.tag != p_tag) {
+				continue;
+			}
+			// Already being built by an offloaded worker task: it will retire
+			// the entry when it finishes, so no poll may take it again.
+			if (cand.build_in_flight) {
 				continue;
 			}
 			if (cand.is_gpu) {
@@ -1807,6 +1961,12 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 
 	uint64_t slice_bytes_processed = 0;
 	constexpr uint64_t kMaxBytesPerSlice = 64ULL * 1024ULL * 1024ULL; // 64 MiB slice cap
+	// Offload at most this many CPU builds per slice. Posting is O(1) and
+	// allocates nothing beyond the entry's already-resident buffers, but an
+	// uncapped loop would let a caller whose slice rate exceeds the build rate
+	// grow the pool queue without bound.
+	constexpr int kMaxOffloadsPerSlice = 2;
+	int offloads = 0;
 
 	for (size_t ti = 0; ti < terminal_ids.size(); ++ti) {
 		if (p_max_items > 0 && processed >= p_max_items) {
@@ -1818,13 +1978,14 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				break;
 			}
 		}
-		if (processed > 0 && slice_bytes_processed >= kMaxBytesPerSlice) {
+		if (slice_bytes_processed >= kMaxBytesPerSlice) {
 			break;
 		}
 
 		Tracked t;
 		bool found = false;
 		bool budget_exhausted = false;
+		bool offloaded = false;
 		{
 			std::lock_guard<std::mutex> lock(state().mutex);
 			State &s = state();
@@ -1833,22 +1994,50 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				// Tag filter re-check: a concurrent poll may have retagged?
 				// Pending entries are immutable once enqueued, but the
 				// caller tag may differ per concurrent poll call.
-				if (p_tag == 0 || it->second.tag == p_tag) {
+				if ((p_tag == 0 || it->second.tag == p_tag) && !it->second.build_in_flight) {
+					const bool is_gpu = it->second.is_gpu;
 					uint64_t est_bytes = estimate_payload_bytes(it->second.meta);
-					// For CPU builds, estimate ~50us per MB for memcpy/unpad; GPU is instant (<2us)
-					uint64_t est_usec = it->second.is_gpu ? 2 : (est_bytes / (1024ULL * 1024ULL)) * 50ULL;
+					// CPU builds are 20-27 ms for a 64 MiB texture (measured), so
+					// the estimate is deliberately conservative; GPU completion is a
+					// constant 2 us (RID wrap + store, no data movement).
+					uint64_t est_usec = is_gpu ? 2 : (est_bytes / (1024ULL * 1024ULL)) * kCpuBuildUsecPerMiB;
 					uint64_t elapsed = (p_max_usec > 0 && Time::get_singleton()) ? (Time::get_singleton()->get_ticks_usec() - start_usec) : 0;
 
-					// Pre-estimate defer: If adding this texture exceeds byte or time budget, defer it to next slice
-					if (processed > 0 && (slice_bytes_processed + est_bytes > kMaxBytesPerSlice || (p_max_usec > 0 && elapsed + est_usec > p_max_usec))) {
-						budget_exhausted = true;
+					bool fits;
+					if (p_max_usec > 0) {
+						// No first-item exemption: the budget is a promise to the
+						// calling thread. An oversized CPU entry is offloaded below.
+						const uint64_t remaining = (elapsed < p_max_usec) ? (p_max_usec - elapsed) : 0;
+						fits = (est_usec <= remaining) && (slice_bytes_processed + est_bytes <= kMaxBytesPerSlice);
 					} else {
+						// Explicit unbounded caller (p_max_usec == 0): legacy
+						// semantics. The first item is always taken; later items
+						// still respect the byte cap.
+						fits = (processed == 0) || (slice_bytes_processed + est_bytes <= kMaxBytesPerSlice);
+					}
+
+					if (fits || is_gpu || p_max_usec == 0) {
+						t = it->second;
+						s.pending.erase(it);
+						found = true;
+					} else if (offloads >= kMaxOffloadsPerSlice) {
+						// Budget for this slice is spent; the next call offloads more.
+						budget_exhausted = true;
+					} else if (offload_cpu_build_locked(it->first)) {
+						offloaded = true;
+					} else {
+						// No usable worker pool: build inline so the stream still
+						// drains. Progress beats a strict bound.
 						t = it->second;
 						s.pending.erase(it);
 						found = true;
 					}
 				}
 			}
+		}
+		if (offloaded) {
+			++offloads;
+			continue;
 		}
 		if (budget_exhausted) {
 			break;
@@ -1857,70 +2046,22 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 			continue;
 		}
 
-		bool ok = true;
-		std::vector<PackedByteArray> buffers;
-		if (!t.is_gpu) {
-			for (int r = 0; r < t.requests.size(); ++r) {
-				if (t.requests[r].is_null() || t.requests[r]->get_status() != DSRequest::STATUS_COMPLETED) {
-					ok = false;
-					break;
-				}
-				buffers.push_back(t.requests[r]->get_destination_buffer());
-			}
-		}
-
 		if (t.is_gpu) {
 			complete_gpu_entry(t, cache, stored);
 			slice_bytes_processed += estimate_payload_bytes(t.meta);
-		} else if (ok) {
-			Ref<Texture2D> tex = build_texture(t.meta, buffers);
-			if (tex.is_valid()) {
-				String alias = (t.meta.payload_key != t.meta.engine_path) ? t.meta.payload_key : String();
-				// Report the decision: a refused store (cache disabled or raced)
-				// keeps nothing resident, so it must not count as stored.
-				if (cache->store(t.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias)) {
-					stored++;
-				} else {
-					UtilityFunctions::print_verbose("DSPreloader: cache refused prewarmed texture '", t.meta.engine_path, "'; not counted as stored.");
-				}
-				uint64_t entry_bytes = estimate_payload_bytes(t.meta);
-				if (entry_bytes == 0) {
-					for (size_t b = 0; b < buffers.size(); ++b) {
-						entry_bytes += (uint64_t)buffers[b].size();
-					}
-				}
-				slice_bytes_processed += entry_bytes;
-			} else {
-				UtilityFunctions::push_warning("DSPreloader: Failed to build prewarmed texture for ", t.meta.engine_path, ".");
-			}
 		} else {
-			UtilityFunctions::print_verbose("DSPreloader: Prewarm texture '", t.meta.engine_path, "' did not complete; dropping (sync load remains available).");
+			int cpu_stored = 0;
+			uint64_t entry_bytes = 0;
+			complete_cpu_entry(t, cache, cpu_stored, entry_bytes);
+			stored += cpu_stored;
+			slice_bytes_processed += entry_bytes;
 		}
 		processed++;
 
 		// Safely unblock any worker threads awaiting this specific texture
 		{
 			std::lock_guard<std::mutex> lock(state().mutex);
-			State &s = state();
-			if (!t.meta.engine_path.is_empty()) {
-				auto it_p = s.pending_paths.find(t.meta.engine_path);
-				if (it_p != s.pending_paths.end()) {
-					it_p->value--;
-					if (it_p->value <= 0) {
-						s.pending_paths.erase(t.meta.engine_path);
-					}
-				}
-			}
-			if (!t.meta.payload_key.is_empty() && t.meta.payload_key != t.meta.engine_path) {
-				auto it_p = s.pending_paths.find(t.meta.payload_key);
-				if (it_p != s.pending_paths.end()) {
-					it_p->value--;
-					if (it_p->value <= 0) {
-						s.pending_paths.erase(t.meta.payload_key);
-					}
-				}
-			}
-			s.pending_cv.notify_all();
+			unblock_pending_paths_locked(t);
 		}
 	}
 
@@ -1970,7 +2111,10 @@ int DSPreloader::get_unbuilt_cpu_prewarm_count(uint64_t p_tag) {
 	State &s = state();
 	int count = 0;
 	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
-		if ((p_tag == 0 || it->second.tag == p_tag) && !it->second.is_gpu) {
+		// In-flight offloaded builds are excluded: ds_runtime.gd:523 spawns a
+		// worker slice whenever this count is non-zero, and an entry already
+		// being built would only make it post a no-op task every frame.
+		if ((p_tag == 0 || it->second.tag == p_tag) && !it->second.is_gpu && !it->second.build_in_flight) {
 			count++;
 		}
 	}
@@ -1990,6 +2134,57 @@ int DSPreloader::get_unbuilt_gpu_prewarm_count(uint64_t p_tag) {
 }
 
 void DSPreloader::shutdown() {
+	// Offloaded CPU builds run on WorkerThreadPool and may still be inside
+	// DSTextureCache::store() when teardown starts. Signal them, then drain
+	// before touching the cache or the state containers. The wait is bounded:
+	// the largest legal payload is capped at DSTEX_MAX_TOTAL_BYTES (512 MiB), so
+	// this waits for a finite build. A job that outlives the deadline is leaked
+	// deliberately - never freed under a running task.
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		state().shutdown_generation++;
+	}
+	{
+		const uint64_t deadline = Time::get_singleton() ? (Time::get_singleton()->get_ticks_usec() + 5000000ULL) : 0;
+		for (;;) {
+			std::vector<int64_t> ids;
+			{
+				std::lock_guard<std::mutex> lock(state().mutex);
+				if (state().in_flight_builds == 0) {
+					break;
+				}
+				for (std::unordered_map<int64_t, BuildJob *>::const_iterator it = state().build_jobs.begin(); it != state().build_jobs.end(); ++it) {
+					ids.push_back(it->first);
+				}
+			}
+			WorkerThreadPool *pool = WorkerThreadPool::get_singleton();
+			if (pool == nullptr) {
+				UtilityFunctions::push_warning("DSPreloader: shutdown found offloaded CPU builds but no WorkerThreadPool; leaking them.");
+				break;
+			}
+			for (size_t i = 0; i < ids.size(); ++i) {
+				// Never is_task_completed() after this: the id is retired and the
+				// call errors with "Invalid Task ID" (measured at 368f5cb).
+				pool->wait_for_task_completion(ids[i]);
+			}
+			if (deadline != 0 && Time::get_singleton() && Time::get_singleton()->get_ticks_usec() >= deadline) {
+				UtilityFunctions::push_warning("DSPreloader: shutdown timed out waiting for offloaded CPU builds; leaking the remaining job(s).");
+				break;
+			}
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		for (std::unordered_map<int64_t, BuildJob *>::iterator it = s.build_jobs.begin(); it != s.build_jobs.end(); ++it) {
+			if (it->second->done.load()) {
+				delete it->second;
+			}
+			// else: deliberately leaked (the task may still be inside store()).
+		}
+		s.build_jobs.clear();
+	}
+
 	// Destination RIDs this preloader still owns must leave through
 	// DSTextureCache::release_owned_rid(), never by dropping the containers: that
 	// is the only path that consults is_resource_in_flight() and defers a free
@@ -2083,7 +2278,10 @@ Ref<Texture2D> DSPreloader::await_pending_texture(const String &p_path, uint32_t
 			}
 			ctx->collect_completed_results();
 		}
-		poll_completed();
+		// Explicit unbounded: this is the render-thread deadlock-avoidance pump
+		// and the caller is about to look the texture up. A bounded slice would
+		// offload the very build it is waiting for and return a miss.
+		poll_completed(0, 0, 0);
 		if (cache != nullptr) {
 			return cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
 		}

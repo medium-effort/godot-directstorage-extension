@@ -103,7 +103,7 @@ public:
 	uint64_t prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size = 16, bool p_prefer_gpu = true);
 	void pump_gpu_prewarm();
 	bool is_gpu_prewarm_available();
-	int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, int p_max_usec = 0);
+	int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, int p_max_usec = 4000);
 	int get_pending_prewarm_count(uint64_t p_tag = 0) const;
 	int get_unbuilt_prewarm_count(uint64_t p_tag = 0) const;
 	int get_unbuilt_cpu_prewarm_count(uint64_t p_tag = 0) const;
