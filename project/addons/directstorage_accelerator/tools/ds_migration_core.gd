@@ -49,28 +49,73 @@ static func _read_bytes(res_path: String) -> PackedByteArray:
 	return f.get_buffer(int(f.get_length()))
 
 
+# --- Failure-injection seam for the headless write-integrity suite -----------------
+# Inert unless a debug build (the editor counts) opts in. Never called by the tool.
+static var _test_write_truncate := 0
+static var _test_commit_error := OK
+
+
+## Drops p_truncate bytes from the temporary write while still reporting success, and/or
+## makes the commit step fail with p_commit_error. Used only by
+## project/headless_tests/test_migration_write_integrity.gd.
+static func _set_io_faults_for_testing(p_truncate: int = 0, p_commit_error: int = OK) -> void:
+	if not OS.is_debug_build():
+		return
+	_test_write_truncate = maxi(0, p_truncate)
+	_test_commit_error = p_commit_error
+
+
 static func _atomic_write_bytes(res_path: String, data: PackedByteArray) -> int:
 	var abs_dir := ProjectSettings.globalize_path(res_path.get_base_dir())
 	if not DirAccess.dir_exists_absolute(abs_dir):
 		var mk := DirAccess.make_dir_recursive_absolute(abs_dir)
 		if mk != OK:
 			return mk
+	var da := DirAccess.open(res_path.get_base_dir())
+	if da == null:
+		return ERR_CANT_OPEN
 	var tmp_res := res_path + ".tmp.%d" % randi()
 	var f := FileAccess.open(tmp_res, FileAccess.WRITE)
 	if f == null:
 		return FileAccess.get_open_error()
-	f.store_buffer(data)
+	var payload := data
+	if _test_write_truncate > 0:
+		payload = data.slice(0, maxi(0, data.size() - _test_write_truncate))
+	var wrote := f.store_buffer(payload)
 	f.flush()
+	var write_err := f.get_error()
+	var written_len := f.get_length()
 	f.close()
-	var da := DirAccess.open(res_path.get_base_dir())
-	if da == null:
-		return ERR_CANT_OPEN
-	if FileAccess.file_exists(res_path):
-		var rm := da.remove(res_path.get_file())
-		if rm != OK:
+	# A short write can still report success: the length is the backstop.
+	if not wrote or write_err != OK or written_len != data.size():
+		da.remove(tmp_res.get_file())
+		return write_err if write_err != OK else ERR_FILE_CANT_WRITE
+
+	var dest_file := res_path.get_file()
+	var had_dest := FileAccess.file_exists(res_path)
+	var bak_file := dest_file + ".bak.%d" % randi()
+	while had_dest and FileAccess.file_exists(res_path.get_base_dir().path_join(bak_file)):
+		bak_file = dest_file + ".bak.%d" % randi()  # never clobber a previous run's backup
+
+	# DirAccess.rename() is not an atomic replace on Windows: it removes the destination
+	# first (dir_access_windows.cpp:340-346). Park the original, move the verified temporary
+	# into place, and put the original back if that fails, so no failure path loses it.
+	if had_dest:
+		var parked := da.rename(dest_file, bak_file)
+		if parked != OK:
 			da.remove(tmp_res.get_file())
-			return rm
-	return da.rename(tmp_res.get_file(), res_path.get_file())
+			return parked
+	var put := _test_commit_error
+	if put == OK:
+		put = da.rename(tmp_res.get_file(), dest_file)
+	if put != OK:
+		da.remove(tmp_res.get_file())
+		if had_dest:
+			da.rename(bak_file, dest_file)  # best-effort: if this fails the bytes stay in the .bak
+		return put
+	if had_dest and da.remove(bak_file) != OK:
+		push_warning("Migration: could not remove backup %s" % bak_file)
+	return OK
 
 
 ## True when p is a canonical res:// path with no traversal segment.
