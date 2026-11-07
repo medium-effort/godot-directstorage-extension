@@ -24,6 +24,7 @@
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
+#include <godot_cpp/variant/vector2i.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -222,6 +223,12 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 	r_out.file_path = String(info.get("archive_path", archive_path));
 	r_out.width = info["width"];
 	r_out.height = info["height"];
+	// get_entry_info reports logical keys with a storage fallback. Only a
+	// differing size is retained; 0 keeps the "same as storage" meaning.
+	uint32_t dspkg_logical_w = info.get("logical_width", r_out.width);
+	uint32_t dspkg_logical_h = info.get("logical_height", r_out.height);
+	r_out.logical_width = (dspkg_logical_w != 0 && dspkg_logical_w != r_out.width) ? dspkg_logical_w : 0;
+	r_out.logical_height = (dspkg_logical_h != 0 && dspkg_logical_h != r_out.height) ? dspkg_logical_h : 0;
 	r_out.pixel_format = info["pixel_format"];
 	r_out.is_srgb = (bool)info.get("is_srgb", false) || DSTex::is_rd_format_srgb((int)r_out.pixel_format);
 	r_out.mip_count = info["mip_count"];
@@ -426,6 +433,16 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 	PayloadHeader filled;
 	filled.width = header.width;
 	filled.height = header.height;
+	if (header.version == 3) {
+		// v3_ext was validated above (logical <= storage, 0 = storage).
+		// Only a differing size is retained; 0 keeps "same as storage".
+		if (v3_ext.logical_width != 0 && v3_ext.logical_width != header.width) {
+			filled.logical_width = v3_ext.logical_width;
+		}
+		if (v3_ext.logical_height != 0 && v3_ext.logical_height != header.height) {
+			filled.logical_height = v3_ext.logical_height;
+		}
+	}
 	filled.pixel_format = header.pixel_format;
 	filled.mip_count = header.mip_count;
 	filled.flags = header.flags;
@@ -549,6 +566,8 @@ void DSPreloader::payload_from_header(const String &p_engine_path, const String 
 	r_out.file_path = p_dstex_path;
 	r_out.width = p_header.width;
 	r_out.height = p_header.height;
+	r_out.logical_width = p_header.logical_width;
+	r_out.logical_height = p_header.logical_height;
 	r_out.pixel_format = p_header.pixel_format;
 	// read_header reports is_srgb as flags-bit OR rd-format probe, and
 	// as_image_texture as flags-bit (== its own as_image_texture key).
@@ -1523,6 +1542,12 @@ void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 	Ref<Texture2DRD> tex_rd;
 	tex_rd.instantiate();
 	tex_rd->set_texture_rd_rid(p_entry.gpu_tex_rid);
+	// NOTE: no size override here. The wrap above executes asynchronously on
+	// the render thread, so the RS wrapper RID is not available yet, and the
+	// device RID lives in the RD namespace that texture_set_size_override
+	// must never receive. GPU-prewarmed NPOT textures therefore report
+	// storage dims until the v5-writer follow-up wires a deferred override;
+	// CPU prewarm and sync loads have full parity.
 	const String alias = (p_entry.meta.payload_key != p_entry.meta.engine_path) ? p_entry.meta.payload_key : String();
 	// can_own() is a pre-check, not a reservation. If the cache was disabled
 	// between it and store(), store() reports refusal and we still own the RID.
@@ -1687,7 +1712,16 @@ Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vect
 		image = Image::create_from_data((int)p_meta.width, (int)p_meta.height, use_mipmaps, (Image::Format)img_fmt, image_data);
 	}
 	if (image.is_valid() && !image->is_empty()) {
-		return ImageTexture::create_from_image(image);
+		Ref<ImageTexture> img_tex = ImageTexture::create_from_image(image);
+		// NPOT display size via the engine-blessed path: get_width() reports
+		// the logical size and the RS override covers render-side queries.
+		if (img_tex.is_valid() && p_meta.logical_width > 0 && p_meta.logical_height > 0 &&
+				p_meta.logical_width <= p_meta.width && p_meta.logical_height <= p_meta.height &&
+				(p_meta.logical_width != p_meta.width || p_meta.logical_height != p_meta.height)) {
+			img_tex->set_size_override(Vector2i((int32_t)p_meta.logical_width, (int32_t)p_meta.logical_height));
+		}
+		Ref<Texture2D> tex = img_tex;
+		return tex;
 	}
 	return Ref<Texture2D>();
 }

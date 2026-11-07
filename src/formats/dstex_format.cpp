@@ -386,7 +386,7 @@ void DSTex::normalize_image(const Ref<Image> &p_image) {
 }
 
 void DSTex::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level", "is_srgb", "as_image_texture"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1), DEFVAL(false), DEFVAL(false));
+	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level", "is_srgb", "as_image_texture", "logical_width", "logical_height", "depth_or_layers"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1), DEFVAL(false), DEFVAL(false), DEFVAL(0), DEFVAL(0), DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("read_header", "path"), &DSTex::read_header);
 	ClassDB::bind_method(D_METHOD("read_from_file", "path"), &DSTex::read_from_file);
 	ClassDB::bind_method(D_METHOD("get_file_info", "path"), &DSTex::get_file_info);
@@ -712,7 +712,7 @@ bool DSTex::gacl_transform_matches_pixel_format(DSGaclTransform p_transform, int
 	}
 }
 
-Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level, bool p_is_srgb, bool p_as_image_texture) {
+Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level, bool p_is_srgb, bool p_as_image_texture, int p_logical_width, int p_logical_height, int p_depth_or_layers) {
 	if (p_raw_data.size() == 0 || p_width <= 0 || p_height <= 0 || p_mip_count <= 0 || p_mip_count > static_cast<int>(DSTEX_MAX_MIP_COUNT)) {
 		return ERR_INVALID_PARAMETER;
 	}
@@ -799,7 +799,6 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 
 	DSTexHeader header;
 	header.magic = 0x58455444; // "DTEX"
-	header.version = 2;
 	header.flags = (p_is_srgb ? DSTEX_FLAG_SRGB : 0) | (p_as_image_texture ? DSTEX_FLAG_AS_IMAGE_TEXTURE : 0);
 	header.width = static_cast<uint32_t>(p_width);
 	header.height = static_cast<uint32_t>(p_height);
@@ -807,7 +806,40 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	header.mip_count = static_cast<uint32_t>(mip_count);
 	header.original_size = footprint_size;
 	header.compressed_size = total_compressed_size;
-	header.reserved = 0;
+	// v3 capability word: this writer only emits inline GDeflate payloads.
+	header.reserved = static_cast<uint64_t>(DSCompressionFormat::GDEFLATE);
+
+	// NPOT logical size (Phase 3 item 2): 0 means "same as storage". A
+	// logical size that differs from storage upgrades the file to v3 rev1;
+	// otherwise the v2 byte layout is preserved exactly.
+	DSTexHeaderV3Ext v3_ext{};
+	bool needs_v3 = false;
+	if (p_logical_width < 0 || p_logical_height < 0 || p_depth_or_layers < 0) {
+		return ERR_INVALID_PARAMETER;
+	}
+	if (p_depth_or_layers > 1) {
+		// Readers fail closed on depth_or_layers > 1: never emit it.
+		UtilityFunctions::push_error("DSTex: 3D/array textures are not supported by the v3 writer.");
+		return ERR_INVALID_PARAMETER;
+	}
+	if ((p_logical_width > 0 && p_logical_width != p_width) ||
+			(p_logical_height > 0 && p_logical_height != p_height) ||
+			p_depth_or_layers > 0) {
+		if ((p_logical_width > 0 && p_logical_width > p_width) ||
+				(p_logical_height > 0 && p_logical_height > p_height)) {
+			UtilityFunctions::push_error("DSTex: Logical dimensions exceed storage dimensions.");
+			return ERR_INVALID_PARAMETER;
+		}
+		v3_ext.logical_width = static_cast<uint32_t>(p_logical_width);
+		v3_ext.logical_height = static_cast<uint32_t>(p_logical_height);
+		v3_ext.depth_or_layers = static_cast<uint32_t>(p_depth_or_layers);
+		v3_ext.reserved0 = 0;
+		needs_v3 = true;
+	}
+	header.version = needs_v3 ? 3 : 2;
+	if (!needs_v3) {
+		header.reserved = 0;
+	}
 
 	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::WRITE);
 	if (file.is_null() || !file->is_open()) {
@@ -816,8 +848,20 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	}
 
 	file->store_buffer(reinterpret_cast<const uint8_t *>(&header), sizeof(DSTexHeader));
+	if (file->get_error() != OK) {
+		file->close();
+		return ERR_FILE_CANT_WRITE;
+	}
+	if (needs_v3) {
+		file->store_buffer(reinterpret_cast<const uint8_t *>(&v3_ext), sizeof(DSTexHeaderV3Ext));
+		if (file->get_error() != OK) {
+			file->close();
+			return ERR_FILE_CANT_WRITE;
+		}
+	}
 
-	uint64_t data_offset = sizeof(DSTexHeader) + (sizeof(DSTexMipEntryV2) * static_cast<uint64_t>(mip_count));
+	uint64_t header_size = needs_v3 ? sizeof(DSTexHeaderV3) : sizeof(DSTexHeader);
+	uint64_t data_offset = header_size + (sizeof(DSTexMipEntryV2) * static_cast<uint64_t>(mip_count));
 	if (!align_up(data_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, data_offset)) {
 		file->close();
 		return ERR_INVALID_DATA;
@@ -831,6 +875,8 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		mip_entry.compressed_size = static_cast<uint32_t>(compressed_mips[i].size());
 		mip_entry.uncompressed_size = static_cast<uint32_t>(layouts[i].footprint_size);
 		mip_entry.row_pitch = static_cast<uint32_t>(layouts[i].row_pitch);
+		// v3 reuses the reserved word as chunk_count: 1 = inline payload.
+		mip_entry.chunk_count = needs_v3 ? 1 : 0;
 		mip_entries.push_back(mip_entry);
 		if (running_offset > std::numeric_limits<uint64_t>::max() - compressed_mips[i].size() ||
 				!align_up(running_offset + compressed_mips[i].size(), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_offset)) {
@@ -841,9 +887,17 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	for (const DSTexMipEntryV2 &mip_entry : mip_entries) {
 		file->store_buffer(reinterpret_cast<const uint8_t *>(&mip_entry), sizeof(DSTexMipEntryV2));
 	}
+	if (file->get_error() != OK) {
+		file->close();
+		return ERR_FILE_CANT_WRITE;
+	}
 	for (int i = 0; i < mip_count; ++i) {
 		file->seek(mip_entries[i].offset);
 		file->store_buffer(compressed_mips[i].ptr(), compressed_mips[i].size());
+		if (file->get_error() != OK) {
+			file->close();
+			return ERR_FILE_CANT_WRITE;
+		}
 	}
 	file->close();
 

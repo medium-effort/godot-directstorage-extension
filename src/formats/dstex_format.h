@@ -141,7 +141,7 @@ public:
 	DSTex();
 	~DSTex();
 
-	Error write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count = 1, int p_compression_level = 1, bool p_is_srgb = false, bool p_as_image_texture = false);
+	Error write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count = 1, int p_compression_level = 1, bool p_is_srgb = false, bool p_as_image_texture = false, int p_logical_width = 0, int p_logical_height = 0, int p_depth_or_layers = 0);
 	Dictionary read_header(const String &p_path);
 	Dictionary read_from_file(const String &p_path);
 	/// Convenience alias for read_header; returns the same header metadata dictionary.

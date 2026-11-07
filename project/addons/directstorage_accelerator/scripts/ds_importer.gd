@@ -15,6 +15,21 @@ const PRESET_3D := 1
 const PRESET_2D := 2
 const PRESET_NAMES := ["Project Default", "3D (Streaming)", "CPU / ImageTexture (2D, UI, Decals)"]
 
+# Replaces the single v5 compression/source enum. The sRGB flag is the only
+# part .dstex stores explicitly; channel interpretation is a compression-time
+# decision, so the two are separate options now.
+const COLOR_SPACE_LINEAR := 0
+const COLOR_SPACE_SRGB := 1
+const NORMAL_MAP_DISABLED := 0
+const NORMAL_MAP_ENABLED := 1
+const CHANNEL_PACK_SRGB_FRIENDLY := 0
+const CHANNEL_PACK_OPTIMIZED := 1
+
+# Keys introduced by the color-option split. Their presence in an asset's .import file
+# means the user (or a previous import with the new options) already owns the channel settings,
+# so the legacy compression/source shim must not override them.
+const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "compress/channel_pack"]
+
 ## DirectStorage Texture Import Plugin
 ##
 ## Author: MediumEffort
@@ -23,7 +38,9 @@ const PRESET_NAMES := ["Project Default", "3D (Streaming)", "CPU / ImageTexture 
 ## in the Import dock:
 ## - [b]compression/mode[/b]: VRAM block compression vs VRAM uncompressed.
 ## - [b]compression/high_quality[/b]: BPTC/BC7 instead of S3TC (BC1-BC5).
-## - [b]compression/source[/b]: Source color space (Generic, sRGB, Normal Map).
+## - [b]compression/color_space[/b]: Linear or sRGB storage flag.
+## - [b]compress/normal_map[/b]: Normalize and renormalize as a normal map.
+## - [b]compress/channel_pack[/b]: sRGB-friendly or optimized channel packing.
 ## - [b]compression/gdeflate_level[/b]: GDeflate compression level (1-12).
 ## - [b]mipmaps/generate[/b]: Generate a full mip chain.
 ## - [b]process/size_limit[/b]: Resize the longer edge before mip generation.
@@ -116,10 +133,22 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 			"hint_string": "Uses BPTC/BC7 instead of S3TC (BC1-BC5). Slower to import; ignored when mode is VRAM Uncompressed.",
 		},
 		{
-			"name": "compression/source",
-			"default_value": Image.COMPRESS_SOURCE_SRGB,
+			"name": "compression/color_space",
+			"default_value": COLOR_SPACE_SRGB,
 			"property_hint": PROPERTY_HINT_ENUM,
-			"hint_string": "Generic,sRGB,Normal Map",
+			"hint_string": "Linear,sRGB",
+		},
+		{
+			"name": "compress/normal_map",
+			"default_value": NORMAL_MAP_DISABLED,
+			"property_hint": PROPERTY_HINT_ENUM,
+			"hint_string": "Disabled,Enabled",
+		},
+		{
+			"name": "compress/channel_pack",
+			"default_value": CHANNEL_PACK_SRGB_FRIENDLY,
+			"property_hint": PROPERTY_HINT_ENUM,
+			"hint_string": "sRGB Friendly,Optimized",
 		},
 		{
 			"name": "compression/gdeflate_level",
@@ -161,9 +190,64 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 
 ## Hides options that do not apply to the current compression mode.
 func _get_option_visibility(path: String, option_name: StringName, options: Dictionary) -> bool:
-	if option_name == &"compression/high_quality":
+	if option_name == &"compression/high_quality" or option_name == &"compress/channel_pack":
 		return int(options.get("compression/mode", 0)) == 0
 	return true
+
+## Returns true for an asset whose .import still stores the
+## combined compression/source key and has not been migrated to the split options.
+## Godot backfills missing option defaults in memory before calling _import, so
+## the on-disk .import file is the only reliable record of what the user stored.
+func _uses_legacy_compression_source(source_file: String, options: Dictionary) -> bool:
+	if not options.has("compression/source"):
+		return false
+	var config := ConfigFile.new()
+	if config.load(source_file + ".import") != OK:
+		return false
+	if not config.has_section("params"):
+		return false
+	for key in COLOR_OPTION_KEYS:
+		if config.has_section_key("params", key):
+			return false
+	return config.has_section_key("params", "compression/source")
+
+
+## Resolves the split color options, falling back to the legacy compression/source
+## enum for assets that have not migrated yet. The legacy mapping is exactly the
+## old behavior: Generic -> linear/optimized, sRGB -> sRGB/friendly, Normal Map
+## -> linear/optimized with normal-map processing.
+func _resolve_color_options(source_file: String, options: Dictionary) -> Dictionary:
+	var color_space: int = clampi(int(options.get("compression/color_space", COLOR_SPACE_SRGB)), COLOR_SPACE_LINEAR, COLOR_SPACE_SRGB)
+	var normal_map: int = clampi(int(options.get("compress/normal_map", NORMAL_MAP_DISABLED)), NORMAL_MAP_DISABLED, NORMAL_MAP_ENABLED)
+	var channel_pack: int = clampi(int(options.get("compress/channel_pack", CHANNEL_PACK_SRGB_FRIENDLY)), CHANNEL_PACK_SRGB_FRIENDLY, CHANNEL_PACK_OPTIMIZED)
+
+	if _uses_legacy_compression_source(source_file, options):
+		var legacy: int = clampi(int(options.get("compression/source", Image.COMPRESS_SOURCE_SRGB)), Image.COMPRESS_SOURCE_GENERIC, Image.COMPRESS_SOURCE_NORMAL)
+		match legacy:
+			Image.COMPRESS_SOURCE_GENERIC:
+				color_space = COLOR_SPACE_LINEAR
+				normal_map = NORMAL_MAP_DISABLED
+				channel_pack = CHANNEL_PACK_OPTIMIZED
+			Image.COMPRESS_SOURCE_NORMAL:
+				color_space = COLOR_SPACE_LINEAR
+				normal_map = NORMAL_MAP_ENABLED
+				channel_pack = CHANNEL_PACK_OPTIMIZED
+			_:
+				color_space = COLOR_SPACE_SRGB
+				normal_map = NORMAL_MAP_DISABLED
+				channel_pack = CHANNEL_PACK_SRGB_FRIENDLY
+
+	var compress_source := Image.COMPRESS_SOURCE_GENERIC
+	if normal_map == NORMAL_MAP_ENABLED:
+		compress_source = Image.COMPRESS_SOURCE_NORMAL
+	elif channel_pack == CHANNEL_PACK_SRGB_FRIENDLY:
+		compress_source = Image.COMPRESS_SOURCE_SRGB
+
+	return {
+		"color_space": color_space,
+		"normal_map": normal_map == NORMAL_MAP_ENABLED,
+		"compress_source": compress_source,
+	}
 
 ## Aligns an integer value up to the nearest multiple of alignment.
 static func _align_up(value: int, alignment: int) -> int:
@@ -263,7 +347,9 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 
 	var compression_mode: int = int(options.get("compression/mode", 0))
 	var high_quality: bool = bool(options.get("compression/high_quality", false))
-	var compression_source: int = int(options.get("compression/source", Image.COMPRESS_SOURCE_SRGB))
+	var color_options := _resolve_color_options(source_file, options)
+	var compression_source: int = color_options["compress_source"]
+	var is_normal_map: bool = color_options["normal_map"]
 	var generate_mipmaps: bool = bool(options.get("mipmaps/generate", true))
 	var size_limit: int = clampi(int(options.get("process/size_limit", 0)), 0, DSTEX_MAX_DIMENSION)
 	var fix_alpha_border: bool = bool(options.get("process/fix_alpha_border", false))
@@ -302,7 +388,12 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 			push_warning("[DirectStorage Importer] Asset '%s' exceeded the %d px container limit and was resized from %dx%d to %dx%d." % [source_file, DSTEX_MAX_DIMENSION, source_width, source_height, new_width, new_height])
 
 	# Block codecs pad to 4x4 blocks internally; align first so the mip chain and
-	# the written dimensions agree.
+	# the written dimensions agree. The pre-align size is the logical
+	# (authoring) size; the post-compression size is the storage size. When
+	# they differ the writer emits a v3 file so the loader can size-override
+	# back to the logical dimensions.
+	var logical_width := img.get_width()
+	var logical_height := img.get_height()
 	if compression_mode == 0:
 		var aligned_width := img.get_width()
 		var aligned_height := img.get_height()
@@ -314,7 +405,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 
 	# Godot normalizes the base level only after a size-limit resize; do it for
 	# every normal map so the source normals are unit length before mips.
-	if compression_source == Image.COMPRESS_SOURCE_NORMAL:
+	if is_normal_map:
 		ClassDB.class_call_static("DSTex", "normalize_image", img)
 
 	if fix_alpha_border:
@@ -323,7 +414,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		img.premultiply_alpha()
 
 	if generate_mipmaps:
-		img.generate_mipmaps(compression_source == Image.COMPRESS_SOURCE_NORMAL)
+		img.generate_mipmaps(is_normal_map)
 	else:
 		img.clear_mipmaps()
 
@@ -363,10 +454,13 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		_staging_warnings[source_file] = true
 		push_warning("[DirectStorage Importer] Asset '" + source_file + "' requires " + str(ceili(float(raw_data.size()) / 1048576.0)) + " MiB of staging memory, but DirectStorage is configured for " + str(staging_mb) + " MiB. Increase Project Settings > DirectStorage > Staging Buffer Size.")
 
-	var is_srgb: bool = (compression_source == Image.COMPRESS_SOURCE_SRGB)
+	var is_srgb: bool = int(color_options["color_space"]) == COLOR_SPACE_SRGB
 	var as_image_texture: bool = bool(options.get("compatibility/as_image_texture", false))
 	var out_file_path := save_path + "." + _get_save_extension()
-	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level, is_srgb, as_image_texture)
+	# The codec may round dimensions itself; logical dims never exceed storage.
+	var v3_logical_width := mini(logical_width, width)
+	var v3_logical_height := mini(logical_height, height)
+	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level, is_srgb, as_image_texture, v3_logical_width, v3_logical_height)
 	if write_err != OK:
 		push_error("[DirectStorage Importer] Failed to write .dstex file to: " + out_file_path)
 		return write_err

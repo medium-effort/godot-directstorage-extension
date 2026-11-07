@@ -75,6 +75,10 @@ public:
 		String file_path; // physical file handed to DSRequest (dspkg or dstex)
 		uint32_t width = 0;
 		uint32_t height = 0;
+		// NPOT display size (Phase 3 item 2). 0 = same as storage; the build
+		// step applies RenderingServer::texture_set_size_override when set.
+		uint32_t logical_width = 0;
+		uint32_t logical_height = 0;
 		uint32_t pixel_format = 0;
 		bool is_srgb = false;
 		uint32_t mip_count = 0;
@@ -103,6 +107,8 @@ public:
 	struct PayloadHeader {
 		uint32_t width = 0;
 		uint32_t height = 0;
+		uint32_t logical_width = 0;
+		uint32_t logical_height = 0;
 		uint32_t pixel_format = 0;
 		uint32_t mip_count = 0;
 		uint32_t flags = 0;

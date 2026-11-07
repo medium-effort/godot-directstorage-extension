@@ -55,6 +55,10 @@ func _run() -> void:
 	_check(_importer._get_preset_count() == 3, "preset count is 3")
 	_check(_importer._get_preset_name(1) == "3D (Streaming)", "preset 1 is 3D (Streaming)")
 	_check(_importer._get_preset_name(2) == "CPU / ImageTexture (2D, UI, Decals)", "preset 2 is CPU/ImageTexture")
+	_check(d3d.has("compression/color_space") and not d3d.has("compression/source"), "split compression/source into color options")
+	_check(int(d3d["compression/color_space"]) == 1, "color space defaults to sRGB")
+	_check(int(d3d["compress/normal_map"]) == 0, "normal map processing defaults to disabled")
+	_check(int(d3d["compress/channel_pack"]) == 0, "channel packing defaults to sRGB friendly")
 	_check(int(d3d["compression/mode"]) == 0, "3D preset compresses")
 	_check(bool(d3d["mipmaps/generate"]) == true, "3D preset generates mipmaps")
 	_check(bool(d3d["process/fix_alpha_border"]) == false, "3D preset leaves alpha borders alone")
@@ -66,6 +70,9 @@ func _run() -> void:
 
 	_check(_importer._get_option_visibility("", &"compression/high_quality", {"compression/mode": 0}), "high_quality visible in compressed mode")
 	_check(not _importer._get_option_visibility("", &"compression/high_quality", {"compression/mode": 1}), "high_quality hidden in uncompressed mode")
+	_check(_importer._get_option_visibility("", &"compress/channel_pack", {"compression/mode": 0}), "channel_pack visible in compressed mode")
+	_check(not _importer._get_option_visibility("", &"compress/channel_pack", {"compression/mode": 1}), "channel_pack hidden in uncompressed mode")
+	_check(_importer._get_option_visibility("", &"compress/normal_map", {"compression/mode": 1}), "normal_map stays visible when uncompressed")
 
 	var mode_usage := 0
 	for option in opts_3d:
@@ -96,7 +103,7 @@ func _run() -> void:
 
 	var bc7_options := _with(d3d, {
 		"compression/high_quality": true,
-		"compression/source": Image.COMPRESS_SOURCE_SRGB,
+		"compression/color_space": 1,
 		"mipmaps/generate": true,
 	})
 	var bc7 := _import_fixture(rgba_fixture, "bc7", bc7_options)
@@ -104,6 +111,8 @@ func _run() -> void:
 		var header: Dictionary = bc7["header"]
 		_check(int(header["pixel_format"]) == RenderingDevice.DATA_FORMAT_BC7_SRGB_BLOCK, "high_quality writes BC7 sRGB")
 		_check(int(header["mip_count"]) > 1, "mipmaps/generate writes a full chain")
+		_check(int(header["version"]) == 2, "aligned dims keep the v2 container")
+		_check(int(header["logical_width"]) == 128 and int(header["logical_height"]) == 128, "aligned dims report storage as logical")
 
 	var no_mips := _import_fixture(rgba_fixture, "no_mips", _with(bc7_options, {"mipmaps/generate": false}))
 	if not no_mips.is_empty():
@@ -120,7 +129,7 @@ func _run() -> void:
 	var l8_fixture := TMP_DIR + "/l8.png"
 	_make_png(l8_fixture, 32, 32, Image.FORMAT_L8, false)
 	_cleanup.append(l8_fixture)
-	var l8 := _import_fixture(l8_fixture, "l8", _with(d2d, {"compression/source": Image.COMPRESS_SOURCE_SRGB}))
+	var l8 := _import_fixture(l8_fixture, "l8", _with(d2d, {"compression/color_space": 1}))
 	if not l8.is_empty():
 		var format := int(l8["header"]["pixel_format"])
 		_check(format == RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM or format == RenderingDevice.DATA_FORMAT_R8G8B8A8_SRGB, "L8 becomes RGBA8 (not R8)")
@@ -128,7 +137,7 @@ func _run() -> void:
 	var la8_fixture := TMP_DIR + "/la8.png"
 	_make_png(la8_fixture, 32, 32, Image.FORMAT_LA8, true)
 	_cleanup.append(la8_fixture)
-	var la8 := _import_fixture(la8_fixture, "la8", _with(d2d, {"compression/source": Image.COMPRESS_SOURCE_SRGB}))
+	var la8 := _import_fixture(la8_fixture, "la8", _with(d2d, {"compression/color_space": 1}))
 	if not la8.is_empty():
 		var format := int(la8["header"]["pixel_format"])
 		_check(format == RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM or format == RenderingDevice.DATA_FORMAT_R8G8B8A8_SRGB, "LA8 becomes RGBA8 (alpha preserved)")
@@ -138,11 +147,67 @@ func _run() -> void:
 	_cleanup.append(normal_fixture)
 	var normal := _import_fixture(normal_fixture, "normal", _with(d3d, {
 		"compression/high_quality": true,
-		"compression/source": Image.COMPRESS_SOURCE_NORMAL,
+		"compress/normal_map": 1,
+		"compression/color_space": 0,
 		"mipmaps/generate": false,
 	}))
 	if not normal.is_empty():
+		_check(bool(normal["header"]["is_srgb"]) == false, "normal map writes a linear header")
 		check_normal_base(normal)
+
+	# NPOT parity: a non-multiple-of-4 source stores aligned dims but loads
+	# at its logical (authoring) dims via texture_set_size_override.
+	var npot_fixture := TMP_DIR + "/npot.png"
+	_make_png(npot_fixture, 100, 50, Image.FORMAT_RGBA8, false)
+	_cleanup.append(npot_fixture)
+	var npot := _import_fixture(npot_fixture, "npot", _with(d3d, {
+		"compression/mode": 0,
+		"mipmaps/generate": false,
+	}))
+	if not npot.is_empty():
+		var npot_header: Dictionary = npot["header"]
+		_check(int(npot_header["version"]) == 3, "NPOT import writes v3")
+		_check(int(npot_header["width"]) == 100 and int(npot_header["height"]) == 52, "NPOT stores aligned dims")
+		_check(int(npot_header["logical_width"]) == 100 and int(npot_header["logical_height"]) == 50, "NPOT records logical dims")
+		var npot_tex: Texture2D = load(npot["path"])
+		_check(npot_tex != null, "NPOT texture loads")
+		if npot_tex != null:
+			_check(npot_tex.get_width() == 100 and npot_tex.get_height() == 50, "NPOT loads at logical dims")
+
+	# Legacy shim: an .import file that only stores compression/source keeps
+	# the old channel behavior instead of falling back to the split defaults.
+	var legacy_fixture := TMP_DIR + "/legacy.png"
+	_make_normal_png(legacy_fixture, 8, 8)
+	_cleanup.append(legacy_fixture)
+	_cleanup.append(legacy_fixture + ".import")
+
+	var legacy_options := _with(d3d, {
+		"compression/high_quality": true,
+		"compression/source": Image.COMPRESS_SOURCE_NORMAL,
+		"compression/color_space": 1,
+		"compress/normal_map": 0,
+		"compress/channel_pack": 0,
+		"mipmaps/generate": false,
+	})
+	_write_import_params(legacy_fixture, {"compression/source": Image.COMPRESS_SOURCE_NORMAL})
+	var legacy_resolved: Dictionary = _importer._resolve_color_options(legacy_fixture, legacy_options)
+	_check(bool(legacy_resolved["normal_map"]) == true, "legacy Normal Map shim enables normal processing")
+	_check(int(legacy_resolved["color_space"]) == 0, "legacy Normal Map shim stores linear")
+	_check(int(legacy_resolved["compress_source"]) == Image.COMPRESS_SOURCE_NORMAL, "legacy Normal Map shim compresses as NORMAL")
+	var legacy := _import_fixture(legacy_fixture, "legacy_normal", legacy_options)
+	if not legacy.is_empty():
+		_check(bool(legacy["header"]["is_srgb"]) == false, "legacy Normal Map shim writes a linear header")
+		check_normal_base(legacy)
+
+	# Once any split key exists on disk, the stored new options win over the shim.
+	_write_import_params(legacy_fixture, {
+		"compression/source": Image.COMPRESS_SOURCE_NORMAL,
+		"compress/normal_map": 0,
+	})
+	var migrated_resolved: Dictionary = _importer._resolve_color_options(legacy_fixture, legacy_options)
+	_check(bool(migrated_resolved["normal_map"]) == false, "new keys override the legacy shim")
+	_check(int(migrated_resolved["color_space"]) == 1, "new keys keep the stored color space")
+	_check(int(migrated_resolved["compress_source"]) == Image.COMPRESS_SOURCE_SRGB, "new channel pack selects the sRGB source")
 
 
 func _defaults(options: Array) -> Dictionary:
@@ -157,6 +222,15 @@ func _with(base: Dictionary, overrides: Dictionary) -> Dictionary:
 	for key in overrides:
 		result[key] = overrides[key]
 	return result
+
+
+func _write_import_params(source: String, params: Dictionary) -> void:
+	var config := ConfigFile.new()
+	config.set_value("remap", "importer", "directstorage_texture")
+	for key in params:
+		config.set_value("params", key, params[key])
+	var error := config.save(source + ".import")
+	_check(error == OK, "import params written: " + source + ".import")
 
 
 func _make_png(path: String, width: int, height: int, format: int, gradient_alpha: bool) -> void:

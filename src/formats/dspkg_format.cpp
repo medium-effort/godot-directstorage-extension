@@ -240,6 +240,19 @@ bool checked_multiply(uint64_t p_left, uint64_t p_right, uint64_t &r_result) {
 	return true;
 }
 
+// v5 entry-extension sizing for staged NPOT textures (Phase 3 item 2). A 0
+// staged dimension means storage; the TLV record is emitted only when the
+// logical size actually differs, keeping aligned-source archives v4.
+bool staged_entry_needs_logical_tlv(const DSPkgStagedEntry &p_entry) {
+	const uint32_t lw = p_entry.logical_width == 0 ? p_entry.width : p_entry.logical_width;
+	const uint32_t lh = p_entry.logical_height == 0 ? p_entry.height : p_entry.logical_height;
+	return lw != p_entry.width || lh != p_entry.height;
+}
+
+uint64_t entry_logical_tlv_size(const DSPkgStagedEntry &p_entry) {
+	return staged_entry_needs_logical_tlv(p_entry) ? (DS_TLV_HEADER_SIZE + sizeof(DSPkgTextureLogical)) : 0;
+}
+
 struct DSPkgTlvSummary {
 	bool has_crypto = false;
 	bool has_provenance = false;
@@ -328,6 +341,41 @@ bool validate_tlv_table(const uint8_t *p_data, uint64_t p_size, uint64_t p_max_t
 	return true;
 }
 
+// Scans an already-validated entry TLV table for DS_TLV_TAG_TEXTURE_LOGICAL.
+// Sets r_found and the values when the record is present. Returns false only
+// on a malformed logical record (wrong payload size); an absent record is
+// valid and reports r_found = false. Bounds and padding are trusted here —
+// the table must have passed validate_tlv_table first.
+bool parse_entry_logical_tlv(const uint8_t *p_data, uint64_t p_size, bool &r_found, uint32_t &r_logical_width, uint32_t &r_logical_height) {
+	r_found = false;
+	uint64_t cursor = 0;
+	while (cursor < p_size) {
+		uint32_t tag = 0;
+		uint32_t payload_size = 0;
+		memcpy(&tag, p_data + cursor, 4);
+		memcpy(&payload_size, p_data + cursor + 4, 4);
+		uint64_t padded_size = 0;
+		if (!checked_add(DS_TLV_HEADER_SIZE, payload_size, padded_size) ||
+				!align_up(padded_size, 8, padded_size) ||
+				padded_size > p_size - cursor) {
+			return false;
+		}
+		if (tag == DS_TLV_TAG_TEXTURE_LOGICAL) {
+			if (payload_size != sizeof(DSPkgTextureLogical)) {
+				return false;
+			}
+			DSPkgTextureLogical logical{};
+			memcpy(&logical, p_data + cursor + DS_TLV_HEADER_SIZE, sizeof(DSPkgTextureLogical));
+			r_logical_width = logical.logical_width;
+			r_logical_height = logical.logical_height;
+			r_found = true;
+			return true;
+		}
+		cursor += padded_size;
+	}
+	return true;
+}
+
 bool get_payload_range(const DSPkgHeader &p_header, const DSPkgEntry &p_entry, uint64_t &r_start, uint64_t &r_end) {
 	return checked_add(p_header.data_offset, p_entry.data_offset, r_start) && checked_add(r_start, p_entry.compressed_size, r_end);
 }
@@ -340,7 +388,10 @@ bool payload_sizes_are_supported(const DSPkgEntry &p_entry) {
 
 bool metadata_arrays_are_valid(const Dictionary &p_metadata, uint32_t p_mip_count) {
 	int metadata_version = p_metadata.get("version", 0);
-	if (metadata_version != 2) {
+	// v3 GDeflate-inline payloads share the v2 24-byte mip-entry layout and
+	// 512-byte placement, so the same footprint arrays describe them. v3
+	// chunked/Zstd/GACL payloads are rejected by add_texture(), never here.
+	if (metadata_version != 2 && metadata_version != 3) {
 		return false;
 	}
 	PackedInt32Array mip_sizes = p_metadata.get("mip_sizes", PackedInt32Array());
@@ -415,6 +466,12 @@ bool staged_source_is_unchanged(const DSPkgStagedEntry &p_entry, const Dictionar
 	PackedInt64Array mip_offsets = p_header.get("mip_offsets", PackedInt64Array());
 	if (!(mip_offsets == p_entry.source_mip_offsets)) {
 		r_reason = "mip offset table changed";
+		return false;
+	}
+	uint32_t logical_width = p_header.get("logical_width", 0);
+	uint32_t logical_height = p_header.get("logical_height", 0);
+	if (logical_width != p_entry.logical_width || logical_height != p_entry.logical_height) {
+		r_reason = "logical dimensions changed";
 		return false;
 	}
 	if (p_entry.gpu_metadata) {
@@ -662,8 +719,29 @@ Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_pa
 	}
 
 	Dictionary source_metadata = p_mip_metadata.is_empty() ? dstex_header : p_mip_metadata;
-	if (p_mip_metadata.is_empty() && dstex_version == 2) {
-		source_metadata["version"] = 2;
+	if (p_mip_metadata.is_empty() && (dstex_version == 2 || dstex_version == 3)) {
+		source_metadata["version"] = dstex_version;
+	}
+
+	// v4 archives store inline GDeflate mip payloads only. A v3 source with a
+	// Zstd/GACL/chunked payload has no v4 representation: fail closed here
+	// instead of writing an entry the readers must reject.
+	if (dstex_version == 3) {
+		const int src_compression = dstex_header.get("compression_format", 1);
+		const int src_gacl = dstex_header.get("gacl_transform", 0);
+		const bool src_chunked = dstex_header.get("chunked", false);
+		if (src_compression != static_cast<int>(DSCompressionFormat::GDEFLATE) ||
+				src_gacl != static_cast<int>(DSGaclTransform::NONE) || src_chunked) {
+			UtilityFunctions::push_error("DSPkg: v3 .dstex uses Zstd/GACL/chunked payloads that v4 archives cannot represent: ", p_dstex_path);
+			return ERR_UNAVAILABLE;
+		}
+		PackedInt32Array src_chunk_counts = dstex_header.get("mip_chunk_counts", PackedInt32Array());
+		for (int64_t ci = 0; ci < src_chunk_counts.size(); ++ci) {
+			if (src_chunk_counts[ci] != 1) {
+				UtilityFunctions::push_error("DSPkg: v3 .dstex has chunked mips that v4 archives cannot represent: ", p_dstex_path);
+				return ERR_UNAVAILABLE;
+			}
+		}
 	}
 
 	entry.gpu_metadata = metadata_arrays_are_valid(source_metadata, mip_count);
@@ -713,6 +791,15 @@ Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_pa
 	entry.original_size = dstex_header.get("original_size", 0);
 	entry.width = dstex_header.get("width", 0);
 	entry.height = dstex_header.get("height", 0);
+	// read_header always reports logical keys (storage fallback), so a v2
+	// source stages storage dims and a v3 source stages its display dims.
+	entry.logical_width = dstex_header.get("logical_width", entry.width);
+	entry.logical_height = dstex_header.get("logical_height", entry.height);
+	if (entry.logical_width == 0 || entry.logical_height == 0 ||
+			entry.logical_width > entry.width || entry.logical_height > entry.height) {
+		UtilityFunctions::push_error("DSPkg: .dstex logical dimensions are invalid: ", p_dstex_path);
+		return ERR_INVALID_DATA;
+	}
 	entry.pixel_format = dstex_header.get("pixel_format", 0);
 	entry.mip_count = mip_count;
 	entry.flags = dstex_header.get("flags", 0);
@@ -783,6 +870,17 @@ Error DSPkg::finalize() {
 		seen_staging_paths.insert(res_path);
 	}
 
+	// v5 is emitted only when an entry needs an entry extension (an NPOT
+	// logical-size TLV). Archives without one stay v4 byte-identical.
+	bool write_v5 = false;
+	for (uint32_t i = 0; i < count; ++i) {
+		if (entry_logical_tlv_size(*sorted_entries[i]) > 0) {
+			write_v5 = true;
+			break;
+		}
+	}
+	const uint64_t fixed_entry_size = write_v5 ? DSPKG_FIXED_ENTRY_SIZE_V5 : DSPKG_FIXED_ENTRY_SIZE_V3;
+
 	uint64_t entry_table_size = 0;
 	for (uint32_t i = 0; i < count; ++i) {
 		const DSPkgStagedEntry &item = *sorted_entries[i];
@@ -797,23 +895,33 @@ Error DSPkg::finalize() {
 		uint64_t metadata_size = 0;
 		if (write_gpu_metadata &&
 				(!checked_multiply(mip_count, sizeof(DSPkgMipEntry), metadata_size) ||
-					!checked_add(DSPKG_FIXED_ENTRY_SIZE_V3, metadata_size, entry_size))) {
+					!checked_add(fixed_entry_size, metadata_size, entry_size))) {
 			UtilityFunctions::push_error("DSPkg: Mip metadata table size overflow.");
 			return ERR_INVALID_PARAMETER;
 		}
 		if (!write_gpu_metadata) {
-			entry_size = DSPKG_FIXED_ENTRY_SIZE_V3;
+			entry_size = fixed_entry_size;
+		}
+		if (write_v5) {
+			// Texture entries carry no entry metadata, only the extension
+			// table (logical-size TLV when the staged size differs).
+			uint64_t ext_size = entry_logical_tlv_size(item);
+			if (!checked_add(entry_size, ext_size, entry_size)) {
+				UtilityFunctions::push_error("DSPkg: Entry extension size overflow.");
+				return ERR_INVALID_PARAMETER;
+			}
 		}
 		if (!checked_add(entry_size, path_len, entry_size) || !checked_add(entry_table_size, entry_size, entry_table_size)) {
 			UtilityFunctions::push_error("DSPkg: Entry table size overflow.");
 			return ERR_INVALID_PARAMETER;
 		}
 	}
-	if (entry_table_size > DSPKG_MAX_TOC_SIZE) {
+	if (entry_table_size > (write_v5 ? DSPKG_MAX_TOC_SIZE_V5 : DSPKG_MAX_TOC_SIZE)) {
 		return ERR_INVALID_PARAMETER;
 	}
 
-	const uint64_t header_envelope_size = m_encryption_enabled ? (DSPKG_HEADER_SIZE_V4 + DSPKG_ENCRYPTION_MAC_SIZE) : DSPKG_HEADER_SIZE_V4;
+	const uint64_t header_size = write_v5 ? DSPKG_HEADER_SIZE_V5 : DSPKG_HEADER_SIZE_V4;
+	const uint64_t header_envelope_size = m_encryption_enabled ? (header_size + DSPKG_ENCRYPTION_MAC_SIZE) : header_size;
 	uint64_t table_end_offset = 0;
 	if (!checked_add(header_envelope_size, entry_table_size, table_end_offset)) {
 		UtilityFunctions::push_error("DSPkg: Archive header and entry table size overflow.");
@@ -824,7 +932,7 @@ Error DSPkg::finalize() {
 		UtilityFunctions::push_error("DSPkg: Archive data offset alignment overflow.");
 		return ERR_INVALID_PARAMETER;
 	}
-	if (total_data_offset - header_envelope_size > DSPKG_MAX_TOC_SIZE) {
+	if (total_data_offset - header_envelope_size > (write_v5 ? DSPKG_MAX_TOC_SIZE_V5 : DSPKG_MAX_TOC_SIZE)) {
 		return ERR_INVALID_PARAMETER;
 	}
 	if (is_bin_packing_enabled() && table_end_offset > payload_alignment) {
@@ -912,6 +1020,28 @@ Error DSPkg::finalize() {
 		uint32_t entry_flags = item.flags;
 		writer.put_32(entry_flags);
 
+		if (write_v5) {
+			// v5 descriptor: texture kind, inline GDeflate payload, no entry
+			// metadata, then the extension table (logical-size TLV when the
+			// staged size differs), then the mip table below. Descriptor bytes
+			// pack little-endian to match the reader's get_8 sequence.
+			const uint32_t descriptor = static_cast<uint32_t>(DSPkgEntryKind::TEXTURE) |
+					(static_cast<uint32_t>(DSCompressionFormat::GDEFLATE) << 8) |
+					(static_cast<uint32_t>(DSGaclTransform::NONE) << 16);
+			writer.put_32(descriptor);
+			writer.put_32(0); // metadata_size: texture entries carry none
+			const uint64_t ext_size = entry_logical_tlv_size(item);
+			writer.put_32(static_cast<uint32_t>(ext_size));
+			if (ext_size > 0) {
+				const uint32_t lw = item.logical_width == 0 ? item.width : item.logical_width;
+				const uint32_t lh = item.logical_height == 0 ? item.height : item.logical_height;
+				writer.put_32(DS_TLV_TAG_TEXTURE_LOGICAL);
+				writer.put_32(sizeof(DSPkgTextureLogical));
+				writer.put_32(lw);
+				writer.put_32(lh);
+			}
+		}
+
 		if (write_gpu_metadata) {
 			uint64_t mip_data_offset = 0;
 			if (!checked_add(total_data_offset, running_data_offset, mip_data_offset)) {
@@ -949,6 +1079,11 @@ Error DSPkg::finalize() {
 					mip_entry.uncompressed_size = mip_uncompressed_sizes[mip];
 					mip_entry.row_pitch = mip_row_pitches[mip];
 				}
+				// v5 reuses the reserved word as chunk_count: 1 = inline. This
+				// writer only stages inline payloads (chunked v3 sources are
+				// rejected by add_texture), so v5 entries set 1 while v4
+				// entries keep the reserved zero.
+				mip_entry.chunk_count = write_v5 ? 1 : 0;
 				writer.put_buffer(reinterpret_cast<const uint8_t *>(&mip_entry), sizeof(DSPkgMipEntry));
 				mip_offset += mip_entry.compressed_size;
 			}
@@ -1029,22 +1164,52 @@ Error DSPkg::finalize() {
 		return true;
 	};
 
-	// Step 6: populate header
+	// Step 6: populate header. v5 is emitted only when an entry needs an
+	// entry extension; otherwise the v4 bytes are untouched.
 	DSPkgHeader header{};
-	header.magic = 0x474B5044;
-	header.version = DSPKG_VERSION_V4;
-	header.flags = write_gpu_metadata ? DSPKG_FLAG_GPU_MIP_METADATA : 0;
-	header.entry_count = count;
-	header.data_offset = total_data_offset;
-	header.archive_fingerprint = build_archive_fingerprint;
-	header.compression_codec = 0;
-	header.min_reader_version = 4;
+	DSPkgHeaderV5 header_v5{};
+	const uint8_t *header_bytes = nullptr;
+	uint64_t header_len = 0;
+	if (write_v5) {
+		header_v5.magic = 0x474B5044;
+		header_v5.version = DSPKG_VERSION_V5;
+		header_v5.flags = write_gpu_metadata ? DSPKG_FLAG_GPU_MIP_METADATA : 0;
+		header_v5.entry_count = count;
+		header_v5.data_offset = total_data_offset;
+		header_v5.archive_fingerprint = build_archive_fingerprint;
+		header_v5.compression_codec = 0;
+		header_v5.min_reader_version = DSPKG_VERSION_V5;
+		header_v5.reserved0 = 0;
+		header_v5.header_size = DSPKG_HEADER_SIZE_V5;
+		header_v5.toc_entry_size = DSPKG_FIXED_ENTRY_SIZE_V5;
+		header_v5.capabilities = 0;
+		header_v5.extension_offset = 0;
+		header_v5.extension_size = 0;
+		header_v5.reserved2 = 0;
+		header_bytes = reinterpret_cast<const uint8_t *>(&header_v5);
+		header_len = sizeof(DSPkgHeaderV5);
+	} else {
+		header.magic = 0x474B5044;
+		header.version = DSPKG_VERSION_V4;
+		header.flags = write_gpu_metadata ? DSPKG_FLAG_GPU_MIP_METADATA : 0;
+		header.entry_count = count;
+		header.data_offset = total_data_offset;
+		header.archive_fingerprint = build_archive_fingerprint;
+		header.compression_codec = 0;
+		header.min_reader_version = 4;
+		header_bytes = reinterpret_cast<const uint8_t *>(&header);
+		header_len = sizeof(DSPkgHeader);
+	}
+
+	uint8_t *header_salt = write_v5 ? header_v5.archive_salt : header.archive_salt;
+	uint64_t *header_key_id = write_v5 ? &header_v5.key_id : &header.key_id;
+	uint16_t *header_flags = write_v5 ? &header_v5.flags : &header.flags;
 
 	if (m_encryption_enabled) {
-		header.flags |= DSPKG_FLAG_ENCRYPTED_TOC;
+		*header_flags |= DSPKG_FLAG_ENCRYPTED_TOC;
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 		if (m_test_salt_override.size() == 16) {
-			memcpy(header.archive_salt, m_test_salt_override.ptr(), 16);
+			memcpy(header_salt, m_test_salt_override.ptr(), 16);
 		} else if (m_test_salt_override.size() > 0) {
 			file->close();
 			DirAccess::remove_absolute(build_output_path);
@@ -1058,11 +1223,11 @@ Error DSPkg::finalize() {
 				DirAccess::remove_absolute(build_output_path);
 				return ERR_CANT_CREATE;
 			}
-			memcpy(header.archive_salt, entropy.ptr(), 16);
+			memcpy(header_salt, entropy.ptr(), 16);
 		}
 		uint8_t id_buf[8] = {0};
 		crypto_blake2b(id_buf, 8, m_encryption_key.data(), 32);
-		memcpy(&header.key_id, id_buf, 8);
+		memcpy(header_key_id, id_buf, 8);
 	}
 
 	// Step 7: write header, MAC, TOC
@@ -1074,25 +1239,26 @@ Error DSPkg::finalize() {
 			return ERR_FILE_CORRUPT;
 		}
 		uint8_t nonce[DSPKG_ENCRYPTION_NONCE_SIZE] = {0};
-		memcpy(nonce, header.archive_salt, 16);
-		memcpy(nonce + 16, DOMAIN_SEPARATOR, 8);
+		const uint8_t *nonce_salt = write_v5 ? header_v5.archive_salt : header.archive_salt;
+		memcpy(nonce, nonce_salt, 16);
+		memcpy(nonce + 16, write_v5 ? DOMAIN_SEPARATOR_V5 : DOMAIN_SEPARATOR, 8);
 
 		std::array<uint8_t, 32> local_key = m_encryption_key;
 		PackedByteArray ciphertext;
 		ciphertext.resize(ciphertext_len);
 		uint8_t mac[DSPKG_ENCRYPTION_MAC_SIZE] = {0};
 		crypto_aead_lock(ciphertext.ptrw(), mac, local_key.data(), nonce,
-			reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader),
+			header_bytes, header_len,
 			entries_buf.ptr(), ciphertext_len);
 		crypto_wipe(local_key.data(), 32);
 
-		if (!write_bytes(reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader)) ||
+		if (!write_bytes(header_bytes, header_len) ||
 				!write_bytes(mac, DSPKG_ENCRYPTION_MAC_SIZE) ||
 				!write_bytes(ciphertext.ptr(), ciphertext_len)) {
 			return fail_write("header");
 		}
 	} else {
-		if (!write_bytes(reinterpret_cast<const uint8_t *>(&header), sizeof(DSPkgHeader)) ||
+		if (!write_bytes(header_bytes, header_len) ||
 				!write_bytes(entries_buf.ptr(), entry_table_size)) {
 			return fail_write("header");
 		}
@@ -1184,7 +1350,7 @@ Error DSPkg::finalize() {
 		const uint32_t mips = item.mip_count;
 		if (write_gpu_metadata && item.gpu_metadata && mips > 1) {
 			// v1 containers keep one contiguous payload, so mip slices are read
-			// at cumulative offsets; v2 containers point at each mip directly.
+			// at cumulative offsets; v2/v3-inline containers point at each mip directly.
 			uint64_t contiguous_cursor = 0;
 			for (uint32_t mip = 0; mip < mips; ++mip) {
 				if (mip > 0) {
@@ -1200,7 +1366,7 @@ Error DSPkg::finalize() {
 				}
 				const uint64_t mip_size = static_cast<uint32_t>(item.mip_sizes[mip]);
 				uint64_t slice_offset = 0;
-				if (item.source_version == 2) {
+				if (item.source_version == 2 || item.source_version == 3) {
 					slice_offset = static_cast<uint64_t>(item.source_mip_offsets[mip]);
 				} else {
 					if (!checked_add(item.payload_offset, contiguous_cursor, slice_offset) ||
@@ -1228,11 +1394,11 @@ Error DSPkg::finalize() {
 				}
 			}
 		} else {
-			const uint32_t slice_count = item.source_version == 2 ? mips : 1;
+			const uint32_t slice_count = (item.source_version == 2 || item.source_version == 3) ? mips : 1;
 			for (uint32_t slice = 0; slice < slice_count; ++slice) {
 				uint64_t slice_offset = item.payload_offset;
 				uint64_t slice_size = item.payload_size;
-				if (item.source_version == 2) {
+				if (item.source_version == 2 || item.source_version == 3) {
 					slice_offset = static_cast<uint64_t>(item.source_mip_offsets[slice]);
 					slice_size = static_cast<uint64_t>(static_cast<uint32_t>(item.source_mip_sizes[slice]));
 				}
@@ -1827,6 +1993,24 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 							DS_ENTRY_TLV_MAX_TOTAL, "Entry", summary, tlv_error)) {
 					return fail(ERR_FILE_CORRUPT, tlv_error);
 				}
+				if (entry.entry_kind == static_cast<uint8_t>(DSPkgEntryKind::TEXTURE)) {
+					bool has_logical = false;
+					uint32_t logical_w = 0;
+					uint32_t logical_h = 0;
+					if (!parse_entry_logical_tlv(tlv_data, entry.extensions_size, has_logical, logical_w, logical_h)) {
+						return fail(ERR_FILE_CORRUPT, "Entry logical-size record is malformed.");
+					}
+					if (has_logical) {
+						// 0 means storage (tolerant read); anything past
+						// storage is a hostile archive: fail closed.
+						if ((logical_w != 0 && logical_w > entry.width) ||
+								(logical_h != 0 && logical_h > entry.height)) {
+							return fail(ERR_FILE_CORRUPT, "Entry logical dimensions exceed storage dimensions.");
+						}
+						entry.logical_width = logical_w;
+						entry.logical_height = logical_h;
+					}
+				}
 				if (!reader.skip(entry.extensions_size)) {
 					return fail(ERR_FILE_CORRUPT, "Entry extension table extends past TOC buffer.");
 				}
@@ -2181,6 +2365,8 @@ Dictionary DSPkg::read_texture(const String &p_resource_path) const {
 	result["compressed_data"] = compressed_data;
 	result["width"] = entry.width;
 	result["height"] = entry.height;
+	result["logical_width"] = entry.logical_width > 0 ? entry.logical_width : entry.width;
+	result["logical_height"] = entry.logical_height > 0 ? entry.logical_height : entry.height;
 	result["pixel_format"] = entry.pixel_format;
 	result["mip_count"] = entry.mip_count;
 	result["original_size"] = entry.original_size;
@@ -2236,6 +2422,8 @@ Dictionary DSPkg::get_entry_info(const String &p_resource_path) const {
 	result["original_size"] = entry.original_size;
 	result["width"] = entry.width;
 	result["height"] = entry.height;
+	result["logical_width"] = entry.logical_width > 0 ? entry.logical_width : entry.width;
+	result["logical_height"] = entry.logical_height > 0 ? entry.logical_height : entry.height;
 	result["pixel_format"] = entry.pixel_format;
 	result["mip_count"] = entry.mip_count;
 	result["flags"] = entry.flags;

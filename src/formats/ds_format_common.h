@@ -64,6 +64,10 @@ constexpr uint32_t DS_TLV_TAG_CRYPTO = 0x0001;
 constexpr uint32_t DS_TLV_TAG_PROVENANCE = 0x0002;
 constexpr uint32_t DS_TLV_TAG_ARCHIVE_SET = 0x0003;
 constexpr uint32_t DS_TLV_TAG_DELTA = 0x0004;
+// NPOT display dimensions for a texture entry (Phase 3 item 2). Payload is a
+// DSPkgTextureLogical (8 bytes). Absent = logical size equals storage size.
+// Written by the v5 archive writer; v4 archives never carry it.
+constexpr uint32_t DS_TLV_TAG_TEXTURE_LOGICAL = 0x0005;
 constexpr uint32_t DS_TLV_TAG_EXPERIMENTAL_MIN = 0x8000;
 constexpr uint32_t DS_TLV_HEADER_SIZE = 8;
 constexpr uint32_t DS_TLV_MAX_PAYLOAD = 1024 * 1024;
@@ -80,6 +84,18 @@ struct DSChunkEntry {
 #pragma pack(pop)
 
 static_assert(sizeof(DSChunkEntry) == 16, "DSChunkEntry must be 16 bytes");
+
+// v5 entry-TLV payload for DS_TLV_TAG_TEXTURE_LOGICAL: the NPOT display size.
+// Both fields are 0 (= storage size) when the texture needs no override, but
+// the writer omits the record entirely in that case.
+#pragma pack(push, 1)
+struct DSPkgTextureLogical {
+	uint32_t logical_width;
+	uint32_t logical_height;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(DSPkgTextureLogical) == 8, "DSPkgTextureLogical must be 8 bytes");
 
 inline bool ds_compression_format_is_valid(uint8_t p_format) {
 	return p_format <= static_cast<uint8_t>(DSCompressionFormat::ZSTD);

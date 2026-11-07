@@ -21,6 +21,7 @@
 #include <godot_cpp/classes/thread.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
+#include <godot_cpp/variant/vector2i.hpp>
 
 #include <atomic>
 
@@ -412,13 +413,25 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		const String &p_original_cache_key,
 		int32_t p_cache_mode,
 		bool p_use_sub_threads,
-		bool p_as_image_texture) const {
+		bool p_as_image_texture,
+		uint32_t p_logical_width,
+		uint32_t p_logical_height) const {
 	(void)p_is_srgb;
 	(void)p_mip_row_pitches;
 	if (p_width == 0 || p_height == 0 || p_mip_count == 0) {
 		UtilityFunctions::push_error("DSResourceFormatLoader: Invalid 2D texture dimensions or mip count for '", p_cache_key, "' (width=", p_width, ", height=", p_height, ", mips=", p_mip_count, ").");
 		return Variant();
 	}
+	// NPOT display size (Phase 3 item 2): 0 means "same as storage". The
+	// producers (v3 header, archive TLV) already validate logical <= storage,
+	// but a hostile hand-edited file must not size-override past the texture.
+	const uint32_t logical_width = p_logical_width == 0 ? p_width : p_logical_width;
+	const uint32_t logical_height = p_logical_height == 0 ? p_height : p_logical_height;
+	if (logical_width == 0 || logical_height == 0 || logical_width > p_width || logical_height > p_height) {
+		UtilityFunctions::push_error("DSResourceFormatLoader: Invalid logical texture dimensions for '", p_cache_key, "' (logical=", logical_width, "x", logical_height, ", storage=", p_width, "x", p_height, ").");
+		return Variant();
+	}
+	const bool needs_size_override = (logical_width != p_width) || (logical_height != p_height);
 	if (!dstex_sizes_are_sane(p_width, p_height, p_original_size, p_compressed_size)) {
 		UtilityFunctions::push_error("DSResourceFormatLoader: Payload exceeds sane texture bounds for '", p_cache_key, "' (FMT-01).");
 		return Variant();
@@ -566,6 +579,20 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					Ref<Texture2DRD> tex_rd;
 					tex_rd.instantiate();
 					tex_rd->set_texture_rd_rid(tex_rid);
+					if (needs_size_override) {
+						// The device texture is the aligned storage footprint.
+						// The override targets the RS wrapper (Texture2DRD
+						// reports its own storage-member size; the engine
+						// exposes no setter for it, so get_width() on this
+						// path reports storage dims — CPU/ImageTexture loads
+						// have full parity via set_size_override).
+						// Runs on the render thread here, so the wrap above
+						// already executed and get_rid() is the wrapper.
+						RID wrapper_rid = tex_rd->get_rid();
+						if (wrapper_rid.is_valid()) {
+							rs->texture_set_size_override(wrapper_rid, static_cast<int32_t>(logical_width), static_cast<int32_t>(logical_height));
+						}
+					}
 					// Adopt-or-own, decided exactly once and HERE: the cache
 					// takes the RID when it accepts the texture; otherwise the
 					// texture carries a DSTextureOwner that releases the RID
@@ -760,7 +787,14 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					image = Image::create_from_data(p_width, p_height, use_mipmaps, static_cast<Image::Format>(img_fmt), image_data);
 				}
 				if (image.is_valid() && !image->is_empty()) {
-					result_texture = ImageTexture::create_from_image(image);
+					Ref<ImageTexture> img_tex = ImageTexture::create_from_image(image);
+					if (needs_size_override && img_tex.is_valid()) {
+						// Engine-blessed path (mirrors CompressedTexture2D):
+						// reports logical dims from get_width() and applies
+						// the RS override for render-side size queries.
+						img_tex->set_size_override(Vector2i(static_cast<int32_t>(logical_width), static_cast<int32_t>(logical_height)));
+					}
+					result_texture = img_tex;
 				}
 			}
 		} else {
@@ -830,7 +864,11 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					image = Image::create_from_data(p_width, p_height, use_mipmaps_v1, static_cast<Image::Format>(img_fmt), image_data_v1);
 				}
 				if (image.is_valid() && !image->is_empty()) {
-					result_texture = ImageTexture::create_from_image(image);
+					Ref<ImageTexture> img_tex_v1 = ImageTexture::create_from_image(image);
+					if (needs_size_override && img_tex_v1.is_valid()) {
+						img_tex_v1->set_size_override(Vector2i(static_cast<int32_t>(logical_width), static_cast<int32_t>(logical_height)));
+					}
+					result_texture = img_tex_v1;
 				}
 			}
 		}
@@ -973,8 +1011,10 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 
 			bool as_image_texture = (entry_info.has("flags") && (static_cast<uint32_t>(entry_info["flags"]) & 2U) != 0) ||
 					(entry_info.has("as_image_texture") && (bool)entry_info["as_image_texture"]);
+			uint32_t logical_width = entry_info.has("logical_width") ? static_cast<uint32_t>(entry_info["logical_width"]) : 0;
+			uint32_t logical_height = entry_info.has("logical_height") ? static_cast<uint32_t>(entry_info["logical_height"]) : 0;
 
-			return _load_texture_payload(archive_path, data_offset, comp_size, orig_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, as_image_texture);
+			return _load_texture_payload(archive_path, data_offset, comp_size, orig_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, as_image_texture, logical_width, logical_height);
 		}
 		UtilityFunctions::push_error("DSResourceFormatLoader: Failed to get entry info from res://textures.dspkg for ", target_path);
 		return Variant();
@@ -1012,6 +1052,10 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		PackedInt32Array mip_sizes = header.has("mip_sizes") ? (PackedInt32Array)header["mip_sizes"] : PackedInt32Array();
 		PackedInt32Array mip_uncompressed_sizes = header.has("mip_uncompressed_sizes") ? (PackedInt32Array)header["mip_uncompressed_sizes"] : PackedInt32Array();
 		PackedInt32Array mip_row_pitches = header.has("mip_row_pitches") ? (PackedInt32Array)header["mip_row_pitches"] : PackedInt32Array();
+		// read_header reports logical keys with a storage fallback, so v1/v2
+		// files yield storage dims and no override is applied.
+		uint32_t logical_width = header.has("logical_width") ? static_cast<uint32_t>(header["logical_width"]) : 0;
+		uint32_t logical_height = header.has("logical_height") ? static_cast<uint32_t>(header["logical_height"]) : 0;
 
 		uint64_t data_offset = dstex_header_size(header_version) + ((is_v2 ? sizeof(DSTexMipEntryV2) : sizeof(DSTexMipEntry)) * mip_count);
 		if (header_version == 3) {
@@ -1028,7 +1072,7 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			data_offset = (data_offset + 511) & ~uint64_t(511);
 		}
 
-		return _load_texture_payload(p_path, data_offset, compressed_size, original_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, as_image_texture);
+		return _load_texture_payload(p_path, data_offset, compressed_size, original_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, as_image_texture, logical_width, logical_height);
 	}
 
 	if (ext == "dspkg") {

@@ -137,6 +137,12 @@ struct DSPkgEntry {
 	uint64_t original_size = 0;
 	uint32_t width = 0;
 	uint32_t height = 0;
+	// NPOT display size (Phase 3 item 2). 0 = same as storage. Populated
+	// from the .dstex v3 extension at stage time; persisted via the v5
+	// DS_TLV_TAG_TEXTURE_LOGICAL entry extension (v4 archives never carry
+	// it, so v4 entries always report storage dimensions).
+	uint32_t logical_width = 0;
+	uint32_t logical_height = 0;
 	uint32_t pixel_format = 0;
 	uint32_t mip_count = 0;
 	uint32_t flags = 0;
@@ -185,6 +191,9 @@ struct DSPkgStagedEntry {
 	uint64_t original_size = 0;
 	uint32_t width = 0;
 	uint32_t height = 0;
+	// Staged NPOT display size; 0 = same as storage. See DSPkgEntry.
+	uint32_t logical_width = 0;
+	uint32_t logical_height = 0;
 	uint32_t pixel_format = 0;
 	uint32_t mip_count = 0;
 	uint32_t flags = 0;

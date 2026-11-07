@@ -10,6 +10,7 @@
 		During export, [EditorExportPlugin] bundles [code].dstex[/code] resources into [code]res://textures.dspkg[/code] via [DSPkg], allowing [DSResourceFormatLoader] and [DSContext] to stream textures directly to GPU or CPU memory at runtime.
 		Presets: [b]Project Default[/b] follows [code]directstorage/import/default_profile[/code]; [b]3D (Streaming)[/b] is the product default; [b]CPU / ImageTexture (2D, UI, Decals)[/b] keeps 2D and UI assets on the CPU path. A pure 2D project should normally use Godot's [ResourceImporterTexture] instead.
 		See also [ResourceImporterTexture], [DSTex], and [DSContext].
+		[b]Migration:[/b] the old [code]compression/source[/code] option was replaced by [code]compression/color_space[/code], [code]compress/normal_map[/code], and [code]compress/channel_pack[/code]. Existing [code].import[/code] files that only store the old key are mapped automatically on the next import; once any of the new keys is written, it takes precedence.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -19,20 +20,31 @@
 			Lower values (such as the default [code]1[/code]) maximize encoding speed in the editor and provide the highest DirectStorage decompression throughput.
 			Higher values achieve smaller file sizes on disk at the cost of slower import times and increased decompression workload.
 		</member>
+		<member name="compression/color_space" type="int" setter="" getter="" default="1">
+			Selects the color space stored in the [code].dstex[/code] header:
+			[b]Linear:[/b] Linear data such as normal maps, roughness, metallic, masks, or lookup tables. The loader creates a linear (UNORM) GPU format.
+			[b]sRGB:[/b] Standard color texture (such as albedo or diffuse maps). The loader creates the sRGB counterpart of the GPU format so hardware sampling decodes it to linear correctly.
+			This option is independent from channel packing: it only records how the stored values must be interpreted.
+		</member>
+		<member name="compress/normal_map" type="int" setter="" getter="" default="0">
+			Controls normal-map processing:
+			[b]Disabled:[/b] Treat the image as ordinary color/data.
+			[b]Enabled:[/b] Normalize the base level and renormalize mip levels, and prioritize the red/green channels during block compression. With [code]compression/high_quality[/code] the result is BC7; disable it to get BC5/BC3 normal-map formats.
+			Usage-based auto-detection is not available to a custom importer; enable this explicitly for normal maps.
+		</member>
+		<member name="compress/channel_pack" type="int" setter="" getter="" default="0">
+			Controls channel packing during block compression. Only applies when [code]compression/mode[/code] is [b]VRAM Compressed[/b]:
+			[b]sRGB Friendly:[/b] Detect used channels as sRGB color, avoiding channel packing that would shift values when the texture is sampled as sRGB.
+			[b]Optimized:[/b] Detect used channels as generic data, allowing the codec to pack them more aggressively (smaller files, but not safe for sRGB-sampled color textures).
+		</member>
 		<member name="compression/high_quality" type="bool" setter="" getter="" default="false">
 			When [code]compression/mode[/code] is [b]VRAM Compressed[/b], use BPTC/BC7 instead of S3TC. BPTC preserves alpha and normal-map detail better but takes twice the VRAM of BC1 and encodes on the CPU during import.
-			[b]Note:[/b] With BPTC, a [b]Normal Map[/b] source becomes BC7, not BC5. Disable this option if BC5 normal maps are preferred.
+			[b]Note:[/b] With BPTC, [code]compress/normal_map[/code] produces BC7, not BC5. Disable this option if BC5 normal maps are preferred.
 		</member>
 		<member name="compression/mode" type="int" setter="" getter="" default="0">
 			The compression mode to use for the imported texture.
 			[b]VRAM Compressed:[/b] Compresses texture mipmaps using S3TC (BC1/BC3/BC4/BC5) or, with [code]compression/high_quality[/code], BPTC (BC7) prior to GDeflate compression. This significantly reduces GPU VRAM consumption and optimizes streaming bandwidth. Recommended for standard 3D textures.
 			[b]VRAM Uncompressed:[/b] Retains uncompressed raw pixel data (such as RGBA8) with mipmaps, compressed only on disk using lossless GDeflate. Preserves perfect pixel fidelity with zero block compression artifacts (ideal for pixel art, crisp UI elements, or lookup tables), but requires significantly more memory at runtime.
-		</member>
-		<member name="compression/source" type="int" setter="" getter="" default="1">
-			Controls the source color space and channel interpretation during block compression:
-			[b]Generic:[/b] Generic linear data texture (such as roughness, metallic, masks, or lookup tables). Channel distances are evaluated linearly without assuming sRGB gamma encoding.
-			[b]sRGB:[/b] Standard color texture (such as albedo or diffuse maps). Channel distances are weighted according to perceptual human vision in sRGB space.
-			[b]Normal Map:[/b] Tangent-space normal map. Red and green channels are prioritized, the base level is normalized, and mip levels are renormalized.
 		</member>
 		<member name="mipmaps/generate" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], generate a full mip chain. Disable for 2D/UI textures that are always sampled at 1:1; a disabled chain writes a single-mip [code].dstex[/code] and saves roughly one third of the payload and memory.

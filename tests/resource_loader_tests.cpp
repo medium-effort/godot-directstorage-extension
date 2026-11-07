@@ -97,6 +97,27 @@ bool write_loose_dstex(const char *p_path) {
 	return err == godot::OK;
 }
 
+// NPOT v3 fixture: 100x52 RGBA8 storage, 100x50 logical (Phase 3 item 2).
+// Natural layout payload: 100*4 bytes/row x 52 rows = 20800 bytes.
+constexpr int NPOT_STORAGE_WIDTH = 100;
+constexpr int NPOT_STORAGE_HEIGHT = 52;
+constexpr int NPOT_LOGICAL_WIDTH = 100;
+constexpr int NPOT_LOGICAL_HEIGHT = 50;
+constexpr int64_t NPOT_PAYLOAD_SIZE = 20800;
+
+bool write_npot_v3_dstex(const char *p_path) {
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	if (dstex.is_null()) {
+		return false;
+	}
+	godot::Error err = dstex->write_to_file(
+			godot::String(p_path), make_pattern_payload(NPOT_PAYLOAD_SIZE),
+			NPOT_STORAGE_WIDTH, NPOT_STORAGE_HEIGHT, godot::Image::FORMAT_RGBA8,
+			1, 1, false, false, NPOT_LOGICAL_WIDTH, NPOT_LOGICAL_HEIGHT);
+	return err == godot::OK;
+}
+
 void remove_user_file(const char *p_path) {
 	godot::Ref<godot::DirAccess> dir = godot::DirAccess::open("user://");
 	if (dir.is_valid()) {
@@ -132,11 +153,11 @@ void shutdown_ds_singleton() {
 // later resolve, and the copy has reported success over live scan windows.
 // On failure the exact step is logged so a locked destination is
 // distinguishable from a corrupt one.
-bool stage_textures_dspkg(::gdextest::TestContext &ctx, const char *p_dstex_path, const char *p_dspkg_path, const char *p_virtual_path, bool p_release_context = true, const char *p_second_virtual_path = nullptr) {
+bool stage_textures_dspkg(::gdextest::TestContext &ctx, const char *p_dstex_path, const char *p_dspkg_path, const char *p_virtual_path, bool p_release_context = true, const char *p_second_virtual_path = nullptr, bool p_write_npot_v3 = false) {
 	if (p_release_context) {
 		shutdown_ds_singleton();
 	}
-	if (!write_loose_dstex(p_dstex_path)) {
+	if (p_write_npot_v3 ? !write_npot_v3_dstex(p_dstex_path) : !write_loose_dstex(p_dstex_path)) {
 		return false;
 	}
 	godot::Ref<godot::DSPkg> builder;
@@ -383,7 +404,153 @@ GDEX_TEST_T(loader, load_partial_mip_chain_returns_base_without_mipmaps, TAG_INT
 	remove_user_file(dstex_path);
 }
 
-// --- Cache modes: REUSE returns the same Ref ------------------------------------
+// --- NPOT parity: v3 writer records logical dims; loads report them --------
+
+GDEX_TEST_T(loader, npot_v3_writer_emits_logical_dimensions, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_loader_npot_v3.dstex";
+	if (!write_npot_v3_dstex(dstex_path)) {
+		GDEX_ABORT_TEST("fixture NPOT v3 DSTex write failed");
+	}
+
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	GDEX_ASSERT_TRUE(dstex.is_valid());
+	godot::Dictionary header = dstex->read_header(godot::String(dstex_path));
+	GDEX_ASSERT_FALSE(header.is_empty());
+	GDEX_EXPECT_EQ((int64_t)header["version"], (int64_t)3);
+	GDEX_EXPECT_EQ((int64_t)header["width"], (int64_t)NPOT_STORAGE_WIDTH);
+	GDEX_EXPECT_EQ((int64_t)header["height"], (int64_t)NPOT_STORAGE_HEIGHT);
+	GDEX_EXPECT_EQ((int64_t)header["logical_width"], (int64_t)NPOT_LOGICAL_WIDTH);
+	GDEX_EXPECT_EQ((int64_t)header["logical_height"], (int64_t)NPOT_LOGICAL_HEIGHT);
+
+	// Equal dims keep the v2 container byte-identical: no silent migration.
+	godot::Error v2_err = dstex->write_to_file(
+			godot::String(dstex_path), make_pattern_payload(NPOT_PAYLOAD_SIZE),
+			NPOT_STORAGE_WIDTH, NPOT_STORAGE_HEIGHT, godot::Image::FORMAT_RGBA8, 1, 1);
+	GDEX_ASSERT_EQ((int64_t)v2_err, (int64_t)godot::OK);
+	godot::Dictionary v2_header = dstex->read_header(godot::String(dstex_path));
+	GDEX_ASSERT_FALSE(v2_header.is_empty());
+	GDEX_EXPECT_EQ((int64_t)v2_header["version"], (int64_t)2);
+
+	// Logical dims past storage are rejected, never emitted.
+	godot::Error bad_err = dstex->write_to_file(
+			godot::String(dstex_path), make_pattern_payload(NPOT_PAYLOAD_SIZE),
+			NPOT_STORAGE_WIDTH, NPOT_STORAGE_HEIGHT, godot::Image::FORMAT_RGBA8,
+			1, 1, false, false, NPOT_STORAGE_WIDTH + 4, NPOT_LOGICAL_HEIGHT);
+	GDEX_EXPECT_EQ((int64_t)bad_err, (int64_t)godot::ERR_INVALID_PARAMETER);
+
+	remove_user_file(dstex_path);
+}
+
+GDEX_TEST_T(loader, npot_v3_load_reports_logical_dimensions, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_loader_npot_load.dstex";
+	if (!write_npot_v3_dstex(dstex_path)) {
+		GDEX_ABORT_TEST("fixture NPOT v3 DSTex write failed");
+	}
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	godot::Variant result = loader->_load(godot::String(dstex_path), godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+	godot::Ref<godot::Texture2D> tex(result);
+	GDEX_ASSERT_TRUE(tex.is_valid());
+	// Headless suite has no D3D12 device (see file header): the CPU path
+	// applies ImageTexture::set_size_override, so the texture reports the
+	// authoring size. A GPU-path Texture2DRD would report storage dims
+	// (documented engine limitation: Texture2DRD exposes no size setter).
+	godot::Ref<godot::ImageTexture> img_tex = tex;
+	if (img_tex.is_valid()) {
+		GDEX_EXPECT_EQ(img_tex->get_width(), NPOT_LOGICAL_WIDTH);
+		GDEX_EXPECT_EQ(img_tex->get_height(), NPOT_LOGICAL_HEIGHT);
+	} else {
+		godot::Ref<godot::Texture2DRD> rd_tex = tex;
+		GDEX_ASSERT_TRUE(rd_tex.is_valid());
+	}
+
+	remove_user_file(dstex_path);
+}
+
+GDEX_TEST_T(loader, npot_v3_archived_entry_carries_logical_dimensions, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_loader_npot_stage.dstex";
+	const char *dspkg_path = "user://gdextest_loader_npot.dspkg";
+	const char *virtual_path = "res://gdextest_loader_npot_virtual.png";
+	if (!stage_textures_dspkg(ctx, dstex_path, dspkg_path, virtual_path, true, nullptr, true)) {
+		remove_user_file(dstex_path);
+		remove_user_file(dspkg_path);
+		GDEX_ABORT_TEST("NPOT textures.dspkg staging failed");
+	}
+
+	// An NPOT entry forces the v5 writer; aligned-only archives stay v4.
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+	GDEX_ASSERT_EQ((int64_t)reader->open(godot::String("res://textures.dspkg")), (int64_t)godot::OK);
+	godot::Dictionary info = reader->get_entry_info(godot::String(virtual_path));
+	GDEX_ASSERT_FALSE(info.is_empty());
+	GDEX_EXPECT_EQ((int64_t)info["format_version"], (int64_t)5);
+	GDEX_EXPECT_EQ((int64_t)info["width"], (int64_t)NPOT_STORAGE_WIDTH);
+	GDEX_EXPECT_EQ((int64_t)info["height"], (int64_t)NPOT_STORAGE_HEIGHT);
+	GDEX_EXPECT_EQ((int64_t)info["logical_width"], (int64_t)NPOT_LOGICAL_WIDTH);
+	GDEX_EXPECT_EQ((int64_t)info["logical_height"], (int64_t)NPOT_LOGICAL_HEIGHT);
+
+	// The archived texture loads at its logical dims through the real path.
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	if (ps) {
+		ps->set_setting("directstorage/force_archive_resolution", true);
+	}
+	ctx.add_teardown([ps]() {
+		if (ps) {
+			ps->set_setting("directstorage/force_archive_resolution", false);
+		}
+	});
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+	godot::Ref<godot::Texture2D> tex(loader->_load(godot::String(virtual_path), godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_IGNORE));
+	GDEX_ASSERT_TRUE(tex.is_valid());
+	godot::Ref<godot::ImageTexture> img_tex = tex;
+	if (img_tex.is_valid()) {
+		GDEX_EXPECT_EQ(img_tex->get_width(), NPOT_LOGICAL_WIDTH);
+		GDEX_EXPECT_EQ(img_tex->get_height(), NPOT_LOGICAL_HEIGHT);
+	} else {
+		godot::Ref<godot::Texture2DRD> rd_tex = tex;
+		GDEX_ASSERT_TRUE(rd_tex.is_valid());
+	}
+
+	godot::Error err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+	(void)err;
+	remove_user_file(dstex_path);
+	remove_user_file(dspkg_path);
+}
+
+GDEX_TEST_T(loader, aligned_archive_stays_v4, TAG_INTEGRATION) {
+	const char *v4_dstex_path = "user://gdextest_loader_v4stay.dstex";
+	const char *v4_dspkg_path = "user://gdextest_loader_v4stay.dspkg";
+	const char *v4_virtual_path = "res://gdextest_loader_v4stay_virtual.png";
+	if (!stage_textures_dspkg(ctx, v4_dstex_path, v4_dspkg_path, v4_virtual_path)) {
+		remove_user_file(v4_dstex_path);
+		remove_user_file(v4_dspkg_path);
+		GDEX_ABORT_TEST("textures.dspkg staging failed");
+	}
+
+	// No entry needs an extension: the writer must stay v4 byte-compatible.
+	godot::Ref<godot::DSPkg> v4_reader;
+	v4_reader.instantiate();
+	GDEX_ASSERT_TRUE(v4_reader.is_valid());
+	GDEX_ASSERT_EQ((int64_t)v4_reader->open(godot::String("res://textures.dspkg")), (int64_t)godot::OK);
+	godot::Dictionary v4_info = v4_reader->get_entry_info(godot::String(v4_virtual_path));
+	GDEX_ASSERT_FALSE(v4_info.is_empty());
+	GDEX_EXPECT_EQ((int64_t)v4_info["format_version"], (int64_t)4);
+	GDEX_EXPECT_EQ((int64_t)v4_info["logical_width"], (int64_t)LOADER_TEX_WIDTH);
+	GDEX_EXPECT_EQ((int64_t)v4_info["logical_height"], (int64_t)LOADER_TEX_HEIGHT);
+
+	godot::Error v4_err = godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+	(void)v4_err;
+	remove_user_file(v4_dstex_path);
+	remove_user_file(v4_dspkg_path);
+}
 
 GDEX_TEST_T(loader, cache_mode_reuse_returns_same_ref, TAG_INTEGRATION) {
 	const char *dstex_path = "user://gdextest_loader_012_reuse.dstex";
