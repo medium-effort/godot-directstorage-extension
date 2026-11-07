@@ -5,6 +5,7 @@
 #include <godot_cpp/variant/packed_int64_array.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -355,8 +356,186 @@ PackedByteArray DSTex::unpad_footprint_mip(const PackedByteArray &p_footprint, u
 	return unpadded;
 }
 
+// --- 8-bit bulk pixel path -------------------------------------------------
+//
+// get_pixel()/set_pixel() are GDExtension method-bind dispatches, so a per-pixel
+// loop costs two engine calls per pixel. These two helpers only ever run on
+// import-time source images, where that is seconds to a minute of editor time at
+// the dimension cap. For the formats the importer produces, the same work can be
+// done on one get_data() buffer and written back once.
+//
+// Decode/encode mirror Image::_get_color_at_ofs / Image::_set_color_at_ofs
+// exactly. The engine rounds twice for an inverted channel (float r = ptr/255.0,
+// then 1.0f - r); a one-rounding expression, or a double table, differs from it
+// on 159 of the 256 byte values. Do not "simplify" ds_inverted_u8_lut().
+
+static float ds_u8_to_float(uint8_t p_value) {
+	return static_cast<float>(static_cast<double>(p_value) / 255.0);
+}
+
+static uint8_t ds_float_to_u8(float p_value) {
+	return static_cast<uint8_t>(CLAMP(static_cast<double>(p_value) * 255.0, 0, 255));
+}
+
+static const uint8_t *ds_inverted_u8_lut() {
+	static const std::array<uint8_t, 256> lut = []() {
+		std::array<uint8_t, 256> table{};
+		for (int i = 0; i < 256; ++i) {
+			table[static_cast<size_t>(i)] = ds_float_to_u8(1.0f - ds_u8_to_float(static_cast<uint8_t>(i)));
+		}
+		return table;
+	}();
+	return lut.data();
+}
+
+static const uint8_t *ds_identity_u8_table() {
+	static const std::array<uint8_t, 256> table = []() {
+		std::array<uint8_t, 256> identity{};
+		for (int i = 0; i < 256; ++i) {
+			identity[static_cast<size_t>(i)] = static_cast<uint8_t>(i);
+		}
+		return identity;
+	}();
+	return table.data();
+}
+
+static const uint8_t *ds_constant_u8_table(uint8_t p_value) {
+	static const std::array<uint8_t, 256> zeros = []() {
+		std::array<uint8_t, 256> table{};
+		return table;
+	}();
+	static const std::array<uint8_t, 256> ones = []() {
+		std::array<uint8_t, 256> table{};
+		table.fill(255);
+		return table;
+	}();
+	return p_value == 0 ? zeros.data() : ones.data();
+}
+
+// Layout of the formats the bulk path handles. bytes_per_pixel == 0 means the
+// format keeps the Color loop. Luminance formats store one value for RGB
+// (Image writes Color::get_v() == max(r,g,b)).
+struct DSU8Layout {
+	int bytes_per_pixel = 0;
+	bool has_r = false;
+	bool has_g = false;
+	bool has_b = false;
+	bool has_a = false;
+	bool luminance = false;
+};
+
+static DSU8Layout ds_u8_layout(int p_format) {
+	switch (p_format) {
+		case Image::FORMAT_L8:
+			return { 1, true, true, true, false, true };
+		case Image::FORMAT_LA8:
+			return { 2, true, true, true, true, true };
+		case Image::FORMAT_R8:
+			return { 1, true, false, false, false, false };
+		case Image::FORMAT_RG8:
+			return { 2, true, true, false, false, false };
+		case Image::FORMAT_RGB8:
+			return { 3, true, true, true, false, false };
+		case Image::FORMAT_RGBA8:
+			return { 4, true, true, true, true, false };
+		default:
+			return DSU8Layout();
+	}
+}
+
+// Peak transient memory is one extra copy of the image: get_data() only moves a
+// refcount, and the first write detaches it. Above this base-level size the
+// allocation-light Color loop is kept instead of doubling a very large source.
+constexpr int64_t DS_U8_BYTE_PATH_MAX_BYTES = 256 * 1024 * 1024;
+
+// Returns false when the image is not one of the bulk formats, is too large, or
+// its buffer is shorter than the base level requires; the caller then keeps the
+// Color loop. On success r_data holds the detached, writable base level and the
+// caller must write it back with set_data().
+static bool ds_prepare_u8_data(const Ref<Image> &p_image, DSU8Layout &r_layout, PackedByteArray &r_data, int &r_format, int64_t &r_pixels) {
+	r_format = p_image->get_format();
+	r_layout = ds_u8_layout(r_format);
+	if (r_layout.bytes_per_pixel == 0) {
+		return false;
+	}
+	const int64_t width = p_image->get_width();
+	const int64_t height = p_image->get_height();
+	r_pixels = width * height;
+	const int64_t base_bytes = r_pixels * r_layout.bytes_per_pixel;
+	if (base_bytes <= 0 || base_bytes > DS_U8_BYTE_PATH_MAX_BYTES) {
+		return false;
+	}
+	r_data = p_image->get_data();
+	return r_data.size() >= base_bytes;
+}
+
+static bool ds_normalize_image_u8(const Ref<Image> &p_image) {
+	DSU8Layout layout;
+	PackedByteArray data;
+	int format = 0;
+	int64_t pixels = 0;
+	if (!ds_prepare_u8_data(p_image, layout, data, format, pixels)) {
+		return false;
+	}
+
+	uint8_t *bytes = data.ptrw();
+	const int stride = layout.bytes_per_pixel;
+	for (int64_t pixel = 0; pixel < pixels; ++pixel) {
+		uint8_t *px = bytes + pixel * stride;
+		uint8_t src[4];
+		if (layout.luminance) {
+			src[0] = src[1] = src[2] = px[0];
+			src[3] = layout.has_a ? px[1] : 255;
+		} else {
+			src[0] = layout.has_r ? px[0] : 0;
+			src[1] = layout.has_g ? px[1] : 0;
+			src[2] = layout.has_b ? px[2] : 0;
+			src[3] = layout.has_a ? px[3] : 255;
+		}
+
+		float nx = ds_u8_to_float(src[0]) * 2.0f - 1.0f;
+		float ny = ds_u8_to_float(src[1]) * 2.0f - 1.0f;
+		float nz = ds_u8_to_float(src[2]) * 2.0f - 1.0f;
+		// Same expression as the Color loop: double sqrt narrowed to float.
+		const float length = std::sqrt(nx * nx + ny * ny + nz * nz);
+		if (length > 0.0f) {
+			nx /= length;
+			ny /= length;
+			nz /= length;
+		} else {
+			nx = 0.0f;
+			ny = 0.0f;
+			nz = 0.0f;
+		}
+
+		const uint8_t out_r = ds_float_to_u8(nx * 0.5f + 0.5f);
+		const uint8_t out_g = ds_float_to_u8(ny * 0.5f + 0.5f);
+		const uint8_t out_b = ds_float_to_u8(nz * 0.5f + 0.5f);
+		if (layout.luminance) {
+			px[0] = std::max(out_r, std::max(out_g, out_b));
+		} else {
+			if (layout.has_r) {
+				px[0] = out_r;
+			}
+			if (layout.has_g) {
+				px[1] = out_g;
+			}
+			if (layout.has_b) {
+				px[2] = out_b;
+			}
+		}
+		// Alpha is preserved exactly as the Color path does; only RGB is normalized.
+	}
+
+	p_image->set_data(p_image->get_width(), p_image->get_height(), p_image->has_mipmaps(), static_cast<Image::Format>(format), data);
+	return true;
+}
+
 void DSTex::normalize_image(const Ref<Image> &p_image) {
 	if (p_image.is_null() || p_image->is_empty() || p_image->is_compressed()) {
+		return;
+	}
+	if (ds_normalize_image_u8(p_image)) {
 		return;
 	}
 	const int width = p_image->get_width();
@@ -416,6 +595,145 @@ static uint32_t ds_remap_channel_mask(int p_format) {
 		default:
 			return 0x1 | 0x2 | 0x4 | 0x8;
 	}
+}
+
+static bool ds_remap_channels_u8(const Ref<Image> &p_image, const int p_remaps[4]) {
+	DSU8Layout layout;
+	PackedByteArray data;
+	int format = 0;
+	int64_t pixels = 0;
+	if (!ds_prepare_u8_data(p_image, layout, data, format, pixels)) {
+		return false;
+	}
+
+	// Resolve each output channel once: which input byte feeds it and which
+	// 256-entry table maps that byte to the output. UNUSED never reaches here
+	// (the caller resolves it to 0/1 first); anything else keeps the Color loop.
+	const uint8_t *op_tables[4] = {};
+	int op_sources[4] = {};
+	for (int i = 0; i < 4; ++i) {
+		switch (p_remaps[i]) {
+			case DS_REMAP_R:
+				op_tables[i] = ds_identity_u8_table();
+				op_sources[i] = 0;
+				break;
+			case DS_REMAP_G:
+				op_tables[i] = ds_identity_u8_table();
+				op_sources[i] = 1;
+				break;
+			case DS_REMAP_B:
+				op_tables[i] = ds_identity_u8_table();
+				op_sources[i] = 2;
+				break;
+			case DS_REMAP_A:
+				op_tables[i] = ds_identity_u8_table();
+				op_sources[i] = 3;
+				break;
+			case DS_REMAP_INV_R:
+				op_tables[i] = ds_inverted_u8_lut();
+				op_sources[i] = 0;
+				break;
+			case DS_REMAP_INV_G:
+				op_tables[i] = ds_inverted_u8_lut();
+				op_sources[i] = 1;
+				break;
+			case DS_REMAP_INV_B:
+				op_tables[i] = ds_inverted_u8_lut();
+				op_sources[i] = 2;
+				break;
+			case DS_REMAP_INV_A:
+				op_tables[i] = ds_inverted_u8_lut();
+				op_sources[i] = 3;
+				break;
+			case DS_REMAP_0:
+				op_tables[i] = ds_constant_u8_table(0);
+				op_sources[i] = 0;
+				break;
+			case DS_REMAP_1:
+				op_tables[i] = ds_constant_u8_table(255);
+				op_sources[i] = 0;
+				break;
+			default:
+				return false;
+		}
+	}
+
+	uint8_t *bytes = data.ptrw();
+	const int stride = layout.bytes_per_pixel;
+	if (format == Image::FORMAT_RGBA8) {
+		// The importer converts L8/LA8/RGB8 sources to RGBA8 before remapping,
+		// so this is the hot path. Four table lookups and no per-pixel branches
+		// keep it fast even in the unoptimized dev build the editor imports on.
+		const uint8_t *t0 = op_tables[0];
+		const uint8_t *t1 = op_tables[1];
+		const uint8_t *t2 = op_tables[2];
+		const uint8_t *t3 = op_tables[3];
+		const int s0 = op_sources[0];
+		const int s1 = op_sources[1];
+		const int s2 = op_sources[2];
+		const int s3 = op_sources[3];
+		for (int64_t pixel = 0; pixel < pixels; ++pixel) {
+			uint8_t *px = bytes + pixel * 4;
+			const uint8_t in[4] = { px[0], px[1], px[2], px[3] };
+			px[0] = t0[in[s0]];
+			px[1] = t1[in[s1]];
+			px[2] = t2[in[s2]];
+			px[3] = t3[in[s3]];
+		}
+	} else {
+		const uint8_t *t0 = op_tables[0];
+		const uint8_t *t1 = op_tables[1];
+		const uint8_t *t2 = op_tables[2];
+		const uint8_t *t3 = op_tables[3];
+		const int s0 = op_sources[0];
+		const int s1 = op_sources[1];
+		const int s2 = op_sources[2];
+		const int s3 = op_sources[3];
+		for (int64_t pixel = 0; pixel < pixels; ++pixel) {
+			uint8_t *px = bytes + pixel * stride;
+			uint8_t in[4];
+			if (layout.luminance) {
+				in[0] = in[1] = in[2] = px[0];
+				in[3] = layout.has_a ? px[1] : 255;
+			} else {
+				in[0] = layout.has_r ? px[0] : 0;
+				in[1] = layout.has_g ? px[1] : 0;
+				in[2] = layout.has_b ? px[2] : 0;
+				in[3] = layout.has_a ? px[3] : 255;
+			}
+
+			const uint8_t o0 = t0[in[s0]];
+			const uint8_t o1 = t1[in[s1]];
+			const uint8_t o2 = t2[in[s2]];
+			const uint8_t o3 = t3[in[s3]];
+			if (layout.luminance) {
+				// L8/LA8 store max(r,g,b); a non-uniform RGB remap has already
+				// been converted away by the expansion step, so the three agree.
+				px[0] = std::max(o0, std::max(o1, o2));
+				if (layout.has_a) {
+					px[1] = o3;
+				}
+			} else if (layout.has_a) {
+				px[0] = o0;
+				px[1] = o1;
+				px[2] = o2;
+				px[3] = o3;
+			} else {
+				if (layout.has_r) {
+					px[0] = o0;
+				}
+				if (layout.has_g) {
+					px[1] = o1;
+				}
+				if (layout.has_b) {
+					px[2] = o2;
+				}
+			}
+		}
+	}
+
+	p_image->set_data(p_image->get_width(), p_image->get_height(), p_image->has_mipmaps(), static_cast<Image::Format>(format), data);
+	return true;
 }
 
 void DSTex::remap_channels(const Ref<Image> &p_image, int p_red, int p_green, int p_blue, int p_alpha) {
@@ -544,6 +862,10 @@ void DSTex::remap_channels(const Ref<Image> &p_image, int p_red, int p_green, in
 		} break;
 		default: {
 		} break;
+	}
+
+	if (ds_remap_channels_u8(p_image, remaps)) {
+		return;
 	}
 
 	const int width = p_image->get_width();
