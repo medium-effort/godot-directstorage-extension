@@ -16,9 +16,12 @@ const VERIFY_DIALOG_SCENE: String = "uid://bdepjlb375cg5"
 const VERIFY_DIALOG_SCENE_PATH: String = "res://addons/directstorage_accelerator/tools/dspkg_pack_scan_dialog.tscn"
 const RUNTIME_MENU_ITEM: String = "Manage DirectStorage Runtime..."
 const RUNTIME_DIALOG_SCENE_PATH: String = "res://addons/directstorage_accelerator/tools/runtime_manager_dialog.tscn"
+const MIGRATION_MENU_ITEM: String = "Migrate textures to DirectStorage..."
+const MIGRATION_DIALOG_SCENE_PATH: String = "res://addons/directstorage_accelerator/tools/ds_migration_dialog.tscn"
 const TOOLS_SUBMENU_NAME: String = "dsgd Tools... (DirectStorage)"
 const TOOLS_SUBMENU_VERIFY_ID: int = 0
 const TOOLS_SUBMENU_RUNTIME_ID: int = 1
+const TOOLS_SUBMENU_MIGRATION_ID: int = 2
 const RUNTIME_INSTALLER_SCRIPT = preload("res://addons/directstorage_accelerator/scripts/ds_runtime_installer.gd")
 const IMPORT_PROFILE_SETTING: String = "directstorage/import/default_profile"
 
@@ -27,6 +30,7 @@ var _export_plugin: EditorExportPlugin = null
 var _checked_scenes: Dictionary = {}
 var _verify_dialog: Window = null
 var _runtime_dialog: Window = null
+var _migration_dialog: Window = null
 var _tools_submenu: PopupMenu = null
 
 
@@ -127,6 +131,9 @@ func _exit_tree() -> void:
 	if is_instance_valid(_runtime_dialog):
 		_runtime_dialog.queue_free()
 		_runtime_dialog = null
+	if is_instance_valid(_migration_dialog):
+		_migration_dialog.queue_free()
+		_migration_dialog = null
 
 	if scene_changed.is_connected(_on_scene_changed):
 		scene_changed.disconnect(_on_scene_changed)
@@ -340,6 +347,26 @@ func _on_runtime_menu() -> void:
 		_runtime_dialog.call("open")
 
 
+## Opens the migration tool dialog, rebuilt on every open so a hot-reloaded script
+## never meets a stale node tree (same as runtime menu).
+func _on_migration_menu() -> void:
+	if is_instance_valid(_migration_dialog):
+		_migration_dialog.queue_free()
+		_migration_dialog = null
+	var dialog_scene := ResourceLoader.load(MIGRATION_DIALOG_SCENE_PATH, "PackedScene", ResourceLoader.CACHE_MODE_IGNORE) as PackedScene
+	if dialog_scene == null:
+		push_error("[DirectStorage] Migration dialog missing at " + MIGRATION_DIALOG_SCENE_PATH)
+		return
+	_migration_dialog = dialog_scene.instantiate() as Window
+	var base := EditorInterface.get_base_control()
+	if base == null:
+		EditorInterface.popup_dialog_centered(_migration_dialog)
+		return
+	base.add_child(_migration_dialog)
+	if _migration_dialog.has_method("open"):
+		_migration_dialog.call("open")
+
+
 ## Registers the DirectStorage entries as one Tools submenu instead of two flat
 ## items. The editor owns a registered submenu (remove_tool_menu_item() deletes
 ## it), so the plugin keeps only a reference and drops it on exit.
@@ -349,6 +376,7 @@ func _add_tools_submenu() -> void:
 	_tools_submenu = PopupMenu.new()
 	_tools_submenu.add_item(VERIFY_MENU_ITEM, TOOLS_SUBMENU_VERIFY_ID)
 	_tools_submenu.add_item(RUNTIME_MENU_ITEM, TOOLS_SUBMENU_RUNTIME_ID)
+	_tools_submenu.add_item(MIGRATION_MENU_ITEM, TOOLS_SUBMENU_MIGRATION_ID)
 	_tools_submenu.id_pressed.connect(_on_tools_submenu_pressed)
 	add_tool_submenu_item(TOOLS_SUBMENU_NAME, _tools_submenu)
 
@@ -359,3 +387,5 @@ func _on_tools_submenu_pressed(id: int) -> void:
 			_on_verify_exported_pack()
 		TOOLS_SUBMENU_RUNTIME_ID:
 			_on_runtime_menu()
+		TOOLS_SUBMENU_MIGRATION_ID:
+			_on_migration_menu()

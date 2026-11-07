@@ -1,0 +1,218 @@
+[gd_scene format=4]
+
+[ext_resource type="Script" path="res://addons/directstorage_accelerator/tools/ds_migration_dialog.gd" id="1_dialog"]
+
+[node name="DSMigrationDialog" type="Window"]
+title = "Migrate Textures to DirectStorage"
+size = Vector2i(960, 680)
+visible = false
+exclusive = true
+transient = true
+min_size = Vector2i(840, 540)
+script = ExtResource("1_dialog")
+
+[node name="Background" type="Panel" parent="."]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Layout" type="VBoxContainer" parent="."]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 10.0
+offset_top = 10.0
+offset_right = -10.0
+offset_bottom = -10.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/separation = 8
+
+[node name="Header" type="VBoxContainer" parent="Layout"]
+layout_mode = 2
+
+[node name="TitleLabel" type="Label" parent="Layout/Header"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 15
+text = "DirectStorage Texture Migration Tool"
+
+[node name="DescLabel" type="Label" parent="Layout/Header"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.75, 0.75, 0.75, 1)
+theme_override_font_sizes/font_size = 12
+text = "Select project textures to migrate from Godot's default texture importer to DirectStorage. Original .import files are safely packed into a ZIP archive in the dsgd addon folder, preserving exact UIDs so scenes, materials, and scripts stay 100% compatible."
+autowrap_mode = 3
+
+[node name="FilterRow" type="HBoxContainer" parent="Layout"]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="FilterEdit" type="LineEdit" parent="Layout/FilterRow"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "Filter textures by path or name..."
+clear_button_enabled = true
+
+[node name="StatusFilterOption" type="OptionButton" parent="Layout/FilterRow"]
+unique_name_in_owner = true
+layout_mode = 2
+item_count = 6
+popup/item_0/text = "All Assets"
+popup/item_0/id = 0
+popup/item_1/text = "Eligible Only"
+popup/item_1/id = 1
+popup/item_2/text = "Adopt Only"
+popup/item_2/id = 2
+popup/item_3/text = "Upgrade Only"
+popup/item_3/id = 3
+popup/item_4/text = "Up to Date Only"
+popup/item_4/id = 4
+popup/item_5/text = "Skipped Only"
+popup/item_5/id = 5
+
+[node name="SelectAllButton" type="Button" parent="Layout/FilterRow"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Select All Eligible"
+
+[node name="DeselectAllButton" type="Button" parent="Layout/FilterRow"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Deselect All"
+
+[node name="CollapseAllButton" type="Button" parent="Layout/FilterRow"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Collapse All"
+
+[node name="ExpandAllButton" type="Button" parent="Layout/FilterRow"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Expand All"
+
+[node name="FilterBanner" type="PanelContainer" parent="Layout"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+
+[node name="BannerHBox" type="HBoxContainer" parent="Layout/FilterBanner"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="FilterInfoLabel" type="Label" parent="Layout/FilterBanner/BannerHBox"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_colors/font_color = Color(0.65, 0.85, 1, 1)
+theme_override_font_sizes/font_size = 12
+text = "Showing 0 of 0 textures (0 hidden by current filter)."
+
+[node name="ShowAllButton" type="Button" parent="Layout/FilterBanner/BannerHBox"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 12
+text = "Show All Assets"
+
+[node name="ContentSplit" type="VSplitContainer" parent="Layout"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3
+split_offset = 360
+
+[node name="TreeContainer" type="VBoxContainer" parent="Layout/ContentSplit"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="AssetTree" type="Tree" parent="Layout/ContentSplit/TreeContainer"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+columns = 3
+column_titles_visible = true
+select_mode = 1
+
+[node name="LogContainer" type="VBoxContainer" parent="Layout/ContentSplit"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3
+custom_minimum_size = Vector2(0, 110)
+theme_override_constants/separation = 4
+
+[node name="ProgressBar" type="ProgressBar" parent="Layout/ContentSplit/LogContainer"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="LogLabel" type="RichTextLabel" parent="Layout/ContentSplit/LogContainer"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+focus_mode = 2
+selection_enabled = true
+context_menu_enabled = true
+scroll_active = true
+scroll_following = true
+
+[node name="StatusRow" type="HBoxContainer" parent="Layout"]
+layout_mode = 2
+
+[node name="SummaryLabel" type="Label" parent="Layout/StatusRow"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Scanning project textures..."
+
+[node name="AutoDeleteCheck" type="CheckBox" parent="Layout/StatusRow"]
+unique_name_in_owner = true
+layout_mode = 2
+button_pressed = true
+text = "Automatically delete replaced .ctex cache files"
+
+[node name="ActionRow" type="HBoxContainer" parent="Layout"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="ScanButton" type="Button" parent="Layout/ActionRow"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Rescan"
+
+[node name="RestoreButton" type="Button" parent="Layout/ActionRow"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Restore from Backup..."
+
+[node name="Spacer" type="Control" parent="Layout/ActionRow"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="MigrateButton" type="Button" parent="Layout/ActionRow"]
+unique_name_in_owner = true
+layout_mode = 2
+disabled = true
+text = "Migrate Selected (0)"
+
+[node name="CloseButton" type="Button" parent="Layout/ActionRow"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Close"
+
+[node name="RestoreFileDialog" type="FileDialog" parent="."]
+unique_name_in_owner = true
+title = "Open a File"
+size = Vector2i(700, 450)
+ok_button_text = "Open"
+file_mode = 0
+filters = PackedStringArray("*.zip ; Migration Backup ZIP")
+
+[node name="ConfirmDialog" type="ConfirmationDialog" parent="."]
+unique_name_in_owner = true
+size = Vector2i(540, 220)
+dialog_text = "Are you sure you want to proceed?"
+dialog_autowrap = true
