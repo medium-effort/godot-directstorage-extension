@@ -3,6 +3,8 @@
 
 #include "formats/dstex_format.h"
 
+#include <godot_cpp/classes/dir_access.hpp>
+#include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/variant/color.hpp>
 
@@ -261,4 +263,51 @@ GDEX_TEST(dstex, remap_channels_r8_to_rg_on_demand) {
     GDEX_EXPECT_NEAR(c.g, 0.5f, 2e-3f);
     GDEX_EXPECT_NEAR(c.b, 0.0f, 2e-3f);
     GDEX_EXPECT_NEAR(c.a, 1.0f, 2e-3f);
+}
+
+// The writer must never leave a truncated .dstex behind: a short file still
+// carries a readable header and mip table, so a reader cannot tell it from a
+// complete one. The injection drops bytes while the writer still reports
+// success, which is why the final size verification is what gets exercised.
+GDEX_TEST_T(dstex, write_failure_aborts, TAG_INTEGRATION) {
+    const char *truncated_path = "user://gdextest_dstex_write_fail.dstex";
+    const char *complete_path = "user://gdextest_dstex_write_ok.dstex";
+
+    godot::PackedByteArray payload;
+    payload.resize(64 * 64 * 4);
+    uint32_t state = 0x9E3779B9u;
+    for (int64_t i = 0; i < payload.size(); ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        payload[i] = static_cast<uint8_t>(state & 0xFF);
+    }
+
+    godot::Ref<godot::DSTex> failing;
+    failing.instantiate();
+    GDEX_ASSERT_TRUE(failing.is_valid());
+    failing->_set_write_truncate_for_testing(8);
+    GDEX_EXPECT_EQ(failing->write_to_file(godot::String(truncated_path), payload, 64, 64,
+                           godot::Image::FORMAT_RGBA8, 1, 1),
+            godot::ERR_FILE_CANT_WRITE);
+    GDEX_EXPECT_FALSE(godot::FileAccess::file_exists(godot::String(truncated_path)));
+
+    godot::Ref<godot::DSTex> clean;
+    clean.instantiate();
+    GDEX_ASSERT_TRUE(clean.is_valid());
+    GDEX_EXPECT_EQ(clean->write_to_file(godot::String(complete_path), payload, 64, 64,
+                           godot::Image::FORMAT_RGBA8, 1, 1),
+            godot::OK);
+    GDEX_ASSERT_TRUE(godot::FileAccess::file_exists(godot::String(complete_path)));
+
+    godot::Dictionary header = clean->read_header(godot::String(complete_path));
+    GDEX_EXPECT_TRUE(header.size() > 0);
+
+    godot::Ref<godot::FileAccess> written = godot::FileAccess::open(godot::String(complete_path), godot::FileAccess::READ);
+    GDEX_ASSERT_TRUE(written.is_valid());
+    GDEX_EXPECT_TRUE(written->get_length() > static_cast<int64_t>(sizeof(godot::DSTexHeader)));
+    written->close();
+
+    godot::DirAccess::remove_absolute(godot::String(truncated_path));
+    godot::DirAccess::remove_absolute(godot::String(complete_path));
 }

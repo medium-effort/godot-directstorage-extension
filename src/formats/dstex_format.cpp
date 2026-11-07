@@ -1,5 +1,6 @@
 #include "dstex_format.h"
 #include "compression/gdeflate_compressor.h"
+#include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
 #include <godot_cpp/variant/packed_int64_array.hpp>
@@ -1378,23 +1379,73 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		return FileAccess::get_open_error();
 	}
 
-	file->store_buffer(reinterpret_cast<const uint8_t *>(&header), sizeof(DSTexHeader));
-	if (file->get_error() != OK) {
+	// godot-cpp's store_buffer() returns void, so a full disk is only observable
+	// through FileAccess::get_error(). Every write is inspected, and the final
+	// size is verified below: a truncated file would still carry a readable
+	// header and mip table, so a reader cannot tell it from a complete one.
+	uint64_t written_bytes = 0;
+	auto write_bytes = [&](const uint8_t *p_data, uint64_t p_size) -> bool {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		if (m_test_write_truncate_after_bytes >= 0) {
+			const uint64_t allowed = static_cast<uint64_t>(m_test_write_truncate_after_bytes);
+			if (written_bytes >= allowed) {
+				// Pretend the bytes landed: the final size check must catch it.
+				written_bytes += p_size;
+				return true;
+			}
+			if (p_size > allowed - written_bytes) {
+				const uint64_t keep = allowed - written_bytes;
+				if (keep > 0) {
+					file->store_buffer(p_data, static_cast<int64_t>(keep));
+					if (file->get_error() != OK) {
+						return false;
+					}
+				}
+				written_bytes += p_size;
+				return true;
+			}
+		}
+#endif
+		if (p_size > 0) {
+			file->store_buffer(p_data, static_cast<int64_t>(p_size));
+			if (file->get_error() != OK) {
+				return false;
+			}
+		}
+		written_bytes += p_size;
+		return true;
+	};
+	// Closing first is required on Windows: an open handle blocks the delete, and
+	// a locked (antivirus-scanned) file can defeat the removal even then. Never
+	// fail silently, because a surviving partial .dstex parses like a good one.
+	auto remove_partial = [&]() {
 		file->close();
+		const Error remove_err = DirAccess::remove_absolute(p_path);
+		if (remove_err != OK) {
+			UtilityFunctions::push_warning(String("DSTex: Failed to remove the partial texture file (error ") +
+					String::num_int64(static_cast<int64_t>(remove_err)) + "): " + p_path);
+		}
+	};
+	auto fail_write = [&](const char *p_stage) -> Error {
+		UtilityFunctions::push_error(String("DSTex: Failed to write the texture ") + String(p_stage) +
+				" (out of disk space?). The partial file was removed: " + p_path);
+		remove_partial();
 		return ERR_FILE_CANT_WRITE;
+	};
+
+	if (!write_bytes(reinterpret_cast<const uint8_t *>(&header), sizeof(DSTexHeader))) {
+		return fail_write("header");
 	}
 	if (needs_v3) {
-		file->store_buffer(reinterpret_cast<const uint8_t *>(&v3_ext), sizeof(DSTexHeaderV3Ext));
-		if (file->get_error() != OK) {
-			file->close();
-			return ERR_FILE_CANT_WRITE;
+		if (!write_bytes(reinterpret_cast<const uint8_t *>(&v3_ext), sizeof(DSTexHeaderV3Ext))) {
+			return fail_write("v3 header extension");
 		}
 	}
 
 	uint64_t header_size = needs_v3 ? sizeof(DSTexHeaderV3) : sizeof(DSTexHeader);
 	uint64_t data_offset = header_size + (sizeof(DSTexMipEntryV2) * static_cast<uint64_t>(mip_count));
 	if (!align_up(data_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, data_offset)) {
-		file->close();
+		remove_partial();
 		return ERR_INVALID_DATA;
 	}
 	std::vector<DSTexMipEntryV2> mip_entries;
@@ -1411,29 +1462,56 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		mip_entries.push_back(mip_entry);
 		if (running_offset > std::numeric_limits<uint64_t>::max() - compressed_mips[i].size() ||
 				!align_up(running_offset + compressed_mips[i].size(), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_offset)) {
-			file->close();
+			remove_partial();
 			return ERR_INVALID_DATA;
 		}
 	}
 	for (const DSTexMipEntryV2 &mip_entry : mip_entries) {
-		file->store_buffer(reinterpret_cast<const uint8_t *>(&mip_entry), sizeof(DSTexMipEntryV2));
-	}
-	if (file->get_error() != OK) {
-		file->close();
-		return ERR_FILE_CANT_WRITE;
+		if (!write_bytes(reinterpret_cast<const uint8_t *>(&mip_entry), sizeof(DSTexMipEntryV2))) {
+			return fail_write("mip table");
+		}
 	}
 	for (int i = 0; i < mip_count; ++i) {
+		// seek() returns void in godot-cpp, so verify the position instead. A
+		// silently failed seek would write at the wrong offset, and the final
+		// size check alone could still pass if the last payload lands correctly.
 		file->seek(mip_entries[i].offset);
-		file->store_buffer(compressed_mips[i].ptr(), compressed_mips[i].size());
-		if (file->get_error() != OK) {
-			file->close();
-			return ERR_FILE_CANT_WRITE;
+		if (file->get_position() != mip_entries[i].offset) {
+			return fail_write("payload offset");
 		}
+		if (!write_bytes(compressed_mips[i].ptr(), static_cast<uint64_t>(compressed_mips[i].size()))) {
+			return fail_write("payload");
+		}
+	}
+
+	// A short write that store_buffer() did not report would still ship a file
+	// whose header and mip table parse fine. Verify the exact expected size.
+	uint64_t expected_end = 0;
+	for (const DSTexMipEntryV2 &mip_entry : mip_entries) {
+		const uint64_t mip_end = mip_entry.offset + mip_entry.compressed_size;
+		if (mip_end > expected_end) {
+			expected_end = mip_end;
+		}
+	}
+	file->seek_end();
+	const uint64_t actual_end = static_cast<uint64_t>(file->get_position());
+	if (actual_end != expected_end || file->get_error() != OK) {
+		UtilityFunctions::push_error(String("DSTex: Texture size mismatch after writing (expected ") +
+				String::num_uint64(expected_end) + " bytes, got " + String::num_uint64(actual_end) +
+				"); the partial file was removed: " + p_path);
+		remove_partial();
+		return ERR_FILE_CANT_WRITE;
 	}
 	file->close();
 
 	return OK;
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+void DSTex::_set_write_truncate_for_testing(int64_t p_bytes) {
+	m_test_write_truncate_after_bytes = p_bytes;
+}
+#endif
 
 Dictionary DSTex::read_header(const String &p_path) {
 	Dictionary result;

@@ -23,6 +23,9 @@ param(
 #   * the fail-closed paths (empty PCK key, include filter miss, exclude filter)
 #   * subset exports (scenes, resources, exclude, dedicated server)
 #   * partial salvage and a stale archive left by a failed export
+#   * the pre-flight rewrite estimate (previous exe, PCK, console wrapper and archive)
+#   * fail-closed when any EXPORT_MESSAGE_ERROR reaches _export_end (injected by the
+#     sibling fixture plugin through the same platform message list the engine uses)
 #   * encrypt_directory on and off
 #   * a corrupted TOC
 #   * a plaintext archive substituted into a protected build (the archive id is
@@ -704,6 +707,37 @@ Invoke-Case 'unprotected_success' {
     }
 }
 
+# ---------------------------------------------------------------- pre-flight rewrite estimate
+#
+# _warn_if_low_disk_space() sizes the artifact set this export rewrites from the
+# files already at the target paths. Plant four known files at exactly those
+# paths (the estimate is read before the old archive is removed), then assert the
+# reported total. A fresh directory yields zero and would skip the new line.
+
+Invoke-Case 'rewrite_estimate' {
+    if (-not $ProtectedAvailable) {
+        Add-NotCovered 'rewrite_estimate' $TemplateReason
+    } else {
+        $proj = New-ProjectCopy 'rewrite_estimate'
+        Write-Preset -ProjectDir $proj -Name 'contract_rewrite_estimate' -Runnable $true -Template $TemplatePath -EncryptPck $false -Bundle $true -Pairing $true
+        Write-CredentialFile -ProjectDir $proj -KeyHex ''
+        $out = Join-Path $proj 'release'
+        New-Item -ItemType Directory -Path $out -Force | Out-Null
+        # 10 MiB exactly: exe 1 + pck 2 + archive 3 + console wrapper 4.
+        [System.IO.File]::WriteAllBytes((Join-Path $out 'game.exe'), (New-Object byte[] (1MB)))
+        [System.IO.File]::WriteAllBytes((Join-Path $out 'game.pck'), (New-Object byte[] (2MB)))
+        [System.IO.File]::WriteAllBytes((Join-Path $out 'textures.dspkg'), (New-Object byte[] (3MB)))
+        [System.IO.File]::WriteAllBytes((Join-Path $out 'game.console.exe'), (New-Object byte[] (4MB)))
+        $run = Export-Release -ProjectDir $proj -Preset 'contract_rewrite_estimate' -OutputDir $out
+        $log = Get-ExportText $run
+        Save-Log -Name 'rewrite_estimate' -Text $log
+        Add-Check 'rewrite_estimate.reported' ($log -match 'Previous exe/PCK/archive in the target directory total 10\.0 MiB') 'the estimate must size exe + pck + console wrapper + previous archive'
+        Add-Check 'rewrite_estimate.deployed' ($log -match 'Successfully deployed standalone textures archive') 'the export must still deploy its archive'
+        Add-Check 'rewrite_estimate.archive_replaced' (@(Get-ArchiveList $out).Count -eq 1) ('archives=' + @(Get-ArchiveList $out).Count)
+        Add-Check 'rewrite_estimate.export_exit' (($run.ExitCode -eq 0) -and -not $run.TimedOut) ('exit=' + $run.ExitCode)
+    }
+}
+
 # ---------------------------------------------------------------- plaintext archive in a protected build
 #
 # The requirement must come from the build, not from the archive. A protected
@@ -1085,6 +1119,39 @@ Invoke-Case 'skip_on_finalize_failure' {
         Add-Check 'skip_on_finalize_failure.payloads_skipped' (($probe.PayloadUsed -eq $false) -and ($probe.PayloadUnused -eq $false)) ('used=' + $probe.PayloadUsed + ' unused=' + $probe.PayloadUnused)
         $scan = Invoke-Scan -PackPath $pck
         Add-Check 'skip_on_finalize_failure.scan_ok' ($scan.Ok) ('verdict=' + $scan.Verdict)
+    }
+}
+
+# ---------------------------------------------------------------- engine error before _export_end
+#
+# _core_export_reports_error() must stop the archive from being deployed when the
+# engine recorded an EXPORT_MESSAGE_ERROR for this run. The gate cannot make a
+# real PCK write fail after the texture walk, so the sibling fixture plugin (which
+# is registered first, so its _export_end runs first) records an error through the
+# same platform message list the engine uses for its own template/PCK failures.
+# This exercises the message-count snapshot, the worst-type comparison and the
+# fail-closed branch together.
+
+Invoke-Case 'engine_error_fail_closed' {
+    if (-not $ProtectedAvailable) {
+        Add-NotCovered 'engine_error_fail_closed' $TemplateReason
+    } else {
+        $proj = New-ProjectCopy 'engine_error_fail_closed'
+        Write-Preset -ProjectDir $proj -Name 'contract_engine_error' -Runnable $true -Template $TemplatePath -EncryptPck $false -Bundle $true -Pairing $true
+        Write-CredentialFile -ProjectDir $proj -KeyHex ''
+        $out = Join-Path $proj 'release'
+        $run = Export-Release -ProjectDir $proj -Preset 'contract_engine_error' -OutputDir $out -Environment @{
+            DSPKG_CONTRACT_ENGINE_ERROR = 'injected engine export failure'
+        }
+        $log = Get-ExportText $run
+        Save-Log -Name 'engine_error_fail_closed' -Text $log
+        Add-Check 'engine_error_fail_closed.error_injected' ($log -match '\[contract-injector\] engine_error=injected engine export failure') 'the sibling plugin must record the error before the add-on sees it'
+        Add-Check 'engine_error_fail_closed.engine_error_recorded' ($log -match 'ERROR: Contract Injector: injected engine export failure') 'the platform must carry the injected EXPORT_MESSAGE_ERROR'
+        Add-Check 'engine_error_fail_closed.fail_closed_log' ($log -match 'the export failed before .* could be deployed') 'the add-on must refuse to deploy after an engine error'
+        Add-Check 'engine_error_fail_closed.no_archive' (@(Get-ArchiveList $out).Count -eq 0) ('archives=' + @(Get-ArchiveList $out).Count)
+        Add-Check 'engine_error_fail_closed.no_staging' (@(Get-ChildItem -LiteralPath $out -Filter '*.dspkg.tmp' -File -ErrorAction SilentlyContinue).Count -eq 0) 'the staging file must be removed'
+        Add-Check 'engine_error_fail_closed.failure_escalated' ($log -match 'DirectStorage archive step failed') 'the export must be reported as failed to the platform'
+        Add-Check 'engine_error_fail_closed.engine_steps_completed' ((Test-Path -LiteralPath (Join-Path $out 'game.exe')) -and (Test-Path -LiteralPath (Join-Path $out 'game.pck'))) 'the engine exe/PCK steps still complete; only the archive is withheld'
     }
 }
 

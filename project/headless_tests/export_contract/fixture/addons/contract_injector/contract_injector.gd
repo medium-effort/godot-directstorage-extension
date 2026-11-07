@@ -14,8 +14,14 @@ extends EditorPlugin
 ## happens in `_export_end`, which runs after the whole export walk. The add-on
 ## plugin is registered after this one, so its `_export_end` (the `finalize()`
 ## call) runs after the mutation.
+##
+## DSPKG_CONTRACT_ENGINE_ERROR text to record as an EXPORT_MESSAGE_ERROR in
+## `_export_end`. It reaches the add-on through the same platform message list
+## the engine uses for template/PCK failures, and because this plugin runs first
+## the add-on must see it and fail closed instead of deploying the archive.
 
 const MUTATE_TARGET_ENV := "DSPKG_CONTRACT_MUTATE_TARGET"
+const ENGINE_ERROR_ENV := "DSPKG_CONTRACT_ENGINE_ERROR"
 
 var _exporter: ContractMutationExporter
 
@@ -34,17 +40,31 @@ func _exit_tree() -> void:
 
 class ContractMutationExporter extends EditorExportPlugin:
 	var _mutated: bool = false
+	var _injected_engine_error: bool = false
 
 	func _get_name() -> String:
 		return "ExportContractInjector"
 
 	func _export_begin(_features: PackedStringArray, _is_debug: bool, _path: String, _flags: int) -> void:
 		_mutated = false
+		_injected_engine_error = false
 		var target := OS.get_environment(MUTATE_TARGET_ENV).strip_edges()
 		if not target.is_empty():
 			print("[contract-injector] armed target=%s" % target)
+		var engine_error := OS.get_environment(ENGINE_ERROR_ENV).strip_edges()
+		if not engine_error.is_empty():
+			print("[contract-injector] armed engine_error=%s" % engine_error)
 
 	func _export_end() -> void:
+		var engine_error := OS.get_environment(ENGINE_ERROR_ENV).strip_edges()
+		if not engine_error.is_empty() and not _injected_engine_error:
+			_injected_engine_error = true
+			var platform := get_export_platform()
+			if platform != null:
+				platform.add_message(EditorExportPlatform.EXPORT_MESSAGE_ERROR, "Contract Injector", engine_error)
+				print("[contract-injector] engine_error=%s" % engine_error)
+			else:
+				print("[contract-injector] engine_error_failed reason=no_platform")
 		if _mutated:
 			return
 		var target := OS.get_environment(MUTATE_TARGET_ENV).strip_edges()

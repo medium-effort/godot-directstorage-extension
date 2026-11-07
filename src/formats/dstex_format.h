@@ -176,6 +176,19 @@ public:
 	// declared layout and the table must add up to the header totals. Used by
 	// DSTex, DSPreloader and Win32Backend so all three reject the same files.
 	static bool mip_table_is_sane(const DSTexHeader &p_header, const DSTexMipEntryV2 *p_entries);
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only injection: a non-negative byte offset silently drops writes past
+	// that point while write_to_file() still reports success, so the final size
+	// verification is exercised without a genuinely full disk. Never bound to
+	// GDScript (the binding surface stays unchanged).
+	void _set_write_truncate_for_testing(int64_t p_bytes);
+#endif
+
+private:
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	int64_t m_test_write_truncate_after_bytes = -1;
+#endif
 };
 
 } // namespace godot

@@ -80,6 +80,13 @@ var _outcome: String = _policy.OUTCOME_DISABLED
 ## message only.
 var _protection_failure_reason: String = ""
 var _target_export_dir: String = ""
+## Absolute path of the exported executable. Used only to size the pre-flight
+## disk-space estimate from the previous export's artifact set.
+var _target_export_path: String = ""
+## platform.get_message_count() at _export_begin. _export_end considers only
+## messages added after this index, so an accumulated list (CLI exports, or one
+## plugin instance serving several presets) cannot inherit an earlier error.
+var _platform_messages_at_begin: int = 0
 var _export_features: PackedStringArray = []
 var _is_debug_export: bool = false
 var _bundle_dspkg_enabled: bool = false
@@ -141,9 +148,15 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 ## Starts the archive for the current export and decides the protection outcome.
 func _export_begin(features: PackedStringArray, is_debug: bool, path: String, flags: int) -> void:
 	print("[DirectStorage Exporter] Export started for target: ", path)
+	# Snapshot the platform message count now: the engine's own failure
+	# messages (template copy, PCK write) are added to this list before
+	# _export_end runs, and only those must count as this run's errors.
+	var platform: EditorExportPlatform = get_export_platform()
+	_platform_messages_at_begin = platform.get_message_count() if platform != null and platform.has_method("get_message_count") else 0
 	var resolved_export_path := path.strip_edges().simplify_path()
 	if resolved_export_path.is_empty():
 		_target_export_dir = ""
+		_target_export_path = ""
 		push_error("[DirectStorage Exporter] Export path is empty; archive bundling will be skipped.")
 	else:
 		if resolved_export_path.begins_with("res://") or resolved_export_path.begins_with("user://"):
@@ -154,11 +167,14 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		if not _target_export_dir.is_absolute_path():
 			push_error("[DirectStorage Exporter] Could not resolve an absolute export directory from: " + path)
 			_target_export_dir = ""
+			_target_export_path = ""
 		else:
 			var target_dir_err := DirAccess.make_dir_recursive_absolute(_target_export_dir)
 			if target_dir_err != OK and not DirAccess.dir_exists_absolute(_target_export_dir):
 				push_error("[DirectStorage Exporter] Failed to prepare export directory '" + _target_export_dir + "': " + error_string(target_dir_err) + ". Verify the export path is writable.")
+				_target_export_path = ""
 			else:
+				_target_export_path = resolved_export_path
 				print("[DirectStorage Exporter] Resolved export directory: ", _target_export_dir)
 
 	_export_features = features
@@ -225,6 +241,10 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 
 	_warn_if_low_disk_space(_target_export_dir)
 	_cleanup_staging()
+	# Remove the previous archive now rather than just before the rename: the
+	# peak footprint then excludes it, and an export that produces no archive
+	# (or fails) can never leave a stale one next to a freshly written PCK.
+	_remove_file_silent(_target_dspkg_path)
 	_cleanup_legacy_user_temp()
 	_dspkg = ClassDB.instantiate("DSPkg")
 	if _dspkg == null:
@@ -517,7 +537,18 @@ func _export_end() -> void:
 			# only in the partial archive. Deploy it rather than deleting data.
 			push_warning("[DirectStorage Exporter] WARNING: bundling was aborted after " + str(_archive_entries.size()) + " texture(s) were added. Deploying a PARTIAL archive; the remaining textures stay in the PCK. Re-export to produce a complete archive.")
 
-	if _dspkg != null and _outcome != _policy.OUTCOME_DISABLED and _outcome != _policy.OUTCOME_FAILED and not _archive_entries.is_empty():
+	if _core_export_reports_error() and _dspkg != null and not _archive_entries.is_empty():
+		# The engine already recorded an export error, almost certainly in the
+		# template copy or the PCK write. Deploying now would pair a fresh
+		# archive (new archive id) with whatever exe/PCK survived, so fail
+		# closed instead. The plugin cannot abort the engine's own steps; the
+		# error added at the end is what marks the export failed.
+		dspkg_ok = false
+		push_error("[DirectStorage Exporter] FATAL: the export failed before " + _archive_name + " could be deployed (see the engine export errors above); the archive was not written.")
+		_dspkg = null
+		_cleanup_staging()
+		_remove_file_silent(_target_dspkg_path)
+	elif _dspkg != null and _outcome != _policy.OUTCOME_DISABLED and _outcome != _policy.OUTCOME_FAILED and not _archive_entries.is_empty():
 		var err: Error = _dspkg.finalize()
 		if err != OK:
 			dspkg_ok = false
@@ -549,6 +580,7 @@ func _export_end() -> void:
 	_cleanup_staging()
 	_cleanup_legacy_user_temp()
 	if not dspkg_ok:
+		_mark_export_failed()
 		return
 
 ## Writer round-trip: install the key this export generated, then open the
@@ -658,17 +690,83 @@ func _format_bytes(bytes_value: int) -> String:
 	value /= 1024.0
 	return "%.2f GiB" % value
 
-## Early warning when the target drive is nearly full. The final archive size
-## is only known at finalize() time, so this cannot abort the export; it just
-## names the drive and the free bytes while there is still time to free space.
+## Early warning when the target drive is nearly full. The final archive size is
+## only known at finalize() time, so this cannot abort the export; it estimates
+## the artifact set this export rewrites (the previous files are the best
+## predictor available at begin time) and names the drive and the free bytes
+## before the engine's template/PCK writes consume them.
 func _warn_if_low_disk_space(abs_dir: String) -> void:
 	const WARN_THRESHOLD_BYTES: int = 1024 * 1024 * 1024
+	const HEADROOM_BYTES: int = 256 * 1024 * 1024
 	var free_bytes := _get_free_space_bytes(abs_dir)
 	if free_bytes < 0:
 		return
+	var rewrite_bytes := _estimate_rewrite_bytes()
 	print("[DirectStorage Exporter] Free space on export drive: ", _format_bytes(free_bytes), " (", abs_dir, ")")
-	if free_bytes < WARN_THRESHOLD_BYTES:
-		push_warning("[DirectStorage Exporter] Low disk space: only " + _format_bytes(free_bytes) + " free at '" + abs_dir + "'. The textures.dspkg + PCK + exe typically need several hundred MiB. Free up space before the export fails with file-write errors.")
+	if rewrite_bytes > 0:
+		print("[DirectStorage Exporter] Previous exe/PCK/archive in the target directory total ", _format_bytes(rewrite_bytes), "; this export rewrites them.")
+	if free_bytes < WARN_THRESHOLD_BYTES or free_bytes < rewrite_bytes + HEADROOM_BYTES:
+		push_warning("[DirectStorage Exporter] Low disk space: only " + _format_bytes(free_bytes) + " free at '" + abs_dir + "'. This export rewrites about " + _format_bytes(rewrite_bytes) + " of exe/PCK/archive plus " + _format_bytes(HEADROOM_BYTES) + " of headroom. Free up space before the export fails with file-write errors.")
+
+## Best-effort size of the artifact set this export overwrites in the target
+## directory. Zero means "first export" (nothing to measure), in which case only
+## the flat threshold applies. The previous files predict the next export well,
+## because an export rewrites the same template, PCK and archive names.
+func _estimate_rewrite_bytes() -> int:
+	if _target_export_path.is_empty():
+		return 0
+	var total := _file_size_or_zero(_target_export_path)
+	total += _file_size_or_zero(_target_export_path.get_basename() + ".console.exe")
+	total += _file_size_or_zero(_target_dspkg_path)
+	if not _preset_embeds_pck():
+		total += _file_size_or_zero(_target_export_path.get_basename() + ".pck")
+	return total
+
+## The embedded-PCK preset writes the pack inside the executable, so the
+## estimate must not count a sibling .pck that will never be written.
+func _preset_embeds_pck() -> bool:
+	var preset: EditorExportPreset = get_export_preset()
+	if preset == null:
+		return false
+	return bool(preset.get("binary_format/embed_pck"))
+
+func _file_size_or_zero(path: String) -> int:
+	if path.is_empty() or not FileAccess.file_exists(path):
+		return 0
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		return 0
+	var size := int(file.get_length())
+	file.close()
+	return size
+
+## True when the engine recorded an export error for THIS run. The platform's
+## message list is the same signal EditorExportPlatform::fill_log_messages uses
+## to mark the result dialog "Failed.". Only messages added after _export_begin
+## count, so an accumulated list (CLI exports, "Export All" reuse) cannot leak
+## an earlier run's error into this one.
+func _core_export_reports_error() -> bool:
+	var platform: EditorExportPlatform = get_export_platform()
+	if platform == null:
+		return false
+	if not platform.has_method("get_message_count") or not platform.has_method("get_message_type"):
+		return false
+	var count: int = platform.get_message_count()
+	for index in range(_platform_messages_at_begin, count):
+		if int(platform.get_message_type(index)) >= int(EditorExportPlatform.EXPORT_MESSAGE_ERROR):
+			return true
+	return false
+
+## An EditorExportPlugin cannot abort the engine's PCK/exe steps, so without
+## this the result dialog would report success for an export that deployed no
+## archive. An EXPORT_MESSAGE_ERROR makes fill_log_messages report "Failed.";
+## the artifact set is already fail-closed (no archive was deployed).
+func _mark_export_failed() -> void:
+	var platform: EditorExportPlatform = get_export_platform()
+	if platform == null or not platform.has_method("add_message"):
+		return
+	platform.add_message(EditorExportPlatform.EXPORT_MESSAGE_ERROR, "DirectStorage",
+			"The DirectStorage archive step failed; " + _archive_name + " was not deployed (see the errors above).")
 
 func _is_disk_space_error(err: Error) -> bool:
 	return err == ERR_FILE_CANT_WRITE or err == ERR_FILE_CANT_OPEN or err == ERR_CANT_CREATE or err == FAILED
