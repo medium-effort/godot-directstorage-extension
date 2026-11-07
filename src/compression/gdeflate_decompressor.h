@@ -5,6 +5,8 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 
+#include <cstdint>
+
 namespace godot {
 
 class GDeflateDecompressor : public RefCounted {
@@ -24,6 +26,14 @@ public:
 
 	void set_worker_count(int p_count);
 	int get_worker_count() const;
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only observation point: the byte count of the last destination
+	// allocation request, recorded immediately before output.resize(). Never
+	// bound to ClassDB; native tests call it directly.
+	static int64_t _get_last_resize_request_for_testing();
+	static void _reset_last_resize_request_for_testing();
+#endif
 };
 
 } // namespace godot
