@@ -1336,6 +1336,68 @@ GDEX_TEST_T(win32_remediation, dstorage_requests_not_shared_during_enqueue_windo
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, drain_counter_access_is_serialised, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // The shutdown drain reads each queue's completion fence and counter before it
+    // waits, and records the completed value afterwards. Every other reader and
+    // writer of those counters - wait_for_completion(), the submit paths and the
+    // completion thread - holds batch_mutex while it does so, so the drain must
+    // too. The DEBUG/DEV seam parks the drain at the access and another thread
+    // asks whether the lock is held there; an unsynchronised access answers "free".
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        // Ordering matters: the hook captured this test's frame, so it must be
+        // gone before the backend (and, through it, the drain) can run again.
+        backend->_debug_set_drain_counter_access_hook_for_testing({});
+        memdelete(backend); // dtor -> shutdown() -> drain
+    });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    std::atomic<bool> window_open{ false };
+    std::atomic<bool> release_window{ false };
+    backend->_debug_set_drain_counter_access_hook_for_testing([&window_open, &release_window]() {
+        window_open.store(true);
+        // Self-releasing: a broken build must not hang the suite here.
+        const auto hook_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!release_window.load() && std::chrono::steady_clock::now() < hook_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    // No batch is in flight in this process, so nothing else can hold batch_mutex:
+    // a free lock at the counter access means the drain is not serialised with the
+    // completion thread and the submit paths.
+    std::thread drainer([backend]() { backend->shutdown(); });
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!window_open.load() && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool entered = window_open.load();
+    const bool counter_access_held = entered && !backend->_debug_batch_mutex_is_free_for_testing();
+
+    release_window.store(true);
+    drainer.join();
+    backend->_debug_set_drain_counter_access_hook_for_testing({});
+
+    GDEX_EXPECT_TRUE(entered);
+    GDEX_EXPECT_TRUE(counter_access_held);
+#else
+    (void)ctx;
+    GDEX_SKIP("The drain counter-access seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, readers_see_no_backend_until_initialize_returns, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)

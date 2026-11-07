@@ -116,6 +116,10 @@ private:
 		// trigger and the completion path no longer reads the record itself.
 		HANDLE error_event = nullptr;
 		ID3D12Fence *completion_fence = nullptr;
+		// Both counters are owned by batch_mutex: submit_async()/submit_batch()
+		// advance completion_fence_value under it, wait_for_completion() and the
+		// completion thread record completed_fence_value under it, and
+		// drain_all_queues() reads and writes them through a snapshot taken under it.
 		uint64_t completion_fence_value = 0;
 		uint64_t completed_fence_value = 0;
 		// Failures captured on error_event that have not reached their completing
@@ -251,6 +255,10 @@ private:
 	// cancel_requests_with_tag(); the real interleaving is a scheduler race that
 	// cannot be produced on demand. Never bound in _bind_methods().
 	std::function<void()> enqueue_window_hook;
+	// Test-only seam: runs at the point drain_all_queues() touches the per-queue
+	// completion counters. A test parks there and asks another thread whether
+	// batch_mutex is held at that instant. Never bound in _bind_methods().
+	std::function<void()> drain_counter_access_hook;
 #endif
 
 #ifdef _WIN32
@@ -406,6 +414,10 @@ public:
 	// Test-only seam: installs (or, with an empty callback, clears) the hook that
 	// runs inside the batch_mutex-free enqueue window. Never bound in _bind_methods().
 	void _debug_set_enqueue_window_hook_for_testing(const std::function<void()> &p_hook);
+	// Test-only seam: installs (or, with an empty callback, clears) the hook that
+	// runs where drain_all_queues() touches the per-queue completion counters.
+	// Never bound in _bind_methods().
+	void _debug_set_drain_counter_access_hook_for_testing(const std::function<void()> &p_hook);
 	// Test-only seam: largest pending enqueue payload across every slot, read
 	// WITHOUT batch_mutex. It must read 0 for the whole window the hook above
 	// opens: the payload is then owned by the submitting stack frame, so no other

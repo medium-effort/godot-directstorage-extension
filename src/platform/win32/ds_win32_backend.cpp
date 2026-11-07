@@ -3204,17 +3204,49 @@ bool Win32Backend::initialize(const String &p_path) {
 
 #ifdef _WIN32
 bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
+	// Snapshot the per-queue wait targets under batch_mutex. Every QueueState
+	// counter belongs to that mutex: submit_async()/submit_batch() advance
+	// completion_fence_value under it, and the completion thread records
+	// completed_fence_value under it (complete_batch_slot()). Reading or writing
+	// either counter here without the lock raced those writers.
+	struct DrainTarget {
+		ID3D12Fence *fence = nullptr;
+		uint64_t target_value = 0;
+		HANDLE event = nullptr;
+	};
+	ID3D12Fence *fences[QUEUE_COUNT] = {};
+	DrainTarget targets[QUEUE_COUNT];
+	int target_count = 0;
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		// Test-only seam: runs inside the counter snapshot, i.e. at the access that
+		// must be serialised with every other reader and writer of these counters.
+		// A test parks in the hook and asks another thread whether batch_mutex is
+		// held here.
+		if (drain_counter_access_hook) {
+			drain_counter_access_hook();
+		}
+#endif
+		for (int i = 0; i < QUEUE_COUNT; i++) {
+			const QueueState &queue = priority_queues[i];
+			fences[i] = queue.completion_fence;
+			if (queue.completion_fence && queue.completion_fence_value != 0 && queue.completion_event) {
+				targets[target_count++] = { queue.completion_fence, queue.completion_fence_value, queue.completion_event };
+			}
+		}
+	}
+
+	// The fence queries, SetEventOnCompletion() and the wait stay outside
+	// batch_mutex: the wait can park for the whole drain budget, and holding the
+	// lock across it would stall every enqueue, submit and batch completion.
 	HANDLE wait_events[QUEUE_COUNT];
 	int event_count = 0;
-
-	for (int i = 0; i < QUEUE_COUNT; i++) {
-		QueueState &queue = priority_queues[i];
-		if (queue.completion_fence && queue.completion_fence_value != 0 && queue.completion_event) {
-			uint64_t completed = queue.completion_fence->GetCompletedValue();
-			if (completed != UINT64_MAX && completed < queue.completion_fence_value) {
-				if (SUCCEEDED(queue.completion_fence->SetEventOnCompletion(queue.completion_fence_value, queue.completion_event))) {
-					wait_events[event_count++] = queue.completion_event;
-				}
+	for (int i = 0; i < target_count; i++) {
+		uint64_t completed = targets[i].fence->GetCompletedValue();
+		if (completed != UINT64_MAX && completed < targets[i].target_value) {
+			if (SUCCEEDED(targets[i].fence->SetEventOnCompletion(targets[i].target_value, targets[i].event))) {
+				wait_events[event_count++] = targets[i].event;
 			}
 		}
 	}
@@ -3223,14 +3255,22 @@ bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 		return true;
 	}
 
+	// Read the fences outside the lock (they are hardware-owned values); apply the
+	// results under it.
+	uint64_t completed_now[QUEUE_COUNT] = {};
+	for (int i = 0; i < QUEUE_COUNT; i++) {
+		completed_now[i] = fences[i] ? fences[i]->GetCompletedValue() : 0;
+	}
+
 	DWORD wait_result = WaitForMultipleObjects(event_count, wait_events, TRUE, p_timeout_ms);
 	if (wait_result >= WAIT_OBJECT_0 && wait_result < WAIT_OBJECT_0 + event_count) {
-		for (int i = 0; i < QUEUE_COUNT; i++) {
-			if (priority_queues[i].completion_fence) {
-				priority_queues[i].completed_fence_value = priority_queues[i].completion_fence->GetCompletedValue();
-			}
-		}
 		std::lock_guard<std::mutex> lock(batch_mutex);
+		for (int i = 0; i < QUEUE_COUNT; i++) {
+			// max, not assignment: the completion thread may have recorded a newer
+			// value while this drain was waiting, and the counter must never move
+			// backwards.
+			priority_queues[i].completed_fence_value = std::max(priority_queues[i].completed_fence_value, completed_now[i]);
+		}
 		for (size_t z = 0; z < zombie_slots.size(); z++) {
 			for (int r = 0; r < zombie_slots[z].requests.size(); r++) {
 				if (zombie_slots[z].requests[r].is_valid()) {
@@ -4926,6 +4966,14 @@ void Win32Backend::_debug_set_enqueue_window_hook_for_testing(const std::functio
 	// empty. Callers must clear it before the captured state dies and before
 	// deleting the backend. Never bound in _bind_methods().
 	enqueue_window_hook = p_hook;
+}
+
+void Win32Backend::_debug_set_drain_counter_access_hook_for_testing(const std::function<void()> &p_hook) {
+	// Test-only seam. Installs the callback run where drain_all_queues() touches
+	// the per-queue completion counters, or clears it when p_hook is empty.
+	// Callers must clear it before the captured state dies and before deleting the
+	// backend. Never bound in _bind_methods().
+	drain_counter_access_hook = p_hook;
 }
 
 int Win32Backend::_debug_pending_enqueue_count() const {
