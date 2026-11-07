@@ -323,6 +323,11 @@ static func is_gpu_prewarm_available() -> bool:
 ## always stay on the memory path, so those arrive as [ImageTexture] even when GPU prewarm is
 ## active.
 ##
+## Non-multiple-of-4 textures are GPU-eligible, but the resulting [Texture2DRD] reports the
+## padded storage size because the engine exposes no size setter. Enable
+## [code]compatibility/as_image_texture[/code] when [method Texture2D.get_width] must report the
+## authoring size.
+##
 ## Textures are allocated in render-thread chunks of [param chunk_size] to bound frame time.
 ## Returns 0 when native singletons or the stream driver are unavailable.
 static func prewarm_gpu_async(paths: PackedStringArray, chunk_size: int = 16, prefer_gpu: bool = true) -> int:

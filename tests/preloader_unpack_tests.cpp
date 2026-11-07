@@ -254,6 +254,76 @@ GDEX_TEST(preloader_gpu, eligibility_matrix) {
 	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(short_tables));
 }
 
+GDEX_TEST(preloader_gpu, eligibility_accepts_npot) {
+	// Contract lock-in: a non-multiple-of-4 payload is deliberately GPU-eligible.
+	// The wrap is a Texture2DRD at the padded storage size (GODOT_QUIRKS.md Q79
+	// documents the missing size setter); compatibility/as_image_texture is the
+	// documented escape when get_width() must report the authoring size. Keeping
+	// the texture on the GPU path is the shipped behaviour and is not changed by
+	// the documentation fix for this finding.
+	godot::DSPreloader::Payload eligible;
+	eligible.engine_path = "res://test_gpu_npot.png";
+	eligible.width = 100;
+	eligible.height = 52;
+	eligible.mip_count = 2;
+	eligible.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_BPTC_RGBA);
+	eligible.is_v2 = true;
+	eligible.mip_offsets.resize(2);
+	eligible.mip_sizes.resize(2);
+	eligible.mip_uncompressed_sizes.resize(2);
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(eligible));
+
+	// 100x50 logical over 100x52 storage stays eligible; the GPU wrap will
+	// report 100x52, which the prewarm warning and the docs state explicitly.
+	godot::DSPreloader::Payload npot = eligible;
+	npot.logical_width = 100;
+	npot.logical_height = 50;
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(npot));
+
+	// A non-zero pair equal to storage is equivalent to the producers' 0
+	// encoding and must not change eligibility either.
+	godot::DSPreloader::Payload equal = eligible;
+	equal.logical_width = 100;
+	equal.logical_height = 52;
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(equal));
+}
+
+GDEX_TEST(preloader_gpu, npot_header_logical_semantics) {
+	// Companion lock-in: v2 cannot express a logical size, so the loader's GPU
+	// branch can only meet needs_size_override through a v3 payload. This pins
+	// the header contract the documented CPU/GPU size difference relies on.
+	const char *v2_path = "user://gdextest_npot_semantics_v2.dstex";
+	const char *v3_path = "user://gdextest_npot_semantics_v3.dstex";
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	GDEX_ASSERT_TRUE(dstex.is_valid());
+
+	godot::PackedByteArray raw;
+	raw.resize(100 * 52 * 4);
+	memset(raw.ptrw(), 0x5A, static_cast<size_t>(raw.size()));
+
+	GDEX_ASSERT_EQ((int64_t)dstex->write_to_file(godot::String(v2_path), raw, 100, 52,
+						   godot::Image::FORMAT_RGBA8, 1, 1),
+			(int64_t)godot::OK);
+	GDEX_ASSERT_EQ((int64_t)dstex->write_to_file(godot::String(v3_path), raw, 100, 52,
+						   godot::Image::FORMAT_RGBA8, 1, 1, false, false, 100, 50),
+			(int64_t)godot::OK);
+
+	godot::Dictionary v2 = dstex->read_header(godot::String(v2_path));
+	godot::Dictionary v3 = dstex->read_header(godot::String(v3_path));
+	GDEX_ASSERT_FALSE(v2.is_empty());
+	GDEX_ASSERT_FALSE(v3.is_empty());
+	GDEX_EXPECT_EQ((int64_t)v2["version"], (int64_t)2);
+	GDEX_EXPECT_EQ((int64_t)v2["logical_width"], (int64_t)100);
+	GDEX_EXPECT_EQ((int64_t)v2["logical_height"], (int64_t)52);
+	GDEX_EXPECT_EQ((int64_t)v3["version"], (int64_t)3);
+	GDEX_EXPECT_EQ((int64_t)v3["logical_width"], (int64_t)100);
+	GDEX_EXPECT_EQ((int64_t)v3["logical_height"], (int64_t)50);
+
+	godot::DirAccess::remove_absolute(godot::String(v2_path));
+	godot::DirAccess::remove_absolute(godot::String(v3_path));
+}
+
 GDEX_TEST(preloader_gpu, pump_idle_is_noop) {
 	// No chunks queued anywhere: must not crash, post nothing, free nothing.
 	godot::DSPreloader::pump_gpu_prewarm();

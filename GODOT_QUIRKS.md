@@ -1930,7 +1930,7 @@ img_tex->set_size_override(godot::Vector2i(logical_w, logical_h));
 
 GPU wraps override the RS wrapper RID from `get_rid()`, and only where the wrap already
 executed (the render thread — `set_texture_rd_rid` is async elsewhere, so preloader GPU
-completion documents storage dims). Implemented in
+completion documents storage dims). The addon exposes the CPU escape as `compatibility/as_image_texture`: enabling it forces an `ImageTexture` with `set_size_override`, which is the supported way to get authoring dimensions for non-multiple-of-4 sources. Implemented in
 `src/integration/ds_resource_format_loader.cpp` (sync loader) and
 `src/integration/ds_preloader.cpp` (prewarm build). Related: Q05 (Texture2DRD CPU-pixel
 gaps), Q27 (Texture2DRD RID ownership), Q36 (which RID to validate). Upstream report:

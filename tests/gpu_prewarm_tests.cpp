@@ -65,6 +65,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -216,6 +217,82 @@ bool stage_large_gpu_dspkg(const char *p_dstex_path, const char *p_dspkg_path, c
     }
     return stage_gpu_dspkg_impl(p_dstex_path, p_dspkg_path, p_virtual_path, p_control_path,
             raw, kLargeSize, kLargeSize, 1);
+}
+
+// Copy a built .dspkg to res://textures.dspkg and verify the entries resolve.
+// Remove-then-copy with one retry for the same Defender/safe-save window the
+// existing staging helper documents.
+bool publish_textures_dspkg(const char *p_dspkg_path, const char *p_virtual_a, const char *p_virtual_b) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+        godot::DirAccess::copy_absolute(godot::String(p_dspkg_path), godot::String("res://textures.dspkg"));
+        godot::Ref<godot::DSPkg> verify;
+        verify.instantiate();
+        godot::Error open_err = godot::ERR_CANT_OPEN;
+        bool has_a = false;
+        bool has_b = true;
+        if (!verify.is_null()) {
+            open_err = verify->open(godot::String("res://textures.dspkg"));
+            has_a = verify->has_texture(godot::String(p_virtual_a));
+            has_b = p_virtual_b == nullptr || verify->has_texture(godot::String(p_virtual_b));
+        }
+        if (open_err == godot::OK && has_a && has_b) {
+            return true;
+        }
+        if (attempt == 0) {
+            godot::OS *os = godot::OS::get_singleton();
+            if (os != nullptr) {
+                os->delay_msec(500);
+            }
+        }
+    }
+    return false;
+}
+
+// Lock-in fixture: one v3 NPOT entry (storage 100x52, logical 100x50) beside
+// one aligned v2 64x64 control, both in the same archive. The control proves
+// the GPU path ran; the NPOT entry documents the padded storage size that the
+// Texture2DRD wrap reports. Kept as loose .dstex files too for the
+// render-thread loader case.
+bool stage_npot_dspkg(const char *p_npot_dstex_path, const char *p_control_dstex_path,
+        const char *p_dspkg_path, const char *p_npot_virtual, const char *p_control_virtual) {
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    if (dstex.is_null()) {
+        return false;
+    }
+    godot::PackedByteArray npot_raw;
+    npot_raw.resize(100 * 52 * 4);
+    memset(npot_raw.ptrw(), 0x5A, static_cast<size_t>(npot_raw.size()));
+    if (dstex->write_to_file(godot::String(p_npot_dstex_path), npot_raw, 100, 52,
+                godot::Image::FORMAT_RGBA8, 1, 1, true, false, 100, 50) != godot::OK) {
+        return false;
+    }
+    godot::PackedByteArray control_raw;
+    control_raw.resize(64 * 64 * 4);
+    memset(control_raw.ptrw(), 0x3C, static_cast<size_t>(control_raw.size()));
+    if (dstex->write_to_file(godot::String(p_control_dstex_path), control_raw, 64, 64,
+                godot::Image::FORMAT_RGBA8, 1, 1, true, false) != godot::OK) {
+        return false;
+    }
+    godot::Ref<godot::DSPkg> builder;
+    builder.instantiate();
+    if (builder.is_null()) {
+        return false;
+    }
+    if (builder->create(godot::String(p_dspkg_path)) != godot::OK) {
+        return false;
+    }
+    if (builder->add_texture(godot::String(p_npot_virtual), godot::String(p_npot_dstex_path)) != godot::OK) {
+        return false;
+    }
+    if (builder->add_texture(godot::String(p_control_virtual), godot::String(p_control_dstex_path)) != godot::OK) {
+        return false;
+    }
+    if (builder->finalize() != godot::OK) {
+        return false;
+    }
+    return publish_textures_dspkg(p_dspkg_path, p_npot_virtual, p_control_virtual);
 }
 
 // Deterministic *natural* (unpadded) block bytes for a linear-only RD format.
@@ -1122,4 +1199,229 @@ GDEX_TEST_T(gpu_prewarm, cancel_in_flight_keeps_parent_and_rid_owned, TAG_INTEGR
     }
 #endif
 }
+
+namespace {
+
+// Render-thread loader probe for the NPOT storage-size contract. Kept in the
+// test file only; not part of the shipped extension.
+struct RenderLoadProbe {
+    std::mutex mutex;
+    godot::Ref<godot::Texture2D> texture;
+    std::atomic<bool> done{ false };
+};
+
+std::atomic<RenderLoadProbe *> g_render_load_probe{ nullptr };
+std::atomic<const char *> g_render_load_path{ nullptr };
+
+void render_load_probe_body() {
+    RenderLoadProbe *probe = g_render_load_probe.load();
+    if (probe == nullptr) {
+        return;
+    }
+    const char *path = g_render_load_path.load();
+    godot::Ref<godot::DSResourceFormatLoader> loader;
+    loader.instantiate();
+    godot::Variant result;
+    if (loader.is_valid() && path != nullptr) {
+        result = loader->_load(godot::String(path), godot::String(""), false,
+                godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+    }
+    {
+        std::lock_guard<std::mutex> lock(probe->mutex);
+        probe->texture = godot::Ref<godot::Texture2D>(result);
+    }
+    probe->done.store(true);
+}
+
+bool run_render_load(const char *p_path, godot::Ref<godot::Texture2D> &r_out, int p_timeout_ms) {
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::OS *os = godot::OS::get_singleton();
+    godot::Time *time = godot::Time::get_singleton();
+    if (rs == nullptr || os == nullptr || time == nullptr) {
+        return false;
+    }
+    RenderLoadProbe *probe = new RenderLoadProbe();
+    g_render_load_path.store(p_path);
+    g_render_load_probe.store(probe);
+    rs->call_on_render_thread(callable_mp_static(render_load_probe_body));
+    const uint64_t deadline = time->get_ticks_msec() + static_cast<uint64_t>(p_timeout_ms);
+    while (!probe->done.load() && time->get_ticks_msec() < deadline) {
+        os->delay_msec(5);
+    }
+    if (!probe->done.load()) {
+        // The render callback may still be inside _load; leak the probe rather
+        // than free memory it can still write through.
+        g_render_load_probe.store(nullptr);
+        godot::UtilityFunctions::push_warning(
+                "gpu_prewarm diagnostic: render-thread load timed out for ", godot::String(p_path));
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(probe->mutex);
+        r_out = probe->texture;
+    }
+    g_render_load_probe.store(nullptr);
+    delete probe;
+    return true;
+}
+
+bool write_loose_npot_fixture(const char *p_path, int p_width, int p_height,
+        int p_logical_width, int p_logical_height) {
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    if (dstex.is_null()) {
+        return false;
+    }
+    godot::PackedByteArray raw;
+    raw.resize(static_cast<int64_t>(p_width) * static_cast<int64_t>(p_height) * 4);
+    memset(raw.ptrw(), 0x5A, static_cast<size_t>(raw.size()));
+    return dstex->write_to_file(godot::String(p_path), raw, p_width, p_height,
+                   godot::Image::FORMAT_RGBA8, 1, 1, true, false, p_logical_width, p_logical_height) == godot::OK;
+}
+
+} // namespace
+
+GDEX_TEST_T(gpu_prewarm, npot_prewarm_reports_storage_dims, TAG_INTEGRATION | TAG_SLOW) {
+    if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
+        GDEX_SKIP("DSContext/DSTextureCache classes unavailable");
+    }
+    if (godot::DSContext *pre = godot::DSContext::get_singleton()) {
+        pre->shutdown_ds();
+    }
+    godot::DSContext *ds = require_singleton_context(ctx);
+    if (!ds->initialize_ds() || !ds->is_initialized()) {
+        GDEX_SKIP("DSContext backend unavailable (initialize_ds failed)");
+    }
+    if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+        GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver)");
+    }
+    if (!godot::DSPreloader::is_gpu_prewarm_available()) {
+        GDEX_SKIP("GPU prewarm unavailable (no live D3D12 RenderingDevice)");
+    }
+    godot::DSTextureCache *cache = new_test_cache(ctx);
+    godot::DSPreloader::shutdown();
+
+    const char *npot_dstex = "user://gdextest_gpu_npot.dstex";
+    const char *control_dstex = "user://gdextest_gpu_npot_control.dstex";
+    const char *dspkg_path = "user://gdextest_gpu_npot.dspkg";
+    const char *npot_virtual = "res://gdextest_gpu_npot.png";
+    const char *control_virtual = "res://gdextest_gpu_npot_control.png";
+
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps) {
+        ps->set_setting("directstorage/force_archive_resolution", true);
+    }
+    ctx.add_teardown([ds, ps]() {
+        if (ps) {
+            ps->set_setting("directstorage/force_archive_resolution", false);
+        }
+        ds->shutdown_ds();
+        remove_abs("res://textures.dspkg");
+        remove_abs("user://gdextest_gpu_npot.dstex");
+        remove_abs("user://gdextest_gpu_npot_control.dstex");
+        remove_abs("user://gdextest_gpu_npot.dspkg");
+        godot::DSPreloader::shutdown();
+    });
+
+    if (!stage_npot_dspkg(npot_dstex, control_dstex, dspkg_path, npot_virtual, control_virtual)) {
+        GDEX_ABORT_TEST("NPOT textures.dspkg staging failed");
+    }
+
+    {
+        godot::Ref<godot::DSPkg> probe;
+        probe.instantiate();
+        GDEX_ASSERT_TRUE(probe.is_valid());
+        GDEX_ASSERT_EQ((int64_t)probe->open(godot::String("res://textures.dspkg")), (int64_t)godot::OK);
+        godot::Dictionary info = probe->get_entry_info(godot::String(npot_virtual));
+        GDEX_ASSERT_FALSE(info.is_empty());
+        GDEX_EXPECT_EQ((int64_t)info["format_version"], (int64_t)5);
+        GDEX_EXPECT_EQ((int64_t)info["width"], (int64_t)100);
+        GDEX_EXPECT_EQ((int64_t)info["height"], (int64_t)52);
+        GDEX_EXPECT_EQ((int64_t)info["logical_width"], (int64_t)100);
+        GDEX_EXPECT_EQ((int64_t)info["logical_height"], (int64_t)50);
+        GDEX_EXPECT_TRUE((bool)info.get("has_gpu_metadata", false));
+    }
+
+    godot::PackedStringArray paths;
+    paths.push_back(godot::String(npot_virtual));
+    paths.push_back(godot::String(control_virtual));
+    uint64_t tag = 0;
+    try {
+        tag = cache->prewarm_gpu_async(paths, 16, true);
+    } catch (const std::exception &e) {
+        GDEX_FAIL(std::string("prewarm_gpu_async threw: ") + e.what());
+    } catch (...) {
+        GDEX_FAIL("prewarm_gpu_async threw an unknown exception.");
+    }
+    GDEX_ASSERT_TRUE(tag != 0);
+
+    const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() + 20000;
+    GDEX_ASSERT_TRUE(drive_prewarm_to_settled(ds, cache, tag, deadline));
+
+    godot::Ref<godot::Texture2D> control_tex = cache->get_cached(godot::String(control_virtual), godot::DSTextureCache::CACHE_MODE_REUSE);
+    GDEX_ASSERT_TRUE(control_tex.is_valid());
+    godot::Ref<godot::Texture2DRD> control_rd = control_tex;
+    GDEX_EXPECT_TRUE(control_rd.is_valid());
+
+    godot::Ref<godot::Texture2D> npot_tex = cache->get_cached(godot::String(npot_virtual), godot::DSTextureCache::CACHE_MODE_REUSE);
+    GDEX_ASSERT_TRUE(npot_tex.is_valid());
+    godot::UtilityFunctions::print("DIAG npot_prewarm type=", npot_tex->get_class(),
+            " size=", npot_tex->get_width(), "x", npot_tex->get_height());
+    // Documented GPU behaviour: the wrap is a Texture2DRD at the padded storage
+    // size because Texture2DRD has no size setter. compatibility/as_image_texture
+    // is the supported CPU-path escape for logical dimensions.
+    godot::Ref<godot::Texture2DRD> npot_rd = npot_tex;
+    GDEX_EXPECT_TRUE(npot_rd.is_valid());
+    GDEX_EXPECT_EQ((int64_t)npot_tex->get_width(), (int64_t)100);
+    GDEX_EXPECT_EQ((int64_t)npot_tex->get_height(), (int64_t)52);
+}
+
+GDEX_TEST_T(gpu_prewarm, npot_loader_render_thread_reports_storage_dims, TAG_INTEGRATION | TAG_SLOW) {
+    if (!godot::ClassDB::class_exists("DSContext")) {
+        GDEX_SKIP("DSContext class unavailable");
+    }
+    if (godot::DSContext *pre = godot::DSContext::get_singleton()) {
+        pre->shutdown_ds();
+    }
+    godot::DSContext *ds = require_singleton_context(ctx);
+    if (!ds->initialize_ds() || !ds->is_initialized()) {
+        GDEX_SKIP("DSContext backend unavailable (initialize_ds failed)");
+    }
+    if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+        GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver)");
+    }
+
+    const char *control_path = "user://gdextest_npot_loader_control.dstex";
+    const char *npot_path = "user://gdextest_npot_loader_v3.dstex";
+    ctx.add_teardown([ds]() {
+        ds->shutdown_ds();
+        remove_abs("user://gdextest_npot_loader_control.dstex");
+        remove_abs("user://gdextest_npot_loader_v3.dstex");
+    });
+
+    if (!write_loose_npot_fixture(control_path, 64, 64, 0, 0)) {
+        GDEX_ABORT_TEST("v2 control fixture write failed");
+    }
+    if (!write_loose_npot_fixture(npot_path, 100, 52, 100, 50)) {
+        GDEX_ABORT_TEST("v3 NPOT fixture write failed");
+    }
+
+    godot::Ref<godot::Texture2D> control_tex;
+    GDEX_ASSERT_TRUE(run_render_load(control_path, control_tex, 10000));
+    godot::UtilityFunctions::print("DIAG npot_loader_control type=", control_tex->get_class(),
+            " size=", control_tex->get_width(), "x", control_tex->get_height());
+    godot::Ref<godot::Texture2DRD> control_rd = control_tex;
+    GDEX_EXPECT_TRUE(control_rd.is_valid());
+
+    godot::Ref<godot::Texture2D> npot_tex;
+    GDEX_ASSERT_TRUE(run_render_load(npot_path, npot_tex, 10000));
+    godot::UtilityFunctions::print("DIAG npot_loader type=", npot_tex->get_class(),
+            " size=", npot_tex->get_width(), "x", npot_tex->get_height());
+    // Same documented behaviour through the render-thread loader path.
+    godot::Ref<godot::Texture2DRD> npot_rd = npot_tex;
+    GDEX_EXPECT_TRUE(npot_rd.is_valid());
+    GDEX_EXPECT_EQ((int64_t)npot_tex->get_width(), (int64_t)100);
+    GDEX_EXPECT_EQ((int64_t)npot_tex->get_height(), (int64_t)52);
+}
+
 

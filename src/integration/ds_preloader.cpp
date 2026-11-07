@@ -1148,6 +1148,10 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 	ready.reserve(payloads.size());
 	std::vector<GpuChunkItem> gpu_items;
 	gpu_items.reserve(payloads.size());
+	// Count non-multiple-of-4 payloads that take the GPU path. Their wrap reports
+	// the padded storage size (Texture2DRD has no size setter), so surface one
+	// batch-level warning instead of one line per texture.
+	int npot_gpu = 0;
 	{
 		Vector<Ref<DSRequest>> reqs;
 		for (size_t i = 0; i < payloads.size(); ++i) {
@@ -1156,6 +1160,9 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 				item.meta = payloads[i];
 				item.pending_id = 0; // assigned at publish below
 				gpu_items.push_back(item);
+				if (payloads[i].logical_width != 0 || payloads[i].logical_height != 0) {
+					npot_gpu++;
+				}
 				continue;
 			}
 			if (!expand_requests(payloads[i], tag, reqs)) {
@@ -1243,6 +1250,10 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 	}
 	// Kick the first GPU chunk without waiting for a batch-manager tick.
 	pump_gpu_prewarm();
+	if (npot_gpu > 0) {
+		UtilityFunctions::push_warning("DSPreloader: ", npot_gpu, " of ", (int64_t)gpu_items.size(),
+				" GPU-prewarmed textures are non-multiple-of-4; Texture2DRD reports their padded storage dimensions. Enable compatibility/as_image_texture to load them as ImageTexture at their logical size.");
+	}
 	UtilityFunctions::print_verbose("DSPreloader: gpu prewarm tag ", String::num_uint64(tag), " tracking ", (int64_t)payloads.size(), " textures (", (int64_t)enqueued, " memory requests, ", (int64_t)gpu_queued, " gpu textures, ", (int64_t)skipped_cached, " cached, ", (int64_t)skipped_unresolvable, " skipped).");
 	return tag;
 }
@@ -1545,9 +1556,10 @@ void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 	// NOTE: no size override here. The wrap above executes asynchronously on
 	// the render thread, so the RS wrapper RID is not available yet, and the
 	// device RID lives in the RD namespace that texture_set_size_override
-	// must never receive. GPU-prewarmed NPOT textures therefore report
-	// storage dims until the v5-writer follow-up wires a deferred override;
-	// CPU prewarm and sync loads have full parity.
+	// must never receive. GPU-prewarmed NPOT textures therefore report storage
+	// dims; the engine exposes no setter (GODOT_QUIRKS.md Q79). Users who need
+	// authoring dimensions enable compatibility/as_image_texture, which routes
+	// the texture to the CPU/ImageTexture path with set_size_override.
 	const String alias = (p_entry.meta.payload_key != p_entry.meta.engine_path) ? p_entry.meta.payload_key : String();
 	// can_own() is a pre-check, not a reservation. If the cache was disabled
 	// between it and store(), store() reports refusal and we still own the RID.

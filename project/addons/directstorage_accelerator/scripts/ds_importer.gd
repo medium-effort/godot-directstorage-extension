@@ -216,7 +216,7 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 			"name": "compatibility/as_image_texture",
 			"default_value": is_2d,
 			"property_hint": PROPERTY_HINT_NONE,
-			"hint_string": "Forces ImageTexture CPU loading even during GPU prewarm. Required for Light3D projectors, Decals, and get_image() callers.",
+			"hint_string": "Forces ImageTexture CPU loading even during GPU prewarm. Required for Light3D projectors, Decals, and get_image() callers. Also the supported way to get authoring (logical) dimensions for non-multiple-of-4 sources, which GPU Texture2DRD wraps report at the padded storage size.",
 		}
 	]
 
@@ -433,7 +433,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		var target_height := aligned_height if aligned_height <= 2 else (aligned_height + 3) & ~3
 		if target_width != aligned_width or target_height != aligned_height:
 			img.resize(target_width, target_height, Image.INTERPOLATE_CUBIC)
-			push_warning("[DirectStorage Importer] Asset '%s' dimensions %dx%d are not a multiple of 4; block compression stores them as %dx%d." % [source_file, aligned_width, aligned_height, target_width, target_height])
+			push_warning("[DirectStorage Importer] Asset '%s' dimensions %dx%d are not a multiple of 4; block compression stores them as %dx%d. GPU-decoded textures report the padded %dx%d size (Texture2DRD has no size setter); enable compatibility/as_image_texture to load it as a %dx%d ImageTexture." % [source_file, aligned_width, aligned_height, target_width, target_height, target_width, target_height, aligned_width, aligned_height])
 
 	# Godot remaps channels right after the size-limit resize; do the same so
 	# packed PBR masks and normal-map swizzles apply before normalization.

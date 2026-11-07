@@ -585,9 +585,11 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 						// reports its own storage-member size; the engine
 						// exposes no setter for it, so get_width() on this
 						// path reports storage dims — CPU/ImageTexture loads
-						// have full parity via set_size_override).
+						// have full parity via set_size_override, which users
+						// opt into with compatibility/as_image_texture).
 						// Runs on the render thread here, so the wrap above
 						// already executed and get_rid() is the wrapper.
+						UtilityFunctions::print_verbose("DSResourceFormatLoader: NPOT payload on the GPU path reports padded storage dims (", p_width, "x", p_height, "); enable compatibility/as_image_texture for authoring dims.");
 						RID wrapper_rid = tex_rd->get_rid();
 						if (wrapper_rid.is_valid()) {
 							rs->texture_set_size_override(wrapper_rid, static_cast<int32_t>(logical_width), static_cast<int32_t>(logical_height));
