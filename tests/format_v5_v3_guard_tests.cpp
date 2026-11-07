@@ -9,6 +9,7 @@
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/string.hpp>
@@ -35,6 +36,15 @@ constexpr uint32_t PAYLOAD_ROW_BYTES = 256;
 constexpr uint32_t MESH_PAYLOAD_BYTES = 1024;
 constexpr uint16_t V5_HEADER_MIN = 96;
 constexpr uint16_t V5_ENTRY_MIN = 66;
+// TLV cost fixtures: one 8-byte zero-payload record per distinct tag, with tags
+// above every known tag so no summary flag or capability check is involved.
+constexpr uint32_t TLV_TAG_BASE = 0x10000;
+constexpr uint32_t HEADER_TLV_RECORD_COUNT = 131072;     // 1 MiB / 8-byte empty record
+constexpr uint32_t HEADER_TLV_SMALL_RECORD_COUNT = 8192; // 64 KiB, 16x fewer records
+constexpr uint32_t ENTRY_TLV_RECORD_COUNT = 8192;        // 64 KiB / 8-byte empty record
+constexpr int64_t HEADER_TLV_TABLE_BUDGET_US = 150000;   // absolute sanity bound
+constexpr int64_t HEADER_TLV_TABLE_RATIO = 60;           // quadratic ~250x here, linear ~16x
+constexpr int64_t HEADER_TLV_TIMING_FLOOR_US = 1000;     // keeps the ratio finite
 
 uint64_t align_up_test(uint64_t p_value, uint64_t p_alignment) {
 	return (p_value + p_alignment - 1) / p_alignment * p_alignment;
@@ -473,10 +483,23 @@ godot::PackedByteArray make_tlv(uint32_t p_tag, const godot::PackedByteArray &p_
 	return tlv;
 }
 
+// The largest legal table of the duplicating shape: one zero-payload record per
+// distinct tag. A per-record scan over the tags already seen costs the
+// triangular number of comparisons on exactly this input.
+godot::PackedByteArray make_distinct_tag_table(uint32_t p_count) {
+	godot::PackedByteArray table;
+	const uint64_t bytes = static_cast<uint64_t>(p_count) * godot::DS_TLV_HEADER_SIZE;
+	table.resize(static_cast<int64_t>(bytes));
+	std::memset(table.ptrw(), 0, static_cast<size_t>(bytes));
+	for (uint32_t i = 0; i < p_count; ++i) {
+		w32(table, static_cast<uint64_t>(i) * godot::DS_TLV_HEADER_SIZE, TLV_TAG_BASE + i);
+	}
+	return table;
+}
+
 godot::String scratch_path(const char *p_name) {
 	return godot::String("user://v5v3_guard_") + p_name;
 }
-
 struct ProtectedSettingGuard {
 	godot::ProjectSettings *settings = nullptr;
 	godot::String name = "directstorage/export/protected";
@@ -598,6 +621,68 @@ GDEX_TEST_T(dspkg_v5, valid_header_tlv_opens, TAG_INTEGRATION) {
 	godot::Ref<godot::DSPkg> pkg = open_v5(path);
 	GDEX_EXPECT_EQ(pkg->get_entry_count(), 1);
 	remove_file(path);
+}
+
+// A table's validation cost must track its byte size. Two tables of the same
+// shape, 16x apart in records: a per-record scan over the tags already seen
+// costs roughly n(n-1)/2 comparisons, so the large table costs about 250x the
+// small one, while linear validation costs about the 16x byte ratio.
+GDEX_TEST_T(dspkg_v5, header_tlv_cost_stays_linear_at_table_cap, TAG_INTEGRATION) {
+	const godot::String big_path = scratch_path("header_tlv_1mib.dspkg");
+	const godot::String small_path = scratch_path("header_tlv_64kib.dspkg");
+
+	V5Spec big_spec;
+	big_spec.header_tlv = make_distinct_tag_table(HEADER_TLV_RECORD_COUNT);
+	big_spec.header_flags = godot::DSPKG_FLAG_GPU_MIP_METADATA | godot::DSPKG_FLAG_EXTENSION_TABLE;
+	V5Built big = build_v5(big_spec);
+
+	V5Spec small_spec;
+	small_spec.header_tlv = make_distinct_tag_table(HEADER_TLV_SMALL_RECORD_COUNT);
+	small_spec.header_flags = godot::DSPKG_FLAG_GPU_MIP_METADATA | godot::DSPKG_FLAG_EXTENSION_TABLE;
+	V5Built small_archive = build_v5(small_spec);
+
+	GDEX_ASSERT_TRUE(write_bytes(big_path, big.bytes));
+	GDEX_ASSERT_TRUE(write_bytes(small_path, small_archive.bytes));
+
+	godot::Ref<godot::DSPkg> big_pkg;
+	big_pkg.instantiate();
+	const int64_t big_start = godot::Time::get_singleton()->get_ticks_usec();
+	const godot::Error big_err = big_pkg->open(big_path, 0);
+	const int64_t big_us = godot::Time::get_singleton()->get_ticks_usec() - big_start;
+
+	godot::Ref<godot::DSPkg> small_pkg;
+	small_pkg.instantiate();
+	const int64_t small_start = godot::Time::get_singleton()->get_ticks_usec();
+	const godot::Error small_err = small_pkg->open(small_path, 0);
+	const int64_t small_us = godot::Time::get_singleton()->get_ticks_usec() - small_start;
+
+	remove_file(big_path);
+	remove_file(small_path);
+
+	GDEX_ASSERT_EQ(static_cast<int64_t>(big_err), static_cast<int64_t>(godot::OK));
+	GDEX_ASSERT_EQ(static_cast<int64_t>(small_err), static_cast<int64_t>(godot::OK));
+	GDEX_EXPECT_EQ(big_pkg->get_entry_count(), 1);
+	GDEX_EXPECT_LT(big_us, static_cast<int64_t>(HEADER_TLV_TABLE_BUDGET_US));
+	const int64_t small_floor_us = small_us > HEADER_TLV_TIMING_FLOOR_US ? small_us : HEADER_TLV_TIMING_FLOOR_US;
+	GDEX_EXPECT_LT(big_us, static_cast<int64_t>(HEADER_TLV_TABLE_RATIO) * small_floor_us);
+}
+
+// Guard, not closure: a full 64 KiB entry table costs milliseconds, too little
+// to bound reliably, but it pins the entry call site and its accepted set.
+GDEX_TEST_T(dspkg_v5, entry_tlv_full_table_opens, TAG_INTEGRATION) {
+	const godot::String path = scratch_path("entry_tlv_64kib.dspkg");
+	V5Spec spec;
+	spec.entry_tlv = make_distinct_tag_table(ENTRY_TLV_RECORD_COUNT);
+	V5Built built = build_v5(spec);
+	GDEX_ASSERT_TRUE(write_bytes(path, built.bytes));
+
+	godot::Ref<godot::DSPkg> pkg;
+	pkg.instantiate();
+	const godot::Error err = pkg->open(path, 0);
+	remove_file(path);
+
+	GDEX_ASSERT_EQ(static_cast<int64_t>(err), static_cast<int64_t>(godot::OK));
+	GDEX_EXPECT_EQ(pkg->get_entry_count(), 1);
 }
 
 GDEX_TEST_T(dspkg_v5, zstd_archive_opens_and_read_texture_fails_closed, TAG_INTEGRATION) {

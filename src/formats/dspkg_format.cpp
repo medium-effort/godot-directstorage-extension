@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 namespace godot {
@@ -274,7 +275,10 @@ bool validate_tlv_table(const uint8_t *p_data, uint64_t p_size, uint64_t p_max_t
 		r_error = String(p_context) + " TLV table exceeds its size limit.";
 		return false;
 	}
-	std::vector<uint32_t> seen_tags;
+	// Membership is O(1), so a table's validation cost stays linear in its byte
+	// size: a hostile table cannot buy quadratic work from the validator.
+	std::unordered_set<uint32_t> seen_tags;
+	seen_tags.reserve(static_cast<size_t>(p_size / DS_TLV_HEADER_SIZE));
 	uint64_t cursor = 0;
 	while (cursor < p_size) {
 		if (p_size - cursor < DS_TLV_HEADER_SIZE) {
@@ -310,11 +314,10 @@ bool validate_tlv_table(const uint8_t *p_data, uint64_t p_size, uint64_t p_max_t
 				return false;
 			}
 		}
-		if (std::find(seen_tags.begin(), seen_tags.end(), tag) != seen_tags.end()) {
+		if (!seen_tags.insert(tag).second) {
 			r_error = String(p_context) + " TLV contains a duplicate tag.";
 			return false;
 		}
-		seen_tags.push_back(tag);
 		switch (tag) {
 			case DS_TLV_TAG_CRYPTO:
 				r_summary.has_crypto = true;
