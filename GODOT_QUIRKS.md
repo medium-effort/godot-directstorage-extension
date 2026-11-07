@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 3 November 2026
+Last updated: 7 November 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1896,4 +1896,43 @@ A teardown throttle written as "release at most `TEARDOWN_VRAM_CAP_MIB = 4.0` Mi
 Never throttle per-frame GPU work on `Performance.get_monitor(RENDER_VIDEO_MEM_USED)` read in `_process`; the counter is refreshed after the draw, so a per-frame delta under-reads and a byte cap behaves like a much larger one - and the release itself is spent by the render thread inside that same draw, after your throttling decision.
 
 Sample it only at window boundaries (drain start, drain end, menu arrival) for reporting, where the level-minus-menu delta is valid, and drive any pacing from measured frame time instead (Q77). Implemented in `tps-demo/main/main.gd`: `_drain_vram_start_mib` / `_menu_vram_mib` are boundary samples for the report, while `DRAIN_TARGET_FRAME_MSEC` pacing sizes the batch from real frame duration. Related: Q77 (the pacing that replaced it), Q75 (memory-pressure teardown), Q35 (eviction/capacity accounting).
+
+## 79. `Texture2DRD` Has No Size Override
+
+### The Engine Reality
+`Texture2DRD::get_width()` / `get_height()` return an internal `size` member copied from the
+device texture format in `_set_texture_rd_rid()` (`scene/resources/texture_rd.cpp`), and the
+class exposes no setter for it. `ImageTexture`, by contrast, ships a bound
+`set_size_override(Size2i)` that updates its `w`/`h` and forwards to
+`RenderingServer::texture_set_size_override()` (`scene/resources/image_texture.cpp`), and
+`CompressedTexture2D::load()` does the same pairing manually (`w = lw; h = lh;` plus the RS
+override). So of the three 2D texture types, `Texture2DRD` is the only one that cannot present
+logical dimensions different from its storage dimensions. Two further traps compose with it:
+the RS override never affects `Texture2DRD::get_width()` (the getter never consults the
+server), and `RenderingDevice` RIDs live in a separate ID space from `RenderingServer` RIDs,
+so passing a device RID to `texture_set_size_override()` risks overriding an unrelated live
+RS texture on numeric collision instead of failing loudly.
+
+### The Trap / Symptom
+A 100x50 NPOT source imports to a 100x52 block footprint (4-pixel alignment, same rounding
+Godot's own `cvtt`/`etcpak`/`betsy` codecs apply). The CPU load path reports 100x50; the GPU
+`Texture2DRD` wrap of the identical payload reports 100x52 with no API to correct it. During
+implementation the GPU branch first applied the override to the device RID — wrong namespace,
+caught only by reading the engine source before any symptom appeared.
+
+### The Rule
+Never expect `Texture2DRD.get_width()` to report logical dims or pass a device RID to `texture_set_size_override`; use `ImageTexture.set_size_override` on CPU paths and document storage-dims on GPU wraps.
+
+```cpp
+godot::Ref<godot::ImageTexture> img_tex = godot::ImageTexture::create_from_image(image);
+img_tex->set_size_override(godot::Vector2i(logical_w, logical_h));
+```
+
+GPU wraps override the RS wrapper RID from `get_rid()`, and only where the wrap already
+executed (the render thread — `set_texture_rd_rid` is async elsewhere, so preloader GPU
+completion documents storage dims). Implemented in
+`src/integration/ds_resource_format_loader.cpp` (sync loader) and
+`src/integration/ds_preloader.cpp` (prewarm build). Related: Q05 (Texture2DRD CPU-pixel
+gaps), Q27 (Texture2DRD RID ownership), Q36 (which RID to validate). Upstream report:
+`.agents/godot-bug-reports/texture2drd-no-size-override.md`.
 
