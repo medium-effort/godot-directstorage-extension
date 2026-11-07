@@ -6,8 +6,9 @@
 	</brief_description>
 	<description>
 		This importer imports [DSTex] ([code].dstex[/code]) compressed texture resources for DirectStorage-accelerated streaming.
-		Image files ([code].png[/code], [code].jpg[/code], [code].jpeg[/code], [code].webp[/code]) are processed with optional S3TC block compression and compressed using Microsoft GDeflate.
+		Image files ([code].png[/code], [code].jpg[/code], [code].jpeg[/code], [code].webp[/code]) are processed with optional VRAM block compression (S3TC or BPTC) and compressed using Microsoft GDeflate.
 		During export, [EditorExportPlugin] bundles [code].dstex[/code] resources into [code]res://textures.dspkg[/code] via [DSPkg], allowing [DSResourceFormatLoader] and [DSContext] to stream textures directly to GPU or CPU memory at runtime.
+		Presets: [b]Project Default[/b] follows [code]directstorage/import/default_profile[/code]; [b]3D (Streaming)[/b] is the product default; [b]CPU / ImageTexture (2D, UI, Decals)[/b] keeps 2D and UI assets on the CPU path. A pure 2D project should normally use Godot's [ResourceImporterTexture] instead.
 		See also [ResourceImporterTexture], [DSTex], and [DSContext].
 	</description>
 	<tutorials>
@@ -18,16 +19,32 @@
 			Lower values (such as the default [code]1[/code]) maximize encoding speed in the editor and provide the highest DirectStorage decompression throughput.
 			Higher values achieve smaller file sizes on disk at the cost of slower import times and increased decompression workload.
 		</member>
+		<member name="compression/high_quality" type="bool" setter="" getter="" default="false">
+			When [code]compression/mode[/code] is [b]VRAM Compressed[/b], use BPTC/BC7 instead of S3TC. BPTC preserves alpha and normal-map detail better but takes twice the VRAM of BC1 and encodes on the CPU during import.
+			[b]Note:[/b] With BPTC, a [b]Normal Map[/b] source becomes BC7, not BC5. Disable this option if BC5 normal maps are preferred.
+		</member>
 		<member name="compression/mode" type="int" setter="" getter="" default="0">
 			The compression mode to use for the imported texture.
-			[b]VRAM Compressed (S3TC):[/b] Compresses texture mipmaps using S3TC block compression (BC1/DXT1 for opaque images, BC3/DXT5 for images with transparency or normal maps) prior to GDeflate compression. This significantly reduces GPU VRAM consumption and optimizes streaming bandwidth. Recommended for standard 3D and 2D textures.
-			[b]VRAM Uncompressed:[/b] Retains uncompressed raw pixel data (such as RGBA8) with mipmaps, compressed only on disk using lossless GDeflate. Preserves perfect pixel fidelity with zero block compression artifacts (ideal for pixel art, crisp UI elements, or lookup tables), but requires significantly more VRAM at runtime.
+			[b]VRAM Compressed:[/b] Compresses texture mipmaps using S3TC (BC1/BC3/BC4/BC5) or, with [code]compression/high_quality[/code], BPTC (BC7) prior to GDeflate compression. This significantly reduces GPU VRAM consumption and optimizes streaming bandwidth. Recommended for standard 3D textures.
+			[b]VRAM Uncompressed:[/b] Retains uncompressed raw pixel data (such as RGBA8) with mipmaps, compressed only on disk using lossless GDeflate. Preserves perfect pixel fidelity with zero block compression artifacts (ideal for pixel art, crisp UI elements, or lookup tables), but requires significantly more memory at runtime.
 		</member>
 		<member name="compression/source" type="int" setter="" getter="" default="1">
-			Controls the source color space and channel interpretation during S3TC block compression:
-			[b]Generic:[/b] Generic linear data texture (such as roughness, metallic, masks, or lookup tables). Color channel distances are evaluated linearly without assuming sRGB gamma encoding.
-			[b]sRGB:[/b] Standard color texture (such as albedo or diffuse maps). Color distances are weighted according to perceptual human vision in sRGB space.
-			[b]Normal Map:[/b] Tangent-space normal map. Red and green channels are prioritized to minimize normal vector distortion and lighting artifacts.
+			Controls the source color space and channel interpretation during block compression:
+			[b]Generic:[/b] Generic linear data texture (such as roughness, metallic, masks, or lookup tables). Channel distances are evaluated linearly without assuming sRGB gamma encoding.
+			[b]sRGB:[/b] Standard color texture (such as albedo or diffuse maps). Channel distances are weighted according to perceptual human vision in sRGB space.
+			[b]Normal Map:[/b] Tangent-space normal map. Red and green channels are prioritized, the base level is normalized, and mip levels are renormalized.
+		</member>
+		<member name="mipmaps/generate" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], generate a full mip chain. Disable for 2D/UI textures that are always sampled at 1:1; a disabled chain writes a single-mip [code].dstex[/code] and saves roughly one third of the payload and memory.
+		</member>
+		<member name="process/size_limit" type="int" setter="" getter="" default="0">
+			If greater than [code]0[/code], resize the image so its longer edge is at most this many pixels before mip generation and compression. [code]0[/code] applies only the 16384-pixel container cap. Useful for mobile targets (4096/8192) and to avoid oversized staging buffers.
+		</member>
+		<member name="process/fix_alpha_border" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], put surrounding color into the transparent border of RGBA8 images before compression, reducing bilinear-filter halos. Enabled by the CPU/ImageTexture (2D) preset.
+		</member>
+		<member name="process/premult_alpha" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], premultiply RGB by alpha before compression. Requires materials configured for premultiplied alpha.
 		</member>
 		<member name="compatibility/as_image_texture" type="bool" setter="" getter="" default="false">
 			Forces the texture to load into CPU memory as an [ImageTexture] even when GPU streaming prewarm ([method DSPreloader.prewarm_gpu_async]) is active.

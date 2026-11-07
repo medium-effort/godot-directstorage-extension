@@ -648,6 +648,95 @@ GDEX_TEST_T(gpu_prewarm, linear_formats_fill_vram_texture, TAG_INTEGRATION | TAG
     }
 }
 
+GDEX_TEST_T(gpu_prewarm, bc7_fill_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
+    if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
+        GDEX_SKIP("DSContext/DSTextureCache classes unavailable");
+    }
+    godot::DSContext *ds = require_singleton_context(ctx);
+    if (!ds->initialize_ds() || !ds->is_initialized()) {
+        GDEX_SKIP("DSContext backend unavailable (initialize_ds failed)");
+    }
+    if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+        GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver)");
+    }
+    if (!godot::DSPreloader::is_gpu_prewarm_available()) {
+        GDEX_SKIP("GPU prewarm unavailable (no live D3D12 RenderingDevice)");
+    }
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("no RenderingDevice for the readback check");
+    }
+    godot::DSTextureCache *cache = new_test_cache(ctx);
+    godot::DSPreloader::shutdown();
+
+    const char *path = "user://gdextest_gpu_prewarm_bc7.dstex";
+    ctx.add_teardown([ds, path]() {
+        ds->shutdown_ds();
+        remove_abs(path);
+        godot::DSPreloader::shutdown();
+    });
+
+    // Arbitrary bytes are valid as BC7 texture data (the GPU samples, it does
+    // not decode on upload), and they make any misplaced byte visible.
+    godot::PackedByteArray expected =
+            make_linear_raw(godot::Image::FORMAT_BPTC_RGBA, kLinearTexWidth, kLinearTexHeight, kLinearMipCount);
+    if (!write_linear_dstex(path, godot::Image::FORMAT_BPTC_RGBA, kLinearTexWidth, kLinearTexHeight,
+                kLinearMipCount, expected)) {
+        GDEX_ABORT_TEST("BC7 .dstex staging failed");
+    }
+
+    godot::PackedStringArray paths;
+    paths.push_back(godot::String(path));
+    uint64_t tag = 0;
+    try {
+        tag = cache->prewarm_gpu_async(paths, 16, true);
+    } catch (const std::exception &e) {
+        GDEX_FAIL(std::string("prewarm_gpu_async threw: ") + e.what());
+    } catch (...) {
+        GDEX_FAIL("prewarm_gpu_async threw an unknown exception.");
+    }
+    GDEX_ASSERT_TRUE(tag != 0);
+
+    const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() + 20000;
+    if (!drive_prewarm_to_settled(ds, cache, tag, deadline)) {
+        godot::Vector2i progress = ds->get_prewarm_progress(tag);
+        GDEX_FAIL(std::string("BC7 prewarm tag did not settle (done=") + std::to_string(progress.x) +
+                ", total=" + std::to_string(progress.y) + ").");
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::DSPreloader::get_unbuilt_prewarm_count(tag)), static_cast<int64_t>(0));
+
+    godot::Ref<godot::Texture2D> tex = cache->get_cached(godot::String(path), godot::DSTextureCache::CACHE_MODE_REUSE);
+    GDEX_ASSERT_TRUE(tex.is_valid());
+    GDEX_EXPECT_EQ(static_cast<int64_t>(tex->get_width()), static_cast<int64_t>(kLinearTexWidth));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(tex->get_height()), static_cast<int64_t>(kLinearTexHeight));
+
+    godot::Ref<godot::Texture2DRD> gpu = tex;
+    GDEX_EXPECT_TRUE(gpu.is_valid());
+    if (gpu.is_null()) {
+        return;
+    }
+    godot::RID texture_rid = gpu->get_texture_rd_rid();
+    GDEX_EXPECT_TRUE(texture_rid.is_valid());
+    if (!texture_rid.is_valid()) {
+        return;
+    }
+    godot::Ref<godot::RDTextureFormat> rd_format = rd->texture_get_format(texture_rid);
+    GDEX_EXPECT_TRUE(rd_format.is_valid());
+    if (rd_format.is_valid()) {
+        GDEX_EXPECT_EQ(static_cast<int64_t>(rd_format->get_format()),
+                static_cast<int64_t>(godot::DSTex::godot_format_to_rd_format(static_cast<int>(godot::Image::FORMAT_BPTC_RGBA))));
+        GDEX_EXPECT_EQ(static_cast<int64_t>(rd_format->get_mipmaps()), static_cast<int64_t>(kLinearMipCount));
+    }
+
+    godot::PackedByteArray readback = rd->texture_get_data(texture_rid, 0);
+    std::string detail;
+    if (!readback_matches_natural(readback, expected, godot::Image::FORMAT_BPTC_RGBA,
+                kLinearTexWidth, kLinearTexHeight, kLinearMipCount, detail)) {
+        GDEX_FAIL("BC7 GPU readback mismatch (readback=" + std::to_string(readback.size()) + "): " + detail);
+    }
+}
+
 GDEX_TEST_T(gpu_prewarm, graceful_memory_fallback, TAG_INTEGRATION | TAG_SLOW) {
     if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
         GDEX_SKIP("DSContext/DSTextureCache classes unavailable");

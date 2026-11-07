@@ -782,3 +782,81 @@ GDEX_TEST_T(preloader_validation, oversized_dstex_not_tracked, TAG_INTEGRATION) 
 
 	ds->cancel_prewarm(tag);
 }
+
+namespace {
+constexpr const char *kParityBptc = "user://importer_parity_bptc.dstex";
+constexpr const char *kParityGuard = "user://importer_parity_guard.dstex";
+} // namespace
+
+GDEX_TEST(preloader_validation, bptc_round_trip) {
+	godot::Ref<godot::Image> image = godot::Image::create(64, 64, false, godot::Image::FORMAT_RGBA8);
+	GDEX_ASSERT_TRUE(image.is_valid());
+	for (int y = 0; y < 64; y++) {
+		for (int x = 0; x < 64; x++) {
+			image->set_pixel(x, y, godot::Color(float(x) / 63.0f, float(y) / 63.0f, 0.25f, 1.0f));
+		}
+	}
+	GDEX_ASSERT_EQ(static_cast<int64_t>(image->generate_mipmaps()), static_cast<int64_t>(godot::OK));
+
+	godot::Error compress_error = image->compress(godot::Image::COMPRESS_BPTC, godot::Image::COMPRESS_SOURCE_SRGB);
+	if (compress_error == godot::ERR_UNAVAILABLE) {
+		GDEX_SKIP("BPTC encoder unavailable (editor build without cvtt)");
+	}
+	GDEX_EXPECT_EQ(static_cast<int64_t>(compress_error), static_cast<int64_t>(godot::OK));
+	GDEX_EXPECT_TRUE(image->is_compressed());
+	GDEX_EXPECT_EQ(static_cast<int64_t>(image->get_format()), static_cast<int64_t>(godot::Image::FORMAT_BPTC_RGBA));
+
+	track_cleanup(ctx, { kParityBptc });
+
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	const int mip_count = image->get_mipmap_count() + 1;
+	GDEX_EXPECT_EQ(static_cast<int64_t>(dstex->write_to_file(godot::String(kParityBptc), image->get_data(),
+			image->get_width(), image->get_height(), image->get_format(), mip_count, 1, true, false)),
+			static_cast<int64_t>(godot::OK));
+
+	const godot::Dictionary header = dstex->read_header(godot::String(kParityBptc));
+	GDEX_EXPECT_FALSE(header.is_empty());
+	GDEX_EXPECT_EQ(static_cast<int64_t>(static_cast<int>(header["pixel_format"])),
+			static_cast<int64_t>(godot::RenderingDevice::DATA_FORMAT_BC7_SRGB_BLOCK));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(static_cast<int>(header["mip_count"])), static_cast<int64_t>(mip_count));
+
+	uint64_t expected_footprint = 0;
+	uint32_t width = static_cast<uint32_t>(image->get_width());
+	uint32_t height = static_cast<uint32_t>(image->get_height());
+	for (int i = 0; i < mip_count; i++) {
+		const godot::DSTexMipLayout layout = godot::DSTex::get_mip_layout(width, height, godot::Image::FORMAT_BPTC_RGBA);
+		expected_footprint += layout.footprint_size;
+		width = width > 1 ? width / 2 : 1;
+		height = height > 1 ? height / 2 : 1;
+	}
+	GDEX_EXPECT_EQ(static_cast<int64_t>(header["original_size"]), static_cast<int64_t>(expected_footprint));
+}
+
+GDEX_TEST(preloader_validation, writer_guard) {
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	track_cleanup(ctx, { kParityGuard });
+
+	godot::PackedByteArray tiny;
+	tiny.push_back(0);
+
+	GDEX_EXPECT_EQ(static_cast<int64_t>(dstex->write_to_file(godot::String(kParityGuard), tiny, 16385, 1,
+			godot::Image::FORMAT_R8, 1, 1)),
+			static_cast<int64_t>(godot::ERR_INVALID_DATA));
+
+	// 16384x16384 RGBA8 is a 1 GiB footprint, over DSTEX_MAX_TOTAL_BYTES. The
+	// guard runs after the layout pass and before the raw-size comparison, so a
+	// 1-byte payload is enough to prove the rejection without allocating 1 GiB.
+	GDEX_EXPECT_EQ(static_cast<int64_t>(dstex->write_to_file(godot::String(kParityGuard), tiny, 16384, 16384,
+			godot::Image::FORMAT_RGBA8, 1, 1)),
+			static_cast<int64_t>(godot::ERR_INVALID_DATA));
+
+	godot::PackedByteArray small;
+	small.resize(8 * 8);
+	uint8_t *small_ptr = small.ptrw();
+	memset(small_ptr, 0x5A, 8 * 8);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(dstex->write_to_file(godot::String(kParityGuard), small, 8, 8,
+			godot::Image::FORMAT_R8, 1, 1)),
+			static_cast<int64_t>(godot::OK));
+}

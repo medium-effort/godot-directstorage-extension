@@ -1,7 +1,7 @@
 [remap]
 
 importer="directstorage_texture"
-importer_version=4
+importer_version=5
 type="Texture2D"
 uid="uid://blsp6kgoecsyl"
 path="res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dstex"
@@ -16,6 +16,11 @@ dest_files=["res://.godot/imported/test.png-907c241c41bc767026da45239985ecb9.dst
 [params]
 
 compression/mode=0
+compression/high_quality=false
 compression/source=1
 compression/gdeflate_level=1
+mipmaps/generate=true
+process/size_limit=0
+process/fix_alpha_border=false
+process/premult_alpha=false
 compatibility/as_image_texture=false

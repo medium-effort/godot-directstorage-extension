@@ -5,6 +5,15 @@ extends EditorImportPlugin
 static var _staging_warnings: Dictionary = {}
 
 const D3D12_TEXTURE_DATA_PITCH_ALIGNMENT := 256
+const DSTEX_MAX_DIMENSION := 16384
+
+const IMPORT_PROFILE_SETTING := "directstorage/import/default_profile"
+const PROFILE_3D := 0
+const PROFILE_2D := 1
+const PRESET_PROJECT_DEFAULT := 0
+const PRESET_3D := 1
+const PRESET_2D := 2
+const PRESET_NAMES := ["Project Default", "3D (Streaming)", "CPU / ImageTexture (2D, UI, Decals)"]
 
 ## DirectStorage Texture Import Plugin
 ##
@@ -12,9 +21,18 @@ const D3D12_TEXTURE_DATA_PITCH_ALIGNMENT := 256
 ## Description: Converts .png, .jpg, .jpeg, and .webp sources into .dstex
 ## resources. The importer runs in the editor and exposes compression settings
 ## in the Import dock:
-## - [b]compression/mode[/b]: S3TC VRAM block compression vs VRAM uncompressed.
+## - [b]compression/mode[/b]: VRAM block compression vs VRAM uncompressed.
+## - [b]compression/high_quality[/b]: BPTC/BC7 instead of S3TC (BC1-BC5).
 ## - [b]compression/source[/b]: Source color space (Generic, sRGB, Normal Map).
 ## - [b]compression/gdeflate_level[/b]: GDeflate compression level (1-12).
+## - [b]mipmaps/generate[/b]: Generate a full mip chain.
+## - [b]process/size_limit[/b]: Resize the longer edge before mip generation.
+## - [b]process/fix_alpha_border[/b], [b]process/premult_alpha[/b]: 2D alpha fixes.
+## - [b]compatibility/as_image_texture[/b]: Force the CPU ImageTexture path.
+##
+## Presets: "Project Default" follows directstorage/import/default_profile;
+## "3D (Streaming)" is the product default; "CPU / ImageTexture (2D, UI, Decals)"
+## keeps UI and sprite assets on the CPU path.
 
 ## Returns the stable importer identifier stored in .import metadata.
 func _get_importer_name() -> String:
@@ -38,7 +56,7 @@ func _get_resource_type() -> String:
 
 ## Returns the importer format version used to invalidate old imports.
 func _get_format_version() -> int:
-	return 4
+	return 5
 
 ## Gives this importer priority over Godot's default texture importer.
 func _get_priority() -> float:
@@ -50,20 +68,52 @@ func _get_import_order() -> int:
 
 ## Returns the number of named import presets.
 func _get_preset_count() -> int:
-	return 1
+	return 3
+
+## Resolves the numeric profile from the project setting.
+func _project_profile() -> int:
+	var configured := int(ProjectSettings.get_setting(IMPORT_PROFILE_SETTING, PROFILE_3D))
+	if configured < PROFILE_3D or configured > PROFILE_2D:
+		return PROFILE_3D
+	return configured
+
+## Clamps an out-of-range preset index to the project-default preset.
+func _clamp_preset(preset_index: int) -> int:
+	if preset_index < PRESET_PROJECT_DEFAULT or preset_index > PRESET_2D:
+		return PRESET_PROJECT_DEFAULT
+	return preset_index
+
+## Resolves a preset index to the concrete 3D or 2D preset.
+func _resolved_preset(preset_index: int) -> int:
+	var preset := _clamp_preset(preset_index)
+	if preset == PRESET_PROJECT_DEFAULT:
+		return PRESET_3D if _project_profile() == PROFILE_3D else PRESET_2D
+	return preset
 
 ## Returns the display name of an import preset.
 func _get_preset_name(preset_index: int) -> String:
-	return "Default"
+	var preset := _clamp_preset(preset_index)
+	if preset == PRESET_PROJECT_DEFAULT:
+		return "Project Default (3D)" if _project_profile() == PROFILE_3D else "Project Default (2D)"
+	return PRESET_NAMES[preset]
 
-## Declares compression mode, source color space, and GDeflate level options.
+## Declares the compression, mipmap, and processing options for a preset.
 func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
+	var preset := _resolved_preset(preset_index)
+	var is_2d := preset == PRESET_2D
 	return [
 		{
 			"name": "compression/mode",
-			"default_value": 0,
+			"default_value": 1 if is_2d else 0,
 			"property_hint": PROPERTY_HINT_ENUM,
 			"hint_string": "VRAM Compressed (S3TC),VRAM Uncompressed",
+			"usage": PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_UPDATE_ALL_IF_MODIFIED,
+		},
+		{
+			"name": "compression/high_quality",
+			"default_value": false,
+			"property_hint": PROPERTY_HINT_NONE,
+			"hint_string": "Uses BPTC/BC7 instead of S3TC (BC1-BC5). Slower to import; ignored when mode is VRAM Uncompressed.",
 		},
 		{
 			"name": "compression/source",
@@ -78,15 +128,41 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 			"hint_string": "1,12,1,prefer_slider",
 		},
 		{
-			"name": "compatibility/as_image_texture",
+			"name": "mipmaps/generate",
+			"default_value": not is_2d,
+			"property_hint": PROPERTY_HINT_NONE,
+			"hint_string": "Generate a full mip chain. Disable for 2D/UI textures that are always sampled at 1:1.",
+		},
+		{
+			"name": "process/size_limit",
+			"default_value": 0,
+			"property_hint": PROPERTY_HINT_RANGE,
+			"hint_string": "0,16384,1",
+		},
+		{
+			"name": "process/fix_alpha_border",
+			"default_value": is_2d,
+			"property_hint": PROPERTY_HINT_NONE,
+			"hint_string": "Puts surrounding color into transparent borders to reduce bilinear-filter halos.",
+		},
+		{
+			"name": "process/premult_alpha",
 			"default_value": false,
+			"property_hint": PROPERTY_HINT_NONE,
+			"hint_string": "Premultiply RGB by alpha. Requires premultiplied-alpha materials.",
+		},
+		{
+			"name": "compatibility/as_image_texture",
+			"default_value": is_2d,
 			"property_hint": PROPERTY_HINT_NONE,
 			"hint_string": "Forces ImageTexture CPU loading even during GPU prewarm. Required for Light3D projectors, Decals, and get_image() callers.",
 		}
 	]
 
-## Keeps all importer options visible in the Import dock.
+## Hides options that do not apply to the current compression mode.
 func _get_option_visibility(path: String, option_name: StringName, options: Dictionary) -> bool:
+	if option_name == &"compression/high_quality":
+		return int(options.get("compression/mode", 0)) == 0
 	return true
 
 ## Aligns an integer value up to the nearest multiple of alignment.
@@ -185,19 +261,94 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 			push_error("[DirectStorage Importer] Failed to load source image: " + source_file)
 			return err
 
-	if img.get_format() == Image.FORMAT_RGB8:
-		img.convert(Image.FORMAT_RGBA8)
-
-	if not img.has_mipmaps():
-		img.generate_mipmaps()
-
 	var compression_mode: int = int(options.get("compression/mode", 0))
+	var high_quality: bool = bool(options.get("compression/high_quality", false))
 	var compression_source: int = int(options.get("compression/source", Image.COMPRESS_SOURCE_SRGB))
+	var generate_mipmaps: bool = bool(options.get("mipmaps/generate", true))
+	var size_limit: int = clampi(int(options.get("process/size_limit", 0)), 0, DSTEX_MAX_DIMENSION)
+	var fix_alpha_border: bool = bool(options.get("process/fix_alpha_border", false))
+	var premult_alpha: bool = bool(options.get("process/premult_alpha", false))
+
+	if not ClassDB.class_exists("DSTex"):
+		push_error("[DirectStorage Importer] ClassDB entry 'DSTex' missing. Is GDExtension built?")
+		return ERR_UNCONFIGURED
+	var dstex = ClassDB.instantiate("DSTex")
+	if dstex == null:
+		push_error("[DirectStorage Importer] Failed to instantiate DSTex.")
+		return ERR_CANT_CREATE
+
+	# L8/LA8 have no RD sRGB/luminance swizzle in .dstex; RGB8 needs an alpha
+	# channel for the alpha options. R8/RG8 are exact and stay as-is.
+	match img.get_format():
+		Image.FORMAT_L8, Image.FORMAT_LA8, Image.FORMAT_RGB8:
+			img.convert(Image.FORMAT_RGBA8)
+
+	# Bound the source before mip generation and compression.
+	var limit := size_limit if size_limit > 0 else DSTEX_MAX_DIMENSION
+	var implicit_limit := size_limit == 0
+	var source_width := img.get_width()
+	var source_height := img.get_height()
+	if source_width > limit or source_height > limit:
+		var new_width: int
+		var new_height: int
+		if source_width >= source_height:
+			new_width = limit
+			new_height = maxi(1, int(round(float(source_height) * float(limit) / float(source_width))))
+		else:
+			new_height = limit
+			new_width = maxi(1, int(round(float(source_width) * float(limit) / float(source_height))))
+		img.resize(new_width, new_height, Image.INTERPOLATE_CUBIC)
+		if implicit_limit:
+			push_warning("[DirectStorage Importer] Asset '%s' exceeded the %d px container limit and was resized from %dx%d to %dx%d." % [source_file, DSTEX_MAX_DIMENSION, source_width, source_height, new_width, new_height])
+
+	# Block codecs pad to 4x4 blocks internally; align first so the mip chain and
+	# the written dimensions agree.
 	if compression_mode == 0:
-		var compress_err := img.compress(Image.COMPRESS_S3TC, compression_source)
-		if compress_err != OK:
-			push_warning("[DirectStorage Importer] S3TC compression unavailable for '" + source_file + "'; falling back to lossless GDeflate.")
-			compression_mode = 1
+		var aligned_width := img.get_width()
+		var aligned_height := img.get_height()
+		var target_width := aligned_width if aligned_width <= 2 else (aligned_width + 3) & ~3
+		var target_height := aligned_height if aligned_height <= 2 else (aligned_height + 3) & ~3
+		if target_width != aligned_width or target_height != aligned_height:
+			img.resize(target_width, target_height, Image.INTERPOLATE_CUBIC)
+			push_warning("[DirectStorage Importer] Asset '%s' dimensions %dx%d are not a multiple of 4; block compression stores them as %dx%d." % [source_file, aligned_width, aligned_height, target_width, target_height])
+
+	# Godot normalizes the base level only after a size-limit resize; do it for
+	# every normal map so the source normals are unit length before mips.
+	if compression_source == Image.COMPRESS_SOURCE_NORMAL:
+		ClassDB.class_call_static("DSTex", "normalize_image", img)
+
+	if fix_alpha_border:
+		img.fix_alpha_edges()
+	if premult_alpha:
+		img.premultiply_alpha()
+
+	if generate_mipmaps:
+		img.generate_mipmaps(compression_source == Image.COMPRESS_SOURCE_NORMAL)
+	else:
+		img.clear_mipmaps()
+
+	var effective_codec := "Uncompressed"
+	if compression_mode == 0:
+		var requested_codec := "BPTC" if high_quality else "S3TC"
+		var compressed := false
+		if high_quality:
+			var bptc_error := img.compress(Image.COMPRESS_BPTC, compression_source)
+			compressed = bptc_error == OK and img.is_compressed() and img.get_format() == Image.FORMAT_BPTC_RGBA
+			if compressed:
+				effective_codec = "BPTC"
+		if not compressed:
+			var s3tc_error := img.compress(Image.COMPRESS_S3TC, compression_source)
+			var s3tc_formats := [Image.FORMAT_DXT1, Image.FORMAT_DXT3, Image.FORMAT_DXT5, Image.FORMAT_RGTC_R, Image.FORMAT_RGTC_RG]
+			compressed = s3tc_error == OK and img.is_compressed() and s3tc_formats.has(img.get_format())
+			if compressed:
+				effective_codec = "S3TC"
+		if not compressed:
+			if img.get_format() != Image.FORMAT_RGBA8:
+				img.convert(Image.FORMAT_RGBA8)
+			effective_codec = "Uncompressed"
+			push_warning("[DirectStorage Importer] Asset '%s': requested %s compression failed (codec unavailable or unsupported); wrote uncompressed RGBA8." % [source_file, requested_codec])
+		elif effective_codec != requested_codec:
+			push_warning("[DirectStorage Importer] Asset '%s': requested %s compression unavailable; wrote %s." % [source_file, requested_codec, effective_codec])
 
 	var raw_data := img.get_data()
 	var width := img.get_width()
@@ -212,15 +363,6 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		_staging_warnings[source_file] = true
 		push_warning("[DirectStorage Importer] Asset '" + source_file + "' requires " + str(ceili(float(raw_data.size()) / 1048576.0)) + " MiB of staging memory, but DirectStorage is configured for " + str(staging_mb) + " MiB. Increase Project Settings > DirectStorage > Staging Buffer Size.")
 
-	if not ClassDB.class_exists("DSTex"):
-		push_error("[DirectStorage Importer] ClassDB entry 'DSTex' missing. Is GDExtension built?")
-		return ERR_UNCONFIGURED
-
-	var dstex = ClassDB.instantiate("DSTex")
-	if dstex == null:
-		push_error("[DirectStorage Importer] Failed to instantiate DSTex.")
-		return ERR_CANT_CREATE
-
 	var is_srgb: bool = (compression_source == Image.COMPRESS_SOURCE_SRGB)
 	var as_image_texture: bool = bool(options.get("compatibility/as_image_texture", false))
 	var out_file_path := save_path + "." + _get_save_extension()
@@ -230,5 +372,5 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		return write_err
 
 	gen_files.append(out_file_path)
-	print("[DirectStorage Importer] Imported ", source_file, " -> ", out_file_path, " (Mode: ", "S3TC" if compression_mode == 0 else "GDeflate", ", GDeflate Level: ", gdeflate_level, ", As ImageTexture: ", as_image_texture, ")")
+	print("[DirectStorage Importer] Imported ", source_file, " -> ", out_file_path, " (Mode: ", effective_codec, ", GDeflate Level: ", gdeflate_level, ", As ImageTexture: ", as_image_texture, ")")
 	return OK

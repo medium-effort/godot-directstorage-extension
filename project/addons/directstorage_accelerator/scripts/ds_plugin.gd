@@ -20,6 +20,7 @@ const TOOLS_SUBMENU_NAME: String = "dsgd Tools... (DirectStorage)"
 const TOOLS_SUBMENU_VERIFY_ID: int = 0
 const TOOLS_SUBMENU_RUNTIME_ID: int = 1
 const RUNTIME_INSTALLER_SCRIPT = preload("res://addons/directstorage_accelerator/scripts/ds_runtime_installer.gd")
+const IMPORT_PROFILE_SETTING: String = "directstorage/import/default_profile"
 
 var _importer: EditorImportPlugin = null
 var _export_plugin: EditorExportPlugin = null
@@ -66,6 +67,8 @@ func _enter_tree() -> void:
 	]:
 		if ProjectSettings.has_setting(internal_setting):
 			ProjectSettings.set_as_internal(internal_setting, true)
+
+	_register_import_profile()
 
 	if _importer == null:
 		var importer_script = load("uid://kqg57i3wmiw")
@@ -145,6 +148,31 @@ func _disable_plugin() -> void:
 	_sync_autoload(AUTOLOAD_NAME, "")
 
 	print("[DirectStorage] Plugin disabled. Autoload, Importer, and Exporter unregistered.")
+
+
+## Registers the project-wide import profile used by the DirectStorage importer.
+##
+## The value is the default for new imports only; stored .import parameters
+## always win on reimport. set_setting() is required before set_initial_value()
+## (the latter errors on a missing property), and ProjectSettings.save() is
+## deliberately not called: the default equals its initial value, so
+## save_custom() skips it until the user actually changes it.
+func _register_import_profile() -> void:
+	if not ProjectSettings.has_setting(IMPORT_PROFILE_SETTING):
+		ProjectSettings.set_setting(IMPORT_PROFILE_SETTING, 0)
+		ProjectSettings.set_initial_value(IMPORT_PROFILE_SETTING, 0)
+		ProjectSettings.add_property_info({
+			"name": IMPORT_PROFILE_SETTING,
+			"type": TYPE_INT,
+			"hint": PROPERTY_HINT_ENUM,
+			"hint_string": "3D (Streaming),CPU / ImageTexture (2D, UI, Decals)",
+		})
+		ProjectSettings.set_as_basic(IMPORT_PROFILE_SETTING, true)
+
+	if ProjectSettings.has_setting("importer_defaults/directstorage_texture"):
+		push_warning(
+			"[DirectStorage] 'importer_defaults/directstorage_texture' is set and overrides the project import profile for new imports."
+		)
 
 
 ## Writes (or erases) an `autoload/` entry directly, then persists project.godot.

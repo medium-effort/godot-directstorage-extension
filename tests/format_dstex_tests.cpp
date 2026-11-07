@@ -4,6 +4,9 @@
 #include "formats/dstex_format.h"
 
 #include <godot_cpp/classes/image.hpp>
+#include <godot_cpp/variant/color.hpp>
+
+#include <cmath>
 
 // Spike suite: pure DSTex helpers only — no engine singletons, no files.
 // Real API from src/formats/dstex_format.h (verified):
@@ -154,4 +157,27 @@ GDEX_TEST(dstex, srgb_counterpart_exhaustive_image_formats_matrix) {
             }
         }
     }
+}
+
+GDEX_TEST(dstex, normalize_image) {
+    godot::Ref<godot::Image> image = godot::Image::create(4, 4, false, godot::Image::FORMAT_RGBA8);
+    GDEX_EXPECT_TRUE(image.is_valid());
+
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            image->set_pixel(x, y, godot::Color(0.9f, 0.2f, 0.3f, 0.5f));
+        }
+    }
+
+    godot::DSTex::normalize_image(image);
+
+    const godot::Color c = image->get_pixel(2, 2);
+    const float nx = c.r * 2.0f - 1.0f;
+    const float ny = c.g * 2.0f - 1.0f;
+    const float nz = c.b * 2.0f - 1.0f;
+    const float length = std::sqrt(nx * nx + ny * ny + nz * nz);
+    // 8-bit channel quantization bounds the achievable precision.
+    GDEX_EXPECT_NEAR(length, 1.0f, 5e-3f);
+    // Alpha is not a vector component and must survive normalization.
+    GDEX_EXPECT_NEAR(c.a, 0.5f, 2e-3f);
 }

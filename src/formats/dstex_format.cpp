@@ -5,6 +5,7 @@
 #include <godot_cpp/variant/packed_int64_array.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -354,6 +355,36 @@ PackedByteArray DSTex::unpad_footprint_mip(const PackedByteArray &p_footprint, u
 	return unpadded;
 }
 
+void DSTex::normalize_image(const Ref<Image> &p_image) {
+	if (p_image.is_null() || p_image->is_empty() || p_image->is_compressed()) {
+		return;
+	}
+	const int width = p_image->get_width();
+	const int height = p_image->get_height();
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			Color color = p_image->get_pixel(x, y);
+			float nx = color.r * 2.0f - 1.0f;
+			float ny = color.g * 2.0f - 1.0f;
+			float nz = color.b * 2.0f - 1.0f;
+			const float length = std::sqrt(nx * nx + ny * ny + nz * nz);
+			if (length > 0.0f) {
+				nx /= length;
+				ny /= length;
+				nz /= length;
+			} else {
+				nx = 0.0f;
+				ny = 0.0f;
+				nz = 0.0f;
+			}
+			color.r = nx * 0.5f + 0.5f;
+			color.g = ny * 0.5f + 0.5f;
+			color.b = nz * 0.5f + 0.5f;
+			p_image->set_pixel(x, y, color);
+		}
+	}
+}
+
 void DSTex::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level", "is_srgb", "as_image_texture"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1), DEFVAL(false), DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("read_header", "path"), &DSTex::read_header);
@@ -365,6 +396,7 @@ void DSTex::_bind_methods() {
 	ClassDB::bind_static_method("DSTex", D_METHOD("rd_format_to_godot_format", "rd_format"), &DSTex::rd_format_to_godot_format);
 	ClassDB::bind_static_method("DSTex", D_METHOD("is_rd_format_srgb", "rd_format"), &DSTex::is_rd_format_srgb);
 	ClassDB::bind_static_method("DSTex", D_METHOD("get_srgb_rd_format", "rd_format"), &DSTex::get_srgb_rd_format);
+	ClassDB::bind_static_method("DSTex", D_METHOD("normalize_image", "image"), &DSTex::normalize_image);
 }
 
 DSTex::DSTex() {
@@ -684,6 +716,10 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	if (p_raw_data.size() == 0 || p_width <= 0 || p_height <= 0 || p_mip_count <= 0 || p_mip_count > static_cast<int>(DSTEX_MAX_MIP_COUNT)) {
 		return ERR_INVALID_PARAMETER;
 	}
+	if (p_width > static_cast<int>(DSTEX_MAX_DIMENSION) || p_height > static_cast<int>(DSTEX_MAX_DIMENSION)) {
+		UtilityFunctions::push_error("DSTex: Texture dimensions exceed the container limit of ", DSTEX_MAX_DIMENSION, " pixels.");
+		return ERR_INVALID_DATA;
+	}
 
 	const int rd_format = godot_format_to_rd_format(p_format, p_is_srgb);
 	if (rd_format == RenderingDevice::DATA_FORMAT_MAX) {
@@ -709,6 +745,11 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		footprint_size += layout.footprint_size;
 		mip_width = std::max<uint32_t>(1, mip_width / 2);
 		mip_height = std::max<uint32_t>(1, mip_height / 2);
+	}
+
+	if (footprint_size > DSTEX_MAX_TOTAL_BYTES) {
+		UtilityFunctions::push_error("DSTex: Texture footprint exceeds the container limit of ", DSTEX_MAX_TOTAL_BYTES, " bytes.");
+		return ERR_INVALID_DATA;
 	}
 
 	const uint64_t input_size = static_cast<uint64_t>(p_raw_data.size());
@@ -749,6 +790,11 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		compressed_mips.push_back(compressed_mip);
 		total_compressed_size += static_cast<uint64_t>(compressed_mip.size());
 		source_offset += source_mip_size;
+	}
+
+	if (total_compressed_size > DSTEX_MAX_TOTAL_BYTES) {
+		UtilityFunctions::push_error("DSTex: Compressed texture exceeds the container limit of ", DSTEX_MAX_TOTAL_BYTES, " bytes.");
+		return ERR_INVALID_DATA;
 	}
 
 	DSTexHeader header;

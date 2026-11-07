@@ -149,6 +149,10 @@ public:
 
 	static DSTexMipLayout get_mip_layout(uint32_t p_width, uint32_t p_height, int p_image_format);
 	static PackedByteArray unpad_footprint_mip(const PackedByteArray &p_footprint, uint32_t p_width, uint32_t p_height, int p_image_format);
+	/// Normalizes the RGB of every pixel as a tangent-space normal, matching
+	/// Image::normalize() (which godot-cpp does not expose). Operates on the base
+	/// level only; the importer calls it before mip generation.
+	static void normalize_image(const Ref<Image> &p_image);
 
 	static bool is_format_supported(int p_image_format);
 	static int godot_format_to_rd_format(int p_image_format, bool p_is_srgb = false);
