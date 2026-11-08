@@ -2553,6 +2553,17 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 		}
 	}
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Benchmark seam (never bound, debug/dev only): lets the I/O-mode probe
+	// reach media classes the production gate deliberately excludes.
+	OS *bench_os = OS::get_singleton();
+	if (!res["directstorage_supported"] && bench_os &&
+			bench_os->get_environment("DSGD_BENCH_ALLOW_ROTATIONAL") == "1") {
+		res["directstorage_supported"] = true;
+		res["reason"] = "Benchmark override: bus/media gate bypassed.";
+	}
+#endif
+
 #else
 	res["reason"] = "Platform is non-Windows.";
 #endif
@@ -2574,6 +2585,19 @@ void Win32Backend::apply_dstorage_configuration() {
 	DSContext *ctx = DSContext::get_singleton();
 	bool disable_gpu = ctx ? ctx->get_disable_gpu_decompression() : false;
 	bool file_buffering = s_desired_file_buffering.load();
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Benchmark seams (never bound, debug/dev only). The production decision
+	// comes from the asset volume's media class; the env switches let the probe
+	// A/B the I/O modes on the same hardware.
+	OS *bench_os = OS::get_singleton();
+	if (bench_os) {
+		if (bench_os->get_environment("DSGD_BENCH_FILE_BUFFERING") == "1") {
+			file_buffering = true;
+		} else if (bench_os->get_environment("DSGD_BENCH_DISABLE_FILE_BUFFERING") == "1") {
+			file_buffering = false;
+		}
+	}
+#endif
 
 	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
 	if (s_dstorage_configured_module == current_module) {

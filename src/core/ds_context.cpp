@@ -991,33 +991,45 @@ bool DSContext::initialize_ds_locked() {
 #endif
 
 #ifdef _WIN32
-	Win32Backend *backend = memnew(Win32Backend);
+	bool bench_try_win32 = true;
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
-	// Fires at the position publication used to occupy: the backend object exists
-	// but has not run initialize() yet, so no reader may see it.
-	initialization_window_opened = true;
-	if (initialization_window_hook) {
-		initialization_window_hook();
+	// Benchmark seam (never bound, debug/dev only): lets the I/O-mode probe
+	// compare the software fallback against DirectStorage on the same volume.
+	OS *bench_os = OS::get_singleton();
+	if (bench_os && bench_os->get_environment("DSGD_BENCH_FORCE_FALLBACK") == "1") {
+		bench_try_win32 = false;
+		UtilityFunctions::print("[DirectStorage] BENCH force-fallback override: skipping Win32Backend.");
 	}
 #endif
-	// No publication before the call: a reader that runs while initialize() is in
-	// progress must not see a backend whose queues/fences do not exist yet. The
-	// object is published only after it reports success, under the same unique
-	// lock the shutdown paths use to clear it.
-	bool backend_initialized = initialization_path.is_empty() ? backend->initialize() : backend->initialize(initialization_path);
-	if (backend_initialized) {
-		{
-			std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
-			active_backend = backend;
+	if (bench_try_win32) {
+		Win32Backend *backend = memnew(Win32Backend);
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		// Fires at the position publication used to occupy: the backend object exists
+		// but has not run initialize() yet, so no reader may see it.
+		initialization_window_opened = true;
+		if (initialization_window_hook) {
+			initialization_window_hook();
 		}
-		init_status.store(INIT_STATUS_DIRECTSTORAGE_D3D12, std::memory_order_release);
-		initialized.store(true, std::memory_order_release);
-		UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with Win32Backend.");
-		return true;
-	} else {
-		// Never published, so there is nothing to un-publish.
-		memdelete(backend);
-		UtilityFunctions::print("[DirectStorage] Win32DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
+#endif
+		// No publication before the call: a reader that runs while initialize() is in
+		// progress must not see a backend whose queues/fences do not exist yet. The
+		// object is published only after it reports success, under the same unique
+		// lock the shutdown paths use to clear it.
+		bool backend_initialized = initialization_path.is_empty() ? backend->initialize() : backend->initialize(initialization_path);
+		if (backend_initialized) {
+			{
+				std::unique_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+				active_backend = backend;
+			}
+			init_status.store(INIT_STATUS_DIRECTSTORAGE_D3D12, std::memory_order_release);
+			initialized.store(true, std::memory_order_release);
+			UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with Win32Backend.");
+			return true;
+		} else {
+			// Never published, so there is nothing to un-publish.
+			memdelete(backend);
+			UtilityFunctions::print("[DirectStorage] Win32DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
+		}
 	}
 #endif
 
