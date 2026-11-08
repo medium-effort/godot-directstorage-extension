@@ -764,7 +764,8 @@ GDEX_TEST_T(dspkg, staged_entry_record_is_metadata_only, TAG_INTEGRATION) {
 GDEX_TEST_T(dspkg, builder_staged_source_mutation_aborts_finalize, TAG_INTEGRATION) {
 	// add_texture() records metadata only; finalize() re-stats every source and
 	// refuses to stream bytes that changed after staging. Each sub-case checks
-	// that the output stops at the payload boundary, i.e. nothing was streamed.
+	// that nothing was streamed (the builder aborted at the payload boundary) and
+	// that the aborted build left no archive behind to be mistaken for a valid one.
 	const char *metadata_dstex = "user://gdextest_dspkg_stage_meta.dstex";
 	const char *resize_dstex = "user://gdextest_dspkg_stage_resize.dstex";
 	const char *delete_dstex = "user://gdextest_dspkg_stage_delete.dstex";
@@ -772,6 +773,15 @@ GDEX_TEST_T(dspkg, builder_staged_source_mutation_aborts_finalize, TAG_INTEGRATI
 	const char *resize_dspkg = "user://gdextest_dspkg_stage_resize.dspkg";
 	const char *delete_dspkg = "user://gdextest_dspkg_stage_delete.dspkg";
 	const char *virtual_path = "res://textures/test_staged_source.dstex";
+
+	// A control archive built from an unmutated copy of the same fixture. Its
+	// data_offset is the byte every aborting build must stop at: the entry table
+	// depends on the path, dimensions and mip count, not on the abort reason.
+	const char *control_dstex = "user://gdextest_dspkg_stage_control.dstex";
+	const char *control_dspkg = "user://gdextest_dspkg_stage_control.dspkg";
+	GDEX_ASSERT_TRUE(build_single_entry_archive(control_dstex, control_dspkg, 0, godot::String(), virtual_path));
+	const uint64_t payload_start = dspkg_payload_start(control_dspkg);
+	GDEX_ASSERT_TRUE(payload_start > 0);
 
 	// 1. Header metadata rewritten in place (file length unchanged).
 	GDEX_ASSERT_TRUE(write_temp_dstex(metadata_dstex, 64, 64, 1, 64 * 64 * 4));
@@ -786,10 +796,8 @@ GDEX_TEST_T(dspkg, builder_staged_source_mutation_aborts_finalize, TAG_INTEGRATI
 		GDEX_ASSERT_TRUE(write_u64_at(metadata_dstex, 32, 1ULL));
 
 		GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_FILE_CORRUPT);
-		const uint64_t payload_start = dspkg_payload_start(metadata_dspkg);
-		GDEX_EXPECT_GT(payload_start, uint64_t(0));
-		GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(godot::String(metadata_dspkg)).size(),
-				static_cast<int64_t>(payload_start));
+		GDEX_EXPECT_FALSE(godot::FileAccess::file_exists(godot::String(metadata_dspkg)));
+		GDEX_EXPECT_EQ(builder->_get_finalize_committed_bytes_for_testing(), payload_start);
 	}
 
 	// 2. Source resized after staging.
@@ -803,10 +811,8 @@ GDEX_TEST_T(dspkg, builder_staged_source_mutation_aborts_finalize, TAG_INTEGRATI
 		GDEX_ASSERT_TRUE(append_file_bytes(resize_dstex, 64));
 
 		GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_FILE_CORRUPT);
-		const uint64_t payload_start = dspkg_payload_start(resize_dspkg);
-		GDEX_EXPECT_GT(payload_start, uint64_t(0));
-		GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(godot::String(resize_dspkg)).size(),
-				static_cast<int64_t>(payload_start));
+		GDEX_EXPECT_FALSE(godot::FileAccess::file_exists(godot::String(resize_dspkg)));
+		GDEX_EXPECT_EQ(builder->_get_finalize_committed_bytes_for_testing(), payload_start);
 	}
 
 	// 3. Source removed after staging.
@@ -820,17 +826,17 @@ GDEX_TEST_T(dspkg, builder_staged_source_mutation_aborts_finalize, TAG_INTEGRATI
 		remove_temp_file(delete_dstex);
 
 		GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_CANT_OPEN);
-		const uint64_t payload_start = dspkg_payload_start(delete_dspkg);
-		GDEX_EXPECT_GT(payload_start, uint64_t(0));
-		GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(godot::String(delete_dspkg)).size(),
-				static_cast<int64_t>(payload_start));
+		GDEX_EXPECT_FALSE(godot::FileAccess::file_exists(godot::String(delete_dspkg)));
+		GDEX_EXPECT_EQ(builder->_get_finalize_committed_bytes_for_testing(), payload_start);
 	}
 
 	remove_temp_file(metadata_dstex);
 	remove_temp_file(resize_dstex);
+	remove_temp_file(control_dstex);
 	remove_temp_file(metadata_dspkg);
 	remove_temp_file(resize_dspkg);
 	remove_temp_file(delete_dspkg);
+	remove_temp_file(control_dspkg);
 }
 
 GDEX_TEST_T(dspkg, builder_streams_staged_payloads_one_at_a_time, TAG_INTEGRATION) {
@@ -885,6 +891,7 @@ GDEX_TEST_T(dspkg, builder_streams_staged_payloads_one_at_a_time, TAG_INTEGRATIO
 
 	// Stage the same three textures again, then resize the lexicographically last
 	// source. The first two payloads are already streamed when the third aborts.
+	uint64_t aborted_committed = 0;
 	{
 		godot::Ref<godot::DSPkg> builder;
 		builder.instantiate();
@@ -895,19 +902,98 @@ GDEX_TEST_T(dspkg, builder_streams_staged_payloads_one_at_a_time, TAG_INTEGRATIO
 		GDEX_ASSERT_TRUE(builder->add_texture(godot::String(res_c), godot::String(dstex_c)) == godot::OK);
 		GDEX_ASSERT_TRUE(append_file_bytes(dstex_c, 64));
 		GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_FILE_CORRUPT);
+		aborted_committed = builder->_get_finalize_committed_bytes_for_testing();
 	}
 
-	const int64_t payload_start = static_cast<int64_t>(dspkg_payload_start(dspkg_abort));
-	const int64_t aborted_size = godot::FileAccess::get_file_as_bytes(godot::String(dspkg_abort)).size();
+	// The aborted build leaves nothing on disk, so how far it got is read from the
+	// builder instead of from the leftover: the control archive supplies the byte
+	// the header/TOC envelope ends at, the completed one supplies the full size.
+	const int64_t payload_start = static_cast<int64_t>(dspkg_payload_start(dspkg_ok));
 	const int64_t complete_size = godot::FileAccess::get_file_as_bytes(godot::String(dspkg_ok)).size();
-	GDEX_EXPECT_GT(aborted_size, payload_start);
-	GDEX_EXPECT_LT(aborted_size, complete_size);
+	GDEX_EXPECT_FALSE(godot::FileAccess::file_exists(godot::String(dspkg_abort)));
+	GDEX_EXPECT_GT(aborted_committed, static_cast<uint64_t>(payload_start));
+	GDEX_EXPECT_LT(aborted_committed, static_cast<uint64_t>(complete_size));
 
 	remove_temp_file(dstex_a);
 	remove_temp_file(dstex_b);
 	remove_temp_file(dstex_c);
 	remove_temp_file(dspkg_ok);
 	remove_temp_file(dspkg_abort);
+}
+
+GDEX_TEST_T(dspkg, finalize_aborted_source_removal_leaves_no_archive, TAG_INTEGRATION) {
+	// finalize() truncates the output before it validates the staged sources. An
+	// abort after that point must not leave the half-written archive on disk: its
+	// header and TOC are already valid, so the file reads as an archive to anything
+	// that only checks for existence.
+	const char *dstex_path = "user://gdextest_dspkg_finalize_abort.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_finalize_abort.dspkg";
+	const char *virtual_path = "res://textures/test_finalize_abort.dstex";
+
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), 0ULL) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+
+	// The source is gone by the time finalize() re-stats it, so the archive aborts
+	// after the header and TOC have been written.
+	remove_temp_file(dstex_path);
+
+	GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_CANT_OPEN);
+	// Anti-vacuity: the output was created and the envelope written, so the
+	// absence below is a removal rather than a build that never touched the path.
+	GDEX_EXPECT_GT(builder->_get_finalize_committed_bytes_for_testing(), uint64_t(0));
+	GDEX_EXPECT_FALSE(godot::FileAccess::file_exists(godot::String(dspkg_path)));
+
+	// Positive control: the same builder path still produces an archive when
+	// nothing aborts, so "no file" cannot be satisfied by never writing one.
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 64, 64, 1, 64 * 64 * 4));
+	const char *control_path = "user://gdextest_dspkg_finalize_control.dspkg";
+	godot::Ref<godot::DSPkg> control;
+	control.instantiate();
+	GDEX_ASSERT_TRUE(control.is_valid());
+	GDEX_ASSERT_TRUE(control->create(godot::String(control_path), 0ULL) == godot::OK);
+	GDEX_ASSERT_TRUE(control->add_texture(godot::String(virtual_path), godot::String(dstex_path)) == godot::OK);
+	GDEX_EXPECT_EQ(control->finalize(), godot::OK);
+	GDEX_EXPECT_TRUE(godot::FileAccess::file_exists(godot::String(control_path)));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+	remove_temp_file(control_path);
+}
+
+GDEX_TEST_T(dspkg, finalize_abort_before_open_keeps_existing_archive, TAG_INTEGRATION) {
+	// The abort cleanup must only remove what this call created. An abort that
+	// happens before the output is opened (here: nothing staged) has to leave a
+	// pre-existing archive untouched, or a retry after a failed build would delete
+	// the good archive it was meant to replace.
+	const char *dstex_path = "user://gdextest_dspkg_preopen_keep.dstex";
+	const char *dspkg_path = "user://gdextest_dspkg_preopen_keep.dspkg";
+	const char *virtual_path = "res://textures/test_preopen_keep.dstex";
+
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, 0, godot::String(), virtual_path));
+	const int64_t original_size = godot::FileAccess::get_file_as_bytes(godot::String(dspkg_path)).size();
+	GDEX_ASSERT_TRUE(original_size > 0);
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(dspkg_path), 0ULL) == godot::OK);
+	GDEX_EXPECT_EQ(builder->finalize(), godot::ERR_UNCONFIGURED);
+
+	GDEX_EXPECT_TRUE(godot::FileAccess::file_exists(godot::String(dspkg_path)));
+	GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(godot::String(dspkg_path)).size(), original_size);
+
+	// And it is still a readable archive, not a truncated one.
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::OK);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
 }
 
 // --- Slow: multi-mip GPU footprint metadata + 512-byte per-mip padding --------

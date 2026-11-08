@@ -544,6 +544,7 @@ Error DSPkg::create(const String &p_output_path, uint64_t p_archive_fingerprint)
 	crypto_wipe(m_encryption_key.data(), 32);
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	m_test_salt_override.clear();
+	m_test_finalize_committed_bytes = 0;
 #endif
 	return OK;
 }
@@ -644,6 +645,10 @@ void DSPkg::_set_archive_salt_for_testing(const PackedByteArray &p_salt) {
 
 void DSPkg::_set_write_truncate_for_testing(int64_t p_bytes) {
 	m_test_write_truncate_after_bytes = p_bytes;
+}
+
+uint64_t DSPkg::_get_finalize_committed_bytes_for_testing() const {
+	return m_test_finalize_committed_bytes;
 }
 
 namespace {
@@ -842,11 +847,17 @@ Error DSPkg::finalize() {
 
 	PackedByteArray entries_buf;
 	bool finalize_completed = false;
+	// Set once this call has truncated build_output_path. From that point the
+	// path holds bytes written here, so an aborted build must not leave them
+	// behind (see the removal below). Before that point the destination is
+	// untouched, and the guard must not touch it either.
+	bool output_opened = false;
 
 	struct FinalizeCleanupGuard {
 		DSPkg *pkg = nullptr;
 		PackedByteArray &buf;
 		bool &completed;
+		bool &output_opened;
 		~FinalizeCleanupGuard() {
 			if (buf.size() > 0) {
 				crypto_wipe(buf.ptrw(), buf.size());
@@ -857,9 +868,20 @@ Error DSPkg::finalize() {
 			}
 			if (pkg && !completed) {
 				pkg->close_write();
+				if (output_opened) {
+					// A partially written archive carries a valid header and TOC, so it
+					// must not survive the call that failed to finish it. The removal is
+					// idempotent: the write-failure path already unlinked the file.
+					const Error remove_error = DirAccess::remove_absolute(pkg->build_output_path);
+					if (remove_error != OK && FileAccess::file_exists(pkg->build_output_path)) {
+						UtilityFunctions::push_error(
+								"DSPkg: Failed to remove the partial archive after an aborted build: " +
+								pkg->build_output_path);
+					}
+				}
 			}
 		}
-	} cleanup_guard{this, entries_buf, finalize_completed};
+	} cleanup_guard{this, entries_buf, finalize_completed, output_opened};
 
 	uint32_t count = static_cast<uint32_t>(staging_entries.size());
 	if (count == 0) {
@@ -1130,6 +1152,7 @@ Error DSPkg::finalize() {
 		UtilityFunctions::push_error("DSPkg: Could not open file for writing: ", build_output_path);
 		return FileAccess::get_open_error();
 	}
+	output_opened = true;
 
 	// Step 5: checked write helpers. godot-cpp's store_buffer() returns void, so
 	// a full disk surfaces through FileAccess::get_error(); every write is
@@ -1144,6 +1167,9 @@ Error DSPkg::finalize() {
 			if (written_bytes >= allowed) {
 				// Pretend the bytes landed: the final size check must catch it.
 				written_bytes += p_size;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+				m_test_finalize_committed_bytes = written_bytes;
+#endif
 				return true;
 			}
 			if (p_size > allowed - written_bytes) {
@@ -1155,6 +1181,9 @@ Error DSPkg::finalize() {
 					}
 				}
 				written_bytes += p_size;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+				m_test_finalize_committed_bytes = written_bytes;
+#endif
 				return true;
 			}
 		}
@@ -1166,6 +1195,9 @@ Error DSPkg::finalize() {
 			}
 		}
 		written_bytes += p_size;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		m_test_finalize_committed_bytes = written_bytes;
+#endif
 		return true;
 	};
 	auto fail_write = [&](const char *p_stage) -> Error {

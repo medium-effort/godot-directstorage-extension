@@ -225,6 +225,10 @@ private:
 	// writes past this byte offset while the builder still reports success, so
 	// the final size verification can be exercised without a full disk.
 	int64_t m_test_write_truncate_after_bytes = -1;
+	// Test-only, non-binding: bytes finalize() had committed to the destination
+	// when it aborted, so a test can assert how far payload streaming got after
+	// the partial archive has been removed. Debug/editor builds only, never bound.
+	uint64_t m_test_finalize_committed_bytes = 0;
 #endif
 
 	// Reader state
@@ -278,6 +282,7 @@ public:
 public:
 	void _set_archive_salt_for_testing(const PackedByteArray &p_salt);
 	void _set_write_truncate_for_testing(int64_t p_bytes);
+	uint64_t _get_finalize_committed_bytes_for_testing() const;
 	// Test-only, non-binding: high-water mark of the bytes the encrypted TOC path
 	// holds before the MAC verifies. Debug/editor builds only, never bound.
 	static void _reset_preauth_toc_probe_for_testing();
