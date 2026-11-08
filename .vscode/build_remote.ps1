@@ -920,6 +920,28 @@ elseif ($null -eq $BuildGuard.Owned) {
     Write-Status "[Guard] Warning: could not create build guard '$BuildGuardName'; continuing without concurrency protection." -ForegroundColor Yellow
 }
 
+# --- SCons shared-cache footprint -------------------------------------------
+# The shared object cache never evicts: SCons only ever adds entries, and a new
+# worktree, a flag/target change or a different dev_build each appends a whole
+# generation (~0.4 GiB measured for template_debug + tests). Left alone it grew
+# to 5.5 GiB on a drive with 2.2 GiB free. Measuring it costs about half a second
+# over a few thousand entries, so this runs BEFORE the compile rather than after:
+# a warning after a four minute build is too late to prevent a full disk. Local
+# mode only - a remote build fills Device B's cache, not this one - and never in
+# -Json mode, where stdout must stay machine-readable. Advisory by design: the
+# tool's exit code is ignored so a full cache can never fail a build.
+if (-not $AuditOnly -and -not $IsRemote -and -not $Json) {
+    $CacheTool = Join-Path $WorkspaceRoot "tools\scons_cache.ps1"
+    if (Test-Path -LiteralPath $CacheTool -PathType Leaf) {
+        try {
+            & powershell -NoProfile -ExecutionPolicy Bypass -File $CacheTool -Action Check
+        }
+        catch {
+            Write-Status ("[cache] Warning: could not measure the SCons cache: " + $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
+}
+
 # Hardening gate: every translation unit - C as well as C++ - must be compiled with /guard:cf
 # and /Qspectre. Its output is re-emitted through Write-Status so -Json stdout stays
 # machine-readable. Placement matters and this block must stay BELOW Enter-BuildGuard: the gate
