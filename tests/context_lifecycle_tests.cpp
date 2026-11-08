@@ -290,7 +290,7 @@ GDEX_TEST_T(context_lifecycle, fallback_gdeflate_corrupted_payload_fails_gracefu
     const godot::String backend = static_cast<godot::String>(
         ds->call(godot::StringName("get_active_backend_name")));
     if (backend == godot::String("SoftwareFallback")) {
-        GDEX_EXPECT_STR_CONTAINS(err, "CPU GDeflate decompression failed");
+        GDEX_EXPECT_STR_CONTAINS(err, "GDeflate");
     }
 }
 
@@ -338,7 +338,7 @@ GDEX_TEST_T(context_lifecycle, fallback_gdeflate_size_mismatch_fails_gracefully,
     const godot::String backend = static_cast<godot::String>(
         ds->call(godot::StringName("get_active_backend_name")));
     if (backend == godot::String("SoftwareFallback")) {
-        GDEX_EXPECT_STR_CONTAINS(err, "CPU GDeflate decompression failed");
+        GDEX_EXPECT_STR_CONTAINS(err, "GDeflate");
     }
 }
 
@@ -462,7 +462,7 @@ GDEX_TEST_T(context_lifecycle, fallback_gdeflate_truncated_header_fails_graceful
     const godot::String backend = static_cast<godot::String>(
         ds->call(godot::StringName("get_active_backend_name")));
     if (backend == godot::String("SoftwareFallback")) {
-        GDEX_EXPECT_STR_CONTAINS(err, "CPU GDeflate decompression failed");
+        GDEX_EXPECT_STR_CONTAINS(err, "GDeflate");
     }
 }
 

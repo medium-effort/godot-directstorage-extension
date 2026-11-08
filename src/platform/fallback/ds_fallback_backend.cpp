@@ -8,7 +8,9 @@
 #include <chrono>
 #include "GDeflate.h"
 #include "TileStream.h"
+#include "../../compression/gdeflate_decompressor.h"
 #include "../../compression/gdeflate_parallel.h"
+#include "../../formats/dstex_format.h"
 
 namespace godot {
 
@@ -224,6 +226,19 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 		// cancelled while this request was being read. Never write to
 		// destination buffers of a dropped request.
 		if (should_drop_request(p_request, true)) {
+			return false;
+		}
+		if (static_cast<uint64_t>(uncompressed_size) > DSTEX_MAX_TOTAL_BYTES) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("FallbackBackend: GDeflate output size " + String::num_uint64(uncompressed_size) + " exceeds the 512 MiB limit.");
+			return false;
+		}
+		// Same predicate GDeflateDecompressor::decompress() applies: the stream
+		// header, its declared output, and the per-tile expansion bound must all
+		// agree with the request before anything sizes a destination buffer.
+		if (!GDeflateDecompressor::validate_stream(raw_bytes, static_cast<int>(uncompressed_size))) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("FallbackBackend: Invalid GDeflate stream (header, tile table, or expansion bound).");
 			return false;
 		}
 		PackedByteArray &dest = p_request->get_destination_buffer_ref();

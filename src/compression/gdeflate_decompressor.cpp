@@ -33,49 +33,6 @@ std::atomic<int64_t> s_test_last_resize_request{ 0 };
 // it cannot encode.
 constexpr size_t kMaxGDeflateExpansion = 1100;
 
-bool validate_stream(const PackedByteArray &p_compressed, int p_original_size) {
-	if (p_compressed.size() < static_cast<int64_t>(sizeof(GDeflate::TileStream))) {
-		return false;
-	}
-
-	const GDeflate::TileStream *header = reinterpret_cast<const GDeflate::TileStream *>(p_compressed.ptr());
-	if (!header->IsValid() || header->id != GDeflate::kGDeflateId || header->tileSizeIdx != 1 || header->numTiles == 0 ||
-			header->lastTileSize > GDeflate::kDefaultTileSize || header->GetUncompressedSize() != static_cast<size_t>(p_original_size)) {
-		return false;
-	}
-
-	const size_t tile_table_size = sizeof(GDeflate::TileStream) + static_cast<size_t>(header->numTiles) * sizeof(uint32_t);
-	if (tile_table_size > static_cast<size_t>(p_compressed.size())) {
-		return false;
-	}
-
-	const uint32_t *tile_offsets = reinterpret_cast<const uint32_t *>(p_compressed.ptr() + sizeof(GDeflate::TileStream));
-	const size_t compressed_data_size = static_cast<size_t>(p_compressed.size()) - tile_table_size;
-	for (uint32_t tile_index = 0; tile_index < header->numTiles; tile_index++) {
-		const size_t tile_offset = tile_index > 0 ? tile_offsets[tile_index] : 0;
-		const size_t next_offset = tile_index + 1 < header->numTiles ? tile_offsets[tile_index + 1] : (tile_offset + tile_offsets[0]);
-		if (next_offset < tile_offset || tile_offset > compressed_data_size || next_offset > compressed_data_size) {
-			return false;
-		}
-		// The header already fixes how many bytes this tile must produce. Reject
-		// a tile that cannot encode them: a zero-length tile produces nothing,
-		// and a payload may not claim more output than its compressed bytes can
-		// expand to. This runs before decompress() resizes the destination.
-		const size_t tile_compressed = next_offset - tile_offset;
-		if (tile_compressed == 0) {
-			return false;
-		}
-		const size_t tile_output = std::min<size_t>(GDeflate::kDefaultTileSize,
-				static_cast<size_t>(p_original_size) - static_cast<size_t>(tile_index) * GDeflate::kDefaultTileSize);
-		const size_t min_compressed = (tile_output + kMaxGDeflateExpansion - 1) / kMaxGDeflateExpansion;
-		if (tile_compressed < min_compressed) {
-			return false;
-		}
-	}
-
-	return true;
-}
-
 } // namespace
 
 void GDeflateDecompressor::_bind_methods() {
@@ -117,6 +74,49 @@ void GDeflateDecompressor::set_worker_count(int p_count) {
 
 int GDeflateDecompressor::get_worker_count() const {
 	return worker_count;
+}
+
+bool GDeflateDecompressor::validate_stream(const PackedByteArray &p_compressed, int p_original_size) {
+	if (p_compressed.size() < static_cast<int64_t>(sizeof(GDeflate::TileStream))) {
+		return false;
+	}
+
+	const GDeflate::TileStream *header = reinterpret_cast<const GDeflate::TileStream *>(p_compressed.ptr());
+	if (!header->IsValid() || header->id != GDeflate::kGDeflateId || header->tileSizeIdx != 1 || header->numTiles == 0 ||
+			header->lastTileSize > GDeflate::kDefaultTileSize || header->GetUncompressedSize() != static_cast<size_t>(p_original_size)) {
+		return false;
+	}
+
+	const size_t tile_table_size = sizeof(GDeflate::TileStream) + static_cast<size_t>(header->numTiles) * sizeof(uint32_t);
+	if (tile_table_size > static_cast<size_t>(p_compressed.size())) {
+		return false;
+	}
+
+	const uint32_t *tile_offsets = reinterpret_cast<const uint32_t *>(p_compressed.ptr() + sizeof(GDeflate::TileStream));
+	const size_t compressed_data_size = static_cast<size_t>(p_compressed.size()) - tile_table_size;
+	for (uint32_t tile_index = 0; tile_index < header->numTiles; tile_index++) {
+		const size_t tile_offset = tile_index > 0 ? tile_offsets[tile_index] : 0;
+		const size_t next_offset = tile_index + 1 < header->numTiles ? tile_offsets[tile_index + 1] : (tile_offset + tile_offsets[0]);
+		if (next_offset < tile_offset || tile_offset > compressed_data_size || next_offset > compressed_data_size) {
+			return false;
+		}
+		// The header already fixes how many bytes this tile must produce. Reject
+		// a tile that cannot encode them: a zero-length tile produces nothing,
+		// and a payload may not claim more output than its compressed bytes can
+		// expand to. This runs before any caller resizes a destination.
+		const size_t tile_compressed = next_offset - tile_offset;
+		if (tile_compressed == 0) {
+			return false;
+		}
+		const size_t tile_output = std::min<size_t>(GDeflate::kDefaultTileSize,
+				static_cast<size_t>(p_original_size) - static_cast<size_t>(tile_index) * GDeflate::kDefaultTileSize);
+		const size_t min_compressed = (tile_output + kMaxGDeflateExpansion - 1) / kMaxGDeflateExpansion;
+		if (tile_compressed < min_compressed) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
