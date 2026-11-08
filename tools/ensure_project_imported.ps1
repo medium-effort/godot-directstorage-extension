@@ -10,10 +10,17 @@
     `Parse Error: Identifier "DSPkg" not declared in ds_dspkg_static.gd` in a
     fresh worktree. Running the editor import once writes that registry.
 
-    Idempotent: a no-op when the registry already exists. Judge success by the
-    registry file rather than the exit code, because a cold first import can end
-    in the known teardown abort from engine issue #0169 *after* the import has
-    completed.
+    The same scan also writes `.godot/uid_cache.bin`. Without it, a script that
+    preloads a `uid://` resource fails to parse
+    (`Preload file "uid://..." does not exist`) even though the `.uid` sidecar is
+    present. The short `--quit-after 4` pass writes the registry but exits before
+    the filesystem scan persists the UID cache, so a second, longer pass runs
+    when the cache is still absent. Both files are required: a UID preload is as
+    load-bearing as a GDExtension class name.
+
+    Idempotent: a no-op when both files already exist. Judge success by the files
+    rather than the exit code, because a cold first import can end in the known
+    teardown abort from engine issue #0169 *after* the import has completed.
 
     Lives in tools/ rather than .vscode/ because it is a build utility, not a
     task: build verification calls it, and a person or agent can run it directly
@@ -27,13 +34,13 @@
     GODOT_CONSOLE_PATH entry in the repository's .env.
 
 .PARAMETER TimeoutSec
-    Upper bound on the import. Default: 180.
+    Upper bound on each import pass. Default: 180.
 
 .PARAMETER Quiet
     Print only on failure.
 
 .OUTPUTS
-    Exit code 0 when the extension registry exists afterwards, 1 otherwise.
+    Exit code 0 when the extension registry and the UID cache exist afterwards, 1 otherwise.
 
 .NOTES
     Reports through exit codes, so invoke it as a child process
@@ -61,14 +68,15 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $projectAbs = if ([System.IO.Path]::IsPathRooted($ProjectDir)) { $ProjectDir } else { Join-Path $repoRoot $ProjectDir }
 $registry = Join-Path $projectAbs ".godot\extension_list.cfg"
+$uidCache = Join-Path $projectAbs ".godot\uid_cache.bin"
 
 if (-not (Test-Path -LiteralPath $projectAbs)) {
     Write-Error "[ensure-project-imported] Project directory not found at '$projectAbs'."
     exit 1
 }
 
-if (Test-Path -LiteralPath $registry) {
-    if (-not $Quiet) { Write-Host "[ensure-project-imported] already imported: $registry" -ForegroundColor DarkGray }
+if ((Test-Path -LiteralPath $registry) -and (Test-Path -LiteralPath $uidCache)) {
+    if (-not $Quiet) { Write-Host "[ensure-project-imported] already imported: $registry (+ uid_cache.bin)" -ForegroundColor DarkGray }
     exit 0
 }
 
@@ -105,36 +113,55 @@ if (-not $godot) {
     exit 1
 }
 
-if (-not $Quiet) {
-    Write-Host "[ensure-project-imported] No extension registry in '$projectAbs'; importing once..." -ForegroundColor Yellow
-}
+function Invoke-EditorScan {
+    param(
+        [Parameter(Mandatory = $true)][string]$Godot,
+        [Parameter(Mandatory = $true)][string]$ProjectAbs,
+        [Parameter(Mandatory = $true)][int]$QuitAfterFrames,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec
+    )
 
-$stdout = Join-Path $env:TEMP ("ensure_import_out_" + [System.Guid]::NewGuid().ToString() + ".log")
-$stderr = Join-Path $env:TEMP ("ensure_import_err_" + [System.Guid]::NewGuid().ToString() + ".log")
-try {
-    # --editor --quit-after: the editor's first scan is what writes the registry.
-    # --quit alone does not import, and --import exited immediately without
-    # producing the file on the device this was measured on.
-    $proc = Start-Process -FilePath $godot -ArgumentList @("--headless", "--editor", "--quit-after", "4", "--path", $projectAbs) -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        Write-Warning "[ensure-project-imported] Import did not finish within ${TimeoutSec}s; stopped it."
+    $scanOut = Join-Path $env:TEMP ("ensure_import_out_" + [System.Guid]::NewGuid().ToString() + ".log")
+    $scanErr = Join-Path $env:TEMP ("ensure_import_err_" + [System.Guid]::NewGuid().ToString() + ".log")
+    try {
+        # --editor --quit-after: the editor's filesystem scan is what writes the
+        # registry and the UID cache. --quit alone does not import, and --import
+        # exited immediately without producing the registry on the device this was
+        # measured on.
+        $proc = Start-Process -FilePath $Godot -ArgumentList @("--headless", "--editor", "--quit-after", "$QuitAfterFrames", "--path", $ProjectAbs) -NoNewWindow -PassThru -RedirectStandardOutput $scanOut -RedirectStandardError $scanErr
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Warning "[ensure-project-imported] Import pass (--quit-after $QuitAfterFrames) did not finish within ${TimeoutSec}s; stopped it."
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $scanOut) { $script:lastImportLog += @(Get-Content -LiteralPath $scanOut -ErrorAction SilentlyContinue); Remove-Item -LiteralPath $scanOut -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $scanErr) { $script:lastImportLog += @(Get-Content -LiteralPath $scanErr -ErrorAction SilentlyContinue); Remove-Item -LiteralPath $scanErr -Force -ErrorAction SilentlyContinue }
     }
 }
-finally {
-    $importLog = @()
-    if (Test-Path -LiteralPath $stdout) { $importLog += @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue); Remove-Item -LiteralPath $stdout -Force -ErrorAction SilentlyContinue }
-    if (Test-Path -LiteralPath $stderr) { $importLog += @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue); Remove-Item -LiteralPath $stderr -Force -ErrorAction SilentlyContinue }
+
+if (-not $Quiet) {
+    Write-Host "[ensure-project-imported] Import needed in '$projectAbs'; running the editor scan..." -ForegroundColor Yellow
 }
 
-if (Test-Path -LiteralPath $registry) {
-    if (-not $Quiet) { Write-Host "[ensure-project-imported] Imported; registry written: $registry" -ForegroundColor Green }
+$script:lastImportLog = @()
+# Two passes, measured on 2026-11-08: --quit-after 4 writes extension_list.cfg but
+# exits before the scan persists .godot/uid_cache.bin, so a uid:// preload still
+# fails to parse; the longer second pass writes the cache. Stop as soon as both
+# files exist, so an already-imported checkout pays nothing.
+foreach ($frames in @(4, 240)) {
+    if ((Test-Path -LiteralPath $registry) -and (Test-Path -LiteralPath $uidCache)) { break }
+    Invoke-EditorScan -Godot $godot -ProjectAbs $projectAbs -QuitAfterFrames $frames -TimeoutSec $TimeoutSec
+}
+
+if ((Test-Path -LiteralPath $registry) -and (Test-Path -LiteralPath $uidCache)) {
+    if (-not $Quiet) { Write-Host "[ensure-project-imported] Imported; registry and UID cache written." -ForegroundColor Green }
     exit 0
 }
 
-Write-Error "[ensure-project-imported] The import did not produce '$registry'. GDExtension classes will not resolve in this checkout."
-if ($importLog) {
+Write-Error "[ensure-project-imported] The import did not produce both '$registry' and '$uidCache'. GDExtension classes or uid:// preloads will not resolve in this checkout."
+if ($script:lastImportLog) {
     Write-Host "--- import output (tail) ---" -ForegroundColor Yellow
-    $importLog | Select-Object -Last 15 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkYellow }
+    $script:lastImportLog | Select-Object -Last 15 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkYellow }
 }
 exit 1

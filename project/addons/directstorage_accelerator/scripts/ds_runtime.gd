@@ -2,6 +2,13 @@ extends Node
 
 const RUNTIME_INSTALLER_SCRIPT = preload("res://addons/directstorage_accelerator/scripts/ds_runtime_installer.gd")
 
+## Shared completion predicate. A tracked prewarm tag is only finished once its
+## request stream is terminal AND every completed texture has been built into
+## DSTextureCache; `DSPreloader.is_prewarm_complete()` is the documented promise
+## (`ds_preloader.gd`), so the autoload's signal is derived from it instead of
+## re-implementing half of it.
+const PRELOADER_SCRIPT := preload("uid://h8ts55gju2q4")
+
 ## DirectStorage Runtime Coordinator & Watchdog Autoload
 ##
 ## Author: MediumEffort
@@ -56,7 +63,9 @@ var _boot_failure_code: int = -1
 
 ## Per-tag prewarm progress: (tag: int, done: int, total: int).
 signal prewarm_progress(tag: int, done: int, total: int)
-## Fired once per tracked tag when `is_prewarm_complete(tag)` turns true.
+## Fired once per tracked tag when `DSPreloader.is_prewarm_complete(tag)` turns
+## true: every stream request is terminal AND every completed texture has been
+## built into `DSTextureCache` (an offloaded build may outlive request completion).
 signal prewarm_finished(tag: int)
 
 ## Tags under progress watch: tag (int) -> last emitted Vector2i(done, total).
@@ -540,6 +549,8 @@ func _process(delta: float) -> void:
 
 
 ## Polls tracked tags and emits `prewarm_progress` / `prewarm_finished`.
+## Completion is decided by `DSPreloader.is_prewarm_complete()`, so a tag whose
+## requests are done but whose cache builds are still pending is not finished yet.
 func _poll_prewarm_progress(ctx: Object) -> void:
 	if _tracked_tags.is_empty():
 		return
@@ -555,7 +566,7 @@ func _poll_prewarm_progress(ctx: Object) -> void:
 		if progress != last:
 			_tracked_tags[tag] = progress
 			prewarm_progress.emit(tag, progress.x, progress.y)
-		if ctx.is_prewarm_complete(tag):
+		if PRELOADER_SCRIPT.is_prewarm_complete(tag):
 			_tracked_tags.erase(tag)
 			_finished_tags[tag] = true
 			prewarm_finished.emit(tag)
