@@ -266,12 +266,11 @@ DSErrorHandler::~DSErrorHandler() {
 }
 
 #ifdef _WIN32
-bool DSErrorHandler::register_queue(IDStorageQueue *p_queue, std::mutex *p_queue_access_mutex) {
+bool DSErrorHandler::register_queue(IDStorageQueue *p_queue) {
 	if (!p_queue) {
 		return false;
 	}
 	std::lock_guard<std::mutex> lock(error_mutex);
-	observed_queue_mutex = p_queue_access_mutex;
 	for (IDStorageQueue *queue : observed_queues) {
 		if (queue == p_queue) {
 			return true;
@@ -283,22 +282,35 @@ bool DSErrorHandler::register_queue(IDStorageQueue *p_queue, std::mutex *p_queue
 }
 
 void DSErrorHandler::unregister_queue() {
-	std::lock_guard<std::mutex> lock(error_mutex);
-	observed_queue_mutex = nullptr;
-	for (IDStorageQueue *queue : observed_queues) {
+	// Wait for a drain that is already inside RetrieveErrorRecord() before the queue list is
+	// dropped. Teardown (queue Close/Release, then the runtime's FreeLibrary) must not overtake a
+	// reader, and clearing the list here is what makes a later drain touch no queue at all.
+	// Measured cost of the wait: the drain holds this lock for the SDK call only (~1 us).
+	std::unique_lock<std::mutex> drain_lock(queue_drain_mutex);
+
+	std::vector<IDStorageQueue *> dropped;
+	{
+		std::lock_guard<std::mutex> lock(error_mutex);
+		observed_queues.swap(dropped);
+	}
+	for (IDStorageQueue *queue : dropped) {
 		if (queue) {
 			queue->Release();
 		}
 	}
-	observed_queues.clear();
 }
 
 void DSErrorHandler::process_queue_errors() {
+	// The drain lock is taken BEFORE the queue list is snapshotted. Serialising this drain with
+	// the backend's own RetrieveErrorRecord() caller is what the SDK contract requires (below),
+	// and taking it first also closes the lifetime window: unregister_queue() holds the same lock
+	// while it clears the list, so it cannot let a backend be destroyed - or its runtime unloaded
+	// - between our snapshot and our read.
+	std::unique_lock<std::mutex> queue_lock(queue_drain_mutex);
+
 	std::vector<IDStorageQueue *> queues_copy;
-	std::mutex *queue_access = nullptr;
 	{
 		std::lock_guard<std::mutex> lock(error_mutex);
-		queue_access = observed_queue_mutex;
 		queues_copy.reserve(observed_queues.size());
 		for (IDStorageQueue *queue : observed_queues) {
 			if (queue) {
@@ -308,24 +320,31 @@ void DSErrorHandler::process_queue_errors() {
 		}
 	}
 
-	// Serialise this drain with the completion thread's own RetrieveErrorRecord() caller. The
-	// SDK ties that call to the error event and never licenses two callers, and FailureCount
-	// counts failures "since the last RetrieveErrorRecord call", so racing drains split one
-	// failure record between them.
-	std::unique_lock<std::mutex> queue_lock;
-	if (queue_access) {
-		queue_lock = std::unique_lock<std::mutex>(*queue_access);
-	}
-
+	// SDK contract: the call is tied to the queue's error event and is never licensed for two
+	// concurrent callers, and FailureCount counts failures "since the last RetrieveErrorRecord
+	// call", so racing drains split one failure record between them.
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	_debug_invoke_queue_reader_hook();
 #endif
 
-	// Build the messages here; do not call into the engine while the lock is held.
-	std::vector<String> messages;
+	// Hold the drain lock across the SDK reads only: no engine allocation and no COM Release while
+	// it is held, so the serialisation cost stays bounded by the SDK call itself.
+	std::vector<DSTORAGE_ERROR_RECORD> records;
+	records.reserve(queues_copy.size());
 	for (IDStorageQueue *queue : queues_copy) {
 		DSTORAGE_ERROR_RECORD errorRecord{};
 		queue->RetrieveErrorRecord(&errorRecord);
+		records.push_back(errorRecord);
+	}
+
+	queue_lock.unlock();
+	for (IDStorageQueue *queue : queues_copy) {
+		queue->Release();
+	}
+
+	// Build the messages here; do not call into the engine while any extension lock is held.
+	std::vector<String> messages;
+	for (const DSTORAGE_ERROR_RECORD &errorRecord : records) {
 		if (errorRecord.FailureCount > 0) {
 			const auto &failureRecord = errorRecord.FirstFailure;
 			String mapped_message = describe_hresult(static_cast<uint32_t>(failureRecord.HResult));
@@ -345,13 +364,6 @@ void DSErrorHandler::process_queue_errors() {
 		}
 	}
 
-	if (queue_lock.owns_lock()) {
-		queue_lock.unlock();
-	}
-	for (IDStorageQueue *queue : queues_copy) {
-		queue->Release();
-	}
-
 	// Engine calls happen after every extension mutex is released (GODOT_QUIRKS.md Q46).
 	for (const String &message : messages) {
 		UtilityFunctions::push_error(message);
@@ -359,6 +371,18 @@ void DSErrorHandler::process_queue_errors() {
 			singleton->report_error(message);
 		}
 	}
+}
+
+std::unique_lock<std::mutex> DSErrorHandler::acquire_queue_drain_lock() {
+	return std::unique_lock<std::mutex>(queue_drain_mutex);
+}
+
+bool DSErrorHandler::try_acquire_queue_drain_lock(std::unique_lock<std::mutex> &r_lock) {
+	if (r_lock.owns_lock()) {
+		r_lock.unlock();
+	}
+	r_lock = std::unique_lock<std::mutex>(queue_drain_mutex, std::try_to_lock);
+	return r_lock.owns_lock();
 }
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)

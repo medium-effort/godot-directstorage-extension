@@ -600,10 +600,22 @@ Win32Backend::QueueErrorInfo Win32Backend::read_queue_error(IDStorageQueue *p_qu
 	}
 
 	DSTORAGE_ERROR_RECORD error_record = {};
+	// Serialise with DSErrorHandler's drain. Both backend callers already hold batch_mutex
+	// (handle_queue_error_event and slot completion), so the order is batch_mutex -> the
+	// handler's drain lock; the drain side takes only the drain lock, so the pair cannot invert.
+	// Held across the SDK call and nothing else.
+	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+	std::unique_lock<std::mutex> drain_lock;
+	if (err_handler) {
+		drain_lock = err_handler->acquire_queue_drain_lock();
+	}
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	s_error_record_read_count.fetch_add(1);
 #endif
 	p_queue->RetrieveErrorRecord(&error_record);
+	if (drain_lock.owns_lock()) {
+		drain_lock.unlock();
+	}
 	if (error_record.FailureCount == 0) {
 		return info;
 	}
@@ -3154,7 +3166,7 @@ bool Win32Backend::initialize(const String &p_path) {
 		DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 		if (err_handler) {
 			for (const QueueState &queue : priority_queues) {
-				err_handler->register_queue(queue.queue, &batch_mutex);
+				err_handler->register_queue(queue.queue);
 			}
 		}
 		RenderingServer *rs = RenderingServer::get_singleton();
@@ -4998,7 +5010,8 @@ bool Win32Backend::_debug_batch_mutex_is_free_for_testing() {
 #ifdef _WIN32
 	// Test-only seam, never bound in _bind_methods(). Called from a thread that is NOT the one
 	// whose lock state is being measured: true means batch_mutex was free, false means something
-	// (in the test's case, the queue-error drain) holds it.
+	// holds it. Measures the submit-path serialisation (drain counters, error reporting), NOT the
+	// queue-error drain pair - see _debug_queue_error_read_can_enter_for_testing for that.
 	if (batch_mutex.try_lock()) {
 		batch_mutex.unlock();
 		return true;
@@ -5006,6 +5019,23 @@ bool Win32Backend::_debug_batch_mutex_is_free_for_testing() {
 	return false;
 #else
 	// No Win32 queue to serialise against; nothing can hold the lock here.
+	return true;
+#endif
+}
+
+bool Win32Backend::_debug_queue_error_read_can_enter_for_testing() {
+#ifdef _WIN32
+	// Test-only seam, never bound in _bind_methods(). False means the queue-error drain holds the
+	// handler's drain lock, i.e. this backend's own error-record read would block. That is the
+	// contract; it is deliberately independent of which mutex implements it.
+	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+	if (!err_handler) {
+		return true;
+	}
+	std::unique_lock<std::mutex> probe;
+	return err_handler->try_acquire_queue_drain_lock(probe);
+#else
+	// No Win32 queue to serialise against; nothing can hold the drain here.
 	return true;
 #endif
 }

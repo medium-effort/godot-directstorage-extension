@@ -30,10 +30,13 @@ private:
 
 #ifdef _WIN32
 	std::vector<IDStorageQueue *> observed_queues;
-	// The backend's queue-access mutex, borrowed for the duration of a queue-error drain so the
-	// two RetrieveErrorRecord() callers cannot run concurrently. Null until a backend registers
-	// and cleared again on unregister.
-	std::mutex *observed_queue_mutex = nullptr;
+	// Serialises the two IDStorageQueue::RetrieveErrorRecord() callers (the drain below and the
+	// backend's own error-event read) and bounds how long the drain may hold on to backend state.
+	// Owned here rather than borrowed from a backend: this singleton outlives every Win32Backend,
+	// so a drain can never reach a destroyed mutex, and unregister_queue() can wait for an
+	// in-flight drain before teardown frees the queues (or unloads their runtime). Never held
+	// while calling into the engine.
+	std::mutex queue_drain_mutex;
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	std::mutex queue_reader_hook_mutex;
 	std::function<void()> queue_reader_hook;
@@ -53,9 +56,15 @@ public:
 	~DSErrorHandler();
 
 #ifdef _WIN32
-	bool register_queue(IDStorageQueue *p_queue, std::mutex *p_queue_access_mutex = nullptr);
+	bool register_queue(IDStorageQueue *p_queue);
 	void unregister_queue();
 	void process_queue_errors();
+	// Taken around IDStorageQueue::RetrieveErrorRecord() by both the drain and the backend's own
+	// read, so the two callers are mutually exclusive. Returned by value: the caller owns a
+	// correct RAII guard and the mutex lifetime is this singleton's, not a backend's.
+	std::unique_lock<std::mutex> acquire_queue_drain_lock();
+	// Non-blocking form. On return r_lock owns the mutex only if nothing was inside it.
+	bool try_acquire_queue_drain_lock(std::unique_lock<std::mutex> &r_lock);
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	// Test-only seam, never bound in _bind_methods(): the hook runs inside
 	// process_queue_errors() after the queue-access lock is taken and before the first

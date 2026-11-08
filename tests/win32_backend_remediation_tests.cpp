@@ -1853,15 +1853,18 @@ GDEX_TEST_T(win32_remediation, queue_error_retrieval_is_serialized, TAG_INTEGRAT
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
     // IDStorageQueue::RetrieveErrorRecord() has two callers: the completion thread, which reaches
-    // it through retrieve_queue_error() while holding batch_mutex, and process_queue_errors(),
-    // which used to reach it holding only error_mutex - and that lock is released before the loop,
-    // so the drain was effectively unserialised. The SDK ties the call to the error event and
-    // counts failures "since the last RetrieveErrorRecord call", so two racing drains split one
-    // failure record between them.
+    // it through read_queue_error() while holding batch_mutex, and process_queue_errors(), which
+    // used to reach it holding only error_mutex - and that lock is released before the loop, so
+    // the drain was effectively unserialised. The SDK ties the call to the error event and counts
+    // failures "since the last RetrieveErrorRecord call", so two racing drains split one failure
+    // record between them.
     //
-    // The seam parks the draining thread after it takes the queue-access lock and before the first
-    // RetrieveErrorRecord() call; the test then asks the backend whether its batch_mutex is free.
-    // Post-fix it is held, so the probe answers false.
+    // Both callers now share the handler's own drain lock. The seam parks the draining thread
+    // after it takes that lock and before the first RetrieveErrorRecord() call; the test then asks
+    // the backend whether its own error-record read could enter. Post-fix it cannot, so the probe
+    // answers false. The probe deliberately asks the contract question (would this backend's read
+    // block?) rather than the implementation question (is batch_mutex held?), because batch_mutex
+    // is no longer what serialises these two callers.
     godot::DSErrorHandler *eh = godot::DSErrorHandler::get_singleton();
     if (eh == nullptr) {
         GDEX_SKIP("DSErrorHandler singleton absent: real extension not loaded in this fixture.");
@@ -1898,16 +1901,107 @@ GDEX_TEST_T(win32_remediation, queue_error_retrieval_is_serialized, TAG_INTEGRAT
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     const bool entered = window_open.load();
-    // No batch was submitted, so nothing else in the backend can be holding this lock: a free
-    // lock here means the drain is not serialised with the completion thread's own drain.
-    const bool queue_access_held = entered && !backend->_debug_batch_mutex_is_free_for_testing();
+    // No batch was submitted, so nothing else can be holding queue access: a readable drain lock
+    // here means the drain is not serialised with the completion thread's own error read.
+    const bool drain_read_blocked = entered && !backend->_debug_queue_error_read_can_enter_for_testing();
 
     release_window.store(true);
     drainer.join();
     eh->_debug_set_queue_error_reader_hook_for_testing({});
 
     GDEX_EXPECT_TRUE(entered);
-    GDEX_EXPECT_TRUE(queue_access_held);
+    GDEX_EXPECT_TRUE(drain_read_blocked);
+#else
+    (void)ctx;
+    GDEX_SKIP("The queue-error reader seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, queue_error_drain_blocks_backend_teardown, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // Contract under test: a queue-error drain borrows backend queue access only for as long as
+    // it is running, so Win32Backend teardown must not pass unregister_queue() while a drain is
+    // inside RetrieveErrorRecord(). At HEAD the drain copies a raw pointer to the backend's
+    // batch_mutex and unregister_queue() never waits for a caller that already copied it, so
+    // teardown returns while the drain is still parked inside the protected region - the exact
+    // window in which memdelete(backend) destroys the mutex the drain is about to lock.
+    //
+    // The seam parks the drain after it takes queue access and before the first
+    // RetrieveErrorRecord() call; teardown then runs on its own thread and must still be waiting
+    // when the observation window closes.
+    godot::DSErrorHandler *eh = godot::DSErrorHandler::get_singleton();
+    if (eh == nullptr) {
+        GDEX_SKIP("DSErrorHandler singleton absent: real extension not loaded in this fixture.");
+    }
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    // LIFO: the hook captures this frame, so it is cleared before the backend is deleted.
+    ctx.add_teardown([eh]() { eh->_debug_set_queue_error_reader_hook_for_testing({}); });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    std::atomic<bool> window_open{ false };
+    std::atomic<bool> release_window{ false };
+    std::atomic<bool> drain_done{ false };
+    std::atomic<bool> teardown_returned{ false };
+
+    eh->_debug_set_queue_error_reader_hook_for_testing([&window_open, &release_window]() {
+        window_open.store(true);
+        // Self-releasing: a broken build must not hang the suite here.
+        const auto hook_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!release_window.load() && std::chrono::steady_clock::now() < hook_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    std::thread drainer([eh, &drain_done]() {
+        eh->process_queue_errors();
+        drain_done.store(true);
+    });
+
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!window_open.load() && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool entered = window_open.load();
+
+    std::thread teardown;
+    if (entered) {
+        teardown = std::thread([eh, &teardown_returned]() {
+            eh->unregister_queue();
+            teardown_returned.store(true);
+        });
+        // Bounded observation window: a drain inside the region must keep teardown out for at
+        // least this long. Returning sooner means teardown is not serialised with the drain.
+        const auto observe_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        while (!teardown_returned.load() && std::chrono::steady_clock::now() < observe_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    const bool teardown_waited = entered && !teardown_returned.load();
+
+    release_window.store(true);
+    drainer.join();
+    if (teardown.joinable()) {
+        teardown.join();
+    }
+    eh->_debug_set_queue_error_reader_hook_for_testing({});
+
+    GDEX_EXPECT_TRUE(entered);
+    GDEX_EXPECT_TRUE(teardown_waited);
+    GDEX_EXPECT_TRUE(!entered || teardown_returned.load());
+    GDEX_EXPECT_TRUE(drain_done.load());
 #else
     (void)ctx;
     GDEX_SKIP("The queue-error reader seam is compiled out of release builds.");

@@ -424,9 +424,13 @@ public:
 	// thread can observe, mutate or clear it. Never bound in _bind_methods().
 	int _debug_pending_enqueue_count() const;
 	// Test-only seam: try-lock batch_mutex and release it again; true when it was free. Used to
-	// prove process_queue_errors() is serialised with the completion thread's error drain.
+	// prove the drain-counter access and the queue-error *report* run under/outside batch_mutex.
 	// Never bound in _bind_methods().
 	bool _debug_batch_mutex_is_free_for_testing();
+	// Test-only seam: try to take the queue-error drain lock; true when nothing held it. Used to
+	// prove process_queue_errors() is serialised with the completion thread's own error drain.
+	// Never bound in _bind_methods().
+	bool _debug_queue_error_read_can_enter_for_testing();
 	// Test-only seam: installs (or, with an empty callback, clears) the hook that
 	// runs immediately before a captured queue error is pushed to the engine. A
 	// test parks in it and asks another thread whether batch_mutex is free: the
