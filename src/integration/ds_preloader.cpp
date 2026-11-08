@@ -317,9 +317,9 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 	// header); the max-table over-read is ~384 bytes, capped by file_len,
 	// and surplus bytes are never parsed. Total per miss: 1 open +
 	// 1 buffer + zero Dictionary/Packed* churn until Payload construction.
-	// (Covers every valid file: required = 48 + count * entry <=
-	// 48 + 16 * 24 = MAX_BULK, so the buffer always spans the table
-	// whenever required <= file_len.)
+	// (Covers every valid file: required = dstex_header_size(version) +
+	// count * entry <= 64 + 16 * 24 = MAX_BULK, so the buffer always spans the
+	// table whenever required <= file_len.)
 	constexpr uint64_t MAX_TABLE = (uint64_t)DSTEX_MAX_MIP_COUNT * sizeof(DSTexMipEntryV2);
 	constexpr uint64_t MAX_BULK = sizeof(DSTexHeaderV3) + MAX_TABLE;
 	uint64_t want = file_len < MAX_BULK ? file_len : MAX_BULK;
@@ -474,7 +474,7 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 		// Each table entry is a uint32 and there are at most 16 of them, so the
 		// sums cannot overflow uint64 and need no guard of their own.
 		DSTexMipEntryV2 entries[DSTEX_MAX_MIP_COUNT];
-		uint64_t previous_end = sizeof(DSTexHeader) +
+		uint64_t previous_end = dstex_header_size(header.version) +
 				static_cast<uint64_t>(header.mip_count) * sizeof(DSTexMipEntryV2);
 		previous_end = (previous_end + 511) & ~uint64_t(511);
 		for (uint32_t i = 0; i < header.mip_count; ++i) {
@@ -597,8 +597,10 @@ void DSPreloader::payload_from_header(const String &p_engine_path, const String 
 		memcpy(r_out.mip_row_pitches.ptrw(), p_header.mip_row_pitches, (size_t)mips * sizeof(int32_t));
 	}
 	// Byte offset of the first payload byte: header + mip table, 512-aligned
-	// for v2. Mirrors DSResourceFormatLoader::_load's dstex branch exactly.
-	uint64_t data_offset = sizeof(DSTexHeader) + ((r_out.is_v2 ? sizeof(DSTexMipEntryV2) : sizeof(DSTexMipEntry)) * (uint64_t)r_out.mip_count);
+	// for v2. Mirrors DSResourceFormatLoader::_load's dstex branch exactly. The
+	// header size comes from the file's version, not the base struct: a v3 file
+	// carries its 16-byte extension between the header and the mip table.
+	uint64_t data_offset = dstex_header_size(p_header.version) + ((r_out.is_v2 ? sizeof(DSTexMipEntryV2) : sizeof(DSTexMipEntry)) * (uint64_t)r_out.mip_count);
 	if (r_out.is_v2) {
 		data_offset = (data_offset + 511) & ~uint64_t(511);
 	}

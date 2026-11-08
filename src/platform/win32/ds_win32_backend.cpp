@@ -18,6 +18,9 @@
 #include <godot_cpp/classes/thread.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_int64_array.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #ifdef _WIN32
@@ -235,25 +238,36 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 		return false;
 	}
 
-	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ);
-	if (file.is_null()) {
-		return false;
-	}
-	file->seek(sizeof(DSTexHeader));
-	PackedByteArray raw_entries = file->get_buffer(static_cast<int64_t>(sizeof(DSTexMipEntryV2) * mip_count));
-	if (raw_entries.size() != static_cast<int64_t>(sizeof(DSTexMipEntryV2) * mip_count)) {
+	// The mip table comes from DSTex::read_header(), which located it with
+	// dstex_header_size(version) and already validated bounds, per-version
+	// alignment, chunk counts and the per-mip footprint. Re-reading the file here
+	// would reintroduce a second parser that must be kept in sync with the header
+	// layout, which is exactly how a v3 file came to be decoded with a v2 offset.
+	const PackedInt64Array mip_offsets = header["mip_offsets"];
+	const PackedInt32Array mip_sizes = header["mip_sizes"];
+	const PackedInt32Array mip_uncompressed_sizes = header["mip_uncompressed_sizes"];
+	if (mip_offsets.size() != static_cast<int64_t>(mip_count) ||
+			mip_sizes.size() != static_cast<int64_t>(mip_count) ||
+			mip_uncompressed_sizes.size() != static_cast<int64_t>(mip_count)) {
 		return false;
 	}
 
 	uint64_t destination_offset = 0;
 	for (uint32_t mip_index = 0; mip_index < mip_count; mip_index++) {
-		DSTexMipEntryV2 mip_entry = {};
-		const uint8_t *entry_data = raw_entries.ptr() + sizeof(DSTexMipEntryV2) * mip_index;
-		std::memcpy(&mip_entry, entry_data, sizeof(DSTexMipEntryV2));
-		uint64_t source_offset = mip_entry.offset;
-		uint64_t source_size = mip_entry.compressed_size;
-		uint64_t destination_size = mip_entry.uncompressed_size;
-		if (source_size == 0 || destination_size == 0 || destination_size > p_capacity) {
+		// A v1 mip record has no uncompressed size, so read_header leaves this
+		// table zero-filled for v1 files. This splitter sizes destinations from
+		// that table, so it must refuse v1 rather than take a size from another
+		// field.
+		const int32_t compressed_size = mip_sizes[mip_index];
+		const int32_t uncompressed_size = mip_uncompressed_sizes[mip_index];
+		if (compressed_size <= 0 || uncompressed_size <= 0) {
+			r_chunks.clear();
+			return false;
+		}
+		uint64_t source_offset = static_cast<uint64_t>(mip_offsets[mip_index]);
+		uint64_t source_size = static_cast<uint64_t>(compressed_size);
+		uint64_t destination_size = static_cast<uint64_t>(uncompressed_size);
+		if (destination_size > p_capacity) {
 			r_chunks.clear();
 			return false;
 		}
@@ -275,6 +289,31 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 	}
 	return !r_chunks.is_empty();
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+Dictionary Win32Backend::_debug_get_dstex_mip_chunks_for_testing(const String &p_path, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t p_capacity) {
+	Vector<DSChunkBoundary> chunks;
+	if (!get_dstex_mip_chunks(p_path, p_payload_offset, p_payload_size, p_capacity, chunks)) {
+		return Dictionary();
+	}
+	PackedInt64Array source_offsets;
+	PackedInt64Array source_sizes;
+	PackedInt64Array destination_offsets;
+	PackedInt64Array destination_sizes;
+	for (int64_t i = 0; i < chunks.size(); ++i) {
+		source_offsets.push_back(static_cast<int64_t>(chunks[i].source_offset));
+		source_sizes.push_back(static_cast<int64_t>(chunks[i].source_size));
+		destination_offsets.push_back(static_cast<int64_t>(chunks[i].destination_offset));
+		destination_sizes.push_back(static_cast<int64_t>(chunks[i].destination_size));
+	}
+	Dictionary result;
+	result["source_offsets"] = source_offsets;
+	result["source_sizes"] = source_sizes;
+	result["destination_offsets"] = destination_offsets;
+	result["destination_sizes"] = destination_sizes;
+	return result;
+}
+#endif
 
 bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries) {
 	r_entries.clear();

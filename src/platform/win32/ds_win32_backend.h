@@ -481,6 +481,12 @@ public:
 	bool _debug_get_texture_mip_entries_for_testing(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries) {
 		return get_texture_mip_entries(p_path, p_offset, r_entries);
 	}
+	// Test-only seam: runs the standalone-.dstex chunk splitter without a live
+	// queue or device, so the per-mip split can be measured headlessly. Empty on
+	// rejection, otherwise source_offsets / source_sizes / destination_offsets /
+	// destination_sizes (PackedInt64Array), one element per split chunk.
+	// Never bound in _bind_methods().
+	static Dictionary _debug_get_dstex_mip_chunks_for_testing(const String &p_path, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t p_capacity);
 #endif
 
 	static bool is_path_valid(const String &p_path);

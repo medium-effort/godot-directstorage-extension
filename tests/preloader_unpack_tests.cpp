@@ -18,6 +18,7 @@
 
 #include <godot_cpp/variant/color.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/variant/vector2i.hpp>
 
 #include <algorithm>
@@ -42,6 +43,11 @@ struct PreloaderUnpackTest {
 
 	static bool read_header(const String &p_dstex_path, DSPreloader::PayloadHeader &r_out) {
 		return DSPreloader::read_header_uncached(p_dstex_path, r_out);
+	}
+
+	static void payload_from_header(const String &p_engine_path, const String &p_dstex_path,
+			const DSPreloader::PayloadHeader &p_header, DSPreloader::Payload &r_out) {
+		DSPreloader::payload_from_header(p_engine_path, p_dstex_path, p_header, r_out);
 	}
 
 	static bool resolve(const String &p_engine_path, DSPreloader::Payload &r_out) {
@@ -810,6 +816,59 @@ GDEX_TEST_T(preloader_validation, writer_output_still_accepted, TAG_UNIT) {
 		GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::resolve(godot::String(paths[i]), payload));
 		GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::validate(payload));
 	}
+}
+
+GDEX_TEST_T(preloader_validation, payload_offset_matches_mip_table, TAG_UNIT) {
+	// data_offset is the request offset the standalone prewarm uses, so it must be
+	// the mip table's first payload byte. Enumerated over every mip count the
+	// writer can produce from a 64x64 base, in both file layouts, so the claim
+	// cannot hold for one shape and fail for another.
+	const char *const kV2 = "user://gdex_offset_probe_v2.dstex";
+	const char *const kV3 = "user://gdex_offset_probe_v3.dstex";
+	track_cleanup(ctx, { kV2, kV3 });
+
+	const char *const paths[2] = { kV2, kV3 };
+	const int64_t expected_version[2] = { 2, 3 };
+	int failing_shapes = 0;
+
+	for (int mips = 1; mips <= 7; ++mips) {
+		godot::Ref<godot::DSTex> writer;
+		writer.instantiate();
+		GDEX_ASSERT_EQ((int64_t)writer->write_to_file(godot::String(kV2), make_chain_data(mips),
+							   kBaseWidth, kBaseHeight, godot::Image::FORMAT_RGBA8, mips, 1),
+				(int64_t)godot::OK);
+		GDEX_ASSERT_EQ((int64_t)writer->write_to_file(godot::String(kV3), make_chain_data(mips),
+							   kBaseWidth, kBaseHeight, godot::Image::FORMAT_RGBA8, mips, 1,
+							   false, false, kBaseWidth - 4, kBaseHeight - 8),
+				(int64_t)godot::OK);
+
+		for (int v = 0; v < 2; ++v) {
+			godot::Dictionary dict = loader_header(paths[v]);
+			GDEX_EXPECT_EQ((int64_t)dict["version"], expected_version[v]);
+			const godot::PackedInt64Array table_offsets = dict["mip_offsets"];
+			GDEX_ASSERT_EQ(table_offsets.size(), (int64_t)mips);
+
+			godot::DSPreloader::PayloadHeader header;
+			GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::read_header(godot::String(paths[v]), header));
+
+			godot::DSPreloader::Payload payload;
+			godot::PreloaderUnpackTest::payload_from_header(godot::String(paths[v]), godot::String(paths[v]), header, payload);
+
+			const int64_t aligned = (int64_t)payload.data_offset;
+			GDEX_EXPECT_EQ(aligned, table_offsets[0]);
+			GDEX_EXPECT_EQ(aligned % 512, (int64_t)0);
+			if (aligned != table_offsets[0]) {
+				failing_shapes++;
+			}
+			godot::UtilityFunctions::print(godot::String("p2: mips=") + godot::String::num_int64(mips) +
+					" version=" + godot::String::num_int64(expected_version[v]) +
+					" data_offset=" + godot::String::num_int64(aligned) +
+					" first_mip=" + godot::String::num_int64(table_offsets[0]));
+		}
+	}
+
+	godot::UtilityFunctions::print(godot::String("p2: shapes_mismatched=") + godot::String::num_int64(failing_shapes));
+	GDEX_EXPECT_EQ(failing_shapes, 0);
 }
 
 GDEX_TEST_T(preloader_validation, oversized_dstex_not_tracked, TAG_INTEGRATION) {
