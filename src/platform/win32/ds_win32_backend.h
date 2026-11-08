@@ -478,9 +478,15 @@ public:
 	// device. The parser is pure file I/O + validation, so this stays
 	// headless-safe and lets the v3/v5 guard suite pin forged headers.
 	// Never bound in _bind_methods().
+#ifdef _WIN32
+	// Windows-only: get_texture_mip_entries() is declared (and defined) only in
+	// the Win32 build. This inline body is parsed on every platform, so it needs
+	// the same guard as the declaration instead of inheriting the DEBUG_ENABLED
+	// block it sits in.
 	bool _debug_get_texture_mip_entries_for_testing(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries) {
 		return get_texture_mip_entries(p_path, p_offset, r_entries);
 	}
+#endif
 	// Test-only seam: runs the standalone-.dstex chunk splitter without a live
 	// queue or device, so the per-mip split can be measured headlessly. Empty on
 	// rejection, otherwise source_offsets / source_sizes / destination_offsets /
