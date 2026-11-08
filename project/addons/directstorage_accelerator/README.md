@@ -163,5 +163,9 @@ A source build can compile the archive key into the extension binary (`DSPKG_ENC
 - **Precedence**: a valid `res://.dspkg/toc.key` wins; the baked key is used only when no readable key entry exists.
 - **Distribution**: published binaries carry no key in the DLL (`dspkg-key-id=none`); the build audit treats a binary that carries a key, or one with no tag, as a violation for distributed targets.
 
+## Trademarks and Attribution
+
+This addon/extension (DSGD) is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft. Microsoft and DirectStorage are trademarks of the Microsoft group of companies. The DirectStorage runtime is installed under Microsoft's license and is not bundled with this addon/extension; see Runtime Install & License.
+
 
 

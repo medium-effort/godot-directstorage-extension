@@ -279,3 +279,9 @@ Deployment is one implementation, [`tools/sync_artifacts.py`](tools/sync_artifac
 - `.vscode/sync_addon.ps1` runs the same code without building: `-Targets all` for every configured mirror, `-Targets copyable`, or `-DryRun` to preview. This is the "Sync Addon to Test Project (no build)" task.
 
 Only loadable modules and the manifest are mirrored (`bin/` outside those stays local), and the build manifest is patched once with the sync result before being copied to each target. The former `scons sync*` aliases are gone: a build tool should not be copying files into other repositories.
+
+---
+
+## 9. Trademarks and Attribution
+
+This project (DSGD) is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft. Microsoft and DirectStorage are trademarks of the Microsoft group of companies. The DirectStorage SDK and runtime are used under Microsoft's license and are not redistributed from this repository; see Section 8.1.
