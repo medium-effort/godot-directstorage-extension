@@ -15,6 +15,10 @@ const PRESET_3D := 1
 const PRESET_2D := 2
 const PRESET_NAMES := ["Project Default", "3D (Streaming)", "CPU / ImageTexture (2D, UI, Decals)"]
 
+## Format version stamped into every .import sidecar this importer writes. Migration tooling
+## derives its target from this constant, so bumping it cannot leave the tool behind.
+const FORMAT_VERSION := 5
+
 # Replaces the single v5 compression/source enum. The sRGB flag is the only
 # part .dstex stores explicitly; channel interpretation is a compression-time
 # decision, so the two are separate options now.
@@ -81,7 +85,7 @@ func _get_resource_type() -> String:
 
 ## Returns the importer format version used to invalidate old imports.
 func _get_format_version() -> int:
-	return 5
+	return FORMAT_VERSION
 
 ## Gives this importer priority over Godot's default texture importer.
 func _get_priority() -> float:

@@ -9,6 +9,21 @@ const TEST_IMPORT := "res://test_migration_tmp/hero.png.import"
 const TEST_CTEX := "res://.godot/imported/test_hero.ctex"
 const TEST_UID := "uid://ds_migration_test_uid_98765"
 
+# Importer-contract fixtures. The v5 sidecar is what Godot writes after a reimport with the
+# current importer; the v4 sidecar is the legacy shape whose compression/source key the
+# migration tool must translate on upgrade.
+const IMPORTER_SCRIPT_PATH := "res://addons/directstorage_accelerator/scripts/ds_importer.gd"
+const CORE_SCRIPT_PATH := "res://addons/directstorage_accelerator/tools/ds_migration_core.gd"
+const V5_DIR := "res://test_migration_v5_tmp"
+const V5_PNG := "res://test_migration_v5_tmp/v5.png"
+const V5_IMPORT := "res://test_migration_v5_tmp/v5.png.import"
+const V5_ARTIFACT := "res://.godot/imported/test_migration_v5.dstex"
+const V5_UID := "uid://ds_migration_v5_uid_98765"
+const V4_PNG := "res://test_migration_v5_tmp/v4.png"
+const V4_IMPORT := "res://test_migration_v5_tmp/v4.png.import"
+const V4_ARTIFACT := "res://.godot/imported/test_migration_v4.dstex"
+const V4_UID := "uid://ds_migration_v4_uid_98765"
+
 
 func _init() -> void:
 	print("=== Running DirectStorage Texture Migration Tool Tests ===")
@@ -20,6 +35,18 @@ func _init() -> void:
 
 	if not _test_full_migration_lifecycle():
 		print("FAIL: Full migration lifecycle test failed.")
+		ok = false
+
+	if not _test_importer_contract_parity():
+		print("FAIL: Importer contract parity test failed.")
+		ok = false
+
+	if not _test_v5_verification_and_scan():
+		print("FAIL: v5 verification and scan classification test failed.")
+		ok = false
+
+	if not _test_v5_option_emission():
+		print("FAIL: v5 option emission test failed.")
 		ok = false
 
 	if ok:
@@ -250,4 +277,307 @@ func _cleanup_fixtures(zip_path: String = "") -> void:
 		DirAccess.remove_absolute(dir_abs)
 	if not zip_path.is_empty() and FileAccess.file_exists(zip_path):
 		DirAccess.remove_absolute(ProjectSettings.globalize_path(zip_path))
+
+
+# ==============================================================================
+# Importer-Contract Parity (v5)
+# ==============================================================================
+
+func _test_importer_contract_parity() -> bool:
+	print("--- Test 3: Importer Contract Parity ---")
+	# The importer cannot be instantiated outside editor context ("Class 'EditorImportPlugin'
+	# can only be instantiated by editor"), so the declared version is read from the script's
+	# constant map instead of an instance.
+	var importer_script: Script = load(IMPORTER_SCRIPT_PATH)
+	if importer_script == null:
+		print("FAIL: Could not load %s" % IMPORTER_SCRIPT_PATH)
+		return false
+
+	var importer_consts: Dictionary = importer_script.get_script_constant_map()
+	if not importer_consts.has("FORMAT_VERSION"):
+		print("FAIL: importer does not declare FORMAT_VERSION")
+		return false
+	var format_version := int(importer_consts["FORMAT_VERSION"])
+	if format_version != 5:
+		print("FAIL: importer FORMAT_VERSION is %d, expected 5" % format_version)
+		return false
+
+	var core_script: Script = load(CORE_SCRIPT_PATH)
+	if core_script == null:
+		print("FAIL: Could not load %s" % CORE_SCRIPT_PATH)
+		return false
+	var core_consts: Dictionary = core_script.get_script_constant_map()
+	if not core_consts.has("TARGET_VERSION"):
+		print("FAIL: DSMigrationCore does not declare TARGET_VERSION")
+		return false
+	var target_version := int(core_consts["TARGET_VERSION"])
+	if target_version != format_version:
+		print("FAIL: TARGET_VERSION (%d) != importer FORMAT_VERSION (%d)" % [target_version, format_version])
+		return false
+	if target_version != 5:
+		print("FAIL: TARGET_VERSION is %d, expected 5; an importer bump must update this suite and its fixtures" % target_version)
+		return false
+
+	print("PASS: migration target and importer format version agree at 5.")
+	return true
+
+
+func _test_v5_verification_and_scan() -> bool:
+	print("--- Test 4: v5 Verification and Scan Classification ---")
+	_cleanup_v5_fixtures()
+	if not _stage_v5_fixtures():
+		_cleanup_v5_fixtures()
+		return false
+
+	var core_script: Script = load(CORE_SCRIPT_PATH)
+	var plan: Array = core_script.callv("scan", [])
+	var v5_entry := _find_entry(plan, V5_PNG)
+	var v4_entry := _find_entry(plan, V4_PNG)
+	if v5_entry.is_empty() or v4_entry.is_empty():
+		print("FAIL: scan() did not classify the staged fixtures (plan size %d)" % plan.size())
+		_cleanup_v5_fixtures()
+		return false
+
+	# 1. A sidecar written by the current importer must verify clean.
+	var results: Array = core_script.callv("verify_migration", [[
+		{"source": V5_PNG, "uid": V5_UID},
+		{"source": V4_PNG, "uid": V4_UID},
+	]])
+	var v5_result := _find_entry(results, V5_PNG)
+	var v4_result := _find_entry(results, V4_PNG)
+	if v5_result.is_empty() or v4_result.is_empty():
+		print("FAIL: verify_migration() returned no result for the staged fixtures")
+		_cleanup_v5_fixtures()
+		return false
+	if not bool(v5_result.get("verified", false)):
+		print("FAIL: v5 sidecar failed verification: %s" % str(v5_result.get("detail", "")))
+		_cleanup_v5_fixtures()
+		return false
+
+	# 2. A sidecar from the previous importer version must be rejected, not silently accepted.
+	if bool(v4_result.get("verified", true)):
+		print("FAIL: v4 sidecar was accepted by verify_migration()")
+		_cleanup_v5_fixtures()
+		return false
+	var expected_detail := "importer_version=4 (expected 5)"
+	if not str(v4_result.get("detail", "")).contains(expected_detail):
+		print("FAIL: v4 rejection detail does not name the version mismatch: %s" % str(v4_result.get("detail", "")))
+		_cleanup_v5_fixtures()
+		return false
+
+	# 3. A version-4 asset must be offered as an upgrade.
+	if str(v4_entry.get("mode", "")) != "upgrade" or not bool(v4_entry.get("eligible", false)):
+		print("FAIL: v4 asset classified '%s' (eligible=%s), expected upgrade" % [v4_entry.get("mode", ""), v4_entry.get("eligible", false)])
+		_cleanup_v5_fixtures()
+		return false
+
+	# 4. Positive control: a current asset stays up_to_date.
+	if str(v5_entry.get("mode", "")) != "up_to_date":
+		print("FAIL: v5 asset classified '%s', expected up_to_date" % str(v5_entry.get("mode", "")))
+		_cleanup_v5_fixtures()
+		return false
+	if int(v5_entry.get("importer_version", -1)) != 5:
+		print("FAIL: v5 fixture reports importer_version=%s" % str(v5_entry.get("importer_version", "")))
+		_cleanup_v5_fixtures()
+		return false
+
+	# 5. The upgrade entry's default parameters must describe its own legacy sidecar, so the
+	#    dialog lists a normal map as a normal map instead of "VRAM Compressed".
+	var mapped: Dictionary = v4_entry.get("mapped_params", {})
+	if str(mapped.get("compress/normal_map", "")) != "1" or str(mapped.get("compression/color_space", "")) != "0":
+		print("FAIL: upgrade entry parameters do not reflect compression/source=2: %s" % str(mapped))
+		_cleanup_v5_fixtures()
+		return false
+
+	_cleanup_v5_fixtures()
+	print("PASS: v5 verification, upgrade classification and upgrade defaults behave as specified.")
+	return true
+
+
+func _test_v5_option_emission() -> bool:
+	print("--- Test 5: v5 Option Emission ---")
+	var core_script: Script = load(CORE_SCRIPT_PATH)
+
+	# 1. Godot's Enable(1) normal map -> linear + normal + optimized, without the legacy key.
+	var normal_result: Array = core_script.callv("map_texture_params", [{"compress/mode": "2", "compress/normal_map": "1"}])
+	var normal_params: Dictionary = normal_result[0]
+	if str(normal_params.get("compression/color_space", "")) != "0" \
+			or str(normal_params.get("compress/normal_map", "")) != "1" \
+			or str(normal_params.get("compress/channel_pack", "")) != "1" \
+			or normal_params.has("compression/source"):
+		print("FAIL: Godot normal map did not map to linear/normal/optimized: %s" % str(normal_params))
+		return false
+
+	# 2. Godot's Disabled(2) must not invert into "enabled".
+	var disabled_result: Array = core_script.callv("map_texture_params", [{"compress/mode": "2", "compress/normal_map": "2", "compress/channel_pack": "1"}])
+	var disabled_params: Dictionary = disabled_result[0]
+	if str(disabled_params.get("compress/normal_map", "")) != "0" \
+			or str(disabled_params.get("compression/color_space", "")) != "1" \
+			or str(disabled_params.get("compress/channel_pack", "")) != "1":
+		print("FAIL: Godot Disabled(2) normal map inverted or lost channel packing: %s" % str(disabled_params))
+		return false
+
+	# 3. BPTC mode -> BPTC output.
+	var bptc_result: Array = core_script.callv("map_texture_params", [{"compress/mode": "5"}])
+	var bptc_params: Dictionary = bptc_result[0]
+	if str(bptc_params.get("compression/mode", "")) != "0" or str(bptc_params.get("compression/high_quality", "")) != "true":
+		print("FAIL: BPTC mode did not request compression/high_quality: %s" % str(bptc_params))
+		return false
+
+	# 4. Uncompressed output must not claim BPTC.
+	var uncompressed_result: Array = core_script.callv("map_texture_params", [{"compress/mode": "3", "compress/high_quality": "true"}])
+	var uncompressed_params: Dictionary = uncompressed_result[0]
+	if str(uncompressed_params.get("compression/high_quality", "")) != "false":
+		print("FAIL: uncompressed mode claimed high quality: %s" % str(uncompressed_params))
+		return false
+
+	# 5. Upgrading a legacy normal-map sidecar translates and removes compression/source.
+	var upgraded := CORE.rewrite_import(_v4_import_text().to_utf8_buffer(), "upgrade", {})
+	var upgraded_text := upgraded.get_string_from_utf8()
+	if not upgraded_text.contains("compress/normal_map=1") \
+			or not upgraded_text.contains("compression/color_space=0") \
+			or not upgraded_text.contains("compress/channel_pack=1"):
+		print("FAIL: upgrade did not translate compression/source=2 into the v5 triple:\n%s" % upgraded_text)
+		return false
+	if upgraded_text.contains("compression/source="):
+		print("FAIL: upgrade left the legacy compression/source key behind:\n%s" % upgraded_text)
+		return false
+	if upgraded_text.count("compression/mode=0") != 1:
+		print("FAIL: upgrade did not preserve exactly one compression/mode key:\n%s" % upgraded_text)
+		return false
+	if not upgraded_text.contains("importer_version=0"):
+		print("FAIL: upgrade did not force a reimport via importer_version=0:\n%s" % upgraded_text)
+		return false
+
+	# 6. The action table emits the same contract the dialog uses.
+	var normal_action := 3
+	var adopt_params: Variant = core_script.callv("action_mapped_params", [normal_action])
+	if not (adopt_params is Dictionary):
+		print("FAIL: DSMigrationCore.action_mapped_params() is missing")
+		return false
+	if str(adopt_params.get("compress/normal_map", "")) != "1" or str(adopt_params.get("compression/color_space", "")) != "0":
+		print("FAIL: Normal Map action does not emit a linear normal map: %s" % str(adopt_params))
+		return false
+	var adopted := CORE.rewrite_import(_v5_import_text().to_utf8_buffer(), "adopt", adopt_params)
+	var adopted_text := adopted.get_string_from_utf8()
+	for key in ["compression/color_space=0", "compress/normal_map=1", "compress/channel_pack=1"]:
+		if not adopted_text.contains(key):
+			print("FAIL: adopt output missing '%s':\n%s" % [key, adopted_text])
+			return false
+	if adopted_text.contains("compression/source="):
+		print("FAIL: adopt output still writes compression/source:\n%s" % adopted_text)
+		return false
+	if not adopted_text.contains("uid=\"%s\"" % V5_UID) or not adopted_text.contains("importer_version=0"):
+		print("FAIL: adopt output lost the UID or the forced reimport:\n%s" % adopted_text)
+		return false
+
+	# 7. Default action derivation used by the dialog tree.
+	var derived_normal: Variant = core_script.callv("action_for_params", [adopt_params])
+	var derived_uncompressed: Variant = core_script.callv("action_for_params", [{"compression/mode": "1"}])
+	var derived_default: Variant = core_script.callv("action_for_params", [{}])
+	if derived_normal != 3 or derived_uncompressed != 2 or derived_default != 1:
+		print("FAIL: action_for_params() returned %s/%s/%s, expected 3/2/1" % [str(derived_normal), str(derived_uncompressed), str(derived_default)])
+		return false
+
+	print("PASS: v5 option emission, upgrade translation, adopt output and action table agree.")
+	return true
+
+
+func _find_entry(entries: Array, source: String) -> Dictionary:
+	for e in entries:
+		if str(e.get("source", "")) == source:
+			return e
+	return {}
+
+
+func _v4_import_text() -> String:
+	return (
+		"[remap]\n\n"
+		+ "importer=\"directstorage_texture\"\n"
+		+ "importer_version=4\n"
+		+ "type=\"Texture2D\"\n"
+		+ "uid=\"%s\"\n" % V4_UID
+		+ "path=\"%s\"\n\n" % V4_ARTIFACT
+		+ "[deps]\n\n"
+		+ "files=[\"%s\"]\n" % V4_ARTIFACT
+		+ "source_file=\"%s\"\n" % V4_PNG
+		+ "dest_files=[\"%s\"]\n\n" % V4_ARTIFACT
+		+ "[params]\n\n"
+		+ "compression/mode=0\n"
+		+ "compression/source=2\n"
+		+ "compression/gdeflate_level=1\n"
+		+ "compatibility/as_image_texture=false\n"
+	)
+
+
+func _v5_import_text() -> String:
+	return (
+		"[remap]\n\n"
+		+ "importer=\"directstorage_texture\"\n"
+		+ "importer_version=5\n"
+		+ "type=\"Texture2D\"\n"
+		+ "uid=\"%s\"\n" % V5_UID
+		+ "path=\"%s\"\n\n" % V5_ARTIFACT
+		+ "[deps]\n\n"
+		+ "files=[\"%s\"]\n" % V5_ARTIFACT
+		+ "source_file=\"%s\"\n" % V5_PNG
+		+ "dest_files=[\"%s\"]\n\n" % V5_ARTIFACT
+		+ "[params]\n\n"
+		+ "compression/mode=0\n"
+		+ "compression/high_quality=false\n"
+		+ "compression/color_space=1\n"
+		+ "compress/normal_map=0\n"
+		+ "compress/channel_pack=0\n"
+		+ "compression/gdeflate_level=1\n"
+		+ "compatibility/as_image_texture=false\n"
+	)
+
+
+func _stage_v5_fixtures() -> bool:
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(V5_DIR))
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("res://.godot/imported"))
+
+	var png_bytes := PackedByteArray([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0])
+	for path in [V5_PNG, V4_PNG]:
+		var img := FileAccess.open(path, FileAccess.WRITE)
+		if img == null:
+			print("FAIL: Could not create %s" % path)
+			return false
+		img.store_buffer(png_bytes)
+		img.close()
+
+	var artifact_bytes := "DTEX".to_utf8_buffer() + PackedByteArray([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+	for path in [V5_ARTIFACT, V4_ARTIFACT]:
+		var art := FileAccess.open(path, FileAccess.WRITE)
+		if art == null:
+			print("FAIL: Could not create %s" % path)
+			return false
+		art.store_buffer(artifact_bytes)
+		art.close()
+
+	if not _write_text_file(V5_IMPORT, _v5_import_text()):
+		return false
+	if not _write_text_file(V4_IMPORT, _v4_import_text()):
+		return false
+	return true
+
+
+func _write_text_file(path: String, text: String) -> bool:
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		print("FAIL: Could not create %s" % path)
+		return false
+	f.store_string(text)
+	f.close()
+	return true
+
+
+func _cleanup_v5_fixtures() -> void:
+	for path in [V5_PNG, V5_IMPORT, V4_PNG, V4_IMPORT, V5_ARTIFACT, V4_ARTIFACT]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+	var dir_abs := ProjectSettings.globalize_path(V5_DIR)
+	if DirAccess.dir_exists_absolute(dir_abs):
+		DirAccess.remove_absolute(dir_abs)
+
 

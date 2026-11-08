@@ -287,14 +287,7 @@ func _rebuild_tree() -> void:
 			var action_idx := 0
 			if eligible:
 				var mapped_params: Dictionary = entry.get("mapped_params", {})
-				var comp_mode := str(mapped_params.get("compression/mode", "0"))
-				var comp_source := str(mapped_params.get("compression/source", "1"))
-				if comp_source == "2":
-					action_idx = 3 # Normal Map
-				elif comp_mode == "1":
-					action_idx = 2 # VRAM Uncompressed
-				else:
-					action_idx = 1 # VRAM Compressed
+				action_idx = CORE.action_for_params(mapped_params)
 
 				file_item.set_text(1, ACTION_LABELS[action_idx])
 				file_item.set_checked(0, true)
@@ -596,7 +589,7 @@ func _on_tree_item_edited() -> void:
 func _handle_action_selected(item: TreeItem, entry: Dictionary, action_idx: int) -> void:
 	item.set_text(1, ACTION_LABELS[action_idx])
 	match action_idx:
-		0: # Skip (Keep Texture2D)
+		CORE.ACTION_SKIP: # Skip (Keep Texture2D)
 			entry["eligible"] = false
 			entry["mode"] = "skip"
 			item.set_checked(0, false)
@@ -606,48 +599,33 @@ func _handle_action_selected(item: TreeItem, entry: Dictionary, action_idx: int)
 			item.set_custom_color(0, disabled_color)
 			item.set_custom_color(2, disabled_color)
 
-		1: # Migrate: VRAM Compressed
+		CORE.ACTION_VRAM_COMPRESSED: # Migrate: VRAM Compressed
 			entry["eligible"] = true
 			entry["mode"] = "adopt"
-			entry["mapped_params"] = {
-				"compression/mode": "0",
-				"compression/source": "1",
-				"compression/gdeflate_level": "1",
-				"compatibility/as_image_texture": "false",
-			}
+			entry["mapped_params"] = CORE.action_mapped_params(CORE.ACTION_VRAM_COMPRESSED)
 			item.set_checked(0, true)
 			item.set_editable(0, true)
 			item.set_text(2, "VRAM Compressed (BC/S3TC) -> compression/mode=0")
 			item.clear_custom_color(0)
 			item.clear_custom_color(2)
 
-		2: # Migrate: VRAM Uncompressed
+		CORE.ACTION_VRAM_UNCOMPRESSED: # Migrate: VRAM Uncompressed
 			entry["eligible"] = true
 			entry["mode"] = "adopt"
-			entry["mapped_params"] = {
-				"compression/mode": "1",
-				"compression/source": "1",
-				"compression/gdeflate_level": "1",
-				"compatibility/as_image_texture": "false",
-			}
+			entry["mapped_params"] = CORE.action_mapped_params(CORE.ACTION_VRAM_UNCOMPRESSED)
 			item.set_checked(0, true)
 			item.set_editable(0, true)
 			item.set_text(2, "VRAM Uncompressed -> compression/mode=1")
 			item.clear_custom_color(0)
 			item.clear_custom_color(2)
 
-		3: # Migrate: Normal Map
+		CORE.ACTION_NORMAL_MAP: # Migrate: Normal Map
 			entry["eligible"] = true
 			entry["mode"] = "adopt"
-			entry["mapped_params"] = {
-				"compression/mode": "0",
-				"compression/source": "2",
-				"compression/gdeflate_level": "1",
-				"compatibility/as_image_texture": "false",
-			}
+			entry["mapped_params"] = CORE.action_mapped_params(CORE.ACTION_NORMAL_MAP)
 			item.set_checked(0, true)
 			item.set_editable(0, true)
-			item.set_text(2, "Normal Map -> compression/mode=0, source=2")
+			item.set_text(2, "Normal Map -> compress/normal_map=1, compression/color_space=0")
 			item.clear_custom_color(0)
 			item.clear_custom_color(2)
 

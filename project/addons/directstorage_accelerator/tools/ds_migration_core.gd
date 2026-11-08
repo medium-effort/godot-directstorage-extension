@@ -12,20 +12,34 @@ extends RefCounted
 ## All methods are static or pure data helpers. Reimport triggers and UI are
 ## handled by callers (ds_migration_dialog.gd).
 
+const IMPORTER = preload("res://addons/directstorage_accelerator/scripts/ds_importer.gd")
 const TARGET_IMPORTER := "directstorage_texture"
-const TARGET_VERSION := 4
+const TARGET_VERSION := IMPORTER.FORMAT_VERSION
 const SCHEMA := 1
 const SUPPORTED_EXTS := ["png", "jpg", "jpeg", "webp"]
 const SKIP_DIRS := [".godot", ".git", ".migration_backup"]
 const ADDON_TREE := "addons/directstorage_accelerator"
 const DEFAULT_BACKUP_DIR := "res://addons/directstorage_accelerator/.migration_backup"
 
+## Option keys the v5 importer owns. Their presence in a sidecar means the asset already
+## speaks v5, so the legacy compression/source key must not override them.
+const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "compress/channel_pack"]
+
+## Migration actions, in ds_migration_dialog.ACTION_LABELS order.
+const ACTION_SKIP := 0
+const ACTION_VRAM_COMPRESSED := 1
+const ACTION_VRAM_UNCOMPRESSED := 2
+const ACTION_NORMAL_MAP := 3
+
 ## First 4 bytes of a readable .dstex file ("DTEX").
 const DSTEX_MAGIC := [0x44, 0x54, 0x45, 0x58]
 
 const DS_DEFAULTS := {
 	"compression/mode": "0",
-	"compression/source": "1",
+	"compression/high_quality": "false",
+	"compression/color_space": "1",
+	"compress/normal_map": "0",
+	"compress/channel_pack": "0",
 	"compression/gdeflate_level": "1",
 	"compatibility/as_image_texture": "false",
 }
@@ -205,27 +219,93 @@ static func _should_skip_dir(rel: String, excludes: Array = []) -> bool:
 # Parameter Mapping Parity
 # ==============================================================================
 
+## v5 colour triple for a normal-map / channel-packing decision. Normal maps are always stored
+## linear (Godot's legacy COMPRESS_SOURCE_NORMAL did the same), so the sRGB flag and the channel
+## layout follow the normal flag instead of being chosen independently.
+static func _color_options(is_normal: bool, optimized_channels: bool) -> Dictionary:
+	return {
+		"compression/color_space": "0" if is_normal else "1",
+		"compress/normal_map": "1" if is_normal else "0",
+		"compress/channel_pack": "1" if (is_normal or optimized_channels) else "0",
+	}
+
+
+## v5 colour triple equivalent to a legacy compression/source value:
+## 0 = Generic -> linear / not-normal / optimized, 1 = sRGB -> sRGB / not-normal / friendly,
+## 2 = Normal Map -> linear / normal / optimized.
+static func _legacy_source_options(source: int) -> Dictionary:
+	match source:
+		0:
+			return _color_options(false, true)
+		2:
+			return _color_options(true, true)
+		_:
+			return _color_options(false, false)
+
+
+## True when a sidecar already carries the split v5 colour options.
+static func _has_color_options(cp: ConfigFile) -> bool:
+	for k in COLOR_OPTION_KEYS:
+		if cp.has_section_key("params", k):
+			return true
+	return false
+
+
 ## Maps Godot default texture parameters to DirectStorage parameters.
 ## Returns [mapped_dict_or_null, reason_string, is_eligible_bool].
 static func map_texture_params(params: Dictionary) -> Array:
 	var mode := str(params.get("compress/mode", "2")).strip_edges()
 	var mapped := DS_DEFAULTS.duplicate()
 
+	# Godot's ResourceImporterTexture reuses these key names with different enum values for
+	# compress/normal_map (Detect/Enable/Disabled = 0/1/2 there, Disabled/Enabled = 0/1 here),
+	# so only Enable translates to "normal map". Detect cannot be resolved at migration time.
+	var src_normal := str(params.get("compress/normal_map", "0")).strip_edges()
+	var src_channel := str(params.get("compress/channel_pack", "0")).strip_edges()
+	var src_hq := str(params.get("compress/high_quality", "false")).strip_edges()
+	mapped.merge(_color_options(src_normal == "1", src_channel == "1"), true)
+
 	# compress/mode: 0=Lossless, 1=Lossy, 2=VRAM Compressed, 3=VRAM Uncompressed, 4=BasisUniversal, 5=BPTC
 	if mode == "2":
 		mapped["compression/mode"] = "0"
+		mapped["compression/high_quality"] = "true" if src_hq == "true" else "false"
 		return [mapped, "VRAM Compressed (S3TC) -> DirectStorage VRAM Compressed", true]
 	elif mode == "3":
 		mapped["compression/mode"] = "1"
+		mapped["compression/high_quality"] = "false"
 		return [mapped, "VRAM Uncompressed -> DirectStorage Uncompressed", true]
 	elif mode == "5":
 		mapped["compression/mode"] = "0"
-		return [mapped, "VRAM Compressed (BPTC) -> DirectStorage VRAM Compressed (note: BPTC mapped to S3TC/BC)", true]
+		mapped["compression/high_quality"] = "true"
+		return [mapped, "VRAM Compressed (BPTC) -> DirectStorage VRAM Compressed (BC7 via compression/high_quality)", true]
 	elif mode in ["0", "1", "4"]:
 		var mode_name := "Lossless" if mode == "0" else ("Lossy" if mode == "1" else "Basis Universal")
 		return [null, "Incompatible compress/mode=%s (%s) — requires default importer" % [mode, mode_name], false]
 
 	return [mapped, "Default DirectStorage parameters applied", true]
+
+
+## Import parameters for one migration action (dialog ACTION_LABELS order).
+static func action_mapped_params(action: int) -> Dictionary:
+	var mapped := DS_DEFAULTS.duplicate()
+	match action:
+		ACTION_VRAM_UNCOMPRESSED:
+			mapped["compression/mode"] = "1"
+			mapped["compression/high_quality"] = "false"
+		ACTION_NORMAL_MAP:
+			mapped.merge(_color_options(true, true), true)
+		_:
+			pass
+	return mapped
+
+
+## Default action for a scanned entry, from the parameters the mapper produced.
+static func action_for_params(mapped: Dictionary) -> int:
+	if str(mapped.get("compress/normal_map", "0")) == "1":
+		return ACTION_NORMAL_MAP
+	if str(mapped.get("compression/mode", "0")) == "1":
+		return ACTION_VRAM_UNCOMPRESSED
+	return ACTION_VRAM_COMPRESSED
 
 
 # ==============================================================================
@@ -330,6 +410,12 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 					"mapped_params": mapped_dict if mapped_dict is Dictionary else DS_DEFAULTS.duplicate(),
 				})
 		elif iver < TARGET_VERSION:
+			# An older sidecar still carries compression/source; translate it so the dialog lists
+			# the real action (a legacy normal map is not "VRAM Compressed").
+			var upgrade_params := DS_DEFAULTS.duplicate()
+			if cp.has_section("params") and not _has_color_options(cp):
+				var legacy_src := int(cp.get_value("params", "compression/source", 1))
+				upgrade_params.merge(_legacy_source_options(legacy_src), true)
 			plan.append({
 				"source": src_res,
 				"mode": "upgrade",
@@ -339,7 +425,7 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 				"importer_version": iver,
 				"uid": uid,
 				"old_dests": old_dests,
-				"mapped_params": DS_DEFAULTS.duplicate(),
+				"mapped_params": upgrade_params,
 			})
 		else:
 			# Up to date importer version: check if artifact exists and is valid
@@ -492,6 +578,7 @@ static func rewrite_import(raw: PackedByteArray, mode: String, mapped_params: Di
 	var out: Array[String] = []
 	var section := ""
 	var params_written := false
+	var legacy_source := ""
 
 	var target_params := DS_DEFAULTS.duplicate()
 	for k in mapped_params.keys():
@@ -520,6 +607,9 @@ static func rewrite_import(raw: PackedByteArray, mode: String, mapped_params: Di
 				out.append("importer_version=0")
 			else:
 				out.append(ln)
+		elif section == "params" and mode == "upgrade" and s.begins_with("compression/source="):
+			legacy_source = s.split("=")[1].strip_edges().trim_prefix("\"").trim_suffix("\"")
+			continue # Translated into the v5 triple below
 		elif section == "params" and mode == "adopt":
 			continue # Drop old texture params
 		else:
@@ -541,6 +631,18 @@ static func rewrite_import(raw: PackedByteArray, mode: String, mapped_params: Di
 			var t := str(ln2).strip_edges()
 			if not t.begins_with("[") and t.contains("="):
 				existing_keys[t.split("=")[0].strip_edges()] = true
+		if not legacy_source.is_empty():
+			var legacy_has_colors := false
+			for k in COLOR_OPTION_KEYS:
+				if existing_keys.has(k):
+					legacy_has_colors = true
+					break
+			if not legacy_has_colors:
+				target_params.merge(_legacy_source_options(int(legacy_source)), true)
+		if not params_written and section != "params":
+			out.append("")
+			out.append("[params]")
+			out.append("")
 		for k in target_params.keys():
 			if not existing_keys.has(k):
 				out.append("%s=%s" % [k, target_params[k]])
