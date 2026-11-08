@@ -14,8 +14,9 @@
     an instruction to run this script).
 
     Flow:
-      1. Read tools/directstorage_versions.json, which pins the package URL,
-         SHA-512 (Microsoft's published packageHash) and size.
+      1. Read project/addons/directstorage_accelerator/runtime_versions.json,
+         which pins the package URL, SHA-512 (Microsoft's published packageHash)
+         and size. The in-editor installer reads the same file.
       2. Download to .cache/directstorage/packages/<version>.nupkg (reused when the
          bytes still match).
       3. Verify size and SHA-512 before anything is extracted.
@@ -32,8 +33,8 @@
     -Decision Accept, which makes the acceptance visible in the workflow log.
 
 .PARAMETER Version
-    Key from tools/directstorage_versions.json. Defaults to 1.3.0, the build
-    baseline. 1.4 fetches runtime DLLs only and leaves the 1.3 import library and
+    Key from project/addons/directstorage_accelerator/runtime_versions.json.
+    Defaults to 1.3.0, the build baseline. 1.4 fetches runtime DLLs only and leaves the 1.3 import library and
     headers untouched.
 
 .PARAMETER Decision
@@ -220,7 +221,7 @@ elseif (-not [System.IO.Path]::IsPathRooted($CacheDir)) {
     $CacheDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $CacheDir))
 }
 
-$ManifestPath = Join-Path $PSScriptRoot 'directstorage_versions.json'
+$ManifestPath = Join-Path $RepoRoot 'project\addons\directstorage_accelerator\runtime_versions.json'
 $ViewerPath = Join-Path $PSScriptRoot 'show_directstorage_license.ps1'
 foreach ($required in @($ManifestPath, $ViewerPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {

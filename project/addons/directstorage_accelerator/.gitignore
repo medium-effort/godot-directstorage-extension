@@ -1,0 +1,15 @@
+# Microsoft DirectStorage runtime binaries and installer state are EULA-bound and
+# machine-local. They are fetched by the editor installer (or
+# tools/fetch_directstorage.ps1) and must not be committed: redistributing the
+# DLLs is not covered by the package license, and this file travels with the
+# addon so a downstream project cannot publish them by accident either.
+#
+# Ignoring them does not break exports: the files still exist on disk, and the
+# .gdextension [dependencies] entries resolve against the filesystem at export
+# time. A fresh clone simply has to install a runtime again, which re-shows the
+# Microsoft license to whoever runs it.
+bin/dstorage.dll
+bin/dstoragecore.dll
+bin/.versions/
+bin/.runtime.json
+bin/.pending.json

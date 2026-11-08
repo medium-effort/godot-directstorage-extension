@@ -20,7 +20,7 @@ The DirectStorage runtime (`dstorage.dll`, `dstoragecore.dll`) is not bundled wi
 
 - The license shown is the exact `LICENSE.txt` from the verified package (SHA-512 checked against Microsoft's published hash). Nothing is installed until you accept it.
 - Installation is editor-only and staged: the new DLL pair is applied on the next editor or game start. Windows locks loaded modules, and one process cannot mix two DirectStorage versions.
-- Pick the 1.4 preview to test its newer capabilities, then switch back to the 1.3 stable runtime if the preview regresses or an asset is incompatible. Restart after switching.
+- Only the 1.3 stable runtime is offered by default. Runtimes newer than 1.3 (including the 1.4 preview) are hidden from the version list; set the `DSGD_ALLOW_DOWNLOAD_RUNTIME_ABOVE_1_POINT_3=1` environment variable and restart the editor to show them. Those are development runtimes: the preview license grants no redistribution rights, so do not commit or ship their DLLs.
 - Runtime DLLs must be installed before exporting; the export dependencies reference them.
 
 ## Direct GPU Decompression & Fallback

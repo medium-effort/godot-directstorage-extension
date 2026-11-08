@@ -19,11 +19,12 @@ const DRIVER_SETTING: String = "rendering/rendering_device/driver.windows"
 const METHOD_SETTING: String = "rendering/renderer/rendering_method"
 const LICENSE_DIALOG_SCENE_PATH: String = "res://addons/directstorage_accelerator/tools/runtime_license_dialog.tscn"
 
-## Display order of the two published packages the addon currently supports.
-const UI_VERSIONS := [
-	"1.3.0",
-	"1.4.0-preview2-2606.904",
-]
+## Runtimes newer than this baseline are hidden from the dropdown unless the
+## developer opts in. This is a product policy, not a license check: the
+## installer still accepts any version its package table knows about.
+const BASELINE_MAJOR: int = 1
+const BASELINE_MINOR: int = 3
+const ALLOW_ABOVE_BASELINE_ENV: String = "DSGD_ALLOW_DOWNLOAD_RUNTIME_ABOVE_1_POINT_3"
 
 @onready var _version_option: OptionButton = %VersionOption
 @onready var _active_label: Label = %ActiveLabel
@@ -35,6 +36,9 @@ const UI_VERSIONS := [
 
 var _installer: Node = null
 var _license_dialog: Window = null
+## Package entries filtered out of the dropdown because they are newer than the
+## baseline and the developer has not opted in. Drives the status hint.
+var _gated_hidden: int = 0
 
 
 func _ready() -> void:
@@ -48,6 +52,7 @@ func _ready() -> void:
 	if is_instance_valid(_d3d12_button):
 		_d3d12_button.pressed.connect(_on_d3d12_pressed)
 	_close_button.pressed.connect(hide)
+	_populate_versions()
 	_refresh()
 
 
@@ -58,6 +63,64 @@ func open() -> void:
 		await ready
 	_refresh()
 	popup_centered()
+
+
+## Rebuilds the version list from the installer's package table. The scene's
+## authored items are only the design-time default; the real list is conditional
+## (entries newer than the baseline are opt-in), so it is regenerated here.
+func _populate_versions() -> void:
+	_version_option.clear()
+	_gated_hidden = 0
+	var allow_above := _allow_above_baseline()
+	var versions: Dictionary = INSTALLER_SCRIPT.get_versions()
+	var keys: Array = versions.keys()
+	keys.sort_custom(func(a, b): return _version_sort_key(String(a)) < _version_sort_key(String(b)))
+	for key in keys:
+		var version := String(key)
+		if _is_above_baseline(version) and not allow_above:
+			_gated_hidden += 1
+			continue
+		var meta: Dictionary = versions[key]
+		var label := version + (" (preview)" if bool(meta.get("preview", false)) else " (stable)")
+		_version_option.add_item(label)
+		_version_option.set_item_metadata(_version_option.item_count - 1, version)
+	if _version_option.item_count == 0:
+		# Only reachable when the manifest is empty and the fallback was stripped.
+		_version_option.add_item("No runtime available")
+		_version_option.set_item_metadata(0, "")
+		_version_option.disabled = true
+
+
+static func _allow_above_baseline() -> bool:
+	var raw := OS.get_environment(ALLOW_ABOVE_BASELINE_ENV).strip_edges().to_lower()
+	return raw in ["1", "true", "yes", "on"]
+
+
+## Parses the numeric release prefix of a package key. Pre-release/build suffixes
+## ("-preview2-2606.904") are ignored and a missing component reads as 0, so
+## "1.4" and "1.4.0" compare equal.
+static func _version_components(version: String) -> PackedInt32Array:
+	var core := version
+	var dash := core.find("-")
+	if dash >= 0:
+		core = core.substr(0, dash)
+	var parts := core.split(".")
+	var components := PackedInt32Array([0, 0, 0])
+	for i in mini(parts.size(), 3):
+		components[i] = int(parts[i])
+	return components
+
+
+## Numeric, zero-padded sort key: string comparison alone puts "1.10.0" below
+## "1.3.0", which is the wrong order the day a 1.10 runtime ships.
+static func _version_sort_key(version: String) -> String:
+	var components := _version_components(version)
+	return "%08d.%08d.%08d.%s" % [components[0], components[1], components[2], version]
+
+
+static func _is_above_baseline(version: String) -> bool:
+	var components := _version_components(version)
+	return components[0] > BASELINE_MAJOR or (components[0] == BASELINE_MAJOR and components[1] > BASELINE_MINOR)
 
 
 func _refresh() -> void:
@@ -80,6 +143,9 @@ func _refresh() -> void:
 			_status_label.text += "\nCurrent renderer: %s. DirectStorage requires Direct3D 12." % driver
 
 	_update_actions(state)
+
+	if _gated_hidden > 0:
+		_status_label.text += "\n%d runtime version(s) newer than %d.%d are hidden. Set %s=1 and restart the editor to show them." % [_gated_hidden, BASELINE_MAJOR, BASELINE_MINOR, ALLOW_ABOVE_BASELINE_ENV]
 
 
 func _update_actions(state: Dictionary) -> void:
@@ -115,9 +181,9 @@ func _update_actions(state: Dictionary) -> void:
 
 func _selected_version() -> String:
 	var index := _version_option.selected
-	if index < 0 or index >= UI_VERSIONS.size():
+	if index < 0 or index >= _version_option.item_count:
 		return ""
-	return UI_VERSIONS[index]
+	return String(_version_option.get_item_metadata(index))
 
 
 func _on_version_selected(_index: int) -> void:

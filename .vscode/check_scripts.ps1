@@ -32,6 +32,18 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
+# 0. Package-table consistency: the built-in baseline pin in the installer must
+#    match the vendored runtime_versions.json, or an in-editor install would
+#    verify against a hash the manifest does not carry.
+$runtimeVersionsCheck = Join-Path $repoRoot "tools\check_runtime_versions.ps1"
+if (Test-Path -LiteralPath $runtimeVersionsCheck) {
+    & powershell -ExecutionPolicy Bypass -File $runtimeVersionsCheck -RepoRoot $repoRoot
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[check_scripts] Runtime version table check failed." -ForegroundColor Red
+        exit 1
+    }
+}
+
 # 1. Resolve Godot Console Executable
 function Resolve-GodotExecutable {
     param([string]$ExplicitPath, [string]$Root)

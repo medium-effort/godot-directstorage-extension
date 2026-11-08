@@ -51,24 +51,73 @@ const RUNTIME_FILES := [
 	"dstoragecore.dll",
 ]
 
-## Microsoft-published packageHash values (base64 SHA-512 of the .nupkg) and
-## package sizes from the NuGet catalog. Pinning them here means a compromised
-## CDN response is rejected even though the hash travels over the same TLS
-## connection.
-const VERSIONS: Dictionary = {
+## Package table. runtime_versions.json is the maintained list: one entry per
+## published Microsoft.Direct3D.DirectStorage package, each carrying the NuGet
+## URL, the package size and Microsoft's published packageHash (base64 SHA-512).
+## Keeping it in a data file means a new runtime version does not need a
+## GDScript edit.
+##
+## FALLBACK_VERSIONS keeps the baseline installable when that file is missing,
+## unreadable or partially synced: a stripped copy of the addon must still be
+## able to fetch 1.3.0. These are the same values as the manifest's baseline
+## entry, and tools/check_runtime_versions.ps1 fails the build when the two
+## drift apart.
+const VERSIONS_MANIFEST_PATH: String = "res://addons/directstorage_accelerator/runtime_versions.json"
+
+const FALLBACK_VERSIONS: Dictionary = {
 	"1.3.0": {
 		"url": "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.directstorage/1.3.0/microsoft.direct3d.directstorage.1.3.0.nupkg",
 		"sha512": "WJqDGU6eBWVFI7nKEEAZgtI126qZHIU1gH1bn4Udh3KBQX15oCEPd7RsD2URT4BfShLwS3vbPeigD+IMeN73kQ==",
 		"size": 2816824,
 		"preview": false,
 	},
-	"1.4.0-preview2-2606.904": {
-		"url": "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.directstorage/1.4.0-preview2-2606.904/microsoft.direct3d.directstorage.1.4.0-preview2-2606.904.nupkg",
-		"sha512": "ZFmyER/khXZDthj9oVuytkIUg72QAmuTHLxqtqVLAx4Bp/Wo1TP0Oq9DFHXk/SbdYHxEFlrX8lFLJnCYU0jULw==",
-		"size": 3986072,
-		"preview": true,
-	},
 }
+
+static var _versions: Dictionary = {}
+
+
+## Merged package table: the built-in fallback plus every valid manifest entry.
+## A version already pinned in FALLBACK_VERSIONS keeps the code copy, so a stale
+## or hand-edited manifest can never downgrade the baseline hash.
+static func get_versions() -> Dictionary:
+	if not _versions.is_empty():
+		return _versions
+	var merged: Dictionary = FALLBACK_VERSIONS.duplicate(true)
+	var manifest := _read_manifest_versions()
+	for version in manifest:
+		if not merged.has(version):
+			merged[version] = manifest[version]
+	_versions = merged
+	return _versions
+
+
+static func _read_manifest_versions() -> Dictionary:
+	var versions: Dictionary = {}
+	if not FileAccess.file_exists(VERSIONS_MANIFEST_PATH):
+		push_warning("[DirectStorage] Runtime version manifest missing (%s); using the built-in package table." % VERSIONS_MANIFEST_PATH)
+		return versions
+	var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(VERSIONS_MANIFEST_PATH))
+	if typeof(parsed) != TYPE_DICTIONARY:
+		push_warning("[DirectStorage] Runtime version manifest is not a JSON object; using the built-in package table.")
+		return versions
+	for version in (parsed as Dictionary):
+		var meta: Variant = (parsed as Dictionary)[version]
+		if typeof(meta) != TYPE_DICTIONARY or not _is_valid_entry(meta as Dictionary):
+			push_warning("[DirectStorage] Ignoring incomplete manifest entry for %s (an https url, sha512 and a positive size are required)." % String(version))
+			continue
+		versions[String(version)] = meta
+	return versions
+
+
+## An entry is usable only when every field the install path trusts is present.
+## None of these may be optional: the URL is fetched and the SHA-512 is the only
+## integrity check, so an incomplete entry is dropped rather than half-used.
+static func _is_valid_entry(meta: Dictionary) -> bool:
+	var url := String(meta.get("url", ""))
+	var sha512 := String(meta.get("sha512", ""))
+	var size := int(meta.get("size", 0))
+	return url.begins_with("https://") and not sha512.is_empty() and size > 0
+
 
 var _http: HTTPRequest = null
 var _license_version: String = ""
@@ -82,7 +131,8 @@ func install(version: String) -> void:
 	if not OS.has_feature("editor"):
 		_finish(version, ERR_UNAUTHORIZED, "DirectStorage runtime installation is editor-only.")
 		return
-	if not VERSIONS.has(version):
+	var versions := get_versions()
+	if not versions.has(version):
 		_finish(version, ERR_INVALID_PARAMETER, "Unknown DirectStorage runtime version: %s" % version)
 		return
 	if _http != null:
@@ -92,7 +142,7 @@ func install(version: String) -> void:
 		_finish(version, ERR_BUSY, "A license decision is pending.")
 		return
 
-	var meta: Dictionary = VERSIONS[version]
+	var meta: Dictionary = versions[version]
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(DOWNLOAD_DIR))
 	var nupkg := DOWNLOAD_DIR.path_join(version + ".nupkg")
 	if FileAccess.file_exists(nupkg):
@@ -215,7 +265,7 @@ static func _match_known_version(raw: String) -> String:
 	var parts := raw.split(".")
 	if parts.size() >= 2:
 		var major_minor := "%s.%s" % [parts[0], parts[1]]
-		for key in VERSIONS:
+		for key in get_versions():
 			var known := String(key).split(".")
 			if known.size() >= 2 and "%s.%s" % [known[0], known[1]] == major_minor:
 				return String(key)
@@ -243,7 +293,7 @@ static func get_cached_versions() -> PackedStringArray:
 
 
 static func get_available_versions() -> Dictionary:
-	return VERSIONS.duplicate(true)
+	return get_versions().duplicate(true)
 
 
 static func get_state() -> Dictionary:
