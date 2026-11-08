@@ -495,6 +495,20 @@ public:
 	static Dictionary _debug_get_dstex_mip_chunks_for_testing(const String &p_path, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t p_capacity);
 #endif
 
+	// Media class of the volume that holds an asset path. Decides the
+	// DirectStorage I/O mode: rotational media reads through the OS cache
+	// (ForceFileBuffering), flash keeps the default unbuffered path.
+	enum class StorageMediaClass {
+		Unknown,
+		Flash,
+		Rotational,
+	};
+	// Pure classification (no device access), kept separate so it is
+	// unit-testable: NVMe short-circuits to flash, a known seek-penalty result
+	// is authoritative, and TRIM is only a corroborating flash signal.
+	static StorageMediaClass classify_storage_media(bool p_is_nvme, bool p_seek_penalty_known,
+			bool p_incurs_seek_penalty, bool p_trim_known, bool p_trim_enabled);
+
 	static bool is_path_valid(const String &p_path);
 	static Dictionary get_drive_info_for_path(const String &p_path);
 	static bool validate_dstex_chunk_range(uint64_t p_source_offset, uint64_t p_source_size, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t &r_resolved_offset);

@@ -75,6 +75,13 @@ struct DSRuntimeProbe {
 static std::mutex s_dstorage_config_mutex;
 static HMODULE s_dstorage_configured_module = nullptr;
 static std::atomic<int> s_dstorage_config_apply_count{ 0 };
+// Desired I/O mode for the one-shot DStorageSetConfiguration call. Set from
+// the asset volume's media class immediately before the runtime is configured,
+// so a rotational volume can request ForceFileBuffering while flash keeps the
+// default unbuffered path.
+static std::atomic<bool> s_desired_file_buffering{ false };
+// Mode actually applied to s_dstorage_configured_module, for mismatch warnings.
+static std::atomic<bool> s_applied_file_buffering{ false };
 
 // Any release of dstorage.dll invalidates the marker: the settings did not survive
 // with it, and the loader may hand the same base address out again for a different
@@ -2321,12 +2328,31 @@ static DSRuntimeProbe probe_runtime(const String &p_bin_dir, uint16_t p_queue_ca
 }
 #endif
 
+Win32Backend::StorageMediaClass Win32Backend::classify_storage_media(bool p_is_nvme, bool p_seek_penalty_known,
+		bool p_incurs_seek_penalty, bool p_trim_known, bool p_trim_enabled) {
+	if (p_is_nvme) {
+		return StorageMediaClass::Flash;
+	}
+	if (p_seek_penalty_known) {
+		return p_incurs_seek_penalty ? StorageMediaClass::Rotational : StorageMediaClass::Flash;
+	}
+	if (p_trim_known && p_trim_enabled) {
+		return StorageMediaClass::Flash;
+	}
+	return StorageMediaClass::Unknown;
+}
+
 Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	Dictionary res;
 	res["drive"] = "";
 	res["bus_type"] = "Unknown";
 	res["file_system"] = "Unknown";
 	res["bypassio_state"] = "Unsupported";
+	res["media_type"] = "Unknown";
+	res["rotational"] = false;
+	res["rotational_known"] = false;
+	res["seek_penalty"] = "Unknown";
+	res["trim"] = "Unknown";
 	res["directstorage_supported"] = false;
 	res["reason"] = "";
 
@@ -2400,6 +2426,11 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 			0,
 			nullptr);
 
+	bool seek_penalty_known = false;
+	bool incurs_seek_penalty = false;
+	bool trim_known = false;
+	bool trim_enabled = false;
+
 	if (hDevice != INVALID_HANDLE_VALUE) {
 		STORAGE_PROPERTY_QUERY query = {};
 		query.PropertyId = StorageDeviceProperty;
@@ -2425,6 +2456,9 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 				case BusTypeSata:
 					res["bus_type"] = "SATA";
 					break;
+				case BusTypeAta:
+					res["bus_type"] = "ATA";
+					break;
 				case BusTypeUsb:
 					res["bus_type"] = "USB";
 					break;
@@ -2441,6 +2475,30 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 					res["bus_type"] = "BusType_" + String::num_int64(dev_desc.BusType);
 					break;
 			}
+		}
+
+		// Media class inputs for the I/O-mode decision. Seek penalty is the
+		// authoritative signal; TRIM only corroborates flash when the seek
+		// query is unavailable.
+		STORAGE_PROPERTY_QUERY media_query = {};
+		media_query.QueryType = PropertyStandardQuery;
+
+		DEVICE_SEEK_PENALTY_DESCRIPTOR seek_desc = {};
+		DWORD seek_bytes = 0;
+		media_query.PropertyId = StorageDeviceSeekPenaltyProperty;
+		if (DeviceIoControl(hDevice, IOCTL_STORAGE_QUERY_PROPERTY, &media_query, sizeof(media_query),
+					&seek_desc, sizeof(seek_desc), &seek_bytes, nullptr)) {
+			seek_penalty_known = true;
+			incurs_seek_penalty = seek_desc.IncursSeekPenalty != FALSE;
+		}
+
+		DEVICE_TRIM_DESCRIPTOR trim_desc = {};
+		DWORD trim_bytes = 0;
+		media_query.PropertyId = StorageDeviceTrimProperty;
+		if (DeviceIoControl(hDevice, IOCTL_STORAGE_QUERY_PROPERTY, &media_query, sizeof(media_query),
+					&trim_desc, sizeof(trim_desc), &trim_bytes, nullptr)) {
+			trim_known = true;
+			trim_enabled = trim_desc.TrimEnabled != FALSE;
 		}
 
 		// Query Windows Kernel BypassIO state
@@ -2468,17 +2526,31 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	}
 
 	bool is_nvme = (res["bus_type"] == "NVMe");
+	bool is_sata_family = (res["bus_type"] == "SATA" || res["bus_type"] == "ATA");
 	bool is_ntfs = (res["file_system"] == "NTFS");
 
-	if (!is_nvme) {
+	StorageMediaClass media = classify_storage_media(is_nvme, seek_penalty_known,
+			incurs_seek_penalty, trim_known, trim_enabled);
+	res["media_type"] = media == StorageMediaClass::Rotational ? "HDD" :
+			(media == StorageMediaClass::Flash ? "SSD" : "Unknown");
+	res["rotational"] = media == StorageMediaClass::Rotational;
+	res["rotational_known"] = media != StorageMediaClass::Unknown;
+	res["seek_penalty"] = !seek_penalty_known ? "Unknown" : (incurs_seek_penalty ? "True" : "False");
+	res["trim"] = !trim_known ? "Unknown" : (trim_enabled ? "Enabled" : "Disabled");
+
+	if (!is_nvme && !is_sata_family) {
 		res["directstorage_supported"] = false;
-		res["reason"] = "Drive is non-NVMe (BusType: " + String(res["bus_type"]) + "). DirectStorage requires NVMe for hardware acceleration.";
+		res["reason"] = "Drive bus is " + String(res["bus_type"]) + ". DirectStorage support requires NVMe, SATA, or ATA.";
 	} else if (!is_ntfs) {
 		res["directstorage_supported"] = false;
 		res["reason"] = "File system is " + String(res["file_system"]) + ". DirectStorage requires NTFS.";
 	} else {
 		res["directstorage_supported"] = true;
-		res["reason"] = "Hardware NVMe drive and NTFS file system support DirectStorage hardware acceleration.";
+		if (media == StorageMediaClass::Rotational) {
+			res["reason"] = "Rotational NTFS media: DirectStorage uses buffered file I/O (ForceFileBuffering).";
+		} else {
+			res["reason"] = "NTFS flash media: DirectStorage uses the default unbuffered path (BypassIO when available).";
+		}
 	}
 
 #else
@@ -2499,29 +2571,53 @@ void Win32Backend::apply_dstorage_configuration() {
 		return;
 	}
 
+	DSContext *ctx = DSContext::get_singleton();
+	bool disable_gpu = ctx ? ctx->get_disable_gpu_decompression() : false;
+	bool file_buffering = s_desired_file_buffering.load();
+
 	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
 	if (s_dstorage_configured_module == current_module) {
+		if (s_applied_file_buffering.load() != file_buffering) {
+			UtilityFunctions::push_warning("[DirectStorage] I/O mode changed after the runtime was configured (requested " +
+					String(file_buffering ? "buffered" : "unbuffered") +
+					"); keeping the already-applied mode. Initialize DirectStorage before any capability probe, or point it at the same volume.");
+		}
 		return;
 	}
 
-	DSContext *ctx = DSContext::get_singleton();
-	bool disable_gpu = ctx ? ctx->get_disable_gpu_decompression() : false;
-
-	DSTORAGE_CONFIGURATION config = {};
-	config.DisableTelemetry = TRUE;
-	config.DisableGpuDecompression = disable_gpu;
-	config.DisableGpuDecompressionMetacommand = disable_gpu;
-
-	HRESULT hr = DStorageSetConfiguration(&config);
-	if (FAILED(hr)) {
-		UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration returned 0x" +
-				String::num_uint64(static_cast<uint32_t>(hr), 16) + " (configuration may already be active).");
+	HRESULT hr = E_FAIL;
+	if (file_buffering) {
+		DSTORAGE_CONFIGURATION1 buffered_config = {};
+		buffered_config.DisableTelemetry = TRUE;
+		buffered_config.DisableGpuDecompression = disable_gpu;
+		buffered_config.DisableGpuDecompressionMetacommand = disable_gpu;
+		buffered_config.DisableBypassIO = TRUE;
+		buffered_config.ForceFileBuffering = TRUE;
+		hr = DStorageSetConfiguration1(&buffered_config);
+		if (SUCCEEDED(hr)) {
+			UtilityFunctions::print("[DirectStorage] File buffering enabled: rotational media uses ForceFileBuffering (BypassIO disabled).");
+		} else {
+			UtilityFunctions::print("[DirectStorage] ForceFileBuffering configuration failed: 0x" +
+					String::num_uint64(static_cast<uint32_t>(hr), 16) + "; continuing with the default I/O path.");
+		}
 	} else {
-		UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration applied successfully.");
+		DSTORAGE_CONFIGURATION config = {};
+		config.DisableTelemetry = TRUE;
+		config.DisableGpuDecompression = disable_gpu;
+		config.DisableGpuDecompressionMetacommand = disable_gpu;
+
+		hr = DStorageSetConfiguration(&config);
+		if (FAILED(hr)) {
+			UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration returned 0x" +
+					String::num_uint64(static_cast<uint32_t>(hr), 16) + " (configuration may already be active).");
+		} else {
+			UtilityFunctions::print_verbose("[DirectStorage] DStorageSetConfiguration applied successfully.");
+		}
 	}
 	// Recorded either way: once a factory exists this call cannot succeed on the same
 	// instance, so retrying it would only repeat the failure log.
 	s_dstorage_configured_module = current_module;
+	s_applied_file_buffering.store(file_buffering);
 	s_dstorage_config_apply_count.fetch_add(1);
 }
 
@@ -2677,6 +2773,17 @@ Dictionary Win32Backend::get_runtime_info() {
 
 bool Win32Backend::probe_system_support() {
 	Dictionary drive_info = get_drive_info_for_path("res://");
+	// The runtime configuration is one-shot and the probe may be the first
+	// caller, so record the media-derived I/O mode before DStorageGetFactory.
+	// Never overwrite a mode initialize() already applied: a capability query
+	// after startup would otherwise re-evaluate res:// and contradict the active
+	// configuration.
+	{
+		std::lock_guard<std::mutex> config_lock(s_dstorage_config_mutex);
+		if (s_dstorage_configured_module == nullptr) {
+			s_desired_file_buffering.store(static_cast<bool>(drive_info.get("rotational", false)));
+		}
+	}
 	if (!drive_info.get("directstorage_supported", false)) {
 		UtilityFunctions::print("[DirectStorage] Backend unavailable: " + String(drive_info["reason"]));
 		return false;
@@ -3058,6 +3165,10 @@ bool Win32Backend::initialize(const String &p_path) {
 		UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Drive " + String(drive_info["drive"]) + " is unsupported (" + String(drive_info["reason"]) + ").");
 		return false;
 	}
+	// Computed before the runtime is configured (DStorageSetConfiguration is
+	// one-shot and must precede DStorageGetFactory). The probe path does the
+	// same from res://; this covers a direct initialize_ds_for_path() call.
+	s_desired_file_buffering.store(static_cast<bool>(drive_info.get("rotational", false)));
 
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (!ps) {

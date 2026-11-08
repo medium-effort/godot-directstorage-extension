@@ -337,6 +337,53 @@ GDEX_TEST_T(win32_remediation, uninitialized_backend_contracts, TAG_UNIT) {
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, storage_media_classification, TAG_UNIT) {
+#ifdef _WIN32
+    using Media = godot::Win32Backend::StorageMediaClass;
+    // NVMe is always flash, whatever the other probes say.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::Win32Backend::classify_storage_media(true, true, true, true, false)),
+            static_cast<int64_t>(Media::Flash));
+    // A known seek-penalty result is authoritative.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::Win32Backend::classify_storage_media(false, true, true, false, false)),
+            static_cast<int64_t>(Media::Rotational));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::Win32Backend::classify_storage_media(false, true, false, true, true)),
+            static_cast<int64_t>(Media::Flash));
+    // TRIM only corroborates flash when the seek query failed.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::Win32Backend::classify_storage_media(false, false, false, true, true)),
+            static_cast<int64_t>(Media::Flash));
+    // Nothing known stays unknown: the caller must keep the default I/O path.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::Win32Backend::classify_storage_media(false, false, false, true, false)),
+            static_cast<int64_t>(Media::Unknown));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::Win32Backend::classify_storage_media(false, false, false, false, false)),
+            static_cast<int64_t>(Media::Unknown));
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, drive_info_reports_media_class, TAG_UNIT) {
+#ifdef _WIN32
+    // The capability report must carry the media fields even when the volume is
+    // unsupported; the I/O-mode decision reads "rotational" from this dictionary.
+    const godot::Dictionary info = godot::Win32Backend::get_drive_info_for_path("res://");
+    GDEX_EXPECT_TRUE(info.has("media_type"));
+    GDEX_EXPECT_TRUE(info.has("rotational"));
+    GDEX_EXPECT_TRUE(info.has("rotational_known"));
+    GDEX_EXPECT_TRUE(info.has("seek_penalty"));
+    GDEX_EXPECT_TRUE(info.has("trim"));
+    const godot::String media = info["media_type"];
+    GDEX_EXPECT_TRUE(media == "HDD" || media == "SSD" || media == "Unknown");
+    if (static_cast<bool>(info["rotational_known"])) {
+        GDEX_EXPECT_EQ(static_cast<int64_t>(static_cast<bool>(info["rotational"])),
+                static_cast<int64_t>(media == "HDD"));
+    }
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, multi_queue_wait_for_completion_bounded_timeout, TAG_INTEGRATION) {
 #ifdef _WIN32
     // HIGH-10: wait_for_completion() must inspect all priority queues up to

@@ -118,7 +118,7 @@
 		<method name="get_drive_info" qualifiers="const">
 			<return type="Dictionary" />
 			<param index="0" name="path" type="String" default="res://" />
-			<description>Returns drive capability information for [param path], including [code]drive[/code], [code]bus_type[/code], [code]file_system[/code], [code]directstorage_supported[/code], and, when applicable, [code]reason[/code].</description>
+			<description>Returns drive capability information for [param path], including [code]drive[/code], [code]bus_type[/code], [code]file_system[/code], [code]bypassio_state[/code], [code]media_type[/code] ([code]HDD[/code], [code]SSD[/code], or [code]Unknown[/code]), [code]rotational[/code], [code]rotational_known[/code], [code]seek_penalty[/code], [code]trim[/code], [code]directstorage_supported[/code], and, when applicable, [code]reason[/code]. [code]rotational[/code] is the media signal that selects the DirectStorage I/O mode.</description>
 		</method>
 		<method name="get_gpu_decompression_support_tier" qualifiers="const">
 			<return type="int" />
@@ -187,7 +187,7 @@
 		<method name="initialize_ds_for_path">
 			<return type="int" enum="@GlobalScope.Error" />
 			<param index="0" name="path" type="String" />
-			<description>Initializes DirectStorage targeting the specific volume where [param path] is located. Validates volume bypass eligibility and DirectStorage support before initializing. Accepts file paths, directory paths, and Godot virtual paths ([code]res://[/code], [code]user://[/code]). If the specified path is on an unsupported drive, falls back to default [code]res://[/code] initialization or software fallback. Returns [constant @GlobalScope.OK] on success, or [constant @GlobalScope.ERR_FILE_NOT_FOUND] if the specified path does not exist.</description>
+			<description>Initializes DirectStorage targeting the specific volume where [param path] is located. Validates volume bypass eligibility and DirectStorage support before initializing. Accepts file paths, directory paths, and Godot virtual paths ([code]res://[/code], [code]user://[/code]). Rotational NTFS volumes select buffered file I/O ([code]ForceFileBuffering[/code], BypassIO disabled) for the process; flash volumes keep the default unbuffered path. If the specified path is on an unsupported drive, falls back to default [code]res://[/code] initialization or software fallback. Returns [constant @GlobalScope.OK] on success, or [constant @GlobalScope.ERR_FILE_NOT_FOUND] if the specified path does not exist.</description>
 		</method>
 		<method name="is_batch_complete" qualifiers="const">
 			<return type="bool" />
