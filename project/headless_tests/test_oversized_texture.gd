@@ -9,8 +9,8 @@ var failures := 0
 func _initialize() -> void:
 	print("[Oversized] staging-buffer split verification")
 	var staging_mb := 128
-	if ProjectSettings.has_setting("directstorage/staging_buffer_size_mb"):
-		staging_mb = int(ProjectSettings.get_setting("directstorage/staging_buffer_size_mb"))
+	if ProjectSettings.has_setting("dsgd_extension/staging_buffer_size_mb"):
+		staging_mb = int(ProjectSettings.get_setting("dsgd_extension/staging_buffer_size_mb"))
 	var staging_bytes := maxi(1, staging_mb) * 1024 * 1024
 	var footprints := Verification.mip_footprints(WIDTH, HEIGHT, RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM, MIP_COUNT)
 	var total := 0

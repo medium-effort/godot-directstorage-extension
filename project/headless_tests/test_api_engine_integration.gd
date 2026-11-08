@@ -56,11 +56,11 @@ func _run() -> void:
 	print("=== TASK_008 API & Engine Integration Test Suite ===")
 
 	var setting_defaults := {
-		"directstorage/staging_buffer_size_mb": 128,
-		"directstorage/disable_gpu_decompression": false,
-		"directstorage/queue_capacity": 512,
-		"directstorage/texture_cache_enabled": true,
-		"directstorage/texture_cache_max_entries": 128,
+		"dsgd_extension/staging_buffer_size_mb": 128,
+		"dsgd_extension/disable_gpu_decompression": false,
+		"dsgd_extension/queue_capacity": 512,
+		"dsgd_extension/texture_cache_enabled": true,
+		"dsgd_extension/texture_cache_max_entries": 128,
 	}
 	for setting_name in setting_defaults:
 		_check(ProjectSettings.has_setting(setting_name), "ProjectSettings registers " + setting_name)

@@ -520,11 +520,11 @@ GDEX_TEST_T(gpu_prewarm, dma_fills_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
     const char *virtual_path = "res://gdextest_gpu_prewarm_dma.png";
     godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
     if (ps) {
-        ps->set_setting("directstorage/force_archive_resolution", true);
+        ps->set_setting("dsgd_extension/force_archive_resolution", true);
     }
     ctx.add_teardown([ds, ps]() {
         if (ps) {
-            ps->set_setting("directstorage/force_archive_resolution", false);
+            ps->set_setting("dsgd_extension/force_archive_resolution", false);
         }
         // Shutdown FIRST: a batch can still own the IDStorageFile handle for
         // res://textures.dspkg, and Windows refuses the remove while it does
@@ -830,11 +830,11 @@ GDEX_TEST_T(gpu_prewarm, graceful_memory_fallback, TAG_INTEGRATION | TAG_SLOW) {
     const char *virtual_path = "res://gdextest_gpu_prewarm_mem.png";
     godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
     if (ps) {
-        ps->set_setting("directstorage/force_archive_resolution", true);
+        ps->set_setting("dsgd_extension/force_archive_resolution", true);
     }
     ctx.add_teardown([ds, ps]() {
         if (ps) {
-            ps->set_setting("directstorage/force_archive_resolution", false);
+            ps->set_setting("dsgd_extension/force_archive_resolution", false);
         }
         // Shutdown first (see dma test): release backend file handles
         // before deleting the archive they may hold open.
@@ -995,12 +995,12 @@ GDEX_TEST_T(gpu_prewarm, shutdown_while_prewarm_in_flight_drains_safely, TAG_INT
     const char *virtual_path = "res://gdextest_gpu_prewarm_drain.png";
     godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
     if (ps) {
-        ps->set_setting("directstorage/force_archive_resolution", true);
-        ps->set_setting("directstorage/shutdown_drain_timeout_ms", 5000);
+        ps->set_setting("dsgd_extension/force_archive_resolution", true);
+        ps->set_setting("dsgd_extension/shutdown_drain_timeout_ms", 5000);
     }
     ctx.add_teardown([ds, ps]() {
         if (ps) {
-            ps->set_setting("directstorage/force_archive_resolution", false);
+            ps->set_setting("dsgd_extension/force_archive_resolution", false);
         }
         ds->shutdown_ds();
         remove_abs("res://textures.dspkg");
@@ -1039,11 +1039,11 @@ GDEX_TEST_T(gpu_prewarm, cancellation_while_gpu_in_flight_retires_safely, TAG_IN
     const char *virtual_path = "res://gdextest_gpu_cancel_drain.png";
     godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
     if (ps) {
-        ps->set_setting("directstorage/force_archive_resolution", true);
+        ps->set_setting("dsgd_extension/force_archive_resolution", true);
     }
     ctx.add_teardown([ds, ps]() {
         if (ps) {
-            ps->set_setting("directstorage/force_archive_resolution", false);
+            ps->set_setting("dsgd_extension/force_archive_resolution", false);
         }
         ds->shutdown_ds();
         remove_abs("res://textures.dspkg");
@@ -1115,11 +1115,11 @@ GDEX_TEST_T(gpu_prewarm, cancel_in_flight_keeps_parent_and_rid_owned, TAG_INTEGR
     const char *virtual_path = "res://gdextest_crit01_cancel_inflight.png";
     godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
     if (ps) {
-        ps->set_setting("directstorage/force_archive_resolution", true);
+        ps->set_setting("dsgd_extension/force_archive_resolution", true);
     }
     ctx.add_teardown([ds, ps]() {
         if (ps) {
-            ps->set_setting("directstorage/force_archive_resolution", false);
+            ps->set_setting("dsgd_extension/force_archive_resolution", false);
         }
         ds->shutdown_ds();
         remove_abs("res://textures.dspkg");
@@ -1309,11 +1309,11 @@ GDEX_TEST_T(gpu_prewarm, npot_prewarm_reports_storage_dims, TAG_INTEGRATION | TA
 
     godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
     if (ps) {
-        ps->set_setting("directstorage/force_archive_resolution", true);
+        ps->set_setting("dsgd_extension/force_archive_resolution", true);
     }
     ctx.add_teardown([ds, ps]() {
         if (ps) {
-            ps->set_setting("directstorage/force_archive_resolution", false);
+            ps->set_setting("dsgd_extension/force_archive_resolution", false);
         }
         ds->shutdown_ds();
         remove_abs("res://textures.dspkg");

@@ -1199,7 +1199,7 @@ GDEX_TEST_T(dspkg, protected_build_rejects_plaintext_archive, TAG_INTEGRATION) {
 	const char *virtual_path = "res://textures/test_protected_plain.dstex";
 	const uint64_t archive_id = 0x5A5A1234DEADBEEFULL;
 	const godot::String key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-	const godot::String setting = "directstorage/export/protected";
+	const godot::String setting = "dsgd_extension/protected";
 
 	// No key file, no installed key: nothing can decrypt, so an accepted open
 	// proves the plaintext path was taken.

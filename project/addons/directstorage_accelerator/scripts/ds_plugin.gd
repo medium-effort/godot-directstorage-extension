@@ -23,7 +23,17 @@ const TOOLS_SUBMENU_VERIFY_ID: int = 0
 const TOOLS_SUBMENU_RUNTIME_ID: int = 1
 const TOOLS_SUBMENU_MIGRATION_ID: int = 2
 const RUNTIME_INSTALLER_SCRIPT = preload("res://addons/directstorage_accelerator/scripts/ds_runtime_installer.gd")
-const IMPORT_PROFILE_SETTING: String = "directstorage/import/default_profile"
+const IMPORT_PROFILE_SETTING: String = "dsgd_extension/default_import_profile"
+const LEGACY_IMPORT_PROFILE_SETTING: String = "directstorage/import/default_profile"
+
+## Export plugin options are stored in export_presets.cfg under their option
+## name, so renaming the constants hides the old values from get_option().
+## This map carries them across once.
+const LEGACY_EXPORT_OPTIONS := {
+	"directstorage/bundle_textures_dspkg": "dsgd_extension/bundle_textures_dspkg",
+	"directstorage/enforce_archive_pairing": "dsgd_extension/enforce_archive_pairing",
+	"directstorage/steampipe_1mb_alignment": "dsgd_extension/steampipe_1mb_alignment",
+}
 
 var _importer: EditorImportPlugin = null
 var _export_plugin: EditorExportPlugin = null
@@ -64,15 +74,16 @@ func _enter_tree() -> void:
 	)
 
 	for internal_setting in [
-		"directstorage/export/bundle_dspkg",
-		"directstorage/export/archive_id",
-		"directstorage/export/protected",
-		"directstorage/archive_name",
+		"dsgd_extension/bundle_dspkg",
+		"dsgd_extension/archive_id",
+		"dsgd_extension/protected",
+		"dsgd_extension/archive_name",
 	]:
 		if ProjectSettings.has_setting(internal_setting):
 			ProjectSettings.set_as_internal(internal_setting, true)
 
 	_register_import_profile()
+	_migrate_export_option_keys()
 
 	if _importer == null:
 		var importer_script = load("uid://kqg57i3wmiw")
@@ -157,6 +168,36 @@ func _disable_plugin() -> void:
 	print("[DirectStorage] Plugin disabled. Autoload, Importer, and Exporter unregistered.")
 
 
+## Carries export-preset options across the settings rename.
+##
+## Godot keys export plugin options by the option name declared in
+## _get_export_options(), so once the constants change, an existing preset's
+## "directstorage/..." keys are invisible and every option would silently
+## revert to its default. Copy them to the new names once, then drop the old
+## keys so export_presets.cfg does not accumulate dead entries.
+func _migrate_export_option_keys() -> void:
+	const PRESET_PATH := "res://export_presets.cfg"
+	if not FileAccess.file_exists(PRESET_PATH):
+		return
+	var config := ConfigFile.new()
+	if config.load(PRESET_PATH) != OK:
+		return
+	var changed := false
+	for section in config.get_sections():
+		if not section.begins_with("preset."):
+			continue
+		for old_key in LEGACY_EXPORT_OPTIONS:
+			if not config.has_section_key(section, old_key):
+				continue
+			var new_key: String = LEGACY_EXPORT_OPTIONS[old_key]
+			if not config.has_section_key(section, new_key):
+				config.set_value(section, new_key, config.get_value(section, old_key))
+			config.erase_section_key(section, old_key)
+			changed = true
+	if changed:
+		config.save(PRESET_PATH)
+
+
 ## Registers the project-wide import profile used by the DirectStorage importer.
 ##
 ## The value is the default for new imports only; stored .import parameters
@@ -165,16 +206,26 @@ func _disable_plugin() -> void:
 ## deliberately not called: the default equals its initial value, so
 ## save_custom() skips it until the user actually changes it.
 func _register_import_profile() -> void:
+	# Migrate the pre-rename key before the tree becomes visible. The value is
+	# carried over once; the legacy key is then removed so a two-segment
+	# "directstorage/..." entry cannot recreate the old settings category.
+	if ProjectSettings.has_setting(LEGACY_IMPORT_PROFILE_SETTING):
+		if not ProjectSettings.has_setting(IMPORT_PROFILE_SETTING):
+			ProjectSettings.set_setting(IMPORT_PROFILE_SETTING, ProjectSettings.get_setting(LEGACY_IMPORT_PROFILE_SETTING))
+		ProjectSettings.clear(LEGACY_IMPORT_PROFILE_SETTING)
+
 	if not ProjectSettings.has_setting(IMPORT_PROFILE_SETTING):
 		ProjectSettings.set_setting(IMPORT_PROFILE_SETTING, 0)
-		ProjectSettings.set_initial_value(IMPORT_PROFILE_SETTING, 0)
-		ProjectSettings.add_property_info({
-			"name": IMPORT_PROFILE_SETTING,
-			"type": TYPE_INT,
-			"hint": PROPERTY_HINT_ENUM,
-			"hint_string": "3D (Streaming),CPU / ImageTexture (2D, UI, Decals)",
-		})
-		ProjectSettings.set_as_basic(IMPORT_PROFILE_SETTING, true)
+	ProjectSettings.set_initial_value(IMPORT_PROFILE_SETTING, 0)
+	ProjectSettings.add_property_info({
+		"name": IMPORT_PROFILE_SETTING,
+		"type": TYPE_INT,
+		"hint": PROPERTY_HINT_ENUM,
+		# Enum labels are comma-separated: a comma inside a label is parsed as
+		# another item and produced four truncated choices instead of two.
+		"hint_string": "3D (Streaming),CPU / ImageTexture (2D / UI / Decals)",
+	})
+	ProjectSettings.set_as_basic(IMPORT_PROFILE_SETTING, true)
 
 	if ProjectSettings.has_setting("importer_defaults/directstorage_texture"):
 		push_warning(

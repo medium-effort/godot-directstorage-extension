@@ -68,7 +68,7 @@ DSPKG_BOOT status=ok mode=<protected|unprotected> entries=<n> key_id=<16 hex|non
 
 | Field | Meaning |
 |---|---|
-| `mode` | the mode you asked to validate; when the boot was not asked to validate, the mode the export recorded in `directstorage/export/protected` |
+| `mode` | the mode you asked to validate; when the boot was not asked to validate, the mode the export recorded in `dsgd_extension/protected` |
 | `entries` | number of entries in the opened archive; `0` when the archive was not bundled, or was bundled with nothing to archive |
 | `key_id` | `none` when no key was committed; 16 hex characters when a key was committed after matching the archive header's key id and decrypting the table of contents |
 

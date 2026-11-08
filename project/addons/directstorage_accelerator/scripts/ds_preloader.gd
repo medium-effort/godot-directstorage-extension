@@ -93,7 +93,7 @@ static func _warn_missing_stream_pump() -> void:
 		return
 	_missing_pump_warned = true
 	push_error(
-		"[DirectStorage] DSPreloader: async prewarm unavailable - neither /root/%s nor /root/%s exists, so nothing submits or harvests the stream queue (requests would sit there forever). Enable the DirectStorage Accelerator plugin in Project Settings > Plugins so it registers the autoload, or add '%s' to autoload manually." % [STREAM_PUMP_AUTOLOAD, STREAM_PUMP_LEGACY_AUTOLOAD, STREAM_PUMP_AUTOLOAD]
+		"[DirectStorage] DSPreloader: async prewarm unavailable - neither /root/%s nor /root/%s exists, so nothing submits or harvests the stream queue (requests would sit there forever). Enable the dsgd plugin in Project Settings > Plugins so it registers the autoload, or add '%s' to autoload manually." % [STREAM_PUMP_AUTOLOAD, STREAM_PUMP_LEGACY_AUTOLOAD, STREAM_PUMP_AUTOLOAD]
 	)
 
 
@@ -146,7 +146,7 @@ static func _resolve_dependency_path(raw_dep: String) -> String:
 static func _resolve_dspkg_path() -> String:
 	if OS.has_feature("editor") or Engine.is_editor_hint():
 		return ""
-	var archive_name := String(ProjectSettings.get_setting("directstorage/archive_name", "textures.dspkg"))
+	var archive_name := String(ProjectSettings.get_setting("dsgd_extension/archive_name", "textures.dspkg"))
 	if archive_name.is_empty():
 		archive_name = "textures.dspkg"
 	var logical := "res://" + archive_name
@@ -188,7 +188,7 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 	if not extra_scan_dirs.is_empty() and not pkg_path.is_empty() and ClassDB.class_exists("DSPkg"):
 		var dspkg: RefCounted = ClassDB.instantiate("DSPkg")
 		if dspkg != null and dspkg.has_method("open") and dspkg.has_method("get_entries"):
-			var archive_id: int = int(ProjectSettings.get_setting("directstorage/export/archive_id", 0))
+			var archive_id: int = int(ProjectSettings.get_setting("dsgd_extension/archive_id", 0))
 			if dspkg.call("open", pkg_path, archive_id) == OK:
 				var pkg_entries: Array = dspkg.call("get_entries")
 				for entry in pkg_entries:
@@ -229,7 +229,7 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 	if not pkg_path.is_empty() and ClassDB.class_exists("DSPkg"):
 		var dspkg: RefCounted = ClassDB.instantiate("DSPkg")
 		if dspkg != null and dspkg.has_method("open") and dspkg.has_method("get_entries"):
-			var archive_id: int = int(ProjectSettings.get_setting("directstorage/export/archive_id", 0))
+			var archive_id: int = int(ProjectSettings.get_setting("dsgd_extension/archive_id", 0))
 			if dspkg.call("open", pkg_path, archive_id) == OK:
 				var pkg_entries: Array = dspkg.call("get_entries")
 				for entry in pkg_entries:

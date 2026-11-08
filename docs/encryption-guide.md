@@ -382,7 +382,7 @@ Yes. Each game still gets its own random archive key and archive id, so the arch
 from each other. A leaked PCK key covers every pack built with it.
 
 **Does this break Steam updates?**
-No, but turn on `directstorage/steampipe_1mb_alignment` in the export preset before you ship on Steam;
+No, but turn on `dsgd_extension/steampipe_1mb_alignment` in the export preset before you ship on Steam;
 it is off by default. It lays the payloads out in 1 MiB chunks, padding only when a texture would cross
 a chunk boundary, so a modified texture rewrites the chunks it occupies instead of shifting every
 payload behind it. Without it the archive is packed tightly and any change in a texture's size shifts
@@ -422,9 +422,9 @@ above matters.
 | `encrypt_pck` | export preset | turns PCK encryption on |
 | Encryption Key | export preset, stored in `.godot/export_credentials.cfg` | the key compiled into your templates |
 | `encryption_include_filters` | export preset | must cover `res://.dspkg/toc.key`, or nothing is encrypted |
-| `directstorage/bundle_textures_dspkg` | add-on export option | whether an archive is built at all |
-| `directstorage/enforce_archive_pairing` | add-on export option | publishes a random archive id; off publishes `0` and disables the check |
-| `directstorage/steampipe_1mb_alignment` | add-on export option | 1 MiB payload chunking so a changed texture only rewrites the chunks it occupies (smaller SteamPipe deltas); off by default |
+| `dsgd_extension/bundle_textures_dspkg` | add-on export option | whether an archive is built at all |
+| `dsgd_extension/enforce_archive_pairing` | add-on export option | publishes a random archive id; off publishes `0` and disables the check |
+| `dsgd_extension/steampipe_1mb_alignment` | add-on export option | 1 MiB payload chunking so a changed texture only rewrites the chunks it occupies (smaller SteamPipe deltas); off by default |
 
 ### Build inputs
 

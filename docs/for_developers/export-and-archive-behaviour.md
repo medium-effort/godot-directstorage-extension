@@ -45,14 +45,14 @@ from the editor (`set_as_internal`) and must stay in sync with the runtime.
 
 | Setting | Meaning | Producer |
 |---|---|---|
-| `directstorage/export/bundle_dspkg` | "an archive is expected to exist beside the executable" | `_publish_contract()` |
-| `directstorage/export/archive_id` | the random 64-bit archive id of this export, or `0` when pairing is off | same |
-| `directstorage/export/protected` | true for the `protected` and `failed` outcomes | same |
-| `directstorage/archive_name` | archive filename (default `textures.dspkg`) | same |
+| `dsgd_extension/bundle_dspkg` | "an archive is expected to exist beside the executable" | `_publish_contract()` |
+| `dsgd_extension/archive_id` | the random 64-bit archive id of this export, or `0` when pairing is off | same |
+| `dsgd_extension/protected` | true for the `protected` and `failed` outcomes | same |
+| `dsgd_extension/archive_name` | archive filename (default `textures.dspkg`) | same |
 
 `bundle_dspkg` is true only when **all** of these hold:
 
-- the add-on option `directstorage/bundle_textures_dspkg` is on;
+- the add-on option `dsgd_extension/bundle_textures_dspkg` is on;
 - at least one payload was removed from the PCK (`_skipped_payloads > 0`). The trigger is the
   **skip**, not the add: a protected export that fails before its first add still skips payloads, and
   those textures then exist only in an archive that will never be written, so the game must expect
@@ -65,7 +65,7 @@ never demoted, so a later failure cannot erase the expectation it already publis
 `_publish_contract()` is called from `_export_begin()`, from the first successful skip, and from every
 failure path that changes the answer. That is the only reason the pack can tell the truth.
 
-`directstorage/export/archive_id` is the pairing value the runtime passes to `DSPkg.open()`; it is a
+`dsgd_extension/archive_id` is the pairing value the runtime passes to `DSPkg.open()`; it is a
 random per-export id, not a project or content hash (§5).
 
 ---
@@ -79,7 +79,7 @@ because one plugin instance serves every preset of an "Export All" run.
 
 | Outcome | When | PCK copies | Archive | `bundle_dspkg` | Runtime |
 |---|---|---|---|---|---|
-| `disabled` | `directstorage/bundle_textures_dspkg` off | kept (intended) | none | false | CPU path |
+| `disabled` | `dsgd_extension/bundle_textures_dspkg` off | kept (intended) | none | false | CPU path |
 | `plaintext` | bundling on, `preset.get_encrypt_pck()` false | skipped per texture | deployed, plaintext, no key | true | streams; sentinel `key_id=none` |
 | `protected` | bundling on, PCK key present, key path encrypted | skipped per texture | deployed, encrypted TOC | true | streams; sentinel `mode=protected` |
 | `failed` | bundling on, PCK encryption requested, but no key or the key path is not encrypted | **all skipped** | none (staging removed, stale target deleted) | true | boot fails with `missing_archive` |
@@ -147,7 +147,7 @@ build. Do not remove that.
 
 The archive header carries one 64-bit pairing field. The exporter generates it per export
 (`_new_archive_id()`: 8 random bytes, top bit cleared), publishes it as
-`directstorage/export/archive_id`, and passes it to `DSPkg.create()`.
+`dsgd_extension/archive_id`, and passes it to `DSPkg.create()`.
 
 The reader compares it in full width (`src/formats/dspkg_format.cpp`, `DSPkg::open()`):
 
@@ -158,7 +158,7 @@ if (expected_id != 0 && expected_id != header.archive_fingerprint)
 
 - A non-zero `expected_id` must match exactly. An archive that carries id `0` is **rejected**, so
   zeroing the header field cannot satisfy a build that expects a real id.
-- Passing `0` as the expected id skips the check. `directstorage/enforce_archive_pairing=false`
+- Passing `0` as the expected id skips the check. `dsgd_extension/enforce_archive_pairing=false`
   publishes `0`, so such a build only accepts archives it is paired with nothing; that is a
   local-tooling shape and not a shipping configuration.
 - A mismatch is fatal at boot: `DSPKG_BOOT status=fail reason=archive_pairing_mismatch`, exit 1, no ok
@@ -166,7 +166,7 @@ if (expected_id != 0 && expected_id != header.archive_fingerprint)
 - A difference of one bit (`…472` vs `…473`) is rejected, which is the point of comparing the full
   width rather than a truncated value.
 - `DSPkg.create()` defaults to id `0`, which produces an archive a pairing-enabled build rejects. Any
-  custom build step must pass the id it publishes as `directstorage/export/archive_id`.
+  custom build step must pass the id it publishes as `dsgd_extension/archive_id`.
 
 What the check proves: the pack and the archive come from the same export. What it does not prove:
 that the archive contains every texture the build expects, or anything about the payload bytes.
@@ -210,7 +210,7 @@ be verbose, so a normal boot stays silent. The success line is guarded by a stat
 at most once per process; a duplicate is a CI failure.
 
 `mode` is the validate mode when one was requested, otherwise the exported
-`directstorage/export/protected` value. **`key_id` is the evidence**: `none` when the export was not
+`dsgd_extension/protected` value. **`key_id` is the evidence**: `none` when the export was not
 protected (or no key was committed), 16 hex characters when `open()` committed a key after matching
 the header id and decrypting the TOC.
 

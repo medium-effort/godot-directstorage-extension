@@ -1,4 +1,5 @@
 #include "ds_fallback_backend.h"
+#include "core/ds_settings.h"
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
@@ -290,10 +291,9 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 }
 
 void FallbackBackend::submit_batch() {
-	ProjectSettings *ps = ProjectSettings::get_singleton();
 	uint32_t sync_timeout_ms = 3000;
-	if (ps && ps->has_setting("directstorage/sync_flush_timeout_ms")) {
-		sync_timeout_ms = static_cast<uint32_t>(std::clamp<int64_t>(int64_t(ps->get_setting("directstorage/sync_flush_timeout_ms")), 500, 10000));
+	if (dsgd_settings::has_setting("sync_flush_timeout_ms", "sync_flush_timeout_ms")) {
+		sync_timeout_ms = static_cast<uint32_t>(std::clamp<int64_t>(int64_t(dsgd_settings::get_setting("sync_flush_timeout_ms", "sync_flush_timeout_ms")), 500, 10000));
 	}
 	uint32_t half_timeout_ms = sync_timeout_ms / 2;
 

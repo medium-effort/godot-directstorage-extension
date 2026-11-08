@@ -5,6 +5,7 @@
 #include "../compression/gdeflate_decompressor.h"
 #include "../core/ds_context.h"
 #include "../core/ds_request.h"
+#include "core/ds_settings.h"
 #include "../formats/dspkg_format.h"
 #include "../formats/dstex_format.h"
 
@@ -36,9 +37,9 @@ namespace {
 
 // 0 means the archive is unpaired; pairing is the random archive id, compared
 // in full 64-bit width when the expected value is non-zero.
-uint64_t resolve_expected_fingerprint(ProjectSettings *p_ps) {
-	if (p_ps && p_ps->has_setting("directstorage/export/archive_id")) {
-		return static_cast<uint64_t>(p_ps->get_setting("directstorage/export/archive_id"));
+uint64_t resolve_expected_fingerprint(ProjectSettings * /*p_ps*/) {
+	if (dsgd_settings::has_setting("archive_id", "export/archive_id")) {
+		return static_cast<uint64_t>(dsgd_settings::get_setting("archive_id", "export/archive_id"));
 	}
 	return 0;
 }
@@ -160,16 +161,16 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 	OS *os = OS::get_singleton();
 	ProjectSettings *project_settings = ProjectSettings::get_singleton();
 
-	bool force_resolution = project_settings && project_settings->has_setting("directstorage/force_archive_resolution") &&
-			static_cast<bool>(project_settings->get_setting("directstorage/force_archive_resolution"));
+	bool force_resolution = dsgd_settings::has_setting("force_archive_resolution", "force_archive_resolution") &&
+			static_cast<bool>(dsgd_settings::get_setting("force_archive_resolution", "force_archive_resolution"));
 
 	if (!force_resolution && ((engine && engine->is_editor_hint()) || (os && os->has_feature("editor")))) {
 		return String();
 	}
 
 	String archive_filename = "textures.dspkg";
-	if (project_settings && project_settings->has_setting("directstorage/archive_name")) {
-		String custom_name = project_settings->get_setting("directstorage/archive_name");
+	if (dsgd_settings::has_setting("archive_name", "archive_name")) {
+		String custom_name = dsgd_settings::get_setting("archive_name", "archive_name");
 		if (!custom_name.is_empty()) {
 			archive_filename = custom_name;
 		}
@@ -238,8 +239,8 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 		}
 	}
 
-	if (found.is_empty() && project_settings &&
-			static_cast<bool>(project_settings->get_setting("directstorage/export/bundle_dspkg", false))) {
+	if (found.is_empty() &&
+			static_cast<bool>(dsgd_settings::get_setting("bundle_dspkg", "export/bundle_dspkg", false))) {
 		String exe_dir = os ? os->get_executable_path().get_base_dir() : String();
 		String candidates_str = String("'res://") + archive_filename + String("', '") + exe_dir.path_join(archive_filename) +
 				String("', '") + project_settings->globalize_path(canonical_logical) + String("'");
@@ -483,7 +484,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	OS *os = OS::get_singleton();
 	if (p_file_path.begins_with("res://")) {
-		if (os && !os->has_feature("editor") && ps && !static_cast<bool>(ps->get_setting("directstorage/export/bundle_dspkg", false))) {
+		if (os && !os->has_feature("editor") && !static_cast<bool>(dsgd_settings::get_setting("bundle_dspkg", "export/bundle_dspkg", false))) {
 			is_physical_source = false;
 		} else {
 			String global_path = ps ? ps->globalize_path(p_file_path) : p_file_path;

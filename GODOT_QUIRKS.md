@@ -853,7 +853,7 @@ Querying the package manifest directly from the sidecar archive header guarantee
 ## 35. Texture Cache Capacity Eviction vs. Externally-Bound `Texture2DRD` RIDs
 
 ### The Engine Reality
-`DSTextureCache` defaults to `max_entries = 256` (`src/integration/ds_texture_cache.h:28`, overridable via the `directstorage/texture_cache_max_entries` project setting or `set_max_entries()`). When a bulk prewarm stores ~250 level textures on top of a handful of boot/menu residents, LRU pressure evicts the oldest entries — typically the menu's own textures. Per the Section 27 discipline the cache then calls `free_rid()` on evicted `Texture2DRD` RIDs, which is correct only while the cache is the sole owner.
+`DSTextureCache` defaults to `max_entries = 256` (`src/integration/ds_texture_cache.h:28`, overridable via the `dsgd_extension/texture_cache_max_entries` project setting or `set_max_entries()`). When a bulk prewarm stores ~250 level textures on top of a handful of boot/menu residents, LRU pressure evicts the oldest entries — typically the menu's own textures. Per the Section 27 discipline the cache then calls `free_rid()` on evicted `Texture2DRD` RIDs, which is correct only while the cache is the sole owner.
 
 ### The Pitfall: Evicting Textures That Are Still Drawn
 Eviction drops the cache's `Ref`, but materials in the still-visible menu scene (3D background, `TextureRect` art outside hidden containers) keep drawing those exact objects every frame — now with dead RIDs. The result is per-frame spam with zero DS-side warnings (every load succeeded):
@@ -1365,7 +1365,7 @@ Because the archive is skipped, the failure appears downstream and looks unrelat
 ### The Rule
 Never gate a shipping-path bypass on `OS.has_feature("editor")` without an explicit opt-in override, because every command-line run of an editor binary reports the editor feature.
 ```gdscript
-const FORCE_ARCHIVE_SETTING := "directstorage/force_archive_resolution"
+const FORCE_ARCHIVE_SETTING := "dsgd_extension/force_archive_resolution"
 
 func _force_archive_resolution() -> void:
 	_force_archive_present = ProjectSettings.has_setting(FORCE_ARCHIVE_SETTING)

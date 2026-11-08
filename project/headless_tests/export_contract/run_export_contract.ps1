@@ -302,9 +302,9 @@ function Write-Preset {
     $lines.Add('binary_format/embed_pck=false')
     $lines.Add('binary_format/architecture="x86_64"')
     $lines.Add('application/modify_resources=false')
-    $lines.Add('directstorage/bundle_textures_dspkg=' + $Bundle.ToString().ToLowerInvariant())
-    $lines.Add('directstorage/enforce_archive_pairing=' + $Pairing.ToString().ToLowerInvariant())
-    $lines.Add('directstorage/steampipe_1mb_alignment=false')
+    $lines.Add('dsgd_extension/bundle_textures_dspkg=' + $Bundle.ToString().ToLowerInvariant())
+    $lines.Add('dsgd_extension/enforce_archive_pairing=' + $Pairing.ToString().ToLowerInvariant())
+    $lines.Add('dsgd_extension/steampipe_1mb_alignment=false')
     Write-Utf8NoBom -Path (Join-Path $ProjectDir 'export_presets.cfg') -Text (($lines -join "`r`n") + "`r`n")
 }
 

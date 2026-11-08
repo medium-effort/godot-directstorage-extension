@@ -205,8 +205,8 @@ func _ready() -> void:
 	# the autoload owns the player-facing missing-archive and decryption UX at startup.
 	var archive_entries: int = 0
 	if not OS.has_feature("editor"):
-		if bool(ProjectSettings.get_setting("directstorage/export/bundle_dspkg", false)):
-			var archive_name := String(ProjectSettings.get_setting("directstorage/archive_name", "textures.dspkg"))
+		if bool(ProjectSettings.get_setting("dsgd_extension/bundle_dspkg", false)):
+			var archive_name := String(ProjectSettings.get_setting("dsgd_extension/archive_name", "textures.dspkg"))
 			if archive_name.is_empty():
 				archive_name = "textures.dspkg"
 			var exe_dir := OS.get_executable_path().get_base_dir()
@@ -246,7 +246,7 @@ func _ready() -> void:
 					# The native open() acquires the key from res://.dspkg/toc.key
 					# itself; the runtime never supplies one. The archive id comes
 					# from the export contract and rejects a mixed-export pairing.
-					var archive_id: int = int(ProjectSettings.get_setting("directstorage/export/archive_id", 0))
+					var archive_id: int = int(ProjectSettings.get_setting("dsgd_extension/archive_id", 0))
 					var open_err: Error = probe.call("open", candidate_path, archive_id)
 					if open_err != OK:
 						var reason := "archive_unreadable"
@@ -313,12 +313,12 @@ func _is_validate_mode(mode: String) -> bool:
 
 ## Archive mode reported by the sentinel: the validate argument when present
 ## (the gate states the mode it expects), otherwise what the export published
-## through `directstorage/export/protected`.
+## through `dsgd_extension/protected`.
 func _boot_mode() -> String:
 	var requested := _requested_validate_mode()
 	if not requested.is_empty():
 		return requested
-	if bool(ProjectSettings.get_setting("directstorage/export/protected", false)):
+	if bool(ProjectSettings.get_setting("dsgd_extension/protected", false)):
 		return BOOT_MODE_PROTECTED
 	return BOOT_MODE_UNPROTECTED
 
@@ -327,7 +327,7 @@ func _boot_mode() -> String:
 ## plaintext archive (no key is involved, and a source build's baked key is not
 ## part of the shipped contract).
 func _boot_key_id() -> String:
-	if not bool(ProjectSettings.get_setting("directstorage/export/protected", false)):
+	if not bool(ProjectSettings.get_setting("dsgd_extension/protected", false)):
 		return "none"
 	if not ClassDB.class_exists("DSPkg"):
 		return "none"

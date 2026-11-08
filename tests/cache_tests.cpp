@@ -82,7 +82,7 @@ GDEX_TEST_T(cache, disabled_cache_stores_nothing, TAG_INTEGRATION) {
         memdelete(cache);
     });
     // Drive the state explicitly: the ctor reads ProjectSettings
-    // (directstorage/texture_cache_enabled), which the test fixture does not
+    // (dsgd_extension/texture_cache_enabled), which the test fixture does not
     // set, so never assert the default — pin it instead.
     cache->set_enabled(false);
     cache->store("res://gdextest_cache_disabled_0", make_test_texture(1.0f));

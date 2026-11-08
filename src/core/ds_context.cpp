@@ -1,6 +1,7 @@
 #include "ds_context.h"
 #include "ds_error_handler.h"
 #include "ds_profiler.h"
+#include "ds_settings.h"
 #include "../platform/fallback/ds_fallback_backend.h"
 #ifdef _WIN32
 #include "../platform/win32/ds_win32_backend.h"
@@ -947,21 +948,21 @@ bool DSContext::initialize_ds_locked() {
 	// Load settings from ProjectSettings or set defaults
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (ps) {
-		if (ps->has_setting("directstorage/staging_buffer_size_mb")) {
-			Variant v = ps->get_setting("directstorage/staging_buffer_size_mb");
+		if (dsgd_settings::has_setting("staging_buffer_size_mb", "staging_buffer_size_mb")) {
+			Variant v = dsgd_settings::get_setting("staging_buffer_size_mb", "staging_buffer_size_mb");
 			uint32_t configured_size = static_cast<uint32_t>(v);
 			staging_buffer_size_mb.store(clamp_staging_buffer_size_mb(configured_size > 0 ? configured_size : DEFAULT_STAGING_BUFFER_SIZE_MB));
 		}
-		if (ps->has_setting("directstorage/disable_gpu_decompression")) {
-			disable_gpu_decompression.store(static_cast<bool>(ps->get_setting("directstorage/disable_gpu_decompression")));
+		if (dsgd_settings::has_setting("disable_gpu_decompression", "disable_gpu_decompression")) {
+			disable_gpu_decompression.store(static_cast<bool>(dsgd_settings::get_setting("disable_gpu_decompression", "disable_gpu_decompression")));
 		}
-		if (ps->has_setting("directstorage/queue_capacity")) {
-			Variant v = ps->get_setting("directstorage/queue_capacity");
+		if (dsgd_settings::has_setting("queue_capacity", "queue_capacity")) {
+			Variant v = dsgd_settings::get_setting("queue_capacity", "queue_capacity");
 			uint32_t configured_cap = static_cast<uint32_t>(v);
 			queue_capacity.store(clamp_queue_capacity(configured_cap > 0 ? configured_cap : DEFAULT_QUEUE_CAPACITY));
 		}
-		if (ps->has_setting("directstorage/auto_tune_for_integrated_gpu")) {
-			auto_tune_for_integrated_gpu.store(static_cast<bool>(ps->get_setting("directstorage/auto_tune_for_integrated_gpu")));
+		if (dsgd_settings::has_setting("auto_tune_for_integrated_gpu", "auto_tune_for_integrated_gpu")) {
+			auto_tune_for_integrated_gpu.store(static_cast<bool>(dsgd_settings::get_setting("auto_tune_for_integrated_gpu", "auto_tune_for_integrated_gpu")));
 		}
 	}
 
@@ -985,7 +986,7 @@ bool DSContext::initialize_ds_locked() {
 					"'): auto-tune clamped staging " + String::num_uint64(requested_staging) +
 					"->" + String::num_uint64(clamped_staging) + " MiB, queue " +
 					String::num_uint64(requested_queue) + "->" + String::num_uint64(clamped_queue) +
-					" (directstorage/auto_tune_for_integrated_gpu=true; set false to use configured values).");
+					" (dsgd_extension/auto_tune_for_integrated_gpu=true; set false to use configured values).");
 		}
 	}
 #endif

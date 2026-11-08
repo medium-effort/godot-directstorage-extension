@@ -2,6 +2,7 @@
 #include "ds_preloader.h"
 #include "ds_texture_owner.h"
 #include "../core/ds_context.h"
+#include "core/ds_settings.h"
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
@@ -351,12 +352,11 @@ DSTextureCache::DSTextureCache() {
 		singleton = this;
 	}
 
-	ProjectSettings *ps = ProjectSettings::get_singleton();
-	if (ps && ps->has_setting("directstorage/texture_cache_enabled")) {
-		enabled = ps->get_setting("directstorage/texture_cache_enabled");
+	if (dsgd_settings::has_setting("texture_cache_enabled", "texture_cache_enabled")) {
+		enabled = dsgd_settings::get_setting("texture_cache_enabled", "texture_cache_enabled");
 	}
-	if (ps && ps->has_setting("directstorage/texture_cache_max_entries")) {
-		max_entries = ps->get_setting("directstorage/texture_cache_max_entries");
+	if (dsgd_settings::has_setting("texture_cache_max_entries", "texture_cache_max_entries")) {
+		max_entries = dsgd_settings::get_setting("texture_cache_max_entries", "texture_cache_max_entries");
 		if (max_entries < 1) {
 			max_entries = 256;
 		}

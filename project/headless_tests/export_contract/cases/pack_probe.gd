@@ -23,10 +23,10 @@ func _init() -> void:
 	_magic_hex = _magic.hex_encode().to_utf8_buffer()
 
 	print("PACK_PROBE published bundle=%s protected=%s archive_id=%d archive_name=%s" % [
-		str(bool(ProjectSettings.get_setting("directstorage/export/bundle_dspkg", false))),
-		str(bool(ProjectSettings.get_setting("directstorage/export/protected", false))),
-		int(ProjectSettings.get_setting("directstorage/export/archive_id", 0)),
-		String(ProjectSettings.get_setting("directstorage/archive_name", "textures.dspkg")),
+		str(bool(ProjectSettings.get_setting("dsgd_extension/bundle_dspkg", false))),
+		str(bool(ProjectSettings.get_setting("dsgd_extension/protected", false))),
+		int(ProjectSettings.get_setting("dsgd_extension/archive_id", 0)),
+		String(ProjectSettings.get_setting("dsgd_extension/archive_name", "textures.dspkg")),
 	])
 	print("PACK_PROBE payload used=%s unused=%s trigger=%s" % [
 		str(FileAccess.file_exists("res://assets/used.dstex")),

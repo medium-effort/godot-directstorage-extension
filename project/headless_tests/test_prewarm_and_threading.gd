@@ -13,7 +13,7 @@ var cleanup_paths: Array[String] = []
 # "editor" build feature is set (ds_resource_format_loader.cpp:156), which is
 # true for every run launched from an editor binary - including all CLI test
 # runs. Staging an archive therefore requires opting in, and clearing it again.
-const FORCE_ARCHIVE_SETTING := "directstorage/force_archive_resolution"
+const FORCE_ARCHIVE_SETTING := "dsgd_extension/force_archive_resolution"
 var _force_archive_present := false
 var _force_archive_prev: Variant = null
 

@@ -10,11 +10,11 @@ config_version=5
 
 [application]
 
-config/name="DirectStorage Accelerator Demo"
-config/description="Microsoft DirectStorage NVMe I/O Acceleration Addon for Godot 4.7"
+config/name="dsgd Demo"
+config/description="NVMe asset streaming and GPU texture decompression for Godot 4.7, built on the Microsoft DirectStorage API."
 run/main_scene="uid://c80am0p1q2r3s"
 config/features=PackedStringArray("4.7")
-config/icon="res://addons/directstorage_accelerator/icons/DirectStorage.svg"
+config/icon="res://addons/directstorage_accelerator/icons/dsgd.svg"
 config/author="MediumEffort"
 
 [autoload]

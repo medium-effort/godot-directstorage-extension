@@ -124,8 +124,8 @@ func _initialize() -> void:
 	print("[BenchIO] fixture=", fixture, " file_size=", file_size,
 		" pattern=", pattern, " request_bytes=", request_size,
 		" batch=", batch, " iterations=", iterations, " total_bytes=", total_bytes,
-		" staging_mb=", ProjectSettings.get_setting("directstorage/staging_buffer_size_mb", -1),
-		" queue_capacity=", ProjectSettings.get_setting("directstorage/queue_capacity", -1))
+		" staging_mb=", ProjectSettings.get_setting("dsgd_extension/staging_buffer_size_mb", -1),
+		" queue_capacity=", ProjectSettings.get_setting("dsgd_extension/queue_capacity", -1))
 
 	for iteration in iterations:
 		# Same seed for every pass: pass 1 must re-read exactly the blocks pass 0
@@ -300,7 +300,7 @@ func _run_gpu(ctx: Variant, args: Dictionary) -> void:
 	var order := _make_order(count, int(args.get("seed", 123456789)))
 	print("[BenchIO] destination=gpu-texture textures=", count, " texture_bytes=", logical_bytes,
 		" file_bytes=", file_bytes, " batch=", batch, " iterations=", iterations,
-		" staging_mb=", ProjectSettings.get_setting("directstorage/staging_buffer_size_mb", -1))
+		" staging_mb=", ProjectSettings.get_setting("dsgd_extension/staging_buffer_size_mb", -1))
 
 	for iteration in iterations:
 		var pass_result := _run_gpu_pass(ctx, files, file_sizes, textures, order, batch, size,

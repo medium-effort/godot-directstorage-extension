@@ -126,7 +126,7 @@ func _preconditions() -> bool:
 		_fail("DSTextureCache singleton unavailable")
 		return false
 	if cache.has_method("is_enabled") and not bool(cache.is_enabled()):
-		_fail("DSTextureCache is disabled (directstorage/texture_cache_enabled=false)")
+		_fail("DSTextureCache is disabled (dsgd_extension/texture_cache_enabled=false)")
 		return false
 	if PreloaderScript._has_stream_pump() == false:
 		_fail("no stream pump node; prewarm refuses to start")

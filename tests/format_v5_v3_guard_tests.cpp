@@ -502,7 +502,7 @@ godot::String scratch_path(const char *p_name) {
 }
 struct ProtectedSettingGuard {
 	godot::ProjectSettings *settings = nullptr;
-	godot::String name = "directstorage/export/protected";
+	godot::String name = "dsgd_extension/protected";
 	bool had = false;
 	godot::Variant previous;
 

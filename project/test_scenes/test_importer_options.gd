@@ -9,7 +9,7 @@ extends Node
 ## The scene quits itself with 0 (pass) or 1 (fail). It uses the importer's
 ## public EditorImportPlugin surface and writes fixtures under user://.
 
-const PROFILE_SETTING := "directstorage/import/default_profile"
+const PROFILE_SETTING := "dsgd_extension/default_import_profile"
 const TMP_DIR := "user://importer_parity_test"
 
 var _failures := 0

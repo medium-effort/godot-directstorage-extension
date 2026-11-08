@@ -32,9 +32,9 @@ var _policy: GDScript = _load_policy()
 ## via the .gdextension [libraries] / [dependencies] mappings — no manual
 ## DLL relocation is performed by this plugin.
 
-const OPTION_BUNDLE_DSPKG: StringName = &"directstorage/bundle_textures_dspkg"
-const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"directstorage/enforce_archive_pairing"
-const OPTION_STEAMPIPE_1MB_ALIGNMENT: StringName = &"directstorage/steampipe_1mb_alignment"
+const OPTION_BUNDLE_DSPKG: StringName = &"dsgd_extension/bundle_textures_dspkg"
+const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"dsgd_extension/enforce_archive_pairing"
+const OPTION_STEAMPIPE_1MB_ALIGNMENT: StringName = &"dsgd_extension/steampipe_1mb_alignment"
 
 ## The archive key is delivered inside the encrypted PCK at this virtual path.
 ## The file never exists on disk: it is a 48-byte add_file() entry only.
@@ -98,7 +98,7 @@ var _archive_name: String = "textures.dspkg"
 
 ## Returns the stable export plugin name shown to Godot.
 func _get_name() -> String:
-	return "DirectStorageExporter"
+	return "dsgd Extension"
 
 ## Declares whether this export plugin supports the target platform.
 func _supports_platform(platform: EditorExportPlatform) -> bool:
@@ -196,7 +196,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_archive_key = PackedByteArray()
 	_archive_id = 0
 
-	_archive_name = String(ProjectSettings.get_setting("directstorage/archive_name", "textures.dspkg"))
+	_archive_name = String(ProjectSettings.get_setting("dsgd_extension/archive_name", "textures.dspkg"))
 	if _archive_name.is_empty():
 		_archive_name = "textures.dspkg"
 
@@ -407,14 +407,14 @@ func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
 ## Single writer for the four values the shipped game reads from
 ## `project.binary` and the runtime sentinel reports.
 func _publish_contract() -> void:
-	ProjectSettings.set_setting("directstorage/export/bundle_dspkg", _expect_archive)
-	ProjectSettings.set_as_internal("directstorage/export/bundle_dspkg", true)
-	ProjectSettings.set_setting("directstorage/export/archive_id", _archive_id)
-	ProjectSettings.set_as_internal("directstorage/export/archive_id", true)
-	ProjectSettings.set_setting("directstorage/export/protected", _outcome == _policy.OUTCOME_PROTECTED or _outcome == _policy.OUTCOME_FAILED)
-	ProjectSettings.set_as_internal("directstorage/export/protected", true)
-	ProjectSettings.set_setting("directstorage/archive_name", _archive_name)
-	ProjectSettings.set_as_internal("directstorage/archive_name", true)
+	ProjectSettings.set_setting("dsgd_extension/bundle_dspkg", _expect_archive)
+	ProjectSettings.set_as_internal("dsgd_extension/bundle_dspkg", true)
+	ProjectSettings.set_setting("dsgd_extension/archive_id", _archive_id)
+	ProjectSettings.set_as_internal("dsgd_extension/archive_id", true)
+	ProjectSettings.set_setting("dsgd_extension/protected", _outcome == _policy.OUTCOME_PROTECTED or _outcome == _policy.OUTCOME_FAILED)
+	ProjectSettings.set_as_internal("dsgd_extension/protected", true)
+	ProjectSettings.set_setting("dsgd_extension/archive_name", _archive_name)
+	ProjectSettings.set_as_internal("dsgd_extension/archive_name", true)
 
 ## Marks the archive as failed and keeps the published contract honest.
 ##

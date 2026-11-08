@@ -532,18 +532,18 @@ GDEX_TEST_T(win32_remediation, med07_submit_batch_sync_bounded_wait, TAG_INTEGRA
 
     godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
     if (ps) {
-        bool had_setting = ps->has_setting("directstorage/sync_flush_timeout_ms");
-        godot::Variant prev_val = had_setting ? ps->get_setting("directstorage/sync_flush_timeout_ms") : godot::Variant();
+        bool had_setting = ps->has_setting("dsgd_extension/sync_flush_timeout_ms");
+        godot::Variant prev_val = had_setting ? ps->get_setting("dsgd_extension/sync_flush_timeout_ms") : godot::Variant();
         ctx.add_teardown([ps, had_setting, prev_val]() {
             if (ps) {
                 if (had_setting) {
-                    ps->set_setting("directstorage/sync_flush_timeout_ms", prev_val);
+                    ps->set_setting("dsgd_extension/sync_flush_timeout_ms", prev_val);
                 } else {
-                    ps->clear("directstorage/sync_flush_timeout_ms");
+                    ps->clear("dsgd_extension/sync_flush_timeout_ms");
                 }
             }
         });
-        ps->set_setting("directstorage/sync_flush_timeout_ms", 500);
+        ps->set_setting("dsgd_extension/sync_flush_timeout_ms", 500);
     }
 
     auto start = std::chrono::steady_clock::now();

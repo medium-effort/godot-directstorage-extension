@@ -1,5 +1,6 @@
 #include "ds_preloader.h"
 #include "ds_texture_cache.h"
+#include "core/ds_settings.h"
 #include "../core/ds_context.h"
 #include "../core/ds_request.h"
 #include "../formats/dspkg_format.h"
@@ -68,8 +69,8 @@ String DSPreloader::resolve_archive_path() {
 	OS *os = OS::get_singleton();
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 
-	bool force_resolution = ps && ps->has_setting("directstorage/force_archive_resolution") &&
-			static_cast<bool>(ps->get_setting("directstorage/force_archive_resolution"));
+	bool force_resolution = dsgd_settings::has_setting("force_archive_resolution", "force_archive_resolution") &&
+			static_cast<bool>(dsgd_settings::get_setting("force_archive_resolution", "force_archive_resolution"));
 
 	if (!force_resolution && ((engine && engine->is_editor_hint()) || (os && os->has_feature("editor")))) {
 		return String();
@@ -84,8 +85,8 @@ String DSPreloader::resolve_archive_path() {
 	}
 
 	String archive_filename = "textures.dspkg";
-	if (ps && ps->has_setting("directstorage/archive_name")) {
-		String custom_name = ps->get_setting("directstorage/archive_name");
+	if (dsgd_settings::has_setting("archive_name", "archive_name")) {
+		String custom_name = dsgd_settings::get_setting("archive_name", "archive_name");
 		if (!custom_name.is_empty()) {
 			archive_filename = custom_name;
 		}
@@ -170,9 +171,8 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 			// 0 means the archive is unpaired; pairing is the random archive id,
 			// compared in full 64-bit width when the expected value is non-zero.
 			uint64_t expected_fingerprint = 0;
-			ProjectSettings *ps = ProjectSettings::get_singleton();
-			if (ps && ps->has_setting("directstorage/export/archive_id")) {
-				expected_fingerprint = static_cast<uint64_t>(ps->get_setting("directstorage/export/archive_id"));
+			if (dsgd_settings::has_setting("archive_id", "export/archive_id")) {
+				expected_fingerprint = static_cast<uint64_t>(dsgd_settings::get_setting("archive_id", "export/archive_id"));
 			}
 			Error open_err = fresh->open(archive_path, expected_fingerprint);
 			if (open_err != OK) {
@@ -1133,7 +1133,7 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 	bool prefer_gpu = p_prefer_gpu;
 	if (prefer_gpu && ctx->get_auto_tune_for_integrated_gpu() && ctx->is_integrated_gpu()) {
 		prefer_gpu = false;
-		UtilityFunctions::print("[DirectStorage] Integrated/UMA GPU detected: prewarm_gpu_async auto-routed to System RAM prewarm to eliminate loading screen hitches (directstorage/auto_tune_for_integrated_gpu=true).");
+		UtilityFunctions::print("[DirectStorage] Integrated/UMA GPU detected: prewarm_gpu_async auto-routed to System RAM prewarm to eliminate loading screen hitches (dsgd_extension/auto_tune_for_integrated_gpu=true).");
 	}
 	const bool gpu_ok = prefer_gpu && is_gpu_prewarm_available();
 	const int chunk_size = p_chunk_size > 0 ? p_chunk_size : 16;

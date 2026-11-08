@@ -22,6 +22,8 @@
 #include <godot_cpp/core/defs.hpp>
 #include <godot_cpp/godot.hpp>
 
+#include "core/ds_settings.h"
+
 #ifdef _WIN32
 #include "platform/win32/ds_win32_backend.h"
 #endif
@@ -40,6 +42,10 @@ static void register_directstorage_project_settings() {
 		return;
 	}
 
+	// Migrate the pre-rename "directstorage/*" keys first: registering defaults
+	// beforehand would occupy the new key and mask the user's legacy value.
+	dsgd_settings::migrate_all();
+
 	auto register_setting = [ps](const StringName &p_name, Variant::Type p_type, const Variant &p_default, PropertyHint p_hint, const String &p_hint_string) {
 		if (!ps->has_setting(p_name)) {
 			ps->set_setting(p_name, p_default);
@@ -56,12 +62,12 @@ static void register_directstorage_project_settings() {
 		ps->set_as_basic(p_name, true);
 	};
 
-	register_setting("directstorage/staging_buffer_size_mb", Variant::INT, 128, PROPERTY_HINT_RANGE, "16,2048,16");
-	register_setting("directstorage/disable_gpu_decompression", Variant::BOOL, false, PROPERTY_HINT_NONE, "");
-	register_setting("directstorage/queue_capacity", Variant::INT, 512, PROPERTY_HINT_RANGE, "128,8192,64");
-	register_setting("directstorage/auto_tune_for_integrated_gpu", Variant::BOOL, true, PROPERTY_HINT_NONE, "");
-	register_setting("directstorage/texture_cache_enabled", Variant::BOOL, true, PROPERTY_HINT_NONE, "");
-	register_setting("directstorage/texture_cache_max_entries", Variant::INT, 128, PROPERTY_HINT_RANGE, "16,2048,16");
+	register_setting(dsgd_settings::key("staging_buffer_size_mb"), Variant::INT, 128, PROPERTY_HINT_RANGE, "16,2048,16");
+	register_setting(dsgd_settings::key("disable_gpu_decompression"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
+	register_setting(dsgd_settings::key("queue_capacity"), Variant::INT, 512, PROPERTY_HINT_RANGE, "128,8192,64");
+	register_setting(dsgd_settings::key("auto_tune_for_integrated_gpu"), Variant::BOOL, true, PROPERTY_HINT_NONE, "");
+	register_setting(dsgd_settings::key("texture_cache_enabled"), Variant::BOOL, true, PROPERTY_HINT_NONE, "");
+	register_setting(dsgd_settings::key("texture_cache_max_entries"), Variant::INT, 128, PROPERTY_HINT_RANGE, "16,2048,16");
 }
 
 void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_level) {

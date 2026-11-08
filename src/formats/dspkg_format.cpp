@@ -1,5 +1,6 @@
 #include "dspkg_format.h"
 #include "dstex_format.h"
+#include "core/ds_settings.h"
 #include "gen/dspkg_encryption_key.h"
 #include "monocypher.h"
 #include <godot_cpp/classes/dir_access.hpp>
@@ -1630,16 +1631,15 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 	}
 
 	// The encryption requirement comes from the build, never from the file. A
-	// protected export publishes directstorage/export/protected into its own
+	// protected export publishes dsgd_extension/protected into its own
 	// settings, and the header flag that would otherwise decide whether the TOC
 	// is authenticated is attacker-controlled: reading it alone lets a plaintext
 	// archive with a copied archive id open in a build that advertises an
 	// authenticated TOC. Source and editor builds never publish the setting, so
 	// they keep accepting plaintext archives.
 	bool require_encrypted_toc = false;
-	const ProjectSettings *ps = ProjectSettings::get_singleton();
-	if (ps != nullptr && ps->has_setting("directstorage/export/protected")) {
-		require_encrypted_toc = static_cast<bool>(ps->get_setting("directstorage/export/protected"));
+	if (dsgd_settings::has_setting("protected", "export/protected")) {
+		require_encrypted_toc = static_cast<bool>(dsgd_settings::get_setting("protected", "export/protected"));
 	}
 	if (require_encrypted_toc && !is_encrypted) {
 		// A v4/v5 header that simply cleared the flag is a downgrade; anything

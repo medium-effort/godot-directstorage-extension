@@ -2,6 +2,7 @@
 #include "../../core/ds_context.h"
 #include "../../core/ds_error_handler.h"
 #include "../../core/ds_profiler.h"
+#include "core/ds_settings.h"
 #include "../../formats/dstex_format.h"
 #include "../../formats/dspkg_format.h"
 
@@ -576,9 +577,8 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 			// 0 means the archive is unpaired; pairing is the random archive id,
 			// compared in full 64-bit width when the expected value is non-zero.
 			uint64_t expected_fingerprint = 0;
-			ProjectSettings *ps = ProjectSettings::get_singleton();
-			if (ps && ps->has_setting("directstorage/export/archive_id")) {
-				expected_fingerprint = static_cast<uint64_t>(ps->get_setting("directstorage/export/archive_id"));
+			if (dsgd_settings::has_setting("archive_id", "export/archive_id")) {
+				expected_fingerprint = static_cast<uint64_t>(dsgd_settings::get_setting("archive_id", "export/archive_id"));
 			}
 			Error open_err = (fresh.is_valid()) ? fresh->open(resolved_path, expected_fingerprint) : ERR_CANT_CREATE;
 			if (open_err != OK) {
@@ -3490,10 +3490,9 @@ void Win32Backend::shutdown() {
 
 	// 2. Drain all GPU DMA work across all priority queues concurrently BEFORE
 	// stopping the completion thread or touching any file handles or resource guards.
-	ProjectSettings *ps = ProjectSettings::get_singleton();
 	uint32_t timeout_ms = 10000;
-	if (ps && ps->has_setting("directstorage/shutdown_drain_timeout_ms")) {
-		timeout_ms = static_cast<uint32_t>(MAX(100, int64_t(ps->get_setting("directstorage/shutdown_drain_timeout_ms"))));
+	if (dsgd_settings::has_setting("shutdown_drain_timeout_ms", "shutdown_drain_timeout_ms")) {
+		timeout_ms = static_cast<uint32_t>(MAX(100, int64_t(dsgd_settings::get_setting("shutdown_drain_timeout_ms", "shutdown_drain_timeout_ms"))));
 	}
 	bool drained = drain_all_queues(timeout_ms);
 	last_shutdown_drained.store(drained);
@@ -4127,7 +4126,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			if (staging_size > 0 && (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size ||
 					mip_entry.offset > UINT64_MAX - mip_entry.compressed_size)) {
 				p_request->set_status(DSRequest::STATUS_FAILED);
-				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
+				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
 				return false;
 			}
 		}
@@ -4194,7 +4193,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource];
 		if (staging_size > 0 && (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size)) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
+			p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
 			return false;
 		}
 
@@ -4256,7 +4255,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		bool use_dstex_chunks = get_dstex_mip_chunks(p_request->get_file_path(), p_request->get_offset(), src_size, chunk_capacity, dstex_chunks);
 		if (!use_dstex_chunks) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
+			p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
 			return false;
 		}
 		uint64_t chunk_count = dstex_chunks.size();
@@ -4270,7 +4269,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			uint64_t destination_end = boundary.destination_offset + boundary.destination_size;
 			if (src_end <= src_begin || destination_end <= destination_begin || src_end - src_begin > chunk_capacity || destination_end - destination_begin > chunk_capacity) {
 				p_request->set_status(DSRequest::STATUS_FAILED);
-				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase directstorage/staging_buffer_size_mb");
+				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
 				return false;
 			}
 		}
@@ -4612,10 +4611,9 @@ void Win32Backend::submit_batch() {
 		return;
 	}
 	int submit_slot_index = -1;
-	ProjectSettings *ps = ProjectSettings::get_singleton();
 	uint32_t sync_timeout_ms = 3000;
-	if (ps && ps->has_setting("directstorage/sync_flush_timeout_ms")) {
-		sync_timeout_ms = static_cast<uint32_t>(std::clamp<int64_t>(int64_t(ps->get_setting("directstorage/sync_flush_timeout_ms")), 500, 10000));
+	if (dsgd_settings::has_setting("sync_flush_timeout_ms", "sync_flush_timeout_ms")) {
+		sync_timeout_ms = static_cast<uint32_t>(std::clamp<int64_t>(int64_t(dsgd_settings::get_setting("sync_flush_timeout_ms", "sync_flush_timeout_ms")), 500, 10000));
 	}
 	uint32_t half_timeout_ms = sync_timeout_ms / 2;
 	auto sync_start_time = std::chrono::steady_clock::now();
@@ -5071,7 +5069,7 @@ void Win32Backend::_debug_zombify_active_batch_for_testing() {
 	// submit_batch()): the active slot's in-flight requests are moved out of the
 	// slot into zombie_slots with their fence value intact, and the slot is reset.
 	// The real branch needs a DMA >500 ms stall, which
-	// directstorage/sync_flush_timeout_ms cannot produce on demand (it is clamped
+	// dsgd_extension/sync_flush_timeout_ms cannot produce on demand (it is clamped
 	// to [500, 10000]). Never bound in _bind_methods().
 	std::lock_guard<std::mutex> lock(batch_mutex);
 	for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {

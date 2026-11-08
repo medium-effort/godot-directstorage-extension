@@ -61,7 +61,7 @@ private:
 	// untouched; set false to use configured values verbatim.
 	std::atomic<bool> auto_tune_for_integrated_gpu{ true };
 	// Must match the ProjectSetting default registered in register_types.cpp
-	// ("directstorage/queue_capacity" = 512); the setting wins at init,
+	// ("dsgd_extension/queue_capacity" = 512); the setting wins at init,
 	// this is only the no-setting fallback.
 	std::atomic<uint16_t> queue_capacity{ 512 };
 

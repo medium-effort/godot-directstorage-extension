@@ -497,11 +497,11 @@ GDEX_TEST_T(loader, npot_v3_archived_entry_carries_logical_dimensions, TAG_INTEG
 	// The archived texture loads at its logical dims through the real path.
 	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
 	if (ps) {
-		ps->set_setting("directstorage/force_archive_resolution", true);
+		ps->set_setting("dsgd_extension/force_archive_resolution", true);
 	}
 	ctx.add_teardown([ps]() {
 		if (ps) {
-			ps->set_setting("directstorage/force_archive_resolution", false);
+			ps->set_setting("dsgd_extension/force_archive_resolution", false);
 		}
 	});
 
@@ -638,11 +638,11 @@ GDEX_TEST_T(loader, virtual_dspkg_path_resolves_through_archive, TAG_INTEGRATION
 	// In gdextest (--editor), override editor bypass to verify archive resolution path.
 	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
 	if (ps) {
-		ps->set_setting("directstorage/force_archive_resolution", true);
+		ps->set_setting("dsgd_extension/force_archive_resolution", true);
 	}
 	ctx.add_teardown([ps]() {
 		if (ps) {
-			ps->set_setting("directstorage/force_archive_resolution", false);
+			ps->set_setting("dsgd_extension/force_archive_resolution", false);
 		}
 	});
 
@@ -689,7 +689,7 @@ GDEX_TEST_T(loader, editor_mode_unconditionally_bypasses_dspkg, TAG_INTEGRATION)
 	// Ensure force_archive_resolution is explicitly false (default behavior).
 	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
 	if (ps) {
-		ps->set_setting("directstorage/force_archive_resolution", false);
+		ps->set_setting("dsgd_extension/force_archive_resolution", false);
 	}
 
 	godot::Ref<godot::DSResourceFormatLoader> loader;
@@ -731,11 +731,11 @@ GDEX_TEST_T(loader, embedded_pck_detection_warning, TAG_INTEGRATION) {
 
 	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
 	if (ps) {
-		ps->set_setting("directstorage/force_archive_resolution", true);
+		ps->set_setting("dsgd_extension/force_archive_resolution", true);
 	}
 	ctx.add_teardown([ps]() {
 		if (ps) {
-			ps->set_setting("directstorage/force_archive_resolution", false);
+			ps->set_setting("dsgd_extension/force_archive_resolution", false);
 		}
 	});
 
@@ -764,7 +764,7 @@ GDEX_TEST_T(loader, embedded_pck_detection_warning, TAG_INTEGRATION) {
 				" probe_open=", static_cast<int64_t>(probe_err),
 				" entries=", probe->get_entry_count(),
 				" has_texture=", probe->has_texture(res_path),
-				" force=", ps ? static_cast<bool>(ps->get_setting("directstorage/force_archive_resolution")) : false,
+				" force=", ps ? static_cast<bool>(ps->get_setting("dsgd_extension/force_archive_resolution")) : false,
 				" editor=", engine ? engine->is_editor_hint() : false);
 	}
 	GDEX_EXPECT_TRUE(staged_resolves);
@@ -804,11 +804,11 @@ GDEX_TEST_T(loader, archive_replacement_after_load_is_observed, TAG_INTEGRATION)
 
 	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
 	if (ps) {
-		ps->set_setting("directstorage/force_archive_resolution", true);
+		ps->set_setting("dsgd_extension/force_archive_resolution", true);
 	}
 	ctx.add_teardown([ps]() {
 		if (ps) {
-			ps->set_setting("directstorage/force_archive_resolution", false);
+			ps->set_setting("dsgd_extension/force_archive_resolution", false);
 		}
 	});
 
@@ -899,11 +899,11 @@ GDEX_TEST_T(loader, dspkg_resource_instance_isolated_from_loader_cache, TAG_INTE
 	// In gdextest (--editor), override editor bypass so the archive resolves.
 	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
 	if (ps) {
-		ps->set_setting("directstorage/force_archive_resolution", true);
+		ps->set_setting("dsgd_extension/force_archive_resolution", true);
 	}
 	ctx.add_teardown([ps]() {
 		if (ps) {
-			ps->set_setting("directstorage/force_archive_resolution", false);
+			ps->set_setting("dsgd_extension/force_archive_resolution", false);
 		}
 	});
 

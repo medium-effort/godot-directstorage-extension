@@ -7,7 +7,7 @@ static var _staging_warnings: Dictionary = {}
 const D3D12_TEXTURE_DATA_PITCH_ALIGNMENT := 256
 const DSTEX_MAX_DIMENSION := 16384
 
-const IMPORT_PROFILE_SETTING := "directstorage/import/default_profile"
+const IMPORT_PROFILE_SETTING := "dsgd_extension/default_import_profile"
 const PROFILE_3D := 0
 const PROFILE_2D := 1
 const PRESET_PROJECT_DEFAULT := 0
@@ -59,7 +59,7 @@ const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "c
 ## - [b]process/fix_alpha_border[/b], [b]process/premult_alpha[/b]: 2D alpha fixes.
 ## - [b]compatibility/as_image_texture[/b]: Force the CPU ImageTexture path.
 ##
-## Presets: "Project Default" follows directstorage/import/default_profile;
+## Presets: "Project Default" follows dsgd_extension/default_import_profile;
 ## "3D (Streaming)" is the product default; "CPU / ImageTexture (2D, UI, Decals)"
 ## keeps UI and sprite assets on the CPU path.
 
@@ -492,7 +492,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	var mip_count: int = (img.get_mipmap_count() + 1) if img.has_mipmaps() else 1
 	raw_data = _pad_texture_data(raw_data, width, height, format, mip_count)
 	var gdeflate_level: int = int(options.get("compression/gdeflate_level", options.get("compression/level", 1)))
-	var configured_staging_mb: float = float(ProjectSettings.get_setting("directstorage/staging_buffer_size_mb", 128.0))
+	var configured_staging_mb: float = float(ProjectSettings.get_setting("dsgd_extension/staging_buffer_size_mb", 128.0))
 	var staging_mb: float = configured_staging_mb if configured_staging_mb > 0.0 else 128.0
 	if raw_data.size() > int(staging_mb * 1024.0 * 1024.0) and not _staging_warnings.has(source_file):
 		_staging_warnings[source_file] = true
