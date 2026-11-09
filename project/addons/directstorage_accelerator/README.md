@@ -29,6 +29,8 @@ The runtime is Microsoft-licensed and is not bundled or re-licensed by this addo
 
 When running on Windows with a Direct3D 12 `RenderingDevice` (`--rendering-driver d3d12`), DirectStorage decompresses GDeflate mip streams directly into GPU VRAM as `Texture2DRD` resources via compute shaders. If GPU decompression is disabled, unsupported, or if legacy version 1 assets are loaded, the system automatically falls back to multi-threaded CPU software decompression (`ImageTexture`).
 
+*Custom Godot Engine builds:* Direct GPU decompression requires Godot compiled with the D3D12 driver enabled (`d3d12=yes`). If you build Godot from source or strip modules for size, see the custom engine build guide (`docs/custom-godot-builds.md`) for required SCons flags and module guardrails.
+
 The file I/O mode is chosen from the volume that holds the assets. NTFS volumes on NVMe, SATA, or ATA buses use DirectStorage's default unbuffered path (BypassIO when the OS and drivers allow it). Rotational volumes automatically switch to buffered file I/O with `ForceFileBuffering` and BypassIO disabled, so the Windows cache and read-ahead are used; this is the supported configuration for hard drives. The choice is process-wide and is taken from the volume passed to `initialize_ds_for_path()`, or from `res://` for default startup. Initialize DirectStorage before querying capabilities; a capability probe that runs first fixes the I/O mode from `res://`.
 
 ## Runtime API

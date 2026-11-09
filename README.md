@@ -206,7 +206,7 @@ The extension is built with SCons against the vendored SDKs, so there is no pack
 | MSVC C++ toolset | Visual Studio 2022 or 2026 **Build Tools** with the “Desktop development with C++” workload (MSVC 14.50 verified). Only the C++ toolset and the Windows SDK are needed — the IDE is not. |
 | Windows SDK | A 10.x SDK providing D3D12 and DXGI (`d3d12.h`, `dxgi.lib`; `dxgi.h` lives in the SDK’s `shared` include directory). 10.0.26100 verified. |
 | Git | Required: submodules, plus the commit stamp written into `build_manifest.json`. |
-| Godot (tests and export only) | 4.7.2-stable **console** executable, pointed at by `GODOT_CONSOLE_PATH` in `.env`. The `.gdextension` manifest declares `compatibility_minimum = "4.3"`. |
+| Godot (tests and export only) | 4.7.2-stable **console** executable, pointed at by `GODOT_CONSOLE_PATH` in `.env`. The `.gdextension` manifest declares `compatibility_minimum = "4.3"`. For custom engine builds or building from source, D3D12 must be enabled (`d3d12=yes`); see [`docs/custom-godot-builds.md`](docs/custom-godot-builds.md). |
 
 Vendored and already in the repository — nothing to download or install:
 

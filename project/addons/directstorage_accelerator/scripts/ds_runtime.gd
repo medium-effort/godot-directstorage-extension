@@ -1,6 +1,6 @@
 extends Node
 
-const RUNTIME_INSTALLER_SCRIPT = preload("res://addons/directstorage_accelerator/scripts/ds_runtime_installer.gd")
+const RUNTIME_INSTALLER_PATH: String = "res://addons/directstorage_accelerator/scripts/ds_runtime_installer.gd"
 
 ## Shared completion predicate. A tracked prewarm tag is only finished once its
 ## request stream is terminal AND every completed texture has been built into
@@ -183,7 +183,10 @@ func _ready() -> void:
 	if ClassDB.class_exists("DSContext"):
 		# Apply a staged runtime before the first DirectStorage call. No-op
 		# outside the editor and when nothing is pending.
-		RUNTIME_INSTALLER_SCRIPT.apply_pending()
+		if OS.has_feature("editor") and ResourceLoader.exists(RUNTIME_INSTALLER_PATH):
+			var installer: Script = load(RUNTIME_INSTALLER_PATH)
+			if installer and installer.has_method("apply_pending"):
+				installer.apply_pending()
 		var ctx = Engine.get_singleton("DSContext")
 		if ctx:
 			ctx.initialize_ds()
