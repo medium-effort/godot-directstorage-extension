@@ -47,10 +47,16 @@ scons platform=windows target=template_release \
 ```
 
 ### Module Breakdown
-* **`module_zip_enabled=yes` (`minizip=yes`)**: Required by the in-editor DirectStorage Runtime Manager to inspect and extract official Microsoft NuGet `.nupkg` packages (`ZIPReader`).
+* **`module_zip_enabled=yes`**: Required by the in-editor DirectStorage Runtime Manager to inspect and extract official Microsoft NuGet `.nupkg` packages (`ZIPReader`). The module's `minizip` option (global, default `yes`) must not be turned off either, but note that `minizip=yes` alone does **not** restore the module once `module_zip_enabled=no` is in effect.
 * **`module_mbedtls_enabled=yes`**: Backs Godot's `Crypto` class (used by the export plugin to generate random archive encryption keys) and powers TLS/HTTPS in `HTTPRequest` for package downloads.
 * **`module_betsy_enabled=yes` & `module_etcpak_enabled=yes`**: Implements S3TC/BC texture compression in `Image.compress()` during `.dstex` import. If disabled, the importer cannot compress textures into VRAM block formats and falls back to uncompressed VRAM.
 * **`module_webp_enabled=yes` (and `module_jpg_enabled=yes`)**: Required if importing `.webp` or `.jpg` source images into `.dstex`.
+
+### Core Classes Are Not Optional
+
+`JSON`, `HashingContext`, `Image`/`ImageTexture` and `FileAccess` live in `core/` and are compiled unconditionally. The addon's JSON use (runtime version manifest, `.pending.json`, migration manifests) therefore needs no build flag, and `modules_enabled_by_default=no` cannot remove it: a build without `JSON` would fail to parse the autoload, so there is nothing for the addon to guard at runtime.
+
+Only `JSONRPC` is a module (`module_jsonrpc_enabled`), and the addon does not use it.
 
 ---
 

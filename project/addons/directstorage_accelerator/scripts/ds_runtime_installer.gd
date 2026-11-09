@@ -133,7 +133,7 @@ func install(version: String) -> void:
 		_finish(version, ERR_UNAUTHORIZED, "DirectStorage runtime installation is editor-only.")
 		return
 	if not ClassDB.class_exists("ZIPReader"):
-		_finish(version, ERR_UNAVAILABLE, "ZIP archive support is not available in this Godot build (module_zip_enabled=no). Compile Godot with minizip=yes.")
+		_finish(version, ERR_UNAVAILABLE, "ZIP archive support is not available in this Godot build (module_zip_enabled=no). Compile Godot with module_zip_enabled=yes.")
 		return
 	var versions := get_versions()
 	if not versions.has(version):
@@ -352,7 +352,7 @@ func _on_download_completed(result: int, response_code: int, _headers: PackedStr
 	# LICENSE.txt from the verified package, not a copy bundled in the addon.
 	if not ClassDB.class_exists("ZIPReader"):
 		_remove_download(nupkg)
-		_finish(version, ERR_UNAVAILABLE, "ZIP archive support is not available in this Godot build (module_zip_enabled=no). Compile Godot with minizip=yes.")
+		_finish(version, ERR_UNAVAILABLE, "ZIP archive support is not available in this Godot build (module_zip_enabled=no). Compile Godot with module_zip_enabled=yes.")
 		return
 	var zip := ZIPReader.new()
 	if zip.open(nupkg) != OK:
