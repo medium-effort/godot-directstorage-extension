@@ -35,6 +35,11 @@ var _policy: GDScript = _load_policy()
 const OPTION_BUNDLE_DSPKG: StringName = &"dsgd_extension/bundle_textures_dspkg"
 const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"dsgd_extension/enforce_archive_pairing"
 const OPTION_STEAMPIPE_1MB_ALIGNMENT: StringName = &"dsgd_extension/steampipe_1mb_alignment"
+const OPTION_INCLUDE_THIRD_PARTY_NOTICES: StringName = &"dsgd_extension/include_third_party_notices"
+
+## Binary distributions ship the notice next to the executable.
+const THIRD_PARTY_NOTICES_SOURCE: String = "res://addons/directstorage_accelerator/THIRD_PARTY_NOTICES.txt"
+const THIRD_PARTY_NOTICES_EXPORT_NAME: String = "dsgd_THIRD_PARTY_NOTICES.txt"
 
 ## The archive key is delivered inside the encrypted PCK at this virtual path.
 ## The file never exists on disk: it is a 48-byte add_file() entry only.
@@ -92,6 +97,7 @@ var _is_debug_export: bool = false
 var _bundle_dspkg_enabled: bool = false
 var _enforce_pairing_enabled: bool = true
 var _steampipe_1mb_alignment_enabled: bool = false
+var _include_third_party_notices: bool = true
 var _archive_key: PackedByteArray = PackedByteArray()
 var _archive_id: int = 0
 var _archive_name: String = "textures.dspkg"
@@ -142,6 +148,16 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 				"usage": PROPERTY_USAGE_DEFAULT
 			},
 			"default_value": false,
+		},
+		{
+			"option": {
+				"name": OPTION_INCLUDE_THIRD_PARTY_NOTICES,
+				"type": TYPE_BOOL,
+				"hint": PROPERTY_HINT_NONE,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT
+			},
+			"default_value": true,
 		}
 	]
 
@@ -182,6 +198,10 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
+	var notices_option: Variant = get_option(OPTION_INCLUDE_THIRD_PARTY_NOTICES)
+	# A preset created before this option existed has no key and returns nil;
+	# treat that as the default (on) instead of silently disabling the notice.
+	_include_third_party_notices = true if notices_option == null else bool(notices_option)
 
 	_archive_entries.clear()
 	_skipped_payloads = 0
@@ -521,6 +541,7 @@ func _resolve_dstex_path(path: String) -> String:
 ## log but the remaining core steps still run outside this plugin's control.
 ## Native DLLs (dsgd_64, dstorage) are exported flat by Godot itself.
 func _export_end() -> void:
+	_deploy_third_party_notices()
 	var dspkg_ok := true
 	if _archive_failed:
 		dspkg_ok = false
@@ -582,6 +603,31 @@ func _export_end() -> void:
 	if not dspkg_ok:
 		_mark_export_failed()
 		return
+
+
+## Copies the addon's third-party notice next to the exported binaries.
+##
+## The notice is self-contained (full license texts), because the addon package
+## carries no thirdparty/ source tree. A missing file or a failed copy is a
+## warning, not an export failure: the binaries are still usable, and failing
+## an entire export over a text file would be disproportionate.
+func _deploy_third_party_notices() -> void:
+	if not _include_third_party_notices:
+		return
+	if _target_export_dir.is_empty():
+		push_warning("[DirectStorage Exporter] Third-party notices are enabled but the export directory is unknown; the notice was not deployed.")
+		return
+	var source := ProjectSettings.globalize_path(THIRD_PARTY_NOTICES_SOURCE)
+	if not FileAccess.file_exists(source):
+		push_warning("[DirectStorage Exporter] Third-party notice is missing at '" + THIRD_PARTY_NOTICES_SOURCE + "'. Run a build to copy it from the repository root, or disable dsgd_extension/include_third_party_notices. The notice was not deployed.")
+		return
+	var target := _target_export_dir.path_join(THIRD_PARTY_NOTICES_EXPORT_NAME)
+	var err := DirAccess.copy_absolute(source, target)
+	if err != OK:
+		push_warning("[DirectStorage Exporter] Failed to deploy third-party notices to '" + target + "': " + error_string(err) + ".")
+	else:
+		print("[DirectStorage Exporter] Deployed third-party notices to: ", target)
+
 
 ## Writer round-trip: install the key this export generated, then open the
 ## archive that was just deployed with it and the published archive id.

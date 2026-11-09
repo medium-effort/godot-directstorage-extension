@@ -887,6 +887,14 @@ if env["platform"] == "windows":
         print("[SCons] NOTE: DirectStorage runtime DLLs are not fetched; skipping the bin/ copy.")
         print("[SCons]       Run tools/fetch_directstorage.ps1 (or the 'Fetch DirectStorage Runtime' task) to enable the DirectStorage suites.")
 
+# The addon folder is the distributable unit and must carry the third-party
+# notice. Keep it byte-identical to the repository-root canonical copy.
+install_notice = env.InstallAs(
+    "project/addons/directstorage_accelerator/THIRD_PARTY_NOTICES.txt",
+    "THIRD_PARTY_NOTICES.txt",
+)
+targets.append(install_notice)
+
 # --- gdextest integration (test-only build target) ---
 # Build with: scons tests=true
 # Run with:   ./extern/gdextest/gdextest test

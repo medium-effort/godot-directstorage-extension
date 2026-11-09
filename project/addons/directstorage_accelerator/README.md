@@ -100,13 +100,14 @@ Why that matters for DirectStorage settings:
 
 ## Export Preset Options
 
-The exporter adds three options to every Windows Desktop preset, on the **Options** tab (`Project -> Export... -> Windows Desktop -> Options`):
+The exporter adds four options to every Windows Desktop preset, on the **Options** tab (`Project -> Export... -> Windows Desktop -> Options`):
 
 | Export Option | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `dsgd_extension/bundle_textures_dspkg` | `bool` | `true` | Bundles exported textures into `textures.dspkg` for unbuffered DirectStorage DMA loading. |
 | `dsgd_extension/enforce_archive_pairing` | `bool` | `true` | Publishes a random 64-bit archive id per export and compares it, in full, when the runtime opens the archive. Set to `false` only for local tooling: it publishes `0`, which skips the check in that build, and writes an archive carrying id `0` that any build expecting a real id rejects. |
 | `dsgd_extension/steampipe_1mb_alignment` | `bool` | `false` | Aligns texture payloads to 1 MiB chunks for SteamPipe differential patching efficiency. |
+| `dsgd_extension/include_third_party_notices` | `bool` | `true` | Copies the addon's `THIRD_PARTY_NOTICES.txt` next to the exported binaries as `dsgd_THIRD_PARTY_NOTICES.txt`. |
 
 Encryption is not one of those options. It comes entirely from the same preset's **Encryption** tab (`Project -> Export... -> Windows Desktop -> Encryption`), next to Options. The add-on keeps no encryption toggle and no key field of its own, and caches nothing from the preset, because one plugin instance serves every preset of an "Export All" run.
 
@@ -166,6 +167,8 @@ A source build can compile the archive key into the extension binary (`DSPKG_ENC
 ## Trademarks and Attribution
 
 This addon/extension (DSGD) is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft. Microsoft and DirectStorage are trademarks of the Microsoft group of companies. The DirectStorage runtime is installed under Microsoft's license and is not bundled with this addon/extension; see Runtime Install & License.
+
+Third-party license texts and attributions are in `THIRD_PARTY_NOTICES.txt`, shipped with the addon and copied next to exported binaries as `dsgd_THIRD_PARTY_NOTICES.txt`.
 
 
 

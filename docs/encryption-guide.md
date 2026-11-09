@@ -425,6 +425,7 @@ above matters.
 | `dsgd_extension/bundle_textures_dspkg` | add-on export option | whether an archive is built at all |
 | `dsgd_extension/enforce_archive_pairing` | add-on export option | publishes a random archive id; off publishes `0` and disables the check |
 | `dsgd_extension/steampipe_1mb_alignment` | add-on export option | 1 MiB payload chunking so a changed texture only rewrites the chunks it occupies (smaller SteamPipe deltas); off by default |
+| `dsgd_extension/include_third_party_notices` | add-on export option | copies `THIRD_PARTY_NOTICES.txt` next to the exported binaries as `dsgd_THIRD_PARTY_NOTICES.txt`; on by default |
 
 ### Build inputs
 
