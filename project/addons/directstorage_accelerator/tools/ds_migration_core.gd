@@ -21,6 +21,11 @@ const SKIP_DIRS := [".godot", ".git", ".migration_backup"]
 const ADDON_TREE := "addons/directstorage_accelerator"
 const DEFAULT_BACKUP_DIR := "res://addons/directstorage_accelerator/.migration_backup"
 
+## ZIPPacker.ZipAppend.APPEND_CREATE, duplicated as an int because naming the
+## class here would make this whole file a parse error on an engine built
+## without the zip module (module_zip_enabled=no).
+const ZIP_APPEND_CREATE := 0
+
 ## Option keys the v5 importer owns. Their presence in a sidecar means the asset already
 ## speaks v5, so the legacy compression/source key must not override them.
 const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "compress/channel_pack"]
@@ -490,8 +495,12 @@ static func create_zip_backup(entries_to_backup: Array, backup_dir: String = DEF
 	var zip_res_path := backup_dir.path_join(zip_name)
 	var zip_abs_path := ProjectSettings.globalize_path(zip_res_path)
 
-	var packer := ZIPPacker.new()
-	var open_err := packer.open(zip_abs_path, ZIPPacker.APPEND_CREATE)
+	if not ClassDB.class_exists("ZIPPacker"):
+		return {"ok": false, "error": "ZIP archive writing is not available in this Godot build (module_zip_enabled=no). Compile Godot with module_zip_enabled=yes."}
+	var packer: RefCounted = ClassDB.instantiate("ZIPPacker")
+	if packer == null:
+		return {"ok": false, "error": "Could not create a ZIPPacker instance."}
+	var open_err: Error = packer.open(zip_abs_path, ZIP_APPEND_CREATE)
 	if open_err != OK:
 		return {"ok": false, "error": "Failed to open ZIPPacker at %s: %s" % [zip_res_path, error_string(open_err)]}
 
@@ -781,13 +790,17 @@ static func cleanup_old_artifacts(verified_entries: Array) -> Array[Dictionary]:
 ## Restores original .import files from a ZIP backup and deletes the created .dstex files.
 ## Caller triggers EditorFileSystem.reimport_files afterwards.
 static func restore_from_zip(zip_res_path: String) -> Dictionary:
+	if not ClassDB.class_exists("ZIPReader"):
+		return {"ok": false, "error": "ZIP archive reading is not available in this Godot build (module_zip_enabled=no). Compile Godot with module_zip_enabled=yes."}
 	var zip_abs_path := ProjectSettings.globalize_path(zip_res_path)
-	var reader := ZIPReader.new()
-	var err := reader.open(zip_abs_path)
+	var reader: RefCounted = ClassDB.instantiate("ZIPReader")
+	if reader == null:
+		return {"ok": false, "error": "Could not create a ZIPReader instance."}
+	var err: Error = reader.open(zip_abs_path)
 	if err != OK:
 		return {"ok": false, "error": "Failed to open ZIP backup: %s" % error_string(err)}
 
-	var manifest_raw := reader.read_file("manifest.json")
+	var manifest_raw: PackedByteArray = reader.read_file("manifest.json")
 	if manifest_raw.is_empty():
 		reader.close()
 		return {"ok": false, "error": "Backup ZIP missing manifest.json"}
@@ -826,7 +839,7 @@ static func restore_from_zip(zip_res_path: String) -> Dictionary:
 			results.append({"source": src_res, "status": "skipped", "reason": "Source image modified since backup"})
 			continue
 
-		var original_import_bytes := reader.read_file(zip_entry)
+		var original_import_bytes: PackedByteArray = reader.read_file(zip_entry)
 		if original_import_bytes.is_empty():
 			results.append({"source": src_res, "status": "failed", "reason": "Failed to read %s from ZIP" % zip_entry})
 			continue
