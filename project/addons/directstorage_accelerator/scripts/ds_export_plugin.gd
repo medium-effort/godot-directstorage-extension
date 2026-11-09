@@ -541,6 +541,7 @@ func _resolve_dstex_path(path: String) -> String:
 ## log but the remaining core steps still run outside this plugin's control.
 ## Native DLLs (dsgd_64, dstorage) are exported flat by Godot itself.
 func _export_end() -> void:
+	_notice_runtime_license()
 	_deploy_third_party_notices()
 	var dspkg_ok := true
 	if _archive_failed:
@@ -603,6 +604,16 @@ func _export_end() -> void:
 	if not dspkg_ok:
 		_mark_export_failed()
 		return
+
+
+## The runtime is redistributed under Microsoft's license. Print a notice rather
+## than a warning: this is an informational obligation on the game developer,
+## not a defect in the export.
+func _notice_runtime_license() -> void:
+	var runtime_dir := "res://addons/directstorage_accelerator/bin"
+	if not FileAccess.file_exists(runtime_dir.path_join("dstorage.dll")):
+		return
+	print("[DirectStorage Exporter] NOTICE: the Microsoft DirectStorage runtime is redistributed under Microsoft's license. You are responsible for complying with that license and for including its EULA and NOTICES.txt when you distribute this build. The package texts are extracted to res://addons/directstorage_accelerator/bin/.versions/<version>/.")
 
 
 ## Copies the addon's third-party notice next to the exported binaries.

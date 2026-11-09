@@ -36,13 +36,14 @@ const DOWNLOAD_DIR: String = "user://directstorage_runtime"
 
 ## Package payload extracted into bin/.versions/<version>/. get_file() is used
 ## for the destination name, so every basename here must be unique.
+## Only redistributable runtime files plus the package texts are extracted: the
+## import library is not in distributable_files.txt and the headers are unused
+## at runtime, so neither belongs in a project that may later be packaged.
 const PAYLOAD_FILES := [
 	"native/bin/x64/dstorage.dll",
 	"native/bin/x64/dstoragecore.dll",
-	"native/include/dstorage.h",
-	"native/include/dstorageerr.h",
-	"native/lib/x64/dstorage.lib",
 	"LICENSE.txt",
+	"NOTICES.txt",
 ]
 
 ## The only files copied over the active flat layout.

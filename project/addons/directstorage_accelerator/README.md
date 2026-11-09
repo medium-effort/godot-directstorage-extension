@@ -23,6 +23,8 @@ The DirectStorage runtime (`dstorage.dll`, `dstoragecore.dll`) is not bundled wi
 - Only the 1.3 stable runtime is offered by default. Runtimes newer than 1.3 (including the 1.4 preview) are hidden from the version list; set the `DSGD_ALLOW_DOWNLOAD_RUNTIME_ABOVE_1_POINT_3=1` environment variable and restart the editor to show them. Those are development runtimes: the preview license grants no redistribution rights, so do not commit or ship their DLLs.
 - Runtime DLLs must be installed before exporting; the export dependencies reference them.
 
+The runtime is Microsoft-licensed and is not bundled or re-licensed by this addon. When you ship `dstorage.dll` / `dstoragecore.dll` with a game, you are responsible for complying with Microsoft's EULA and for including its `LICENSE.txt` and `NOTICES.txt`. The installer extracts both into `bin/.versions/<version>/` so the exact texts are available to include.
+
 ## Direct GPU Decompression & Fallback
 
 When running on Windows with a Direct3D 12 `RenderingDevice` (`--rendering-driver d3d12`), DirectStorage decompresses GDeflate mip streams directly into GPU VRAM as `Texture2DRD` resources via compute shaders. If GPU decompression is disabled, unsupported, or if legacy version 1 assets are loaded, the system automatically falls back to multi-threaded CPU software decompression (`ImageTexture`).
