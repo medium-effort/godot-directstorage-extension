@@ -354,8 +354,8 @@ func _on_download_completed(result: int, response_code: int, _headers: PackedStr
 		_remove_download(nupkg)
 		_finish(version, ERR_UNAVAILABLE, "ZIP archive support is not available in this Godot build (module_zip_enabled=no). Compile Godot with module_zip_enabled=yes.")
 		return
-	var zip := ZIPReader.new()
-	if zip.open(nupkg) != OK:
+	var zip: RefCounted = ClassDB.instantiate("ZIPReader")
+	if zip == null or zip.open(nupkg) != OK:
 		_remove_download(nupkg)
 		_finish(version, ERR_FILE_CORRUPT, "Could not reopen the verified package to read its license.")
 		return
@@ -364,7 +364,7 @@ func _on_download_completed(result: int, response_code: int, _headers: PackedStr
 		_remove_download(nupkg)
 		_finish(version, ERR_FILE_CORRUPT, "Package has no LICENSE.txt; refusing to install it.")
 		return
-	var license_text := zip.read_file("LICENSE.txt").get_string_from_utf8()
+	var license_text: String = zip.read_file("LICENSE.txt").get_string_from_utf8()
 	zip.close()
 	if license_text.strip_edges().is_empty():
 		_remove_download(nupkg)
@@ -417,8 +417,8 @@ func _clear_license() -> void:
 static func _extract_package(nupkg: String, version: String) -> int:
 	if not ClassDB.class_exists("ZIPReader"):
 		return ERR_UNAVAILABLE
-	var zip := ZIPReader.new()
-	if zip.open(nupkg) != OK:
+	var zip: RefCounted = ClassDB.instantiate("ZIPReader")
+	if zip == null or zip.open(nupkg) != OK:
 		return ERR_FILE_CORRUPT
 
 	var target_dir := VERSIONS_PATH.path_join(version)
