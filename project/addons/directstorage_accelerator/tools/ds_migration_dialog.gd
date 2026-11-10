@@ -12,6 +12,14 @@ extends Window
 const CORE = preload("res://addons/directstorage_accelerator/tools/ds_migration_core.gd")
 
 const BATCH_SIZE := 50
+## ConfirmationDialog modes: the dialog is shared by the restore confirmation and
+## the "restart the editor" prompt that follows a committed restore.
+const CONFIRM_RESTORE := "restore"
+const CONFIRM_RESTART := "restart"
+## Upper bound for letting the editor's own scan/import settle before restarting.
+const RESTART_SETTLE_TIMEOUT_MS := 30000
+## Cancel button of the restart prompt: declining the restart reimports in-session.
+const RESTART_CANCEL_TEXT := "Reimport without restarting"
 const ACTION_LABELS := [
 	"Skip (Keep Texture2D)",
 	"Migrate - VRAM Compressed",
@@ -54,6 +62,10 @@ var _plan: Array[Dictionary] = []
 var _file_items: Array[TreeItem] = []
 var _is_busy := false
 var _pending_restore_zip := ""
+## Which action the shared confirmation dialog is confirming (CONFIRM_*).
+var _pending_action := CONFIRM_RESTORE
+## Sources the last restore put back on disk; reimported if the restart is skipped.
+var _restored_sources: Array[String] = []
 var _action_popup: PopupMenu
 var _current_editing_item: TreeItem = null
 var _last_closed_item: TreeItem = null
@@ -91,6 +103,7 @@ func _ready() -> void:
 
 	_restore_file_dialog.file_selected.connect(_on_restore_file_selected)
 	_confirm_dialog.confirmed.connect(_on_confirm_dialog_confirmed)
+	_confirm_dialog.canceled.connect(_on_confirm_dialog_canceled)
 
 	_setup_tree_columns()
 	_setup_status_options()
@@ -900,23 +913,83 @@ func _on_restore_pressed() -> void:
 
 	# Default to latest backup
 	_pending_restore_zip = backups[0]
+	_pending_action = CONFIRM_RESTORE
+	_confirm_dialog.cancel_button_text = "Cancel"
 	_confirm_dialog.dialog_text = "Restore original .import files and remove generated .dstex textures from latest backup?\n\nBackup file:\n%s" % _pending_restore_zip
 	_confirm_dialog.popup_centered()
 
 
 func _on_restore_file_selected(path: String) -> void:
 	_pending_restore_zip = path
+	_pending_action = CONFIRM_RESTORE
+	_confirm_dialog.cancel_button_text = "Cancel"
 	_confirm_dialog.dialog_text = "Restore original .import files and remove generated .dstex textures from:\n\n%s" % _pending_restore_zip
 	_confirm_dialog.popup_centered()
 
 
 func _on_confirm_dialog_confirmed() -> void:
-	if _pending_restore_zip.is_empty():
+	if _pending_action == CONFIRM_RESTART:
+		_pending_action = ""
+		_log("Asking the editor to reload the project (confirm its own prompt if it appears)...")
+		# This tool is an exclusive window: an editor confirmation popped while it
+		# is still visible can end up unreachable behind it (that is why the editor
+		# appeared not to restart). Hide first, then ask on the next idle frame.
+		hide()
+		_request_editor_restart.call_deferred()
+		return
+	_begin_restore()
+
+
+## Runs after this window is hidden. EditorInterface.restart_editor() can ask its
+## own questions (unsaved resources, a playing project, an untitled scene), and all
+## of those need a reachable editor dialog rather than a modal tool window.
+##
+## It also waits for the editor's own filesystem work to settle first: a scan or
+## import still running while the editor tears down is what crashed the previous
+## attempt inside ProgressDialog::add_task (the editor then closed without
+## relaunching, because a crashed process never reaches the restart-on-exit
+## hand-off).
+func _request_editor_restart() -> void:
+	if not is_inside_tree():
 		return
 
 	var fs := EditorInterface.get_resource_filesystem()
-	if fs != null and fs.is_scanning():
-		_log("[WARN] Cannot start restore: EditorFileSystem is currently scanning. Please wait and retry.")
+	if fs != null:
+		var deadline_msec := Time.get_ticks_msec() + RESTART_SETTLE_TIMEOUT_MS
+		while (fs.is_scanning() or fs.is_importing()) and Time.get_ticks_msec() < deadline_msec:
+			if not is_inside_tree():
+				return
+			await get_tree().process_frame
+
+	if not is_inside_tree():
+		return
+	EditorInterface.restart_editor(true)
+
+
+## Commits the restore on disk and then asks for the editor restart that makes
+## Godot reimport the restored sidecars.
+##
+## The tool deliberately does not call EditorFileSystem.reimport_files()/scan()
+## any more. EditorFileSystem::_update_scan_actions() -> reimport_files() ->
+## EditorProgress -> EditorNode::progress_add_task() -> ProgressDialog::add_task()
+## runs against the editor's progress dialog, and the engine frees that dialog in
+## EditorNode::NOTIFICATION_EXIT_TREE while EditorNode::singleton (and the member
+## pointer) is still set, so a scan/import that is still settling when the editor
+## is closed dereferences a freed ProgressDialog (measured: 0xc0000005 inside
+## ProgressDialog::add_task, both before and after the earlier deferred-scan
+## change). A restart is the editor's own, well-tested path for "import files
+## changed on disk": the startup scan reimports them before anything else runs.
+func _begin_restore() -> void:
+	if _pending_restore_zip.is_empty():
+		return
+	if _is_busy:
+		# A second confirmation while the restore is still running would start a
+		# concurrent restore over the same sidecars.
+		return
+
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs != null and (fs.is_scanning() or fs.is_importing()):
+		_log("[WARN] Cannot start restore: the editor is still scanning or importing. Please wait and retry.")
 		return
 
 	_set_busy(true)
@@ -928,37 +1001,80 @@ func _on_confirm_dialog_confirmed() -> void:
 		_set_busy(false)
 		return
 
-	var to_reimport: Array[String] = res.get("reimport_sources", [])
-
-	# Uncache any live Texture2D instances before restoring to default texture importer
-	for src in to_reimport:
-		if ResourceLoader.has_cached(src):
-			var cached := ResourceLoader.load(src, "", ResourceLoader.CACHE_MODE_REUSE)
-			if cached != null:
-				cached.take_over_path("")
-
-	_log("Restored %d .import files. Reimporting original textures..." % to_reimport.size())
-
-	if fs != null and not to_reimport.is_empty():
-		var total := to_reimport.size()
-		var processed := 0
-		var current_batch := PackedStringArray()
-
-		for src in to_reimport:
-			current_batch.append(src)
-			if current_batch.size() >= BATCH_SIZE:
-				fs.reimport_files(current_batch)
-				current_batch.clear()
-				processed += BATCH_SIZE
-				_progress_bar.value = (float(processed) / float(total)) * 100.0
-				await get_tree().process_frame
-
-		if not current_batch.is_empty():
-			fs.reimport_files(current_batch)
-			current_batch.clear()
-			_progress_bar.value = 100.0
-			await get_tree().process_frame
-
-	_log("--- Rollback Completed Successfully! ---")
+	var restored: Array[String] = res.get("reimport_sources", [])
+	_pending_restore_zip = ""
+	_restored_sources = restored
+	_progress_bar.value = 100.0
+	_log("Restored %d .import file(s) and removed the migrated artifacts." % restored.size())
 	_set_busy(false)
+	_on_scan_pressed()
+	_prompt_restart(restored.size())
+
+
+## Offers the restart. Declining leaves the sidecars restored on disk; the next
+## editor start still reimports them, so the restore is already committed.
+func _prompt_restart(restored_count: int) -> void:
+	_pending_action = CONFIRM_RESTART
+	_confirm_dialog.dialog_text = (
+		"Restored %d .import file(s).\n\n"
+		+ "The editor must restart so Godot reimports the restored textures; the startup scan does this automatically. "
+		+ "Unsaved scene changes are saved first.\n\nRestart the editor now?\n\n"
+		+ "(The restore is already saved to disk. If the editor does not come back, open the project again; "
+		+ "you can also use Project > Reload Current Project. Choosing '" + RESTART_CANCEL_TEXT
+		+ "' reimports them here instead.)"
+	) % restored_count
+	_confirm_dialog.cancel_button_text = RESTART_CANCEL_TEXT
+	_confirm_dialog.popup_centered()
+
+
+## Cancel of the restart prompt (AcceptDialog also emits this for the title-bar X).
+## The sidecars are restored but the .ctex artifacts were removed by the migration,
+## so the project is unusable (e.g. running the game fails on every missing texture)
+## until a reimport. Cancelling therefore reimports in this session.
+func _on_confirm_dialog_canceled() -> void:
+	if _pending_action != CONFIRM_RESTART:
+		_pending_action = CONFIRM_RESTORE
+		_confirm_dialog.cancel_button_text = "Cancel"
+		return
+	_pending_action = ""
+	_confirm_dialog.cancel_button_text = "Cancel"
+	_reimport_after_skipped_restart.call_deferred()
+
+
+## Imports exactly the restored sources, the way the migration tool already does.
+## Deferred so the editor is not re-entered from inside the dialog's own signal.
+## Running the game before this finishes loads .ctex files that do not exist yet.
+func _reimport_after_skipped_restart() -> void:
+	if not is_inside_tree():
+		return
+
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs == null or _restored_sources.is_empty():
+		_log("[WARN] Restart skipped. The restored textures are not reimported; restart the editor before running the game.")
+		return
+
+	var paths := PackedStringArray(_restored_sources)
+	_restored_sources = []
+	_set_busy(true)
+	_progress_bar.value = 10.0
+	_log("Restart skipped. Reimporting %d restored texture(s) now; do not run the game until this finishes..." % paths.size())
+
+	fs.reimport_files(paths)
+
+	var deadline_msec := Time.get_ticks_msec() + RESTART_SETTLE_TIMEOUT_MS
+	while fs.is_scanning() or fs.is_importing():
+		if not is_inside_tree():
+			return
+		if Time.get_ticks_msec() > deadline_msec:
+			_log("[WARN] The editor is still importing. Wait for its progress dialog to finish before running the game.")
+			_set_busy(false)
+			return
+		_progress_bar.value = minf(95.0, _progress_bar.value + 1.5)
+		await get_tree().process_frame
+
+	if not is_inside_tree():
+		return
+	_progress_bar.value = 100.0
+	_set_busy(false)
+	_log("Reimport finished. The restored textures are available; running the game is safe now.")
 	_on_scan_pressed()
