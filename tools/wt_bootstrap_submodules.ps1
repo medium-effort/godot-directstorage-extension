@@ -92,8 +92,10 @@ function Invoke-GitStep {
 
 $primaryModules = Join-Path (Join-Path $primary ".git") "modules"
 $seeded = @()
+$nestedSeeded = @()
 $fromNetwork = @()
 $failed = @()
+$localModuleByPath = @{}
 
 foreach ($rawEntry in $rawEntries) {
     $entry = [string]$rawEntry
@@ -123,6 +125,7 @@ foreach ($rawEntry in $rawEntries) {
         $stepArgs = @("-c", "protocol.file.allow=always", "-c", "submodule.$submoduleName.url=$localModule") + $updateArgs
         if (Invoke-GitStep -Arguments $stepArgs -Label "seed $submodulePath from the primary") {
             $seeded += $submodulePath
+            $localModuleByPath[$submodulePath] = $localModule
         }
         else {
             $failed += $submodulePath
@@ -142,8 +145,63 @@ foreach ($rawEntry in $rawEntries) {
     }
 }
 
-# Nested submodules: the parent is initialized now, so one recursive pass completes
-# them. Public upstreams, so no credential is involved.
+# Nested submodules live inside the parent's module store, not at <primaryModules>/<path>:
+# .git/modules/extern/gdextest/modules/extern/godot-cpp. Seed those from the primary too, so the
+# recursive pass below needs no network at all.
+foreach ($parentPath in @($localModuleByPath.Keys)) {
+    $parentModule = [string]$localModuleByPath[$parentPath]
+    $parentDir = Join-Path $dest $parentPath
+    $nestedGitmodules = Join-Path $parentDir ".gitmodules"
+    if (-not (Test-Path -LiteralPath $nestedGitmodules -PathType Leaf)) { continue }
+
+    $nestedEntries = @(& git config -f $nestedGitmodules --get-regexp '^submodule\..*\.path$' 2>&1)
+    if ($LASTEXITCODE -ne 0) { continue }
+
+    foreach ($rawNested in $nestedEntries) {
+        $nestedLine = [string]$rawNested
+        $nestedSplit = $nestedLine.IndexOf(' ')
+        if ($nestedSplit -lt 1) { continue }
+        $nestedKey = $nestedLine.Substring(0, $nestedSplit).Trim()
+        $nestedPath = $nestedLine.Substring($nestedSplit + 1).Trim()
+        if ($nestedKey -notmatch '^submodule\.(.+)\.path$') { continue }
+        $nestedName = $Matches[1]
+
+        $nestedModule = Join-Path (Join-Path $parentModule "modules") $nestedPath
+        # A module directory can exist but be an empty shell (HEAD with no objects). Only seed when
+        # it actually contains the commit this parent pins; otherwise leave it to the recursive pass.
+        $pinnedLine = @(& git -C $parentDir ls-files -s -- $nestedPath 2>&1)
+        $pinnedCommit = ""
+        if ($LASTEXITCODE -eq 0 -and $pinnedLine.Count -gt 0) {
+            $pinnedParts = ([string]$pinnedLine[0]).Trim() -split '\s+'
+            if ($pinnedParts.Count -ge 2) { $pinnedCommit = $pinnedParts[1] }
+        }
+        if (-not $pinnedCommit) { continue }
+        & git -C $nestedModule cat-file -e "$pinnedCommit^{commit}" 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            # Not available locally; leave it to the recursive pass below.
+            continue
+        }
+
+        $nestedArgs = @("-C", $parentDir, "-c", "protocol.file.allow=always", "-c", "submodule.$nestedName.url=$nestedModule", "submodule", "update", "--init")
+        $nestedDir = Join-Path $parentDir $nestedPath
+        if ((Test-Path -LiteralPath $nestedDir) -and -not (Test-Path -LiteralPath (Join-Path $nestedDir ".git"))) {
+            $nestedArgs += "--force"
+        }
+        $nestedArgs += @("--", $nestedPath)
+
+        if (Invoke-GitStep -Arguments $nestedArgs -Label "seed nested $parentPath/$nestedPath from the primary") {
+            $nestedSeeded += "$parentPath/$nestedPath"
+        }
+        else {
+            $failed += "$parentPath/$nestedPath"
+            Write-Host "[wt] submodules: the primary's nested copy is at '$nestedModule'; retry by hand with:" -ForegroundColor Yellow
+            Write-Host "  git -C $parentDir -c protocol.file.allow=always -c submodule.$nestedName.url=$nestedModule submodule update --init --force $nestedPath" -ForegroundColor Yellow
+        }
+    }
+}
+
+# Anything still missing falls back to the network: the parent is initialized now, so one
+# recursive pass completes it.
 if ($failed.Count -eq 0) {
     if (-not (Invoke-GitStep -Arguments @("submodule", "update", "--init", "--recursive") -Label "recursive submodule update (nested)")) {
         $failed += "(nested)"
@@ -157,6 +215,7 @@ function Format-PathList {
 }
 
 Write-Host ("[wt] submodules: seeded from the primary: {0}" -f (Format-PathList $seeded))
+Write-Host ("[wt] submodules: seeded nested: {0}" -f (Format-PathList $nestedSeeded))
 Write-Host ("[wt] submodules: from the network: {0}" -f (Format-PathList $fromNetwork))
 
 if ($failed.Count -gt 0) {
