@@ -49,6 +49,14 @@ func _init() -> void:
 		print("FAIL: v5 option emission test failed.")
 		ok = false
 
+	if not _test_cleanup_scope():
+		print("FAIL: cleanup scope test failed.")
+		ok = false
+
+	if not _test_upgrade_parameter_preservation():
+		print("FAIL: upgrade parameter preservation test failed.")
+		ok = false
+
 	if ok:
 		print("=== ALL MIGRATION TESTS PASSED ===")
 		quit(0)
@@ -481,6 +489,301 @@ func _test_v5_option_emission() -> bool:
 
 	print("PASS: v5 option emission, upgrade translation, adopt output and action table agree.")
 	return true
+
+
+func _test_cleanup_scope() -> bool:
+	print("--- Test 6: Cleanup Scope ---")
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("res://.godot/imported"))
+
+	var superseded := "res://.godot/imported/test_cleanup_old.ctex"
+	var live := "res://.godot/imported/test_cleanup_live.dstex"
+	var keep_me := "res://.godot/imported/test_cleanup_keep.ctex"
+	var unverified := "res://.godot/imported/test_cleanup_unverified.ctex"
+	var outside := "res://test_migration_v5_tmp/test_cleanup_outside.ctex"
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("res://test_migration_v5_tmp"))
+	for p in [superseded, superseded + ".md5", live, live + ".md5", keep_me, unverified, outside]:
+		_write_text_file(p, "CLEANUP_FIXTURE")
+
+	var ok := true
+
+	# 1. A live .dstex is a current destination, never cleanup material.
+	var del_live: Array = CORE.cleanup_old_artifacts([{
+		"source": "res://test_assets/test.png",
+		"old_dests": [live],
+	}])
+	var deleted_live: Array = del_live[0].get("deleted", [])
+	ok = _check(FileAccess.file_exists(live), "live .dstex survives cleanup") and ok
+	ok = _check(FileAccess.file_exists(live + ".md5"), "live .dstex.md5 survives cleanup") and ok
+	ok = _check(deleted_live.is_empty(), "nothing reported deleted for a live .dstex") and ok
+
+	# 2. Positive control: a superseded .ctex pair is still removed, and reported.
+	var del_ctex: Array = CORE.cleanup_old_artifacts([{
+		"source": "res://test_assets/test.png",
+		"old_dests": [superseded],
+	}])
+	var deleted_ctex: Array = del_ctex[0].get("deleted", [])
+	ok = _check(not FileAccess.file_exists(superseded), "superseded .ctex is deleted") and ok
+	ok = _check(not FileAccess.file_exists(superseded + ".md5"), "superseded .ctex.md5 is deleted") and ok
+	ok = _check(deleted_ctex.size() == 2, "both deleted paths are reported") and ok
+
+	# 3. The new_dests keep-set: a .ctex that is a current destination survives.
+	var del_keep: Array = CORE.cleanup_old_artifacts([{
+		"source": "res://test_assets/test.png",
+		"old_dests": [keep_me],
+		"new_dests": [keep_me],
+	}])
+	var deleted_keep: Array = del_keep[0].get("deleted", [])
+	ok = _check(FileAccess.file_exists(keep_me), "a path listed in new_dests is kept") and ok
+	ok = _check(deleted_keep.is_empty(), "a kept path is not reported deleted") and ok
+
+	# 4. Containment: nothing outside res://.godot/imported is ever touched.
+	var del_out: Array = CORE.cleanup_old_artifacts([{
+		"source": "res://test_assets/test.png",
+		"old_dests": [outside],
+	}])
+	var deleted_out: Array = del_out[0].get("deleted", [])
+	ok = _check(FileAccess.file_exists(outside), "a .ctex outside .godot/imported is untouched") and ok
+	ok = _check(deleted_out.is_empty(), "an outside path is not reported deleted") and ok
+
+	# 5. The verified-subset filter keeps exactly the verified entries, intact.
+	var selected := [
+		{"source": "res://a.png", "old_dests": [superseded]},
+		{"source": "res://b.png", "old_dests": [unverified]},
+		{"source": "res://c.png", "old_dests": [outside]},
+	]
+	var verify_results := [
+		{"source": "res://a.png", "verified": true},
+		{"source": "res://b.png", "verified": false},
+		{"source": "res://c.png", "verified": true},
+	]
+	var filtered: Array = CORE.filter_verified_entries(selected, verify_results)
+	ok = _check(filtered.size() == 2, "filter keeps exactly the verified entries") and ok
+	ok = _check(not filtered.is_empty() and filtered[0].has("old_dests"), "filter keeps the scan entries intact") and ok
+
+	# 6. Composition: the caller's real path leaves the unverified entry alone.
+	_write_text_file(superseded, "CLEANUP_FIXTURE")
+	_write_text_file(unverified, "CLEANUP_FIXTURE")
+	CORE.cleanup_old_artifacts(CORE.filter_verified_entries(selected, verify_results))
+	ok = _check(FileAccess.file_exists(unverified), "an unverified entry's .ctex is not cleaned") and ok
+	ok = _check(not FileAccess.file_exists(superseded), "a verified entry's superseded .ctex is cleaned") and ok
+
+	for p in [superseded, superseded + ".md5", live, live + ".md5", keep_me, unverified, outside]:
+		if FileAccess.file_exists(p):
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(p))
+
+	if ok:
+		print("PASS: cleanup removes only verified, superseded .ctex artifacts.")
+	return ok
+
+
+func _test_upgrade_parameter_preservation() -> bool:
+	print("--- Test 7: Upgrade Parameter Preservation ---")
+	_cleanup_v5_fixtures()
+	if not _stage_v5_fixtures():
+		_cleanup_v5_fixtures()
+		return false
+
+	var v4u_png := "res://test_migration_v5_tmp/v4u.png"
+	var v4u_import := "res://test_migration_v5_tmp/v4u.png.import"
+	var v4u_artifact := "res://.godot/imported/test_migration_v4u.dstex"
+	var repair_png := "res://test_migration_v5_tmp/repair.png"
+	var repair_import := "res://test_migration_v5_tmp/repair.png.import"
+
+	var png_bytes := PackedByteArray([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0])
+	var ok := true
+	if not _write_bytes_file(v4u_png, png_bytes):
+		_cleanup_v5_fixtures()
+		return false
+	if not _write_bytes_file(repair_png, png_bytes):
+		_cleanup_v5_fixtures()
+		return false
+	_write_text_file(v4u_artifact, "DTEX")
+
+	var v4u_text := (
+		"[remap]\n\n"
+		+ "importer=\"directstorage_texture\"\n"
+		+ "importer_version=4\n"
+		+ "type=\"Texture2D\"\n"
+		+ "uid=\"uid://ds_migration_v4u_uid\"\n"
+		+ "path=\"%s\"\n\n" % v4u_artifact
+		+ "[deps]\n\n"
+		+ "files=[\"%s\"]\n" % v4u_artifact
+		+ "source_file=\"%s\"\n" % v4u_png
+		+ "dest_files=[\"%s\"]\n\n" % v4u_artifact
+		+ "[params]\n\n"
+		+ "compression/mode=1\n"
+		+ "compression/gdeflate_level=7\n"
+		+ "compatibility/as_image_texture=true\n"
+		+ "mipmaps/generate=false\n"
+	)
+	var repair_text := (
+		"[remap]\n\n"
+		+ "importer=\"directstorage_texture\"\n"
+		+ "importer_version=5\n"
+		+ "type=\"Texture2D\"\n"
+		+ "uid=\"uid://ds_migration_repair_uid\"\n"
+		+ "path=\"res://.godot/imported/test_migration_repair_missing.dstex\"\n\n"
+		+ "[deps]\n\n"
+		+ "source_file=\"%s\"\n" % repair_png
+		+ "dest_files=[\"res://.godot/imported/test_migration_repair_missing.dstex\"]\n\n"
+		+ "[params]\n\n"
+		+ "compression/mode=1\n"
+		+ "compression/high_quality=false\n"
+	)
+	_write_text_file(v4u_import, v4u_text)
+	_write_text_file(repair_import, repair_text)
+
+	# 1. scan() must label each row from the parameters its own sidecar states.
+	var core_script: Script = load(CORE_SCRIPT_PATH)
+	var plan: Array = core_script.callv("scan", [])
+	var up := _find_entry(plan, v4u_png)
+	var rep := _find_entry(plan, repair_png)
+	ok = _check(not up.is_empty() and str(up.get("mode", "")) == "upgrade", "v4 mode=1 sidecar scans as upgrade") and ok
+	ok = _check(str(up.get("mapped_params", {}).get("compression/mode", "")) == "1", "upgrade scan keeps the sidecar's compression/mode") and ok
+	ok = _check(int(core_script.callv("action_for_params", [up.get("mapped_params", {})])) == 2, "upgrade row labels as VRAM Uncompressed") and ok
+	ok = _check(not rep.is_empty() and str(rep.get("mode", "")) == "repair", "missing-artifact v5 sidecar scans as repair") and ok
+	ok = _check(int(core_script.callv("action_for_params", [rep.get("mapped_params", {})])) == 2, "repair row labels from its own params") and ok
+	ok = _check(str(up.get("base_mode", "")) == "upgrade" and str(rep.get("base_mode", "")) == "repair", "scan records base_mode") and ok
+
+	# 2. An override rewrites in place and leaves every unlisted parameter alone.
+	var overridden: String = CORE.rewrite_import(v4u_text.to_utf8_buffer(), "upgrade", {"compression/mode": "1"}).get_string_from_utf8()
+	ok = _check(_count_key(overridden, "compression/mode") == 1, "override rewrites in place, no duplicate key") and ok
+	ok = _check(_param_value(overridden, "compression/mode") == "1", "the caller's mode wins") and ok
+	ok = _check(_param_value(overridden, "compression/gdeflate_level") == "7", "unlisted gdeflate_level preserved") and ok
+	ok = _check(_param_value(overridden, "compatibility/as_image_texture") == "true", "as_image_texture preserved") and ok
+	ok = _check(_param_value(overridden, "mipmaps/generate") == "false", "mipmaps/generate preserved") and ok
+	ok = _check(overridden.contains("importer_version=0"), "upgrade forces a reimport") and ok
+
+	# 3. The user's choice beats the legacy compression/source translation.
+	var trap_text := (
+		"[remap]\n\n"
+		+ "importer=\"directstorage_texture\"\n"
+		+ "importer_version=4\n"
+		+ "uid=\"uid://ds_migration_trap_uid\"\n\n"
+		+ "[params]\n\n"
+		+ "compression/mode=0\n"
+		+ "compression/source=0\n"
+		+ "compression/gdeflate_level=1\n"
+	)
+	var trapped: String = CORE.rewrite_import(trap_text.to_utf8_buffer(), "upgrade", CORE.action_mapped_params(CORE.ACTION_NORMAL_MAP)).get_string_from_utf8()
+	ok = _check(_param_value(trapped, "compress/normal_map") == "1", "a user normal map beats the legacy source") and ok
+	ok = _check(_param_value(trapped, "compression/color_space") == "0", "a user normal map sets linear colour space") and ok
+	ok = _check(not trapped.contains("compression/source="), "the legacy source key is removed in the trap case") and ok
+	ok = _check(_param_value(trapped, "compression/mode") == "0", "a normal-map action leaves the mode alone") and ok
+
+	# 4. The mode predicate used by the dialog.
+	ok = _check(CORE.action_mode_for_entry({"mode": "upgrade", "base_mode": "upgrade"}, 2) == "upgrade", "an upgrade row stays on upgrade") and ok
+	ok = _check(CORE.action_mode_for_entry({"mode": "skip", "base_mode": "upgrade"}, 2) == "upgrade", "skip then action restores upgrade") and ok
+	ok = _check(CORE.action_mode_for_entry({"mode": "repair", "base_mode": "repair"}, 3) == "upgrade", "repair plus action promotes to upgrade") and ok
+	ok = _check(CORE.action_mode_for_entry({"mode": "adopt", "base_mode": "adopt"}, 2) == "adopt", "an adopt row stays adopt") and ok
+	ok = _check(CORE.action_mode_for_entry({"base_mode": "adopt"}, 0) == "skip", "the skip action writes skip") and ok
+
+	# 5. An untouched row only moves importer_version - no parameter churn.
+	var custom_v5 := (
+		"[remap]\n\n"
+		+ "importer=\"directstorage_texture\"\n"
+		+ "importer_version=5\n"
+		+ "type=\"Texture2D\"\n"
+		+ "uid=\"uid://ds_migration_custom_uid\"\n\n"
+		+ "[params]\n\n"
+		+ "compression/mode=0\n"
+		+ "compression/high_quality=false\n"
+		+ "compression/color_space=1\n"
+		+ "compress/normal_map=0\n"
+		+ "compress/channel_pack=0\n"
+		+ "compression/gdeflate_level=1\n"
+		+ "compatibility/as_image_texture=false\n"
+		+ "mipmaps/generate=true\n"
+		+ "process/size_limit=0\n"
+	)
+	var own_params := {
+		"compression/mode": "0",
+		"compression/high_quality": "false",
+		"compression/color_space": "1",
+		"compress/normal_map": "0",
+		"compress/channel_pack": "0",
+		"compression/gdeflate_level": "1",
+		"compatibility/as_image_texture": "false",
+	}
+	var untouched: String = CORE.rewrite_import(custom_v5.to_utf8_buffer(), "upgrade", own_params).get_string_from_utf8()
+	var diff := _changed_lines(custom_v5, untouched)
+	ok = _check(diff.size() == 1, "an untouched upgrade changes exactly one line") and ok
+	ok = _check(diff.size() == 1 and diff[0].contains("importer_version"), "the one changed line is importer_version") and ok
+
+	# 6. Composition: the dialog's output for an upgrade row keeps unlisted keys.
+	var composed_mode: String = CORE.action_mode_for_entry({"mode": "upgrade", "base_mode": "upgrade"}, CORE.ACTION_VRAM_UNCOMPRESSED)
+	var composed: String = CORE.rewrite_import(custom_v5.to_utf8_buffer(), composed_mode, CORE.action_mapped_params(CORE.ACTION_VRAM_UNCOMPRESSED)).get_string_from_utf8()
+	ok = _check(composed_mode == "upgrade", "composition keeps the upgrade mode") and ok
+	ok = _check(_param_value(composed, "compression/mode") == "1", "composition applies the chosen action") and ok
+	ok = _check(_param_value(composed, "mipmaps/generate") == "true", "composition keeps mipmaps/generate") and ok
+	ok = _check(_param_value(composed, "process/size_limit") == "0", "composition keeps process/size_limit") and ok
+
+	for p in [v4u_png, v4u_import, v4u_artifact, repair_png, repair_import]:
+		if FileAccess.file_exists(p):
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(p))
+
+	if ok:
+		print("PASS: upgrade rows preserve their own parameters and only change what was chosen.")
+	_cleanup_v5_fixtures()
+	return ok
+
+
+func _check(cond: bool, msg: String) -> bool:
+	if cond:
+		print("PASS: " + msg)
+	else:
+		print("FAIL: " + msg)
+	return cond
+
+
+func _write_bytes_file(path: String, bytes: PackedByteArray) -> bool:
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		print("FAIL: could not create %s" % path)
+		return false
+	f.store_buffer(bytes)
+	f.close()
+	return true
+
+
+## Value of `key` inside [params], or "" when absent.
+func _param_value(text: String, key: String) -> String:
+	var in_params := false
+	for ln in text.split("\n"):
+		var t := str(ln).strip_edges()
+		if t.begins_with("[") and t.ends_with("]"):
+			in_params = (t == "[params]")
+			continue
+		if in_params and t.begins_with(key + "="):
+			return t.substr(key.length() + 1).strip_edges()
+	return ""
+
+
+## How many times `key` appears inside [params].
+func _count_key(text: String, key: String) -> int:
+	var count := 0
+	var in_params := false
+	for ln in text.split("\n"):
+		var t := str(ln).strip_edges()
+		if t.begins_with("[") and t.ends_with("]"):
+			in_params = (t == "[params]")
+			continue
+		if in_params and t.begins_with(key + "="):
+			count += 1
+	return count
+
+
+## Lines that differ between two documents, as "after" text.
+func _changed_lines(before: String, after: String) -> Array[String]:
+	var a := before.split("\n")
+	var b := after.split("\n")
+	var out: Array[String] = []
+	for i in mini(a.size(), b.size()):
+		if str(a[i]) != str(b[i]):
+			out.append(str(b[i]))
+	if a.size() != b.size():
+		out.append("line-count %d -> %d" % [a.size(), b.size()])
+	return out
 
 
 func _find_entry(entries: Array, source: String) -> Dictionary:

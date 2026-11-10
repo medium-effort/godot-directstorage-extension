@@ -136,6 +136,31 @@ func _test_restore_rejects_manifest_chosen_paths() -> void:
 	packer.close_file()
 	packer.close()
 
+	# Pre-restore state: the asset is currently migrated, so its sidecar names a .dstex that the
+	# rollback is supposed to delete. The ZIP above still holds the original texture sidecar.
+	var dstex := "res://.godot/imported/test_restore_orphan.dstex"
+	var unrelated_dstex := "res://.godot/imported/test_restore_unrelated.dstex"
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("res://.godot/imported"))
+	var migrated := (
+		"[remap]\n\n"
+		+ "importer=\"directstorage_texture\"\n"
+		+ "importer_version=5\n"
+		+ "type=\"Texture2D\"\n"
+		+ "uid=\"uid://restore_me\"\n"
+		+ "path=\"%s\"\n\n" % dstex
+		+ "[deps]\n\n"
+		+ "source_file=\"%s/restore_me.png\"\n" % TMP
+		+ "dest_files=[\"%s\"]\n\n" % dstex
+		+ "[params]\n\n"
+		+ "compression/mode=0\n"
+	)
+	if not _write(TMP + "/restore_me.png.import", migrated):
+		_cleanup(tmp_abs)
+		return
+	_write(dstex, "DTEXORPHAN")
+	_write(dstex + ".md5", "ORPHANMD5")
+	_write(unrelated_dstex, "DTEXOTHER")
+
 	var res: Dictionary = CORE.restore_from_zip(zip_path)
 	var results: Array = res.get("results", [])
 	var reimport_sources: Array = res.get("reimport_sources", [])
@@ -170,6 +195,11 @@ func _test_restore_rejects_manifest_chosen_paths() -> void:
 				leftovers.append(fn)
 	_check(leftovers.is_empty(), "a rejected entry leaves no temporary file")
 
+	# The rollback must delete the artifacts the migration created, and only those.
+	_check(not FileAccess.file_exists(dstex), "the rollback deletes the .dstex the migration created")
+	_check(not FileAccess.file_exists(dstex + ".md5"), "the rollback deletes that .dstex.md5")
+	_check(FileAccess.file_exists(unrelated_dstex), "the rollback leaves an unrelated .dstex alone")
+
 	_cleanup(tmp_abs)
 
 
@@ -185,6 +215,13 @@ func _cleanup(tmp_abs: String) -> void:
 			var rm := DirAccess.remove_absolute(ProjectSettings.globalize_path(p))
 			if rm != OK:
 				push_warning("cleanup: could not remove %s (err %d)" % [p, rm])
+	for art in ["res://.godot/imported/test_restore_orphan.dstex",
+			"res://.godot/imported/test_restore_orphan.dstex.md5",
+			"res://.godot/imported/test_restore_unrelated.dstex"]:
+		if FileAccess.file_exists(art):
+			var arm := DirAccess.remove_absolute(ProjectSettings.globalize_path(art))
+			if arm != OK:
+				push_warning("cleanup: could not remove %s (err %d)" % [art, arm])
 	var da := DirAccess.open(TMP)
 	if da != null:
 		for fn in da.get_files():

@@ -39,6 +39,10 @@ const ACTION_NORMAL_MAP := 3
 ## First 4 bytes of a readable .dstex file ("DTEX").
 const DSTEX_MAGIC := [0x44, 0x54, 0x45, 0x58]
 
+## Artifact suffixes cleanup is allowed to delete. Anything else - notably the live .dstex -
+## is a current destination, so an unknown suffix is left on disk (fails closed).
+const CLEANUP_SUFFIXES := [".ctex", ".ctex.md5"]
+
 const DS_DEFAULTS := {
 	"compression/mode": "0",
 	"compression/high_quality": "false",
@@ -256,6 +260,18 @@ static func _has_color_options(cp: ConfigFile) -> bool:
 	return false
 
 
+## DirectStorage parameters a sidecar already carries, over the defaults. Only keys
+## DS_DEFAULTS knows are read, so an unknown key keeps its line untouched on rewrite.
+static func _existing_ds_params(cp: ConfigFile) -> Dictionary:
+	var out := DS_DEFAULTS.duplicate()
+	if cp == null or not cp.has_section("params"):
+		return out
+	for k in DS_DEFAULTS.keys():
+		if cp.has_section_key("params", k):
+			out[k] = str(cp.get_value("params", k))
+	return out
+
+
 ## Maps Godot default texture parameters to DirectStorage parameters.
 ## Returns [mapped_dict_or_null, reason_string, is_eligible_bool].
 static func map_texture_params(params: Dictionary) -> Array:
@@ -311,6 +327,18 @@ static func action_for_params(mapped: Dictionary) -> int:
 	if str(mapped.get("compression/mode", "0")) == "1":
 		return ACTION_VRAM_UNCOMPRESSED
 	return ACTION_VRAM_COMPRESSED
+
+
+## Mode an explicit dialog action writes. Rows that are already DirectStorage keep their
+## in-place upgrade path, so the action's parameters override the sidecar's instead of
+## replacing the whole [params] section.
+static func action_mode_for_entry(entry: Dictionary, action: int) -> String:
+	if action == ACTION_SKIP:
+		return "skip"
+	var base := str(entry.get("base_mode", entry.get("mode", "adopt")))
+	if base == "upgrade" or base == "repair":
+		return "upgrade"
+	return "adopt"
 
 
 # ==============================================================================
@@ -394,6 +422,7 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 				plan.append({
 					"source": src_res,
 					"mode": "skip",
+					"base_mode": "skip",
 					"eligible": false,
 					"reason": reason_str,
 					"importer": importer,
@@ -406,6 +435,7 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 				plan.append({
 					"source": src_res,
 					"mode": "adopt",
+					"base_mode": "adopt",
 					"eligible": true,
 					"reason": reason_str,
 					"importer": importer,
@@ -416,14 +446,16 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 				})
 		elif iver < TARGET_VERSION:
 			# An older sidecar still carries compression/source; translate it so the dialog lists
-			# the real action (a legacy normal map is not "VRAM Compressed").
-			var upgrade_params := DS_DEFAULTS.duplicate()
+			# the real action (a legacy normal map is not "VRAM Compressed"). Its own mode is part
+			# of that answer, so start from the parameters the sidecar states.
+			var upgrade_params := _existing_ds_params(cp)
 			if cp.has_section("params") and not _has_color_options(cp):
 				var legacy_src := int(cp.get_value("params", "compression/source", 1))
 				upgrade_params.merge(_legacy_source_options(legacy_src), true)
 			plan.append({
 				"source": src_res,
 				"mode": "upgrade",
+				"base_mode": "upgrade",
 				"eligible": true,
 				"reason": "importer_version %d < %d" % [iver, TARGET_VERSION],
 				"importer": importer,
@@ -446,18 +478,20 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 				plan.append({
 					"source": src_res,
 					"mode": "repair",
+					"base_mode": "repair",
 					"eligible": true,
 					"reason": "DirectStorage artifact missing or corrupt",
 					"importer": importer,
 					"importer_version": iver,
 					"uid": uid,
 					"old_dests": old_dests,
-					"mapped_params": DS_DEFAULTS.duplicate(),
+					"mapped_params": _existing_ds_params(cp),
 				})
 			else:
 				plan.append({
 					"source": src_res,
 					"mode": "up_to_date",
+					"base_mode": "up_to_date",
 					"eligible": false,
 					"reason": "Already on DirectStorage Texture",
 					"importer": importer,
@@ -635,19 +669,34 @@ static func rewrite_import(raw: PackedByteArray, mode: String, mapped_params: Di
 		params_written = true
 
 	if mode == "upgrade":
-		var existing_keys := {}
-		for ln2 in out:
-			var t := str(ln2).strip_edges()
-			if not t.begins_with("[") and t.contains("="):
-				existing_keys[t.split("=")[0].strip_edges()] = true
 		if not legacy_source.is_empty():
 			var legacy_has_colors := false
 			for k in COLOR_OPTION_KEYS:
-				if existing_keys.has(k):
+				if _params_has_key(out, k):
 					legacy_has_colors = true
 					break
 			if not legacy_has_colors:
 				target_params.merge(_legacy_source_options(int(legacy_source)), true)
+
+		# Explicit caller parameters win over the legacy translation and over the sidecar.
+		for k in mapped_params.keys():
+			target_params[k] = str(mapped_params[k])
+
+		# Override the keys the caller named in place; every other [params] line is preserved.
+		var existing_keys := {}
+		var cur := ""
+		for i2 in out.size():
+			var t := str(out[i2]).strip_edges()
+			if t.begins_with("[") and t.ends_with("]"):
+				cur = t.substr(1, t.length() - 2)
+				continue
+			if cur != "params" or not t.contains("="):
+				continue
+			var key := t.split("=")[0].strip_edges()
+			existing_keys[key] = true
+			if mapped_params.has(key):
+				out[i2] = "%s=%s" % [key, str(mapped_params[key])]
+
 		if not params_written and section != "params":
 			out.append("")
 			out.append("[params]")
@@ -657,6 +706,19 @@ static func rewrite_import(raw: PackedByteArray, mode: String, mapped_params: Di
 				out.append("%s=%s" % [k, target_params[k]])
 
 	return "\n".join(PackedStringArray(out)).to_utf8_buffer()
+
+
+## True when the [params] section of an already-built line list carries `key`.
+static func _params_has_key(lines: Array[String], key: String) -> bool:
+	var cur := ""
+	for ln in lines:
+		var t := str(ln).strip_edges()
+		if t.begins_with("[") and t.ends_with("]"):
+			cur = t.substr(1, t.length() - 2)
+			continue
+		if cur == "params" and t.begins_with(key + "="):
+			return true
+	return false
 
 
 ## Applies migration to selected entries: rewrites .import files.
@@ -749,8 +811,24 @@ static func verify_migration(entries: Array) -> Array[Dictionary]:
 	return results
 
 
-## Automatically deletes replaced old artifacts (e.g. .ctex, .ctex.md5) for verified entries.
-## Strictly guarded to files inside res://.godot/imported/.
+## The subset of `selected` scan entries whose post-reimport verification passed.
+## Keeps the scan dictionaries (and therefore old_dests) intact for the cleanup.
+static func filter_verified_entries(selected: Array, verify_results: Array) -> Array:
+	var verified := {}
+	for v in verify_results:
+		if bool(v.get("verified", false)):
+			verified[str(v.get("source", ""))] = true
+
+	var out: Array = []
+	for e in selected:
+		if verified.has(str(e.get("source", ""))):
+			out.append(e)
+	return out
+
+
+## Deletes superseded .ctex artifacts for entries whose migration verified. Three guards:
+## only .ctex/.ctex.md5 (never the live .dstex family), only inside res://.godot/imported/,
+## and never a path that is still a current destination (new_dests).
 static func cleanup_old_artifacts(verified_entries: Array) -> Array[Dictionary]:
 	var results: Array[Dictionary] = []
 	var allowed_dir := ProjectSettings.globalize_path("res://.godot/imported").replace("\\", "/").to_lower()
@@ -760,20 +838,30 @@ static func cleanup_old_artifacts(verified_entries: Array) -> Array[Dictionary]:
 		var deleted: Array[String] = []
 		var old_dests: Array = e.get("old_dests", [])
 
+		# Current destinations, normalised the same way as the candidates below.
+		var keep := {}
+		for nd in e.get("new_dests", []):
+			var nds := str(nd).strip_edges()
+			if not nds.is_empty():
+				keep[ProjectSettings.globalize_path(nds).replace("\\", "/").to_lower()] = true
+
 		for od in old_dests:
 			var ods := str(od).strip_edges()
 			if ods.is_empty():
 				continue
-			var abs_path := ProjectSettings.globalize_path(ods).replace("\\", "/")
-			if not abs_path.to_lower().begins_with(allowed_dir + "/") or abs_path.contains(".."):
-				continue
-			if FileAccess.file_exists(abs_path):
-				if DirAccess.remove_absolute(abs_path) == OK:
-					deleted.append(ods)
-			# Also clean matching .md5 sidecar if present
-			var md5_path := abs_path + ".md5"
-			if FileAccess.file_exists(md5_path):
-				DirAccess.remove_absolute(md5_path)
+			# The .md5 sidecar goes through the same predicate as its main artifact.
+			for cand in [ods, ods + ".md5"]:
+				var cand_s := str(cand)
+				var abs_path := ProjectSettings.globalize_path(cand_s).replace("\\", "/")
+				var low := abs_path.to_lower()
+				if not low.begins_with(allowed_dir + "/") or low.contains(".."):
+					continue
+				if keep.has(low):
+					continue
+				if not _is_cleanup_artifact(low):
+					continue
+				if FileAccess.file_exists(abs_path) and DirAccess.remove_absolute(abs_path) == OK:
+					deleted.append(cand_s)
 
 		results.append({
 			"source": src_res,
@@ -781,6 +869,14 @@ static func cleanup_old_artifacts(verified_entries: Array) -> Array[Dictionary]:
 		})
 
 	return results
+
+
+## True when a lower-cased absolute path is an artifact cleanup may delete.
+static func _is_cleanup_artifact(low_abs_path: String) -> bool:
+	for suf in CLEANUP_SUFFIXES:
+		if low_abs_path.ends_with(suf):
+			return true
+	return false
 
 
 # ==============================================================================
@@ -844,14 +940,17 @@ static func restore_from_zip(zip_res_path: String) -> Dictionary:
 			results.append({"source": src_res, "status": "failed", "reason": "Failed to read %s from ZIP" % zip_entry})
 			continue
 
+		# The migrated sidecar is about to be replaced by the pre-migration copy; capture the
+		# artifacts it produced first, otherwise the list below describes the restored .ctex world.
+		var pre_restore_cp := _load_import(imp_res)
+		var dests := _dest_list(pre_restore_cp)
+
 		var write_err := _atomic_write_bytes(imp_res, original_import_bytes)
 		if write_err != OK:
 			results.append({"source": src_res, "status": "failed", "reason": "Failed to restore %s" % imp_res})
 			continue
 
-		# Clean up any generated .dstex artifacts created during DirectStorage import
-		var current_cp := _load_import(imp_res)
-		var dests := _dest_list(current_cp)
+		# Clean up the .dstex artifacts the migrated sidecar produced
 		for d in dests:
 			var abs_d := ProjectSettings.globalize_path(d).replace("\\", "/")
 			if abs_d.to_lower().ends_with(".dstex") and abs_d.to_lower().begins_with(allowed_imported_dir + "/") and not abs_d.contains(".."):

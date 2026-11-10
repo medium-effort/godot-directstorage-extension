@@ -601,7 +601,7 @@ func _handle_action_selected(item: TreeItem, entry: Dictionary, action_idx: int)
 
 		CORE.ACTION_VRAM_COMPRESSED: # Migrate: VRAM Compressed
 			entry["eligible"] = true
-			entry["mode"] = "adopt"
+			entry["mode"] = CORE.action_mode_for_entry(entry, CORE.ACTION_VRAM_COMPRESSED)
 			entry["mapped_params"] = CORE.action_mapped_params(CORE.ACTION_VRAM_COMPRESSED)
 			item.set_checked(0, true)
 			item.set_editable(0, true)
@@ -611,7 +611,7 @@ func _handle_action_selected(item: TreeItem, entry: Dictionary, action_idx: int)
 
 		CORE.ACTION_VRAM_UNCOMPRESSED: # Migrate: VRAM Uncompressed
 			entry["eligible"] = true
-			entry["mode"] = "adopt"
+			entry["mode"] = CORE.action_mode_for_entry(entry, CORE.ACTION_VRAM_UNCOMPRESSED)
 			entry["mapped_params"] = CORE.action_mapped_params(CORE.ACTION_VRAM_UNCOMPRESSED)
 			item.set_checked(0, true)
 			item.set_editable(0, true)
@@ -621,7 +621,7 @@ func _handle_action_selected(item: TreeItem, entry: Dictionary, action_idx: int)
 
 		CORE.ACTION_NORMAL_MAP: # Migrate: Normal Map
 			entry["eligible"] = true
-			entry["mode"] = "adopt"
+			entry["mode"] = CORE.action_mode_for_entry(entry, CORE.ACTION_NORMAL_MAP)
 			entry["mapped_params"] = CORE.action_mapped_params(CORE.ACTION_NORMAL_MAP)
 			item.set_checked(0, true)
 			item.set_editable(0, true)
@@ -868,10 +868,11 @@ func _on_migrate_pressed() -> void:
 	_progress_bar.value = 85.0
 	await get_tree().process_frame
 
-	# 6. Cleanup replaced .ctex artifacts
+	# 6. Cleanup replaced .ctex artifacts (verified entries only; live .dstex are never touched)
 	if _auto_delete_check.button_pressed and not verified_entries.is_empty():
+		var to_clean := CORE.filter_verified_entries(selected, verify_results)
 		_log("Step 5/5: Deleting replaced .ctex cache from .godot/imported/...")
-		var del_results := CORE.cleanup_old_artifacts(selected)
+		var del_results := CORE.cleanup_old_artifacts(to_clean)
 		var total_deleted := 0
 		for d in del_results:
 			total_deleted += d.get("deleted", []).size()
