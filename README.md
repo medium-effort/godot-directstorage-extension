@@ -283,6 +283,8 @@ Deployment is one implementation, [`tools/sync_artifacts.py`](tools/sync_artifac
 
 Only loadable modules and the manifest are mirrored (`bin/` outside those stays local), and the build manifest is patched once with the sync result before being copied to each target. The former `scons sync*` aliases are gone: a build tool should not be copying files into other repositories.
 
+Because the copy is flat, `SYNC_ADDON_DIR` must name the addon directory itself. A target that looks like a project root (`project.godot` present) or an addons folder (other plugins, no addon marker of its own) is refused with a warning and nothing is copied, rather than scattering the addon across a project. Files the addon no longer ships are reported as a count; `--verbose` lists them.
+
 ---
 
 ## 9. Trademarks and Attribution

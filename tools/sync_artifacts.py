@@ -281,6 +281,36 @@ def find_orphans(src_dir, dst_dir):
     return orphans
 
 
+# A mirror target receives the addon's own contents, so the target must be the
+# addon directory itself. These markers separate a real addon folder from the two
+# ways that value is usually mistyped - a Godot project root, or an addons folder
+# holding several plugins. Both copy "successfully" and then report every
+# unrelated file in the tree as an orphan, which buries the real result.
+PROJECT_ROOT_MARKER = "project.godot"
+ADDON_MARKERS = ("directstorage_accelerator.gdextension", "plugin.cfg")
+
+
+def describe_wrong_addon_target(target):
+    """Why `target` cannot be an addon mirror, or "" when it plausibly is one."""
+    if not os.path.isdir(target):
+        return ""
+    if os.path.isfile(os.path.join(target, PROJECT_ROOT_MARKER)):
+        return f"it contains {PROJECT_ROOT_MARKER}, so it is a Godot project root"
+    if any(os.path.isfile(os.path.join(target, marker)) for marker in ADDON_MARKERS):
+        return ""
+    foreign = []
+    try:
+        for entry in sorted(os.listdir(target)):
+            if os.path.isfile(os.path.join(target, entry, "plugin.cfg")):
+                foreign.append(entry)
+    except OSError:
+        return ""
+    if foreign:
+        shown = ", ".join(foreign[:3]) + ("..." if len(foreign) > 3 else "")
+        return f"it holds other addons ({shown}) and has no addon marker of its own"
+    return ""
+
+
 def sync_addon_target(addon_dir, env, log, dry_run):
     """addon dir -> SYNC_ADDON_DIR."""
     target = env.get("SYNC_ADDON_DIR", "").strip()
@@ -288,6 +318,19 @@ def sync_addon_target(addon_dir, env, log, dry_run):
     if not target:
         result.attempted = False
         log.info("addon    : skipped (SYNC_ADDON_DIR is not configured)")
+        return result
+
+    problem = describe_wrong_addon_target(target)
+    if problem:
+        # Refuse the write instead of scattering the addon into a project root:
+        # the copy is flat, so the damage is real and the orphan list that would
+        # explain it is exactly the unreadable dump this guard exists to prevent.
+        result.error = f"SYNC_ADDON_DIR is not an addon directory: {problem}"
+        log.warn(
+            f"addon target rejected ({target}): {problem}. "
+            "Point SYNC_ADDON_DIR at the addon folder itself, for example "
+            "<project>/addons/directstorage_accelerator. Nothing was copied."
+        )
         return result
 
     try:
@@ -539,8 +582,11 @@ def main(argv=None):
             orphans = find_orphans(addon_dir, addon_result.target_path)
             if orphans:
                 log.info(f"orphaned file(s) in mirror ({len(orphans)}) - no longer in the addon:")
-                for orphan in orphans:
-                    log.info(f"  - {orphan}")
+                if log.verbose:
+                    for orphan in orphans:
+                        log.detail(f"- {orphan}")
+                else:
+                    log.info("rerun with --verbose to list them")
                 log.info("remove them manually if they are no longer needed")
 
     attempted = [r for r in results if r.attempted]
