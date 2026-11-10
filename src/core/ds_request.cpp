@@ -181,6 +181,23 @@ uint32_t DSRequest::get_subresource_count() const {
 	return subresource_count;
 }
 
+void DSRequest::set_texture_region(uint32_t p_top, uint32_t p_bottom) {
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
+		return;
+	}
+	texture_region_top = p_top;
+	texture_region_bottom = p_bottom;
+}
+
+uint32_t DSRequest::get_texture_region_top() const {
+	return texture_region_top;
+}
+
+uint32_t DSRequest::get_texture_region_bottom() const {
+	return texture_region_bottom;
+}
+
 void DSRequest::set_texture_format(uint32_t p_format) {
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");

@@ -51,6 +51,11 @@ private:
 	RID destination_resource;
 	uint32_t first_subresource = 0;
 	uint32_t subresource_count = 1;
+	// Row range inside one subresource for chunked uploads. top == bottom means
+	// "the whole subresource" (the historic range path). Internal to the loader;
+	// never bound to GDScript.
+	uint32_t texture_region_top = 0;
+	uint32_t texture_region_bottom = 0;
 	uint32_t texture_format = 0;
 	uint32_t texture_layout = 0;
 	DSPriority priority = PRIORITY_NORMAL;
@@ -107,6 +112,10 @@ public:
 
 	void set_subresource_count(uint32_t p_count);
 	uint32_t get_subresource_count() const;
+
+	void set_texture_region(uint32_t p_top, uint32_t p_bottom);
+	uint32_t get_texture_region_top() const;
+	uint32_t get_texture_region_bottom() const;
 
 	void set_texture_format(uint32_t p_format);
 	uint32_t get_texture_format() const;

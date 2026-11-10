@@ -147,6 +147,38 @@ extern "C" const PfnDliHook __pfnDliFailureHook2 = ds_delay_load_failure_hook;
 
 static const uint64_t GDEFLATE_PAGE_SIZE = 64ULL * 1024ULL;
 
+// DXGI block-compressed formats: a row-range request must land on 4x4 block
+// boundaries (top aligned, bottom aligned unless it is the mip edge), or the
+// runtime's CopyTextureRegion rejects the box.
+static bool dxgi_format_is_block_compressed(DXGI_FORMAT p_format) {
+	switch (p_format) {
+		case DXGI_FORMAT_BC1_TYPELESS:
+		case DXGI_FORMAT_BC1_UNORM:
+		case DXGI_FORMAT_BC1_UNORM_SRGB:
+		case DXGI_FORMAT_BC2_TYPELESS:
+		case DXGI_FORMAT_BC2_UNORM:
+		case DXGI_FORMAT_BC2_UNORM_SRGB:
+		case DXGI_FORMAT_BC3_TYPELESS:
+		case DXGI_FORMAT_BC3_UNORM:
+		case DXGI_FORMAT_BC3_UNORM_SRGB:
+		case DXGI_FORMAT_BC4_TYPELESS:
+		case DXGI_FORMAT_BC4_UNORM:
+		case DXGI_FORMAT_BC4_SNORM:
+		case DXGI_FORMAT_BC5_TYPELESS:
+		case DXGI_FORMAT_BC5_UNORM:
+		case DXGI_FORMAT_BC5_SNORM:
+		case DXGI_FORMAT_BC6H_TYPELESS:
+		case DXGI_FORMAT_BC6H_UF16:
+		case DXGI_FORMAT_BC6H_SF16:
+		case DXGI_FORMAT_BC7_TYPELESS:
+		case DXGI_FORMAT_BC7_UNORM:
+		case DXGI_FORMAT_BC7_UNORM_SRGB:
+			return true;
+		default:
+			return false;
+	}
+}
+
 struct DSChunkBoundary {
 	uint64_t source_offset = 0;
 	uint64_t source_size = 0;
@@ -3864,7 +3896,13 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	// Both codecs upload a GPU texture mip by mip from the container's padded
 	// footprints, so the mip table is required for NONE payloads too.
 	const bool gpu_texture_destination = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE;
-	bool has_texture_mip_entries = gpu_texture_destination && get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries);
+	// A row-range request is already one chunk of a chunked payload: the caller
+	// resolved its sizes from the validated chunk table, so the legacy
+	// whole-file staging/rewrite logic below must not run for it.
+	const bool is_row_region_request = gpu_texture_destination &&
+			p_request->get_texture_region_bottom() > p_request->get_texture_region_top();
+	bool has_texture_mip_entries = gpu_texture_destination && !is_row_region_request &&
+			get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries);
 	uint64_t texture_footprint = 0;
 	uint32_t texture_first_subresource = p_request->get_first_subresource();
 	uint32_t texture_subresource_count = p_request->get_subresource_count();
@@ -3886,7 +3924,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 	}
 
-	if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE && !has_texture_mip_entries) {
+	if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE && !has_texture_mip_entries &&
+			!is_row_region_request) {
 		p_request->set_status(DSRequest::STATUS_FAILED);
 		p_request->set_error_message("Win32Backend: GPU texture destinations require v2 footprint-padded formats.");
 		return false;
@@ -4154,6 +4193,30 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 					// (the format check above is skipped, the contract still applies).
 					destination_error = "Win32Backend: GPU texture destination is owned by an in-flight DirectStorage batch; wait for batch_completed / wait_for_completion (or collect_completed_results) before sampling or reusing it. For CPU-side access use a DESTINATION_MEMORY request instead.";
 				}
+				if (destination_error.is_empty()) {
+					// Row-range upload (chunked payloads). Validated here because the
+					// box is derived from the mip dimensions, which only this scope has.
+					const uint32_t region_top = p_child->get_texture_region_top();
+					const uint32_t region_bottom = p_child->get_texture_region_bottom();
+					if (region_bottom > region_top) {
+						const uint32_t mip_index = static_cast<uint32_t>(first_subresource % mip_levels);
+						const uint32_t mip_height = static_cast<uint32_t>(std::max<uint64_t>(1, texture_desc.Height >> mip_index));
+						if (texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+							destination_error = "Win32Backend: row-range texture uploads require a 2D texture.";
+						} else if (subresource_count != 1) {
+							destination_error = "Win32Backend: row-range texture uploads must target exactly one subresource (first=" +
+									String::num_uint64(first_subresource) + ", count=" + String::num_uint64(subresource_count) + ").";
+						} else if (region_top >= region_bottom || region_bottom > mip_height) {
+							destination_error = "Win32Backend: texture row range is out of bounds (top=" +
+									String::num_uint64(region_top) + ", bottom=" + String::num_uint64(region_bottom) +
+									", height=" + String::num_uint64(mip_height) + ").";
+						} else if (dxgi_format_is_block_compressed(texture_desc.Format) &&
+								(region_top % 4 != 0 || (region_bottom % 4 != 0 && region_bottom != mip_height))) {
+							destination_error = "Win32Backend: block-compressed row range must start on a 4-row boundary and end on one unless it reaches the mip edge (top=" +
+									String::num_uint64(region_top) + ", bottom=" + String::num_uint64(region_bottom) + ").";
+						}
+					}
+				}
 			}
 		}
 
@@ -4171,8 +4234,13 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	}
 
 	DSTORAGE_REQUEST request = {};
+	// A chunked upload targets a row range of one subresource; everything else
+	// keeps the historic whole-subresource / whole-buffer destinations.
+	const bool texture_row_region = gpu_texture_destination &&
+			p_child->get_texture_region_bottom() > p_child->get_texture_region_top();
 	request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
 	request.Options.DestinationType = gpu_buffer_destination ? DSTORAGE_REQUEST_DESTINATION_BUFFER :
+			texture_row_region ? DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION :
 			gpu_texture_destination ? DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES_RANGE :
 			DSTORAGE_REQUEST_DESTINATION_MEMORY;
 	request.Options.CompressionFormat = (p_child->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE)
@@ -4187,6 +4255,17 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		request.Destination.Buffer.Resource = destination_buffer;
 		request.Destination.Buffer.Offset = p_destination_offset;
 		request.Destination.Buffer.Size = uncompressed_size;
+	} else if (texture_row_region) {
+		request.Destination.Texture.Resource = destination_texture;
+		request.Destination.Texture.SubresourceIndex = p_child->get_first_subresource();
+		D3D12_BOX region = {};
+		region.left = 0;
+		region.top = p_child->get_texture_region_top();
+		region.front = 0;
+		region.right = static_cast<UINT>(dest_desc.Width);
+		region.bottom = p_child->get_texture_region_bottom();
+		region.back = 1;
+		request.Destination.Texture.Region = region;
 	} else if (gpu_texture_destination) {
 		request.Destination.MultipleSubresourcesRange.Resource = destination_texture;
 		request.Destination.MultipleSubresourcesRange.FirstSubresource = p_child->get_first_subresource();
@@ -4216,12 +4295,27 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		resource_guards[p_child.ptr()] = resource_guard;
 	}
 	if (gpu_texture_destination && destination_texture) {
-		GPUTargetTransition transition;
-		transition.resource = destination_texture;
-		transition.original_state = D3D12_RESOURCE_STATE_COMMON;
-		transition.first_subresource = p_child->get_first_subresource();
-		transition.subresource_count = p_child->get_subresource_count();
-		slot.gpu_transitions.push_back(transition);
+		// One barrier per resource+range per batch: a chunked texture stages one
+		// request per chunk, and pushing a transition for every chunk would emit
+		// N identical COMMON->COPY_DEST barriers for one texture.
+		bool already_recorded = false;
+		for (int t = 0; t < slot.gpu_transitions.size(); t++) {
+			const GPUTargetTransition &existing = slot.gpu_transitions[t];
+			if (existing.resource.Get() == destination_texture &&
+					existing.first_subresource == p_child->get_first_subresource() &&
+					existing.subresource_count == p_child->get_subresource_count()) {
+				already_recorded = true;
+				break;
+			}
+		}
+		if (!already_recorded) {
+			GPUTargetTransition transition;
+			transition.resource = destination_texture;
+			transition.original_state = D3D12_RESOURCE_STATE_COMMON;
+			transition.first_subresource = p_child->get_first_subresource();
+			transition.subresource_count = p_child->get_subresource_count();
+			slot.gpu_transitions.push_back(transition);
+		}
 	}
 	if (gpu_buffer_destination || gpu_texture_destination) {
 		p_child->set_gpu_in_flight(true);

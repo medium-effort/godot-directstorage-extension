@@ -26,6 +26,7 @@
 
 #include <atomic>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
@@ -410,6 +411,11 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		const PackedInt32Array &p_mip_sizes,
 		const PackedInt32Array &p_mip_uncompressed_sizes,
 		const PackedInt32Array &p_mip_row_pitches,
+		const PackedInt32Array &p_mip_chunk_counts,
+		const PackedInt64Array &p_chunk_offsets,
+		const PackedInt32Array &p_chunk_compressed_sizes,
+		const PackedInt32Array &p_chunk_uncompressed_sizes,
+		bool p_chunked,
 		const String &p_cache_key,
 		const String &p_original_cache_key,
 		int32_t p_cache_mode,
@@ -419,7 +425,6 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		uint32_t p_logical_width,
 		uint32_t p_logical_height) const {
 	(void)p_is_srgb;
-	(void)p_mip_row_pitches;
 	// The codec comes from the container header, never from the extension: a
 	// writer that loses to its own compression stores NONE payloads, and those
 	// must not be handed to DirectStorage as GDeflate.
@@ -560,33 +565,111 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		if (tex_rid.is_valid()) {
 			uint64_t native_format = rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, tex_rid, 0);
 			if (native_format != 0) {
-				Ref<DSRequest> req;
-				req.instantiate();
-				req->set_file_path(p_file_path);
-				uint64_t start_offset = (p_mip_offsets.size() > 0) ? static_cast<uint64_t>(p_mip_offsets[0]) : p_offset;
-				uint64_t total_span = p_compressed_size;
-				if (p_mip_offsets.size() >= static_cast<int64_t>(p_mip_count) && p_mip_sizes.size() >= static_cast<int64_t>(p_mip_count) && p_mip_count > 0) {
-					uint64_t last_idx = p_mip_count - 1;
-					total_span = (static_cast<uint64_t>(p_mip_offsets[last_idx]) + static_cast<uint64_t>(p_mip_sizes[last_idx])) - start_offset;
-				}
-				req->set_offset(start_offset);
-				req->set_size(static_cast<uint32_t>(total_span));
-				req->set_uncompressed_size(static_cast<uint32_t>(p_original_size));
-				req->set_destination_type(DSRequest::DESTINATION_GPU_TEXTURE);
-				req->set_destination_resource(tex_rid);
-				req->set_first_subresource(0);
-				req->set_subresource_count(p_mip_count);
-				req->set_texture_format(static_cast<uint32_t>(native_format));
-				req->set_compression_format(is_gdeflate ? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
+				// Sync _load path: explicit from_stream=false so the batch manager's
+				// stream flush can never steal a sync request. One batch, one flush,
+				// even when a chunked payload becomes several requests.
+				Vector<Ref<DSRequest>> uploads;
+				auto make_upload = [&](uint64_t p_upload_offset, uint32_t p_size, uint32_t p_uncompressed,
+						uint32_t p_first_subresource, uint32_t p_subresource_count) -> Ref<DSRequest> {
+					Ref<DSRequest> req;
+					req.instantiate();
+					req->set_file_path(p_file_path);
+					req->set_offset(p_upload_offset);
+					req->set_size(p_size);
+					req->set_uncompressed_size(p_uncompressed);
+					req->set_destination_type(DSRequest::DESTINATION_GPU_TEXTURE);
+					req->set_destination_resource(tex_rid);
+					req->set_first_subresource(p_first_subresource);
+					req->set_subresource_count(p_subresource_count);
+					req->set_texture_format(static_cast<uint32_t>(native_format));
+					req->set_compression_format(is_gdeflate ? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
+					uploads.push_back(req);
+					return req;
+				};
 
-				// Sync _load path: explicit from_stream=false so the batch
-				// manager's stream flush can never steal a sync request.
-				// Stays fully synchronous: enqueue + flush_batch + status poll.
-				bool enqueued = ds_ctx->enqueue_request(req, false);
-				if (enqueued) {
+				bool chunk_layout_ok = true;
+				if (p_chunked) {
+					// One request per chunk. A single-chunk mip keeps the whole-
+					// subresource destination: its chunk table entry does not exist.
+					int64_t chunk_cursor = 0;
+					for (uint32_t mip = 0; mip < p_mip_count; ++mip) {
+						const int32_t chunk_count = p_mip_chunk_counts.size() > static_cast<int64_t>(mip) ? p_mip_chunk_counts[mip] : 1;
+						const int32_t pitch = p_mip_row_pitches.size() > static_cast<int64_t>(mip) ? p_mip_row_pitches[mip] : 0;
+						if (chunk_count <= 1) {
+							make_upload(static_cast<uint64_t>(p_mip_offsets[mip]),
+									static_cast<uint32_t>(p_mip_sizes[mip]),
+									static_cast<uint32_t>(p_mip_uncompressed_sizes[mip]), mip, 1);
+							continue;
+						}
+						if (pitch <= 0) {
+							chunk_layout_ok = false;
+							break;
+						}
+						uint32_t row = 0;
+						for (int32_t c = 0; c < chunk_count; ++c, ++chunk_cursor) {
+							if (chunk_cursor >= p_chunk_offsets.size() ||
+									chunk_cursor >= p_chunk_compressed_sizes.size() ||
+									chunk_cursor >= p_chunk_uncompressed_sizes.size()) {
+								chunk_layout_ok = false;
+								break;
+							}
+							const uint32_t uncompressed = static_cast<uint32_t>(p_chunk_uncompressed_sizes[chunk_cursor]);
+							if (uncompressed % static_cast<uint32_t>(pitch) != 0) {
+								chunk_layout_ok = false;
+								break;
+							}
+							Ref<DSRequest> req = make_upload(static_cast<uint64_t>(p_chunk_offsets[chunk_cursor]),
+									static_cast<uint32_t>(p_chunk_compressed_sizes[chunk_cursor]), uncompressed, mip, 1);
+							const uint32_t rows = uncompressed / static_cast<uint32_t>(pitch);
+							req->set_texture_region(row, row + rows);
+							row += rows;
+						}
+						if (!chunk_layout_ok || static_cast<uint64_t>(row) * static_cast<uint64_t>(pitch) !=
+								static_cast<uint64_t>(p_mip_uncompressed_sizes[mip])) {
+							chunk_layout_ok = false;
+							break;
+						}
+					}
+				} else {
+					uint64_t start_offset = (p_mip_offsets.size() > 0) ? static_cast<uint64_t>(p_mip_offsets[0]) : p_offset;
+					uint64_t total_span = p_compressed_size;
+					if (p_mip_offsets.size() >= static_cast<int64_t>(p_mip_count) && p_mip_sizes.size() >= static_cast<int64_t>(p_mip_count) && p_mip_count > 0) {
+						uint64_t last_idx = p_mip_count - 1;
+						total_span = (static_cast<uint64_t>(p_mip_offsets[last_idx]) + static_cast<uint64_t>(p_mip_sizes[last_idx])) - start_offset;
+					}
+					make_upload(start_offset, static_cast<uint32_t>(total_span),
+							static_cast<uint32_t>(p_original_size), 0, p_mip_count);
+				}
+
+				const uint32_t queue_capacity = ds_ctx->get_queue_capacity();
+				if (!chunk_layout_ok) {
+					UtilityFunctions::push_warning("DSResourceFormatLoader: chunk table does not describe a contiguous mip for ", p_cache_key, "; using CPU decompression.");
+					uploads.clear();
+				} else if (uploads.size() > static_cast<int>(std::max<uint32_t>(1, queue_capacity / 2))) {
+					UtilityFunctions::push_warning("DSResourceFormatLoader: ", uploads.size(), " requests exceed the queue budget (", queue_capacity, ") for ", p_cache_key, "; using CPU decompression (raise chunk_size_kb or queue_capacity).");
+					uploads.clear();
+				}
+
+				bool all_completed = uploads.size() > 0;
+				for (int i = 0; i < uploads.size() && all_completed; ++i) {
+					if (!ds_ctx->enqueue_request(uploads[i], false)) {
+						all_completed = false;
+					}
+				}
+				if (all_completed) {
+					ds_ctx->flush_batch();
+					for (int i = 0; i < uploads.size(); ++i) {
+						if (uploads[i]->get_status() != DSRequest::STATUS_COMPLETED) {
+							all_completed = false;
+							break;
+						}
+					}
+				} else if (uploads.size() > 0) {
+					// Some requests may already be staged; drain them before the
+					// RID can be freed by the CPU fallback below.
 					ds_ctx->flush_batch();
 				}
-				if (enqueued && req->get_status() == DSRequest::STATUS_COMPLETED) {
+				if (all_completed) {
 					Ref<Texture2DRD> tex_rd;
 					tex_rd.instantiate();
 					tex_rd->set_texture_rd_rid(tex_rid);
@@ -625,7 +708,23 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					result_texture = tex_rd;
 					ownership_transferred = true;
 				} else {
-					UtilityFunctions::push_warning("DSResourceFormatLoader: GPU texture load failed for ", p_cache_key, "; falling back to CPU decompression.");
+					String failure_reason = uploads.size() == 0 ? String("no request was staged") : String();
+					for (int i = 0; i < uploads.size() && failure_reason.is_empty(); ++i) {
+						if (uploads[i].is_valid() && uploads[i]->get_status() == DSRequest::STATUS_FAILED) {
+							failure_reason = uploads[i]->get_error_message();
+						}
+					}
+					if (failure_reason.is_empty()) {
+						for (int i = 0; i < uploads.size(); ++i) {
+							if (uploads[i].is_valid()) {
+								failure_reason = "request " + String::num_int64(i) + " in status " +
+										String::num_int64(static_cast<int64_t>(uploads[i]->get_status()));
+								break;
+							}
+						}
+					}
+					UtilityFunctions::push_warning("DSResourceFormatLoader: GPU texture load failed for ", p_cache_key,
+							" (", failure_reason, "); falling back to CPU decompression.");
 				}
 			} else {
 				UtilityFunctions::push_warning("DSResourceFormatLoader: Could not retrieve the native texture format for ", p_cache_key, "; falling back to CPU decompression.");
@@ -692,7 +791,9 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		PackedByteArray natural_texture_data;
 		if (p_is_v2 && p_mip_offsets.size() >= static_cast<int64_t>(mip_count) && p_mip_sizes.size() >= static_cast<int64_t>(mip_count)) {
 			// Decompress each mip independently and unpad from 256-byte pitch footprint to natural image data
-			bool ds_usable = is_physical_source && ds_ctx && ds_ctx->is_initialized();
+			// A chunked payload is assembled from independent per-chunk streams, which
+			// the per-mip memory-request path cannot express: take the file path below.
+			bool ds_usable = is_physical_source && ds_ctx && ds_ctx->is_initialized() && !p_chunked;
 			if (p_use_sub_threads && ds_usable) {
 				if (!ds_ctx->is_batch_complete() || ds_ctx->has_stream_pending()) {
 					ds_usable = false;
@@ -726,6 +827,8 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 			Ref<GDeflateDecompressor> gdeflate_decompressor;
 			gdeflate_decompressor.instantiate();
 			Ref<FileAccess> file;
+			// Chunk arrays are flat and only contain mips with chunk_count > 1.
+			int64_t chunk_cursor = 0;
 			uint32_t cur_w = p_width;
 			uint32_t cur_h = p_height;
 			bool all_mips_ok = true;
@@ -743,14 +846,56 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 						file = FileAccess::open(p_file_path, FileAccess::READ);
 					}
 					if (file.is_valid() && file->is_open()) {
-						file->seek(static_cast<uint64_t>(p_mip_offsets[i]));
-						PackedByteArray compressed_mip = file->get_buffer(static_cast<int64_t>(p_mip_sizes[i]));
-						if (compressed_mip.size() == static_cast<int64_t>(p_mip_sizes[i])) {
-							if (is_gdeflate) {
-								mip_decompressed = gdeflate_decompressor->decompress(compressed_mip, expected_footprint_size);
-							} else if (compressed_mip.size() == static_cast<int64_t>(expected_footprint_size)) {
-								// NONE: the file already holds the footprint bytes.
-								mip_decompressed = compressed_mip;
+						const int32_t chunk_count = (p_chunked && p_mip_chunk_counts.size() > static_cast<int64_t>(i))
+								? p_mip_chunk_counts[i] : 1;
+						const int32_t pitch = p_mip_row_pitches.size() > static_cast<int64_t>(i) ? p_mip_row_pitches[i] : 0;
+						if (is_gdeflate && p_chunked && chunk_count > 1 && pitch > 0) {
+							PackedByteArray footprint;
+							footprint.resize(static_cast<int64_t>(expected_footprint_size));
+							uint64_t rows_written = 0;
+							bool chunk_ok = true;
+							for (int32_t c = 0; c < chunk_count; ++c, ++chunk_cursor) {
+								if (chunk_cursor >= p_chunk_offsets.size() ||
+										chunk_cursor >= p_chunk_compressed_sizes.size() ||
+										chunk_cursor >= p_chunk_uncompressed_sizes.size()) {
+									chunk_ok = false;
+									break;
+								}
+								const uint32_t chunk_compressed_size = static_cast<uint32_t>(p_chunk_compressed_sizes[chunk_cursor]);
+								const uint32_t chunk_uncompressed_size = static_cast<uint32_t>(p_chunk_uncompressed_sizes[chunk_cursor]);
+								if (chunk_uncompressed_size % static_cast<uint32_t>(pitch) != 0 ||
+										static_cast<uint64_t>(chunk_uncompressed_size) > static_cast<uint64_t>(expected_footprint_size)) {
+									chunk_ok = false;
+									break;
+								}
+								file->seek(static_cast<uint64_t>(p_chunk_offsets[chunk_cursor]));
+								PackedByteArray compressed_chunk = file->get_buffer(static_cast<int64_t>(chunk_compressed_size));
+								if (compressed_chunk.size() != static_cast<int64_t>(chunk_compressed_size)) {
+									chunk_ok = false;
+									break;
+								}
+								PackedByteArray decoded = gdeflate_decompressor->decompress(compressed_chunk, chunk_uncompressed_size);
+								if (decoded.size() != static_cast<int64_t>(chunk_uncompressed_size) ||
+										rows_written * static_cast<uint64_t>(pitch) + chunk_uncompressed_size > static_cast<uint64_t>(expected_footprint_size)) {
+									chunk_ok = false;
+									break;
+								}
+								memcpy(footprint.ptrw() + rows_written * static_cast<uint64_t>(pitch), decoded.ptr(), decoded.size());
+								rows_written += chunk_uncompressed_size / static_cast<uint32_t>(pitch);
+							}
+							if (chunk_ok && rows_written * static_cast<uint64_t>(pitch) == static_cast<uint64_t>(expected_footprint_size)) {
+								mip_decompressed = footprint;
+							}
+						} else {
+							file->seek(static_cast<uint64_t>(p_mip_offsets[i]));
+							PackedByteArray compressed_mip = file->get_buffer(static_cast<int64_t>(p_mip_sizes[i]));
+							if (compressed_mip.size() == static_cast<int64_t>(p_mip_sizes[i])) {
+								if (is_gdeflate) {
+									mip_decompressed = gdeflate_decompressor->decompress(compressed_mip, expected_footprint_size);
+								} else if (compressed_mip.size() == static_cast<int64_t>(expected_footprint_size)) {
+									// NONE: the file already holds the footprint bytes.
+									mip_decompressed = compressed_mip;
+								}
 							}
 						}
 					}
@@ -1014,26 +1159,36 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 				UtilityFunctions::push_error("DSResourceFormatLoader: DSPkg entry is not a texture: ", target_path);
 				return Variant();
 			}
-			// The CPU/ImageTexture and pre-Step-4 GPU paths decode GDeflate and
-			// raw NONE payloads only. Fail closed instead of misreading
-			// Zstd/GACL bytes or ignoring chunks.
+			// The CPU/ImageTexture and GPU paths decode GDeflate and raw NONE
+			// payloads only. Chunked payloads are supported when the entry carries
+			// its chunk table; Zstd/GACL still fail closed.
 			if ((compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) &&
 						compression_format != static_cast<int>(DSCompressionFormat::NONE)) ||
-					gacl_transform != static_cast<int>(DSGaclTransform::NONE) || chunked) {
-				UtilityFunctions::push_error("DSResourceFormatLoader: DSPkg entry uses Zstd/GACL/chunked payloads that require the GPU path or Step 5 CPU support: ", target_path);
+					gacl_transform != static_cast<int>(DSGaclTransform::NONE)) {
+				UtilityFunctions::push_error("DSResourceFormatLoader: DSPkg entry uses Zstd/GACL payloads that require the GPU path or Step 5 CPU support: ", target_path);
 				return Variant();
 			}
 			PackedInt64Array mip_offsets = entry_info.has("mip_offsets") ? (PackedInt64Array)entry_info["mip_offsets"] : PackedInt64Array();
 			PackedInt32Array mip_sizes = entry_info.has("mip_sizes") ? (PackedInt32Array)entry_info["mip_sizes"] : PackedInt32Array();
 			PackedInt32Array mip_uncompressed_sizes = entry_info.has("mip_uncompressed_sizes") ? (PackedInt32Array)entry_info["mip_uncompressed_sizes"] : PackedInt32Array();
 			PackedInt32Array mip_row_pitches = entry_info.has("mip_row_pitches") ? (PackedInt32Array)entry_info["mip_row_pitches"] : PackedInt32Array();
+			PackedInt32Array mip_chunk_counts = entry_info.has("mip_chunk_counts") ? (PackedInt32Array)entry_info["mip_chunk_counts"] : PackedInt32Array();
+			PackedInt64Array chunk_offsets = entry_info.has("chunk_offsets") ? (PackedInt64Array)entry_info["chunk_offsets"] : PackedInt64Array();
+			PackedInt32Array chunk_compressed_sizes = entry_info.has("chunk_compressed_sizes") ? (PackedInt32Array)entry_info["chunk_compressed_sizes"] : PackedInt32Array();
+			PackedInt32Array chunk_uncompressed_sizes = entry_info.has("chunk_uncompressed_sizes") ? (PackedInt32Array)entry_info["chunk_uncompressed_sizes"] : PackedInt32Array();
+			if (chunked && (chunk_offsets.size() == 0 ||
+					chunk_compressed_sizes.size() != chunk_offsets.size() ||
+					chunk_uncompressed_sizes.size() != chunk_offsets.size())) {
+				UtilityFunctions::push_error("DSResourceFormatLoader: DSPkg entry is marked chunked but carries no chunk table: ", target_path);
+				return Variant();
+			}
 
 			bool as_image_texture = (entry_info.has("flags") && (static_cast<uint32_t>(entry_info["flags"]) & 2U) != 0) ||
 					(entry_info.has("as_image_texture") && (bool)entry_info["as_image_texture"]);
 			uint32_t logical_width = entry_info.has("logical_width") ? static_cast<uint32_t>(entry_info["logical_width"]) : 0;
 			uint32_t logical_height = entry_info.has("logical_height") ? static_cast<uint32_t>(entry_info["logical_height"]) : 0;
 
-			return _load_texture_payload(archive_path, data_offset, comp_size, orig_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, compression_format, as_image_texture, logical_width, logical_height);
+			return _load_texture_payload(archive_path, data_offset, comp_size, orig_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, mip_chunk_counts, chunk_offsets, chunk_compressed_sizes, chunk_uncompressed_sizes, chunked, p_path, p_original_path, p_cache_mode, p_use_sub_threads, compression_format, as_image_texture, logical_width, logical_height);
 		}
 		UtilityFunctions::push_error("DSResourceFormatLoader: Failed to get entry info from res://textures.dspkg for ", target_path);
 		return Variant();
@@ -1061,13 +1216,14 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		// already reports that default for v2 files.
 		const int compression_format = header.has("compression_format") ?
 				(int)header["compression_format"] : static_cast<int>(DSCompressionFormat::GDEFLATE);
+		bool chunked = false;
 		if (header_version == 3) {
 			const int gacl_transform = header.has("gacl_transform") ? (int)header["gacl_transform"] : 0;
-			const bool chunked = header.has("chunked") ? (bool)header["chunked"] : false;
+			chunked = header.has("chunked") ? (bool)header["chunked"] : false;
 			if ((compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) &&
 						compression_format != static_cast<int>(DSCompressionFormat::NONE)) ||
-					gacl_transform != static_cast<int>(DSGaclTransform::NONE) || chunked) {
-				UtilityFunctions::push_error("DSResourceFormatLoader: DSTex v3 uses Zstd/GACL/chunked payloads that require the GPU path or Step 5 CPU support: ", p_path);
+					gacl_transform != static_cast<int>(DSGaclTransform::NONE)) {
+				UtilityFunctions::push_error("DSResourceFormatLoader: DSTex v3 uses Zstd/GACL payloads that require the GPU path or Step 5 CPU support: ", p_path);
 				return Variant();
 			}
 		}
@@ -1075,6 +1231,16 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		PackedInt32Array mip_sizes = header.has("mip_sizes") ? (PackedInt32Array)header["mip_sizes"] : PackedInt32Array();
 		PackedInt32Array mip_uncompressed_sizes = header.has("mip_uncompressed_sizes") ? (PackedInt32Array)header["mip_uncompressed_sizes"] : PackedInt32Array();
 		PackedInt32Array mip_row_pitches = header.has("mip_row_pitches") ? (PackedInt32Array)header["mip_row_pitches"] : PackedInt32Array();
+		PackedInt32Array mip_chunk_counts = header.has("mip_chunk_counts") ? (PackedInt32Array)header["mip_chunk_counts"] : PackedInt32Array();
+		PackedInt64Array chunk_offsets = header.has("chunk_offsets") ? (PackedInt64Array)header["chunk_offsets"] : PackedInt64Array();
+		PackedInt32Array chunk_compressed_sizes = header.has("chunk_compressed_sizes") ? (PackedInt32Array)header["chunk_compressed_sizes"] : PackedInt32Array();
+		PackedInt32Array chunk_uncompressed_sizes = header.has("chunk_uncompressed_sizes") ? (PackedInt32Array)header["chunk_uncompressed_sizes"] : PackedInt32Array();
+		if (chunked && (chunk_offsets.size() == 0 ||
+				chunk_compressed_sizes.size() != chunk_offsets.size() ||
+				chunk_uncompressed_sizes.size() != chunk_offsets.size())) {
+			UtilityFunctions::push_error("DSResourceFormatLoader: DSTex is marked chunked but carries no chunk table: ", p_path);
+			return Variant();
+		}
 		// read_header reports logical keys with a storage fallback, so v1/v2
 		// files yield storage dims and no override is applied.
 		uint32_t logical_width = header.has("logical_width") ? static_cast<uint32_t>(header["logical_width"]) : 0;
@@ -1095,7 +1261,7 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			data_offset = (data_offset + 511) & ~uint64_t(511);
 		}
 
-		return _load_texture_payload(p_path, data_offset, compressed_size, original_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, compression_format, as_image_texture, logical_width, logical_height);
+		return _load_texture_payload(p_path, data_offset, compressed_size, original_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, mip_chunk_counts, chunk_offsets, chunk_compressed_sizes, chunk_uncompressed_sizes, chunked, p_path, p_original_path, p_cache_mode, p_use_sub_threads, compression_format, as_image_texture, logical_width, logical_height);
 	}
 
 	if (ext == "dspkg") {
