@@ -3389,6 +3389,31 @@ bool Win32Backend::initialize(const String &p_path) {
 }
 
 #ifdef _WIN32
+// Samples the fences and applies the result under batch_mutex. Callers invoke this only after the
+// drain has decided whether it needs to block: a value read before the wait is what the hardware
+// held when the drain started blocking, not what it held when the wait was satisfied.
+void Win32Backend::record_drain_watermarks(ID3D12Fence *const *p_fences) {
+	uint64_t completed_now[QUEUE_COUNT] = {};
+	for (int i = 0; i < QUEUE_COUNT; i++) {
+		completed_now[i] = p_fences[i] ? p_fences[i]->GetCompletedValue() : 0;
+	}
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	for (int i = 0; i < QUEUE_COUNT; i++) {
+		// max, not assignment: the completion thread may have recorded a newer value
+		// while this drain was waiting, and the counter must never move backwards.
+		// UINT64_MAX is "device removed", not a completed value; wait_for_completion()
+		// reports it as a failure, so it must never become a watermark.
+		if (completed_now[i] == UINT64_MAX) {
+			continue;
+		}
+		priority_queues[i].completed_fence_value = std::max(priority_queues[i].completed_fence_value, completed_now[i]);
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		debug_last_drain_completion[i] = priority_queues[i].completion_fence_value;
+		debug_last_drain_completed[i] = priority_queues[i].completed_fence_value;
+#endif
+	}
+}
+
 bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 	// Snapshot the per-queue wait targets under batch_mutex. Every QueueState
 	// counter belongs to that mutex: submit_async()/submit_batch() advance
@@ -3438,25 +3463,24 @@ bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 	}
 
 	if (event_count == 0) {
+		// Nothing to block on: every target was already satisfied when the waits were
+		// registered. Those fences were still verified, so the watermarks this drain
+		// reports have to be recorded here too - this exit used to return without
+		// touching the counters, leaving them behind a fence the drain had just
+		// observed as complete.
+		record_drain_watermarks(fences);
 		return true;
-	}
-
-	// Read the fences outside the lock (they are hardware-owned values); apply the
-	// results under it.
-	uint64_t completed_now[QUEUE_COUNT] = {};
-	for (int i = 0; i < QUEUE_COUNT; i++) {
-		completed_now[i] = fences[i] ? fences[i]->GetCompletedValue() : 0;
 	}
 
 	DWORD wait_result = WaitForMultipleObjects(event_count, wait_events, TRUE, p_timeout_ms);
 	if (wait_result >= WAIT_OBJECT_0 && wait_result < WAIT_OBJECT_0 + event_count) {
+		// Record AFTER the wait satisfied every target. The snapshot this used to
+		// read was taken before the block, i.e. it is what the hardware held when the
+		// drain started waiting, not what it held when the wait returned, so it can
+		// sit below the target the wait has just proved. wait_for_completion()
+		// re-samples for the same reason (:1303).
+		record_drain_watermarks(fences);
 		std::lock_guard<std::mutex> lock(batch_mutex);
-		for (int i = 0; i < QUEUE_COUNT; i++) {
-			// max, not assignment: the completion thread may have recorded a newer
-			// value while this drain was waiting, and the counter must never move
-			// backwards.
-			priority_queues[i].completed_fence_value = std::max(priority_queues[i].completed_fence_value, completed_now[i]);
-		}
 		for (size_t z = 0; z < zombie_slots.size(); z++) {
 			for (int r = 0; r < zombie_slots[z].requests.size(); r++) {
 				if (zombie_slots[z].requests[r].is_valid()) {
@@ -5158,6 +5182,39 @@ void Win32Backend::_debug_set_drain_counter_access_hook_for_testing(const std::f
 	// Callers must clear it before the captured state dies and before deleting the
 	// backend. Never bound in _bind_methods().
 	drain_counter_access_hook = p_hook;
+}
+
+void Win32Backend::_debug_get_last_drain_counters_for_testing(int p_queue_index, uint64_t &r_completion_value, uint64_t &r_completed_value) const {
+	// Test-only seam. Per-queue counters as the last successful drain left them;
+	// shutdown() zeroes the live counters, so this is the only post-drain observer.
+	// Never bound in _bind_methods().
+#ifdef _WIN32
+	if (p_queue_index < 0 || p_queue_index >= QUEUE_COUNT) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	r_completion_value = debug_last_drain_completion[p_queue_index];
+	r_completed_value = debug_last_drain_completed[p_queue_index];
+#else
+	(void)p_queue_index;
+	(void)r_completion_value;
+	(void)r_completed_value;
+#endif
+}
+
+void *Win32Backend::_debug_get_queue_completion_fence_for_testing(int p_queue_index) const {
+	// Test-only seam. One queue's completion fence, so a test can drive it to a
+	// value the GPU has not reached on its own. Never bound in _bind_methods().
+#ifdef _WIN32
+	if (p_queue_index < 0 || p_queue_index >= QUEUE_COUNT) {
+		return nullptr;
+	}
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	return priority_queues[p_queue_index].completion_fence;
+#else
+	(void)p_queue_index;
+	return nullptr;
+#endif
 }
 
 int Win32Backend::_debug_pending_enqueue_count() const {

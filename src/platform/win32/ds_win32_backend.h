@@ -137,6 +137,13 @@ private:
 
 	IDStorageFactory *factory = nullptr;
 	std::array<QueueState, QUEUE_COUNT> priority_queues;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Record of the per-queue watermarks the last successful drain left behind.
+	// shutdown() zeroes the live counters, so this is the only post-drain observer.
+	// Written under batch_mutex. Never bound in _bind_methods().
+	uint64_t debug_last_drain_completion[QUEUE_COUNT] = {};
+	uint64_t debug_last_drain_completed[QUEUE_COUNT] = {};
+#endif
 	// Backend-level open-file cache: normalized path -> handle plus its live
 	// owner count. Exported builds funnel a whole batch through one archive,
 	// and a per-request OpenFile costs hundreds of kernel opens per frame, so
@@ -264,6 +271,10 @@ private:
 #ifdef _WIN32
 	void completion_thread_func();
 	bool drain_all_queues(uint32_t p_timeout_ms);
+	// Samples the per-queue completion fences and records the watermarks a successful drain has
+	// verified, under batch_mutex. Callers invoke it only after the drain has decided whether it
+	// needs to block.
+	void record_drain_watermarks(ID3D12Fence *const *p_fences);
 	// Reads the queue's error record and builds its message. Never calls into the
 	// engine and never takes a lock of its own: callers hold batch_mutex, and the
 	// result is reported by report_queue_error() after that lock is released.
@@ -427,6 +438,14 @@ public:
 	// prove the drain-counter access and the queue-error *report* run under/outside batch_mutex.
 	// Never bound in _bind_methods().
 	bool _debug_batch_mutex_is_free_for_testing();
+	// Test-only seam: per-queue counters as the last successful drain left them. shutdown()
+	// zeroes the live counters, so this record is the only post-drain observer. Never bound in
+	// _bind_methods().
+	void _debug_get_last_drain_counters_for_testing(int p_queue_index, uint64_t &r_completion_value, uint64_t &r_completed_value) const;
+	// Test-only seam: one queue's completion fence, so a test can drive it to a value the GPU
+	// has not reached on its own. Declared with void* so the declaration stays buildable on
+	// hosts that have no ID3D12Fence; the test casts under _WIN32. Never bound in _bind_methods().
+	void *_debug_get_queue_completion_fence_for_testing(int p_queue_index) const;
 	// Test-only seam: try to take the queue-error drain lock; true when nothing held it. Used to
 	// prove process_queue_errors() is serialised with the completion thread's own error drain.
 	// Never bound in _bind_methods().

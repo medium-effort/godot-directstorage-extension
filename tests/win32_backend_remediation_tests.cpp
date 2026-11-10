@@ -1445,6 +1445,189 @@ GDEX_TEST_T(win32_remediation, drain_counter_access_is_serialised, TAG_INTEGRATI
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, drain_records_verified_fence_watermarks, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // A drain reports the fences it verified, so the watermark it records must be
+    // read after the wait that proved them. The wait here is satisfied by this
+    // thread signalling the queue's own D3D12 fence, so the target value exists
+    // exactly when the test decides and no DMA-speed race is involved. If the
+    // signal wins the race against the drain's registration, the drain takes its
+    // no-wait exit instead, and the assertions below still hold: the invariant is
+    // the recorded value, not which exit produced it.
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        // Mandatory, not hygiene: a pinned counter above the value the real fence
+        // will ever reach makes the next shutdown() drain wait out its whole budget.
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 0, 0);
+        memdelete(backend);
+    });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence(static_cast<ID3D12Fence *>(
+            backend->_debug_get_queue_completion_fence_for_testing(godot::DSRequest::PRIORITY_HIGH)));
+    GDEX_EXPECT_TRUE(fence != nullptr);
+    if (fence == nullptr) {
+        return;
+    }
+
+    const uint64_t target = fence->GetCompletedValue() + 1;
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, target, 0);
+    GDEX_EXPECT_EQ(backend->get_completion_fence(), target);
+
+    std::atomic<bool> drain_done{ false };
+    std::thread drainer([backend, &drain_done]() {
+        backend->shutdown();
+        drain_done.store(true, std::memory_order_release);
+    });
+    // The drain is inside its WaitForMultipleObjects() by now: nothing else can
+    // satisfy the pinned target, and the budget is the 10 s default.
+    godot::OS::get_singleton()->delay_msec(50);
+    const bool still_waiting = !drain_done.load(std::memory_order_acquire);
+    GDEX_EXPECT_TRUE(fence->Signal(target) == S_OK);
+    drainer.join();
+
+    uint64_t recorded_completion = 0;
+    uint64_t recorded_completed = 0;
+    backend->_debug_get_last_drain_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, recorded_completion, recorded_completed);
+
+    GDEX_EXPECT_TRUE(still_waiting);
+    GDEX_EXPECT_TRUE(backend->was_drain_clean());
+    GDEX_EXPECT_EQ(recorded_completion, target);
+    GDEX_EXPECT_TRUE(recorded_completed >= target);
+#else
+    (void)ctx;
+    GDEX_SKIP("The drain-record seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, drain_no_wait_records_verified_fence_watermarks, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // The other exit: the hardware is already at the target when the drain
+    // registers its waits, so it has nothing to block on. It still verified the
+    // fence, so it must still record it. Fully single-threaded.
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 0, 0);
+        memdelete(backend);
+    });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence(static_cast<ID3D12Fence *>(
+            backend->_debug_get_queue_completion_fence_for_testing(godot::DSRequest::PRIORITY_HIGH)));
+    GDEX_EXPECT_TRUE(fence != nullptr);
+    if (fence == nullptr) {
+        return;
+    }
+
+    const uint64_t target = fence->GetCompletedValue() + 1;
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, target, 0);
+    GDEX_EXPECT_TRUE(fence->Signal(target) == S_OK);
+    backend->shutdown();
+
+    uint64_t recorded_completion = 0;
+    uint64_t recorded_completed = 0;
+    backend->_debug_get_last_drain_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, recorded_completion, recorded_completed);
+
+    GDEX_EXPECT_TRUE(backend->was_drain_clean());
+    GDEX_EXPECT_EQ(recorded_completion, target);
+    GDEX_EXPECT_TRUE(recorded_completed >= target);
+#else
+    (void)ctx;
+    GDEX_SKIP("The drain-record seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, drain_timeout_records_no_watermarks, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // Anti-over-correction control: a drain that could not verify its target must
+    // not record it. This is the case that fails if the fix simply copies
+    // completion_fence_value into completed_fence_value.
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps == nullptr) {
+        GDEX_SKIP("ProjectSettings unavailable in this fixture.");
+    }
+    const bool had_timeout = ps->has_setting("dsgd_extension/shutdown_drain_timeout_ms");
+    const godot::Variant previous_timeout = had_timeout
+            ? ps->get_setting("dsgd_extension/shutdown_drain_timeout_ms")
+            : godot::Variant();
+    ctx.add_teardown([ps, had_timeout, previous_timeout]() {
+        if (had_timeout) {
+            ps->set_setting("dsgd_extension/shutdown_drain_timeout_ms", previous_timeout);
+        } else {
+            ps->clear("dsgd_extension/shutdown_drain_timeout_ms");
+        }
+    });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    bool *drain_timed_out = new bool(false);
+    ctx.add_teardown([backend, drain_timed_out]() {
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 0, 0);
+        const bool leaked = *drain_timed_out;
+        delete drain_timed_out;
+        if (leaked) {
+            // The drain timed out: completion_thread() was detached and hardware may
+            // still be probing this object, so freeing it here is the use-after-free
+            // the deliberate-leak path exists to avoid. Leak the backend on purpose.
+            return;
+        }
+        memdelete(backend);
+    });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence(static_cast<ID3D12Fence *>(
+            backend->_debug_get_queue_completion_fence_for_testing(godot::DSRequest::PRIORITY_HIGH)));
+    GDEX_EXPECT_TRUE(fence != nullptr);
+    if (fence == nullptr) {
+        return;
+    }
+    const uint64_t unreachable_target = fence->GetCompletedValue() + 1000;
+
+    // 100 ms is the documented minimum for the drain budget (backend.cpp:3495).
+    ps->set_setting("dsgd_extension/shutdown_drain_timeout_ms", 100);
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, unreachable_target, 0);
+    backend->shutdown();
+    *drain_timed_out = !backend->was_drain_clean();
+
+    uint64_t recorded_completion = 0;
+    uint64_t recorded_completed = 0;
+    backend->_debug_get_last_drain_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, recorded_completion, recorded_completed);
+
+    GDEX_EXPECT_TRUE(*drain_timed_out);
+    GDEX_EXPECT_EQ(recorded_completion, 0ULL);
+    GDEX_EXPECT_EQ(recorded_completed, 0ULL);
+#else
+    (void)ctx;
+    GDEX_SKIP("The drain-record seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, readers_see_no_backend_until_initialize_returns, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
