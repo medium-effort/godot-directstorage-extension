@@ -1671,7 +1671,7 @@ GDEX_TEST_T(win32_dspkg_mip, chunked_rejected, TAG_INTEGRATION) {
 #endif
 }
 
-GDEX_TEST_T(win32_dspkg_mip, none_rejected, TAG_INTEGRATION) {
+GDEX_TEST_T(win32_dspkg_mip, none_accepted, TAG_INTEGRATION) {
 #if defined(_WIN32) && (defined(DEBUG_ENABLED) || defined(DEV_ENABLED))
 	const godot::String path = scratch_path("be_v5_none.dspkg");
 	V5Spec spec;
@@ -1680,7 +1680,10 @@ GDEX_TEST_T(win32_dspkg_mip, none_rejected, TAG_INTEGRATION) {
 	GDEX_ASSERT_TRUE(write_bytes(path, built.bytes));
 	godot::Win32Backend backend;
 	godot::Vector<godot::DSTexMipEntryV2> entries;
-	GDEX_EXPECT_FALSE(backend._debug_get_texture_mip_entries_for_testing(path, built.data_offset, entries));
+	// A raw NONE entry is uploadable: the staging path copies the bytes and the
+	// request carries COMPRESSION_NONE. Only Zstd/GACL/chunked fail closed.
+	GDEX_EXPECT_TRUE(backend._debug_get_texture_mip_entries_for_testing(path, built.data_offset, entries));
+	GDEX_EXPECT_TRUE(!entries.is_empty());
 	remove_file(path);
 #else
 	GDEX_SKIP("Windows-only backend parser");

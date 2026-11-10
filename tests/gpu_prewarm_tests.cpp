@@ -918,7 +918,12 @@ GDEX_TEST_T(gpu_prewarm, graceful_memory_fallback, TAG_INTEGRATION | TAG_SLOW) {
         req->set_offset((uint64_t)offs[0]);
         req->set_size((uint32_t)sizes[0]);
         req->set_uncompressed_size((uint32_t)uncomps[0]);
-        req->set_compression_format(godot::DSRequest::COMPRESSION_GDEFLATE);
+        // The archive entry's codec comes from the container: a texture whose
+        // compression lost to the raw footprint is stored as NONE.
+        const int entry_compression_format = info.has("compression_format") ?
+                (int)info["compression_format"] : static_cast<int>(godot::DSCompressionFormat::GDEFLATE);
+        req->set_compression_format(entry_compression_format == static_cast<int>(godot::DSCompressionFormat::GDEFLATE) ?
+                godot::DSRequest::COMPRESSION_GDEFLATE : godot::DSRequest::COMPRESSION_NONE);
         req->get_destination_buffer_ref().resize(uncomps[0]);
         GDEX_ASSERT_TRUE(ds->enqueue_request(req, true));
         GDEX_ASSERT_EQ((int64_t)ds->flush_stream_async(), (int64_t)godot::OK);

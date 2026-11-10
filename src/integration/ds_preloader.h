@@ -85,6 +85,9 @@ public:
 		uint32_t mip_count = 0;
 		bool is_v2 = false;
 		bool as_image_texture = false;
+		// Payload codec as declared by the container (DSCompressionFormat).
+		// Defaults to GDeflate, which is what every v1/v2 file carries.
+		uint8_t compression_format = static_cast<uint8_t>(DSCompressionFormat::GDEFLATE);
 		uint64_t data_offset = 0; // v1 single-request start
 		uint64_t compressed_size = 0; // v1 single-request span
 		uint64_t original_size = 0; // v1 single-request output
@@ -114,6 +117,7 @@ public:
 		uint32_t mip_count = 0;
 		uint32_t flags = 0;
 		uint16_t version = 0;
+		uint8_t compression_format = static_cast<uint8_t>(DSCompressionFormat::GDEFLATE);
 		uint64_t original_size = 0;
 		uint64_t compressed_size = 0;
 		uint64_t mtime = 0; // FileAccess::get_modified_time at fill (0 = unstatable)

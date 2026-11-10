@@ -754,17 +754,21 @@ Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_pa
 	}
 
 	// v4 archives store inline GDeflate mip payloads only. A v3 source with a
-	// Zstd/GACL/chunked payload has no v4 representation: fail closed here
-	// instead of writing an entry the readers must reject.
+	// NONE payload is staged as-is and forces the archive to v5 (the only
+	// layout that carries a per-entry codec); Zstd/GACL/chunked payloads have
+	// no representation in either layout, so they fail closed here instead of
+	// writing an entry the readers must reject.
 	if (dstex_version == 3) {
 		const int src_compression = dstex_header.get("compression_format", 1);
 		const int src_gacl = dstex_header.get("gacl_transform", 0);
 		const bool src_chunked = dstex_header.get("chunked", false);
-		if (src_compression != static_cast<int>(DSCompressionFormat::GDEFLATE) ||
+		if ((src_compression != static_cast<int>(DSCompressionFormat::GDEFLATE) &&
+					src_compression != static_cast<int>(DSCompressionFormat::NONE)) ||
 				src_gacl != static_cast<int>(DSGaclTransform::NONE) || src_chunked) {
-			UtilityFunctions::push_error("DSPkg: v3 .dstex uses Zstd/GACL/chunked payloads that v4 archives cannot represent: ", p_dstex_path);
+			UtilityFunctions::push_error("DSPkg: v3 .dstex uses Zstd/GACL/chunked payloads that no archive layout can represent: ", p_dstex_path);
 			return ERR_UNAVAILABLE;
 		}
+		entry.compression_format = static_cast<uint8_t>(src_compression);
 		PackedInt32Array src_chunk_counts = dstex_header.get("mip_chunk_counts", PackedInt32Array());
 		for (int64_t ci = 0; ci < src_chunk_counts.size(); ++ci) {
 			if (src_chunk_counts[ci] != 1) {
@@ -917,11 +921,15 @@ Error DSPkg::finalize() {
 		seen_staging_paths.insert(res_path);
 	}
 
-	// v5 is emitted only when an entry needs an entry extension (an NPOT
-	// logical-size TLV). Archives without one stay v4 byte-identical.
+	// v5 is emitted when an entry needs an entry extension (an NPOT logical-size
+	// TLV) or a payload codec v4 cannot express. v4 has no per-entry codec
+	// field, so it is GDeflate-only; a NONE payload therefore forces v5.
+	// Archives without either stay v4 byte-identical.
 	bool write_v5 = false;
 	for (uint32_t i = 0; i < count; ++i) {
-		if (entry_logical_tlv_size(*sorted_entries[i]) > 0) {
+		const DSPkgStagedEntry &entry = *sorted_entries[i];
+		if (entry_logical_tlv_size(entry) > 0 ||
+				entry.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
 			write_v5 = true;
 			break;
 		}
@@ -1073,7 +1081,7 @@ Error DSPkg::finalize() {
 			// staged size differs), then the mip table below. Descriptor bytes
 			// pack little-endian to match the reader's get_8 sequence.
 			const uint32_t descriptor = static_cast<uint32_t>(DSPkgEntryKind::TEXTURE) |
-					(static_cast<uint32_t>(DSCompressionFormat::GDEFLATE) << 8) |
+					(static_cast<uint32_t>(item.compression_format) << 8) |
 					(static_cast<uint32_t>(DSGaclTransform::NONE) << 16);
 			writer.put_32(descriptor);
 			writer.put_32(0); // metadata_size: texture entries carry none
@@ -2384,10 +2392,11 @@ Dictionary DSPkg::read_texture(const String &p_resource_path) const {
 			UtilityFunctions::push_error("DSPkg: Entry is not a texture: ", p_resource_path);
 			return result;
 		}
-		// The CPU/read_texture path only decodes GDeflate, single-frame,
-		// non-shuffled payloads until Step 5. Never reinterpret Zstd/GACL bytes
-		// as GDeflate and never ignore a chunk table.
-		if (entry.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE) ||
+		// The CPU/read_texture path returns GDeflate or raw NONE payloads,
+		// single-frame, non-shuffled until Step 5. Never reinterpret Zstd/GACL
+		// bytes as GDeflate and never ignore a chunk table.
+		if ((entry.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE) &&
+					entry.compression_format != static_cast<uint8_t>(DSCompressionFormat::NONE)) ||
 				entry.gacl_transform != static_cast<uint8_t>(DSGaclTransform::NONE) ||
 				entry.chunked) {
 			UtilityFunctions::push_error("DSPkg: v5 Zstd/GACL/chunked entries require the GPU path or Step 5 CPU support: ", p_resource_path);

@@ -354,6 +354,55 @@ GDEX_TEST_T(loader, load_loose_dstex_ignore_returns_valid_texture, TAG_INTEGRATI
 	remove_user_file(dstex_path);
 }
 
+// A writer whose compression loses to the raw footprint stores NONE payloads.
+// The loader must take the codec from the header instead of assuming GDeflate,
+// or the payload is misread (and the request fails or decodes garbage).
+GDEX_TEST_T(loader, load_uncompressed_dstex_returns_source_pixels, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_loader_none.dstex";
+	godot::PackedByteArray payload;
+	payload.resize(64 * 64 * 4);
+	uint32_t state = 0x9E3779B9u;
+	for (int64_t i = 0; i < payload.size(); ++i) {
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		payload[i] = static_cast<uint8_t>(state & 0xFF);
+	}
+
+	godot::Ref<godot::DSTex> writer;
+	writer.instantiate();
+	GDEX_ASSERT_TRUE(writer.is_valid());
+	godot::Error write_err = writer->write_to_file(godot::String(dstex_path), payload, 64, 64,
+			godot::Image::FORMAT_RGBA8, 1, 1);
+	GDEX_ASSERT_EQ((int64_t)write_err, (int64_t)godot::OK);
+
+	godot::Dictionary header = writer->read_header(godot::String(dstex_path));
+	GDEX_ASSERT_TRUE(header.size() > 0);
+	GDEX_ASSERT_EQ((int)header["compression_format"],
+			static_cast<int>(godot::DSCompressionFormat::NONE));
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+	godot::Variant result = loader->_load(godot::String(dstex_path), godot::String(""), false,
+			godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+	godot::Ref<godot::Texture2D> tex(result);
+	GDEX_ASSERT_TRUE(tex.is_valid());
+	GDEX_EXPECT_EQ(tex->get_width(), 64);
+	GDEX_EXPECT_EQ(tex->get_height(), 64);
+
+	// The CPU path hands back an ImageTexture, so the exact bytes are
+	// observable. The GPU path wraps a Texture2DRD, which has no CPU image;
+	// there the dstex round-trip suite and the child-codec test cover the bytes.
+	if (tex->get_class() == godot::String("ImageTexture")) {
+		godot::Ref<godot::Image> image = tex->get_image();
+		GDEX_ASSERT_TRUE(image.is_valid());
+		GDEX_EXPECT_TRUE(image->get_data() == payload);
+	}
+
+	remove_user_file(dstex_path);
+}
+
 // --- Load: partial mip chain keeps the base without inventing mipmaps (#0039) --
 
 GDEX_TEST_T(loader, load_partial_mip_chain_returns_base_without_mipmaps, TAG_INTEGRATION) {

@@ -1291,6 +1291,22 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		return ERR_INVALID_DATA;
 	}
 
+	// Copies one mip out of the caller's buffer into its 256-byte-pitch
+	// footprint. Shared by the compressed path and the uncompressed fallback,
+	// so both produce byte-identical payloads.
+	auto build_footprint = [&](const DSTexMipLayout &p_layout, uint64_t p_source_offset) {
+		PackedByteArray footprint;
+		footprint.resize(static_cast<int64_t>(p_layout.footprint_size));
+		memset(footprint.ptrw(), 0, static_cast<size_t>(p_layout.footprint_size));
+		const uint64_t source_row_pitch = input_is_footprint_aligned ? p_layout.row_pitch : p_layout.source_row_bytes;
+		for (uint64_t row = 0; row < p_layout.row_count; ++row) {
+			memcpy(footprint.ptrw() + row * p_layout.row_pitch,
+					p_raw_data.ptr() + p_source_offset + row * source_row_pitch,
+					static_cast<size_t>(p_layout.source_row_bytes));
+		}
+		return footprint;
+	};
+
 	Ref<GDeflateCompressor> compressor;
 	compressor.instantiate();
 	std::vector<PackedByteArray> compressed_mips;
@@ -1303,17 +1319,7 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 			return ERR_INVALID_DATA;
 		}
 
-		PackedByteArray footprint;
-		footprint.resize(static_cast<int64_t>(layout.footprint_size));
-		memset(footprint.ptrw(), 0, static_cast<size_t>(layout.footprint_size));
-		const uint64_t source_row_pitch = input_is_footprint_aligned ? layout.row_pitch : layout.source_row_bytes;
-		for (uint64_t row = 0; row < layout.row_count; ++row) {
-			memcpy(footprint.ptrw() + row * layout.row_pitch,
-					p_raw_data.ptr() + source_offset + row * source_row_pitch,
-					static_cast<size_t>(layout.source_row_bytes));
-		}
-
-		PackedByteArray compressed_mip = compressor->compress(footprint, p_compression_level);
+		PackedByteArray compressed_mip = compressor->compress(build_footprint(layout, source_offset), p_compression_level);
 		if (compressed_mip.size() == 0 || compressed_mip.size() > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
 				total_compressed_size > std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(compressed_mip.size())) {
 			UtilityFunctions::push_error("DSTex: Failed to compress texture mip.");
@@ -1322,6 +1328,24 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		compressed_mips.push_back(compressed_mip);
 		total_compressed_size += static_cast<uint64_t>(compressed_mip.size());
 		source_offset += source_mip_size;
+	}
+
+	// Compression is not a benefit when the codec expands the payload: shipping
+	// the GDeflate stream would cost more disk bytes AND still require a
+	// decompression at load. Store the footprint bytes verbatim instead. NONE
+	// has no representation in the v2 layout (v2 carries no codec field), so
+	// this decision forces the v3 header below.
+	const bool store_uncompressed = total_compressed_size >= footprint_size;
+	if (store_uncompressed) {
+		compressed_mips.clear();
+		compressed_mips.reserve(mip_count);
+		uint64_t raw_offset = 0;
+		for (const DSTexMipLayout &layout : layouts) {
+			const uint64_t source_mip_size = input_is_footprint_aligned ? layout.footprint_size : layout.source_size;
+			compressed_mips.push_back(build_footprint(layout, raw_offset));
+			raw_offset += source_mip_size;
+		}
+		total_compressed_size = footprint_size;
 	}
 
 	if (total_compressed_size > DSTEX_MAX_TOTAL_BYTES) {
@@ -1338,8 +1362,9 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	header.mip_count = static_cast<uint32_t>(mip_count);
 	header.original_size = footprint_size;
 	header.compressed_size = total_compressed_size;
-	// v3 capability word: this writer only emits inline GDeflate payloads.
-	header.reserved = static_cast<uint64_t>(DSCompressionFormat::GDEFLATE);
+	// v3 capability word: inline GDeflate, or NONE when the fallback above
+	// decided the raw footprints are the smaller payload. Never GACL.
+	header.reserved = static_cast<uint64_t>(store_uncompressed ? DSCompressionFormat::NONE : DSCompressionFormat::GDEFLATE);
 
 	// NPOT logical size (Phase 3 item 2): 0 means "same as storage". A
 	// logical size that differs from storage upgrades the file to v3 rev1;
@@ -1366,6 +1391,11 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		v3_ext.logical_height = static_cast<uint32_t>(p_logical_height);
 		v3_ext.depth_or_layers = static_cast<uint32_t>(p_depth_or_layers);
 		v3_ext.reserved0 = 0;
+		needs_v3 = true;
+	}
+	// An uncompressed payload must be v3: v2 has no codec field, so a NONE
+	// decision written as v2 would read back as GDeflate.
+	if (store_uncompressed) {
 		needs_v3 = true;
 	}
 	header.version = needs_v3 ? 3 : 2;
@@ -2014,9 +2044,12 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 			}
 			// The CPU/ImageTexture path cannot decode Zstd, GACL-shuffled data or
 			// chunked mips until Step 5; fail closed instead of misreading them.
+			// GDeflate and NONE are both readable here: a NONE payload is
+			// already the plain footprint bytes, returned as-is.
 			const DSCompressionFormat format = get_compression_format(header.reserved);
 			const DSGaclTransform gacl = get_gacl_transform(header.reserved);
-			if (format != DSCompressionFormat::GDEFLATE || gacl != DSGaclTransform::NONE || chunked) {
+			if ((format != DSCompressionFormat::GDEFLATE && format != DSCompressionFormat::NONE) ||
+					gacl != DSGaclTransform::NONE || chunked) {
 				UtilityFunctions::push_error("DSTex: v3 Zstd/GACL/chunked payloads require the GPU path or Step 5 CPU support.");
 				file->close();
 				return Dictionary();

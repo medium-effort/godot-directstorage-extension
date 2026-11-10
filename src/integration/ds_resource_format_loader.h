@@ -81,6 +81,7 @@ private:
 			const String &p_original_cache_key,
 			int32_t p_cache_mode,
 			bool p_use_sub_threads,
+			int p_compression_format,
 			bool p_as_image_texture = false,
 			uint32_t p_logical_width = 0,
 			uint32_t p_logical_height = 0) const;

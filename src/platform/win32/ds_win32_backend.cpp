@@ -235,10 +235,11 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 	if (header.has("chunked") && static_cast<bool>(header["chunked"])) {
 		return false;
 	}
-	if ((int)header.get("compression_format", (int)DSCompressionFormat::GDEFLATE) != (int)DSCompressionFormat::GDEFLATE ||
+	if (((int)header.get("compression_format", (int)DSCompressionFormat::GDEFLATE) != (int)DSCompressionFormat::GDEFLATE &&
+				(int)header.get("compression_format", (int)DSCompressionFormat::GDEFLATE) != (int)DSCompressionFormat::NONE) ||
 			(int)header.get("gacl_transform", (int)DSGaclTransform::NONE) != (int)DSGaclTransform::NONE) {
-		// The splitter emits GDeflate children; Zstd/GACL payloads must wait for
-		// Step 4's request fields.
+		// The splitter emits children in the parent's codec; Zstd/GACL payloads
+		// must wait for Step 4's request fields.
 		return false;
 	}
 	uint32_t mip_count = header["mip_count"];
@@ -392,10 +393,11 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 			if (format == DSCompressionFormat::NONE && header.compressed_size != header.original_size) {
 				return false;
 			}
-			// Step 3 GPU staging decodes only one GDeflate frame per mip. Zstd,
-			// GACL-shuffled and chunked payloads must fail closed until Step 4
-			// wires their request/destination paths.
-			if (format != DSCompressionFormat::GDEFLATE || gacl != DSGaclTransform::NONE) {
+			// GPU staging decodes one GDeflate frame per mip, or copies raw NONE
+			// bytes. Zstd, GACL-shuffled and chunked payloads must fail closed
+			// until Step 4 wires their request/destination paths.
+			if ((format != DSCompressionFormat::GDEFLATE && format != DSCompressionFormat::NONE) ||
+					gacl != DSGaclTransform::NONE) {
 				return false;
 			}
 		}
@@ -608,11 +610,13 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 		uint8_t entry_gacl = 0;
 		bool entry_chunked = false;
 		if (!dspkg_cache.package->get_entry_features_for_offset(p_offset, entry_format, entry_gacl, entry_chunked) ||
-				entry_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE) ||
+				(entry_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE) &&
+						entry_format != static_cast<uint8_t>(DSCompressionFormat::NONE)) ||
 				entry_gacl != static_cast<uint8_t>(DSGaclTransform::NONE) ||
 				entry_chunked) {
 			// The un-chunked GPU staging path can only submit one GDeflate stream
-			// per mip. Zstd/GACL/chunked entries fail closed until Step 4.
+			// or a raw NONE block per mip. Zstd/GACL/chunked entries fail closed
+			// until Step 4.
 			return false;
 		}
 		r_entries.resize(package_entries.size());
@@ -1511,7 +1515,7 @@ bool Win32Backend::build_single_mip_child_request(Ref<DSRequest> p_parent, const
 	r_child->set_offset(p_mip_entry.offset);
 	r_child->set_size(p_mip_entry.compressed_size);
 	r_child->set_uncompressed_size(p_mip_entry.uncompressed_size);
-	r_child->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+	r_child->set_compression_format(p_parent->get_compression_format());
 	r_child->set_destination_type(p_parent->get_destination_type());
 	r_child->set_priority(p_parent->get_priority());
 	r_child->set_cancellation_tag(p_parent->get_cancellation_tag());
@@ -3729,9 +3733,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	}
 
 	Vector<DSTexMipEntryV2> texture_mip_entries;
-	bool gpu_texture_gdeflate = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE &&
-			p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE;
-	bool has_texture_mip_entries = gpu_texture_gdeflate && get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries);
+	// Both codecs upload a GPU texture mip by mip from the container's padded
+	// footprints, so the mip table is required for NONE payloads too.
+	const bool gpu_texture_destination = p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE;
+	bool has_texture_mip_entries = gpu_texture_destination && get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries);
 	uint64_t texture_footprint = 0;
 	uint32_t texture_first_subresource = p_request->get_first_subresource();
 	uint32_t texture_subresource_count = p_request->get_subresource_count();
@@ -4116,7 +4121,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	uint64_t staging_size = ctx ? static_cast<uint64_t>(ctx->get_staging_buffer_size_mb()) * 1024ULL * 1024ULL : 0;
 	uint64_t request_size = MAX(static_cast<uint64_t>(src_size), static_cast<uint64_t>(uncompressed_size));
 
-	if (gpu_texture_gdeflate && has_texture_mip_entries && texture_subresource_count > 1) {
+	if (gpu_texture_destination && has_texture_mip_entries && texture_subresource_count > 1) {
 		// Multi-mip .dstex files store each mip level as an independent GDeflate compressed stream.
 		// DirectStorage's MultipleSubresourcesRange destination for multiple subresources expects a single continuous stream,
 		// so multi-mip textures MUST be split into per-mip requests using DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES_RANGE with NumSubresources = 1.
@@ -4150,7 +4155,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			if (staging_size > 0 && (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size ||
 					mip_entry.offset > UINT64_MAX - mip_entry.compressed_size)) {
 				p_request->set_status(DSRequest::STATUS_FAILED);
-				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
+				p_request->set_error_message("DirectStorage texture payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
 				return false;
 			}
 		}
@@ -4166,7 +4171,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			child->set_offset(mip_entry.offset);
 			child->set_size(mip_entry.compressed_size);
 			child->set_uncompressed_size(mip_entry.uncompressed_size);
-			child->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+			child->set_compression_format(p_request->get_compression_format());
 			child->set_destination_type(DSRequest::DESTINATION_GPU_TEXTURE);
 			child->set_priority(p_request->get_priority());
 			child->set_cancellation_tag(p_request->get_cancellation_tag());
@@ -4208,7 +4213,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		p_request->set_status(DSRequest::STATUS_SUBMITTED);
 		return true;
 	}
-	if (gpu_texture_gdeflate && has_texture_mip_entries && texture_subresource_count == 1) {
+	if (gpu_texture_destination && has_texture_mip_entries && texture_subresource_count == 1) {
 		// STAGING INVARIANT (single-mip): a single mip is one indivisible GDeflate
 		// tile stream and cannot be split across chunks by DirectStorage without
 		// corrupting it, so it requires MAX(compressed_size, uncompressed_size)
@@ -4217,7 +4222,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource];
 		if (staging_size > 0 && (mip_entry.compressed_size > staging_size || mip_entry.uncompressed_size > staging_size)) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
+			p_request->set_error_message("DirectStorage texture payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
 			return false;
 		}
 
@@ -4279,7 +4284,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		bool use_dstex_chunks = get_dstex_mip_chunks(p_request->get_file_path(), p_request->get_offset(), src_size, chunk_capacity, dstex_chunks);
 		if (!use_dstex_chunks) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
+			p_request->set_error_message("DirectStorage texture payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
 			return false;
 		}
 		uint64_t chunk_count = dstex_chunks.size();
@@ -4293,7 +4298,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 			uint64_t destination_end = boundary.destination_offset + boundary.destination_size;
 			if (src_end <= src_begin || destination_end <= destination_begin || src_end - src_begin > chunk_capacity || destination_end - destination_begin > chunk_capacity) {
 				p_request->set_status(DSRequest::STATUS_FAILED);
-				p_request->set_error_message("DirectStorage GDeflate payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
+				p_request->set_error_message("DirectStorage texture payload exceeds staging buffer capacity; increase dsgd_extension/staging_buffer_size_mb");
 				return false;
 			}
 		}

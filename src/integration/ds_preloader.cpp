@@ -199,11 +199,13 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 	if (info.is_empty()) {
 		return false;
 	}
-	// Preload stages GDeflate requests only. A v5 entry that needs Zstd, GACL
-	// or chunk reassembly must fail closed here rather than be prewarmed with
-	// the wrong codec/destination shape.
+	// Preload stages GDeflate and raw-NONE requests only. A v5 entry that needs
+	// Zstd, GACL or chunk reassembly must fail closed here rather than be
+	// prewarmed with the wrong codec/destination shape.
+	const int entry_compression_format = (int)info.get("compression_format", 1);
 	if ((int)info.get("entry_kind", 0) != static_cast<int>(DSPkgEntryKind::TEXTURE) ||
-			(int)info.get("compression_format", 1) != static_cast<int>(DSCompressionFormat::GDEFLATE) ||
+			(entry_compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) &&
+					entry_compression_format != static_cast<int>(DSCompressionFormat::NONE)) ||
 			(int)info.get("gacl_transform", 0) != static_cast<int>(DSGaclTransform::NONE) ||
 			(bool)info.get("chunked", false)) {
 		UtilityFunctions::push_error("DirectStorage Preloader: Entry requires the GPU path or Step 5 CPU support; preload skipped: " + p_engine_path);
@@ -235,6 +237,7 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 	r_out.mip_count = info["mip_count"];
 	r_out.is_v2 = (bool)info.get("has_gpu_metadata", false);
 	r_out.as_image_texture = (bool)info.get("as_image_texture", false);
+	r_out.compression_format = static_cast<uint8_t>(entry_compression_format);
 	r_out.data_offset = (uint64_t)info.get("data_offset", 0);
 	r_out.compressed_size = (uint64_t)info.get("compressed_size", 0);
 	r_out.original_size = (uint64_t)info.get("original_size", 0);
@@ -353,6 +356,8 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 		return false;
 	}
 	DSTexHeaderV3Ext v3_ext = {};
+	// v1/v2 carry no codec field, so their payload is GDeflate by definition.
+	DSCompressionFormat payload_format = DSCompressionFormat::GDEFLATE;
 	if (header.version == 3) {
 		if (bulk.size() < static_cast<int64_t>(sizeof(DSTexHeaderV3))) {
 			return false;
@@ -384,10 +389,12 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 			UtilityFunctions::push_error("DSTex: Invalid v3 capability word.");
 			return false;
 		}
-		if (format != DSCompressionFormat::GDEFLATE || gacl != DSGaclTransform::NONE) {
-			UtilityFunctions::push_error("DSTex: Preload requires a GDeflate payload without GACL until Step 5.");
+		if ((format != DSCompressionFormat::GDEFLATE && format != DSCompressionFormat::NONE) ||
+				gacl != DSGaclTransform::NONE) {
+			UtilityFunctions::push_error("DSTex: Preload requires a GDeflate or raw NONE payload without GACL until Step 5.");
 			return false;
 		}
+		payload_format = format;
 		if ((capabilities & DSTEX_CAP_CHUNKED) != 0) {
 			// The header cache is a single header + mip-table read; chunk tables
 			// are not available here, and the capability must be set iff a mip is
@@ -448,6 +455,7 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 	filled.mip_count = header.mip_count;
 	filled.flags = header.flags;
 	filled.version = header.version;
+	filled.compression_format = static_cast<uint8_t>(payload_format);
 	filled.original_size = header.original_size;
 	filled.compressed_size = header.compressed_size;
 	filled.mtime = mtime;
@@ -577,6 +585,7 @@ void DSPreloader::payload_from_header(const String &p_engine_path, const String 
 	r_out.mip_count = p_header.mip_count;
 	r_out.original_size = p_header.original_size;
 	r_out.compressed_size = p_header.compressed_size;
+	r_out.compression_format = p_header.compression_format;
 	r_out.is_v2 = p_header.version >= 2;
 	// Bulk mip-table copy: one resize (single zero-fill alloc) + one memcpy
 	// per table instead of 4*mip_count bounds-checked operator[] pairs. Array SHAPES unchanged — v1 keeps all
@@ -751,7 +760,8 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 		req->set_offset(p_payload.data_offset);
 		req->set_size((uint32_t)p_payload.compressed_size);
 		req->set_uncompressed_size((uint32_t)p_payload.original_size);
-		req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+		req->set_compression_format(p_payload.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
+				? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
 		req->set_cancellation_tag(p_tag);
 		req->get_destination_buffer_ref().resize((int64_t)p_payload.original_size);
 		r_out.push_back(req);
@@ -781,7 +791,8 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 		req->set_offset((uint64_t)offsets[i]);
 		req->set_size((uint32_t)size);
 		req->set_uncompressed_size((uint32_t)uncomp);
-		req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+		req->set_compression_format(p_payload.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
+				? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
 		req->set_cancellation_tag(p_tag);
 		req->get_destination_buffer_ref().resize((int64_t)uncomp);
 		r_out.push_back(req);
@@ -1391,7 +1402,8 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 	req->set_offset(start_offset);
 	req->set_size(static_cast<uint32_t>(total_span));
 	req->set_uncompressed_size(static_cast<uint32_t>(total_uncomp));
-	req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+	req->set_compression_format(m.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
+			? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
 	req->set_cancellation_tag(p_tag);
 	req->set_destination_type(DSRequest::DESTINATION_GPU_TEXTURE);
 	req->set_destination_resource(tex_rid);

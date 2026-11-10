@@ -137,6 +137,10 @@ GDEX_TEST_T(gpu_drain, flush_honours_unclean_ds_flag, TAG_INTEGRATION) {
 	const godot::PackedInt64Array mip_offsets = header["mip_offsets"];
 	const godot::PackedInt32Array mip_sizes = header["mip_sizes"];
 	const uint64_t original_size = header["original_size"];
+	// The fixture is pseudorandom, so the writer stores it uncompressed. Read
+	// the codec from the header instead of assuming GDeflate.
+	const int fixture_format = header.has("compression_format") ?
+			(int)header["compression_format"] : static_cast<int>(godot::DSCompressionFormat::GDEFLATE);
 	GDEX_ASSERT_TRUE(mip_count >= 1);
 	GDEX_ASSERT_TRUE(mip_offsets.size() >= mip_count);
 	GDEX_ASSERT_TRUE(mip_sizes.size() >= mip_count);
@@ -172,7 +176,8 @@ GDEX_TEST_T(gpu_drain, flush_honours_unclean_ds_flag, TAG_INTEGRATION) {
 		request->set_destination_resource(texture_rid);
 		request->set_first_subresource(0);
 		request->set_subresource_count(static_cast<uint32_t>(mip_count));
-		request->set_compression_format(godot::DSRequest::COMPRESSION_GDEFLATE);
+		request->set_compression_format(fixture_format == static_cast<int>(godot::DSCompressionFormat::GDEFLATE) ?
+				godot::DSRequest::COMPRESSION_GDEFLATE : godot::DSRequest::COMPRESSION_NONE);
 		request->set_texture_format(0); // 0 => the backend skips the driver-format equality check.
 		if (!ds->enqueue_request(request)) {
 			const std::string why = ::gdextest::to_std_string(request->get_error_message());

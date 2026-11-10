@@ -861,6 +861,60 @@ GDEX_TEST_T(win32_remediation, med08_single_mip_parsed_values_preserved, TAG_INT
 #endif
 }
 
+// The per-mip splitter used to hardcode GDeflate, so an uncompressed payload
+// would be handed to the GPU decompressor as a GDeflate stream. Children must
+// inherit the parent's codec.
+GDEX_TEST_T(win32_remediation, none_payload_children_inherit_codec, TAG_INTEGRATION) {
+#ifdef _WIN32
+    const char *dstex_path = "user://none_codec_child.dstex";
+    remove_temp_file(dstex_path);
+    ctx.add_teardown([dstex_path]() { remove_temp_file(dstex_path); });
+
+    godot::PackedByteArray payload;
+    payload.resize(64 * 64 * 4);
+    uint32_t state = 0x9E3779B9u;
+    for (int64_t i = 0; i < payload.size(); ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        payload[i] = static_cast<uint8_t>(state & 0xFF);
+    }
+    godot::Ref<godot::DSTex> writer;
+    writer.instantiate();
+    GDEX_ASSERT_TRUE(writer.is_valid());
+    GDEX_ASSERT_EQ((int64_t)writer->write_to_file(godot::String(dstex_path), payload, 64, 64,
+                           godot::Image::FORMAT_RGBA8, 1, 1),
+            (int64_t)godot::OK);
+    godot::Dictionary header = writer->read_header(godot::String(dstex_path));
+    GDEX_ASSERT_TRUE(header.size() > 0);
+    GDEX_ASSERT_EQ((int)header["compression_format"],
+            static_cast<int>(godot::DSCompressionFormat::NONE));
+
+    godot::Ref<godot::DSRequest> parent;
+    parent.instantiate();
+    parent->set_file_path(dstex_path);
+    parent->set_offset(0);
+    parent->set_size(static_cast<uint32_t>(payload.size()));
+    parent->set_uncompressed_size(static_cast<uint32_t>(payload.size()));
+    parent->set_compression_format(godot::DSRequest::COMPRESSION_NONE);
+    parent->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    parent->set_subresource_count(1);
+    parent->set_first_subresource(0);
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    godot::Ref<godot::DSRequest> child;
+    GDEX_ASSERT_TRUE(backend->stage_single_mip_request(parent, child));
+    GDEX_ASSERT_TRUE(child.is_valid());
+    GDEX_EXPECT_EQ(child->get_compression_format(), godot::DSRequest::COMPRESSION_NONE);
+    GDEX_EXPECT_EQ(child->get_size(), parent->get_size());
+    GDEX_EXPECT_EQ(child->get_uncompressed_size(), parent->get_uncompressed_size());
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, staged_request_reports_resource_in_flight, TAG_INTEGRATION) {
 #ifdef _WIN32
     // is_resource_in_flight() must answer "yes" for a request the backend

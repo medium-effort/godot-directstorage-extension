@@ -197,6 +197,9 @@ struct DSPkgStagedEntry {
 	uint32_t pixel_format = 0;
 	uint32_t mip_count = 0;
 	uint32_t flags = 0;
+	// Source payload codec (DSCompressionFormat). A NONE payload forces the
+	// archive to v5, the only layout with a per-entry codec field.
+	uint8_t compression_format = static_cast<uint8_t>(DSCompressionFormat::GDEFLATE);
 	bool gpu_metadata = false;
 	uint64_t gpu_footprint = 0;           // sum of mip uncompressed sizes
 	PackedInt64Array source_mip_offsets;  // per-mip payload offsets inside the .dstex

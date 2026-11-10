@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 // Suite covering the same area as project/headless_tests/test_dspkg_alignment.gd
 // (+ test_formats.gd package sections): DSPkg create/finalize/open cycle,
@@ -104,6 +105,35 @@ bool write_temp_dstex_incompressible(const char *p_path, int p_width, int p_heig
 			godot::String(p_path), make_incompressible_payload(p_payload_size, p_seed),
 			p_width, p_height, godot::Image::FORMAT_RGBA8, p_mip_count, 1, p_is_srgb, p_as_image_texture);
 	return err == godot::OK;
+}
+
+// Compressible, but not down to a handful of bytes: one 8 KiB pseudo-random
+// block repeated. Deflate can only match at that distance, so the on-disk
+// GDeflate span stays well above the 512-byte TOC step that the overlap test
+// shifts an entry by. Because the payload still shrinks, the archive keeps the
+// GDeflate-only v4 layout its raw-TOC readers expect.
+godot::PackedByteArray make_repeated_block_payload(int64_t p_size, uint32_t p_seed = 0x12345678) {
+	constexpr int64_t kBlock = 8192;
+	godot::PackedByteArray block = make_incompressible_payload(kBlock, p_seed);
+	godot::PackedByteArray payload;
+	payload.resize(p_size);
+	uint8_t *dst = payload.ptrw();
+	for (int64_t offset = 0; offset < p_size; offset += kBlock) {
+		const int64_t remaining = p_size - offset;
+		const int64_t chunk = remaining < kBlock ? remaining : kBlock;
+		memcpy(dst + offset, block.ptr(), static_cast<size_t>(chunk));
+	}
+	return payload;
+}
+
+bool write_temp_dstex_repeated(const char *p_path, int p_width, int p_height, int p_mip_count, int64_t p_payload_size) {
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	if (dstex.is_null()) {
+		return false;
+	}
+	return dstex->write_to_file(godot::String(p_path), make_repeated_block_payload(p_payload_size),
+				   p_width, p_height, godot::Image::FORMAT_RGBA8, p_mip_count, 1) == godot::OK;
 }
 
 void remove_temp_file(const char *p_path) {
@@ -307,12 +337,14 @@ bool build_single_entry_archive(const char *p_dstex_path, const char *p_dspkg_pa
 	return builder->finalize() == godot::OK;
 }
 
-// Builds a two-entry plaintext archive whose entries both point at one
-// incompressible 128x128 .dstex. The payload is incompressible on purpose:
-// entry A's compressed span has to be much larger than the 512-byte step the
-// span case shifts entry B by, so a shifted B lands strictly inside A.
+// Builds a two-entry plaintext archive whose entries both point at one 128x128
+// .dstex. The payload is a repeated 8 KiB block rather than pure noise: entry
+// A's GDeflate span still has to be much larger than the 512-byte step the span
+// case shifts entry B by, but the archive must stay on the GDeflate-only v4
+// layout that this fixture's raw TOC reader parses (pure noise would be written
+// uncompressed and force v5).
 bool build_two_entry_archive(const char *p_dstex_path, const char *p_dspkg_path) {
-	if (!write_temp_dstex_incompressible(p_dstex_path, 128, 128, 1, 128 * 128 * 4)) {
+	if (!write_temp_dstex_repeated(p_dstex_path, 128, 128, 1, 128 * 128 * 4)) {
 		return false;
 	}
 	godot::Ref<godot::DSPkg> builder;

@@ -9,6 +9,7 @@
 #include <godot_cpp/variant/color.hpp>
 
 #include <cmath>
+#include <cstring>
 
 // Spike suite: pure DSTex helpers only — no engine singletons, no files.
 // Real API from src/formats/dstex_format.h (verified):
@@ -310,4 +311,123 @@ GDEX_TEST_T(dstex, write_failure_aborts, TAG_INTEGRATION) {
 
     godot::DirAccess::remove_absolute(godot::String(truncated_path));
     godot::DirAccess::remove_absolute(godot::String(complete_path));
+}
+
+// Compression is not always a benefit: when GDeflate expands the payload the
+// file must hold the raw 256-byte-pitch footprints instead of a larger stream
+// that still needs a decompression at load. NONE has no v2 representation
+// (v2 carries no codec field), so the writer must upgrade the file to v3.
+GDEX_TEST_T(dstex, uncompressible_payload_falls_back_to_none, TAG_INTEGRATION) {
+    const char *path = "user://gdextest_dstex_none.dstex";
+
+    godot::PackedByteArray payload;
+    payload.resize(64 * 64 * 4);
+    uint32_t state = 0x9E3779B9u;
+    for (int64_t i = 0; i < payload.size(); ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        payload[i] = static_cast<uint8_t>(state & 0xFF);
+    }
+
+    godot::Ref<godot::DSTex> writer;
+    writer.instantiate();
+    GDEX_ASSERT_TRUE(writer.is_valid());
+    GDEX_EXPECT_EQ(writer->write_to_file(godot::String(path), payload, 64, 64,
+                           godot::Image::FORMAT_RGBA8, 1, 1),
+            godot::OK);
+
+    godot::Dictionary header = writer->read_header(godot::String(path));
+    GDEX_ASSERT_TRUE(header.size() > 0);
+    GDEX_EXPECT_EQ((int)header["version"], 3);
+    GDEX_EXPECT_EQ((int)header["compression_format"], static_cast<int>(godot::DSCompressionFormat::NONE));
+    GDEX_EXPECT_EQ((int64_t)header["original_size"], static_cast<int64_t>(payload.size()));
+    GDEX_EXPECT_EQ((int64_t)header["compressed_size"], static_cast<int64_t>(payload.size()));
+
+    godot::Dictionary decoded = writer->read_from_file(godot::String(path));
+    GDEX_ASSERT_TRUE(decoded.size() > 0);
+    godot::Array mip_data = decoded["mip_data"];
+    GDEX_ASSERT_EQ(mip_data.size(), 1);
+    godot::PackedByteArray mip0 = mip_data[0];
+    GDEX_EXPECT_TRUE(mip0 == payload);
+
+    godot::DirAccess::remove_absolute(godot::String(path));
+}
+
+// Positive control for the test above: data the codec CAN shrink must still be
+// stored as GDeflate, and must stay on the v2 layout (no needless v3 upgrade).
+GDEX_TEST_T(dstex, compressible_payload_keeps_gdeflate, TAG_INTEGRATION) {
+    const char *path = "user://gdextest_dstex_gdeflate.dstex";
+
+    godot::PackedByteArray payload;
+    payload.resize(64 * 64 * 4); // resize() zero-fills: maximally compressible
+
+    godot::Ref<godot::DSTex> writer;
+    writer.instantiate();
+    GDEX_ASSERT_TRUE(writer.is_valid());
+    GDEX_EXPECT_EQ(writer->write_to_file(godot::String(path), payload, 64, 64,
+                           godot::Image::FORMAT_RGBA8, 1, 1),
+            godot::OK);
+
+    godot::Dictionary header = writer->read_header(godot::String(path));
+    GDEX_ASSERT_TRUE(header.size() > 0);
+    GDEX_EXPECT_EQ((int)header["version"], 2);
+    GDEX_EXPECT_EQ((int)header["compression_format"], static_cast<int>(godot::DSCompressionFormat::GDEFLATE));
+    GDEX_EXPECT_LT((int64_t)header["compressed_size"], (int64_t)header["original_size"]);
+
+    godot::DirAccess::remove_absolute(godot::String(path));
+}
+
+// Every NONE mip entry must declare compressed_size == uncompressed_size: the
+// header reader, the v3 chunk parser and the loader all reject a mismatch.
+GDEX_TEST_T(dstex, none_mip_entries_are_size_symmetric, TAG_INTEGRATION) {
+    const char *path = "user://gdextest_dstex_none_mips.dstex";
+
+    // Two mips of pseudorandom data: 256x256 then 128x128. Both pitches equal
+    // their row bytes (1024 / 512), so no zero padding can rescue the ratio and
+    // the total codec decision has to land on NONE.
+    const int64_t base_bytes = 256 * 256 * 4;
+    const int64_t next_bytes = 128 * 128 * 4;
+    godot::PackedByteArray payload;
+    payload.resize(base_bytes + next_bytes);
+    uint32_t state = 0x1234567u;
+    for (int64_t i = 0; i < payload.size(); ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        payload[i] = static_cast<uint8_t>(state & 0xFF);
+    }
+
+    godot::Ref<godot::DSTex> writer;
+    writer.instantiate();
+    GDEX_ASSERT_TRUE(writer.is_valid());
+    GDEX_EXPECT_EQ(writer->write_to_file(godot::String(path), payload, 256, 256,
+                           godot::Image::FORMAT_RGBA8, 2, 1),
+            godot::OK);
+
+    godot::Dictionary header = writer->read_header(godot::String(path));
+    GDEX_ASSERT_TRUE(header.size() > 0);
+    GDEX_EXPECT_EQ((int)header["compression_format"], static_cast<int>(godot::DSCompressionFormat::NONE));
+
+    godot::PackedInt32Array mip_sizes = header["mip_sizes"];
+    godot::PackedInt32Array mip_uncompressed = header["mip_uncompressed_sizes"];
+    GDEX_ASSERT_EQ(mip_sizes.size(), 2);
+    GDEX_ASSERT_EQ(mip_uncompressed.size(), 2);
+    for (int i = 0; i < mip_sizes.size(); ++i) {
+        GDEX_EXPECT_EQ(mip_sizes[i], mip_uncompressed[i]);
+    }
+
+    godot::Dictionary decoded = writer->read_from_file(godot::String(path));
+    GDEX_ASSERT_TRUE(decoded.size() > 0);
+    godot::Array mip_data = decoded["mip_data"];
+    GDEX_ASSERT_EQ(mip_data.size(), 2);
+    // 256x256 RGBA8 rows are already 256-byte multiples, so mip 0's footprint
+    // equals its row-packed source bytes.
+    godot::PackedByteArray expected0;
+    expected0.resize(base_bytes);
+    memcpy(expected0.ptrw(), payload.ptr(), static_cast<size_t>(base_bytes));
+    godot::PackedByteArray mip0 = mip_data[0];
+    GDEX_EXPECT_TRUE(mip0 == expected0);
+
+    godot::DirAccess::remove_absolute(godot::String(path));
 }

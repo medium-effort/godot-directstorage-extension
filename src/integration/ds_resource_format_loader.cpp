@@ -414,11 +414,21 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 		const String &p_original_cache_key,
 		int32_t p_cache_mode,
 		bool p_use_sub_threads,
+		int p_compression_format,
 		bool p_as_image_texture,
 		uint32_t p_logical_width,
 		uint32_t p_logical_height) const {
 	(void)p_is_srgb;
 	(void)p_mip_row_pitches;
+	// The codec comes from the container header, never from the extension: a
+	// writer that loses to its own compression stores NONE payloads, and those
+	// must not be handed to DirectStorage as GDeflate.
+	const bool is_gdeflate = p_compression_format == static_cast<int>(DSCompressionFormat::GDEFLATE);
+	if (p_compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) &&
+			p_compression_format != static_cast<int>(DSCompressionFormat::NONE)) {
+		UtilityFunctions::push_error("DSResourceFormatLoader: Unsupported payload compression format ", p_compression_format, " for '", p_cache_key, "'.");
+		return Variant();
+	}
 	if (p_width == 0 || p_height == 0 || p_mip_count == 0) {
 		UtilityFunctions::push_error("DSResourceFormatLoader: Invalid 2D texture dimensions or mip count for '", p_cache_key, "' (width=", p_width, ", height=", p_height, ", mips=", p_mip_count, ").");
 		return Variant();
@@ -567,7 +577,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				req->set_first_subresource(0);
 				req->set_subresource_count(p_mip_count);
 				req->set_texture_format(static_cast<uint32_t>(native_format));
-				req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+				req->set_compression_format(is_gdeflate ? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
 
 				// Sync _load path: explicit from_stream=false so the batch
 				// manager's stream flush can never steal a sync request.
@@ -700,7 +710,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					req->set_size(static_cast<uint32_t>(p_mip_sizes[i]));
 					uint32_t uncomp_size = (p_mip_uncompressed_sizes.size() > static_cast<int64_t>(i)) ? static_cast<uint32_t>(p_mip_uncompressed_sizes[i]) : 0;
 					req->set_uncompressed_size(uncomp_size);
-					req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+					req->set_compression_format(is_gdeflate ? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
 					req->get_destination_buffer_ref().resize(static_cast<int64_t>(uncomp_size));
 					// Sync path: from_stream=false; stream queue untouched.
 					if (ds_ctx->enqueue_request(req, false)) {
@@ -736,7 +746,12 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 						file->seek(static_cast<uint64_t>(p_mip_offsets[i]));
 						PackedByteArray compressed_mip = file->get_buffer(static_cast<int64_t>(p_mip_sizes[i]));
 						if (compressed_mip.size() == static_cast<int64_t>(p_mip_sizes[i])) {
-							mip_decompressed = gdeflate_decompressor->decompress(compressed_mip, expected_footprint_size);
+							if (is_gdeflate) {
+								mip_decompressed = gdeflate_decompressor->decompress(compressed_mip, expected_footprint_size);
+							} else if (compressed_mip.size() == static_cast<int64_t>(expected_footprint_size)) {
+								// NONE: the file already holds the footprint bytes.
+								mip_decompressed = compressed_mip;
+							}
 						}
 					}
 				}
@@ -999,10 +1014,11 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 				UtilityFunctions::push_error("DSResourceFormatLoader: DSPkg entry is not a texture: ", target_path);
 				return Variant();
 			}
-			// The CPU/ImageTexture and pre-Step-4 GPU paths only decode GDeflate,
-			// non-shuffled, single-frame payloads. Fail closed instead of
-			// misreading Zstd/GACL bytes or ignoring chunks.
-			if (compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) ||
+			// The CPU/ImageTexture and pre-Step-4 GPU paths decode GDeflate and
+			// raw NONE payloads only. Fail closed instead of misreading
+			// Zstd/GACL bytes or ignoring chunks.
+			if ((compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) &&
+						compression_format != static_cast<int>(DSCompressionFormat::NONE)) ||
 					gacl_transform != static_cast<int>(DSGaclTransform::NONE) || chunked) {
 				UtilityFunctions::push_error("DSResourceFormatLoader: DSPkg entry uses Zstd/GACL/chunked payloads that require the GPU path or Step 5 CPU support: ", target_path);
 				return Variant();
@@ -1017,7 +1033,7 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			uint32_t logical_width = entry_info.has("logical_width") ? static_cast<uint32_t>(entry_info["logical_width"]) : 0;
 			uint32_t logical_height = entry_info.has("logical_height") ? static_cast<uint32_t>(entry_info["logical_height"]) : 0;
 
-			return _load_texture_payload(archive_path, data_offset, comp_size, orig_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, as_image_texture, logical_width, logical_height);
+			return _load_texture_payload(archive_path, data_offset, comp_size, orig_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, compression_format, as_image_texture, logical_width, logical_height);
 		}
 		UtilityFunctions::push_error("DSResourceFormatLoader: Failed to get entry info from res://textures.dspkg for ", target_path);
 		return Variant();
@@ -1041,11 +1057,15 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 		uint64_t compressed_size = header["compressed_size"];
 		const int header_version = header.has("version") ? (int)header["version"] : 1;
 		bool is_v2 = header_version == 2 || header_version == 3;
+		// v2 has no codec field, so it is GDeflate by definition; read_header
+		// already reports that default for v2 files.
+		const int compression_format = header.has("compression_format") ?
+				(int)header["compression_format"] : static_cast<int>(DSCompressionFormat::GDEFLATE);
 		if (header_version == 3) {
-			const int compression_format = header.has("compression_format") ? (int)header["compression_format"] : 0;
 			const int gacl_transform = header.has("gacl_transform") ? (int)header["gacl_transform"] : 0;
 			const bool chunked = header.has("chunked") ? (bool)header["chunked"] : false;
-			if (compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) ||
+			if ((compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) &&
+						compression_format != static_cast<int>(DSCompressionFormat::NONE)) ||
 					gacl_transform != static_cast<int>(DSGaclTransform::NONE) || chunked) {
 				UtilityFunctions::push_error("DSResourceFormatLoader: DSTex v3 uses Zstd/GACL/chunked payloads that require the GPU path or Step 5 CPU support: ", p_path);
 				return Variant();
@@ -1075,7 +1095,7 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			data_offset = (data_offset + 511) & ~uint64_t(511);
 		}
 
-		return _load_texture_payload(p_path, data_offset, compressed_size, original_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, as_image_texture, logical_width, logical_height);
+		return _load_texture_payload(p_path, data_offset, compressed_size, original_size, width, height, pixel_format, is_srgb, mip_count, is_v2, mip_offsets, mip_sizes, mip_uncompressed_sizes, mip_row_pitches, p_path, p_original_path, p_cache_mode, p_use_sub_threads, compression_format, as_image_texture, logical_width, logical_height);
 	}
 
 	if (ext == "dspkg") {
