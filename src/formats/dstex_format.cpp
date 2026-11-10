@@ -1414,8 +1414,9 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	// the GDeflate stream would cost more disk bytes AND still require a
 	// decompression at load. Store the footprint bytes verbatim instead. NONE has
 	// no representation in the v2 layout (v2 carries no codec field), so this
-	// decision forces the v3 header below. A raw payload is one stream per mip,
-	// so any chunk table built above is dropped.
+	// decision forces the v3 header below. The payload is still split on the same
+	// row grid (a NONE chunk is just a raw row slice), so an incompressible
+	// texture keeps the request-size bound that chunking provides.
 	const bool store_uncompressed = total_compressed_size >= footprint_size;
 	if (store_uncompressed) {
 		chunk_payloads.clear();
@@ -1426,8 +1427,42 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		uint64_t raw_offset = 0;
 		for (const DSTexMipLayout &layout : layouts) {
 			const uint64_t source_mip_size = input_is_footprint_aligned ? layout.footprint_size : layout.source_size;
-			chunk_payloads.push_back({ build_footprint(layout, raw_offset) });
-			chunk_uncompressed_sizes.push_back({ static_cast<uint32_t>(layout.footprint_size) });
+			const PackedByteArray footprint = build_footprint(layout, raw_offset);
+			uint64_t rows_per_chunk = layout.row_count;
+			if (chunk_target_bytes > 0 && layout.row_pitch > 0) {
+				rows_per_chunk = std::max<uint64_t>(1, chunk_target_bytes / layout.row_pitch);
+				if (block_format) {
+					rows_per_chunk -= rows_per_chunk % 4ULL;
+					if (rows_per_chunk == 0) {
+						rows_per_chunk = 4;
+					}
+				}
+				if (rows_per_chunk >= layout.row_count) {
+					rows_per_chunk = layout.row_count;
+				}
+			}
+			std::vector<PackedByteArray> chunks;
+			std::vector<uint32_t> chunk_sizes;
+			if (rows_per_chunk >= layout.row_count) {
+				chunks.push_back(footprint);
+				chunk_sizes.push_back(static_cast<uint32_t>(layout.footprint_size));
+			} else {
+				any_chunked = true;
+				const uint64_t chunk_count = (layout.row_count + rows_per_chunk - 1) / rows_per_chunk;
+				chunks.reserve(static_cast<size_t>(chunk_count));
+				chunk_sizes.reserve(static_cast<size_t>(chunk_count));
+				for (uint64_t row = 0; row < layout.row_count; row += rows_per_chunk) {
+					const uint64_t rows = std::min(rows_per_chunk, layout.row_count - row);
+					const uint64_t chunk_bytes = rows * layout.row_pitch;
+					PackedByteArray slice;
+					slice.resize(static_cast<int64_t>(chunk_bytes));
+					memcpy(slice.ptrw(), footprint.ptr() + row * layout.row_pitch, static_cast<size_t>(chunk_bytes));
+					chunks.push_back(slice);
+					chunk_sizes.push_back(static_cast<uint32_t>(chunk_bytes));
+				}
+			}
+			chunk_payloads.push_back(std::move(chunks));
+			chunk_uncompressed_sizes.push_back(std::move(chunk_sizes));
 			raw_offset += source_mip_size;
 		}
 		total_compressed_size = footprint_size;
@@ -1484,9 +1519,8 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	needs_v3 = needs_v3 || any_chunked;
 	header.version = needs_v3 ? 3 : 2;
 	header.reserved = needs_v3
-			? (store_uncompressed
-					  ? static_cast<uint64_t>(DSCompressionFormat::NONE)
-					  : (static_cast<uint64_t>(DSCompressionFormat::GDEFLATE) | (any_chunked ? DSTEX_CAP_CHUNKED : 0)))
+			? (static_cast<uint64_t>(store_uncompressed ? DSCompressionFormat::NONE : DSCompressionFormat::GDEFLATE) |
+					(any_chunked ? DSTEX_CAP_CHUNKED : 0))
 			: 0;
 
 	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::WRITE);

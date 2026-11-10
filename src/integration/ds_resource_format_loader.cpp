@@ -849,7 +849,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 						const int32_t chunk_count = (p_chunked && p_mip_chunk_counts.size() > static_cast<int64_t>(i))
 								? p_mip_chunk_counts[i] : 1;
 						const int32_t pitch = p_mip_row_pitches.size() > static_cast<int64_t>(i) ? p_mip_row_pitches[i] : 0;
-						if (is_gdeflate && p_chunked && chunk_count > 1 && pitch > 0) {
+						if (p_chunked && chunk_count > 1 && pitch > 0) {
 							PackedByteArray footprint;
 							footprint.resize(static_cast<int64_t>(expected_footprint_size));
 							uint64_t rows_written = 0;
@@ -874,7 +874,13 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 									chunk_ok = false;
 									break;
 								}
-								PackedByteArray decoded = gdeflate_decompressor->decompress(compressed_chunk, chunk_uncompressed_size);
+								PackedByteArray decoded;
+								if (is_gdeflate) {
+									decoded = gdeflate_decompressor->decompress(compressed_chunk, chunk_uncompressed_size);
+								} else if (chunk_compressed_size == chunk_uncompressed_size) {
+									// NONE chunk: the raw row slice is the payload.
+									decoded = compressed_chunk;
+								}
 								if (decoded.size() != static_cast<int64_t>(chunk_uncompressed_size) ||
 										rows_written * static_cast<uint64_t>(pitch) + chunk_uncompressed_size > static_cast<uint64_t>(expected_footprint_size)) {
 									chunk_ok = false;

@@ -785,10 +785,6 @@ Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_pa
 		entry.compression_format = static_cast<uint8_t>(src_compression);
 		PackedInt32Array src_chunk_counts = dstex_header.get("mip_chunk_counts", PackedInt32Array());
 		const bool src_chunked = dstex_header.get("chunked", false);
-		if (src_chunked && src_compression != static_cast<int>(DSCompressionFormat::GDEFLATE)) {
-			UtilityFunctions::push_error("DSPkg: only GDeflate .dstex payloads may be chunked: ", p_dstex_path);
-			return ERR_INVALID_DATA;
-		}
 		if (src_chunked) {
 			PackedInt64Array src_chunk_offsets = dstex_header.get("chunk_offsets", PackedInt64Array());
 			PackedInt32Array src_chunk_compressed = dstex_header.get("chunk_compressed_sizes", PackedInt32Array());
@@ -1014,10 +1010,6 @@ Error DSPkg::finalize() {
 		const DSPkgStagedEntry &entry = *sorted_entries[i];
 		if (entry.chunked || entry_logical_tlv_size(entry) > 0 ||
 				entry.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
-			write_v5 = true;
-			break;
-		}
-	}
 			write_v5 = true;
 			break;
 		}

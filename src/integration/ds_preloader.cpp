@@ -760,10 +760,6 @@ bool DSPreloader::validate_payload(const Payload &p_payload) {
 			return false;
 		}
 		if (p_payload.chunked) {
-			if (p_payload.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
-				UtilityFunctions::push_warning("DSPreloader: only GDeflate payloads may be chunked for '", p_payload.engine_path, "'; skipping prewarm.");
-				return false;
-			}
 			if (p_payload.mip_chunk_counts.size() < mips ||
 					p_payload.chunk_compressed_sizes.size() != p_payload.chunk_offsets.size() ||
 					p_payload.chunk_uncompressed_sizes.size() != p_payload.chunk_offsets.size()) {
@@ -858,7 +854,9 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 				req->set_offset(static_cast<uint64_t>(p_payload.mip_offsets[i]));
 				req->set_size(static_cast<uint32_t>(p_payload.mip_sizes[i]));
 				req->set_uncompressed_size(static_cast<uint32_t>(p_payload.mip_uncompressed_sizes[i]));
-				req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+				req->set_compression_format(p_payload.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
+								? DSRequest::COMPRESSION_GDEFLATE
+								: DSRequest::COMPRESSION_NONE);
 				req->set_cancellation_tag(p_tag);
 				req->get_destination_buffer_ref().resize(static_cast<int64_t>(p_payload.mip_uncompressed_sizes[i]));
 				r_out.push_back(req);
@@ -877,7 +875,9 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 				req->set_offset(static_cast<uint64_t>(p_payload.chunk_offsets[chunk_cursor]));
 				req->set_size(static_cast<uint32_t>(p_payload.chunk_compressed_sizes[chunk_cursor]));
 				req->set_uncompressed_size(static_cast<uint32_t>(p_payload.chunk_uncompressed_sizes[chunk_cursor]));
-				req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+				req->set_compression_format(p_payload.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
+								? DSRequest::COMPRESSION_GDEFLATE
+								: DSRequest::COMPRESSION_NONE);
 				req->set_cancellation_tag(p_tag);
 				req->get_destination_buffer_ref().resize(
 						static_cast<int64_t>(p_payload.chunk_uncompressed_sizes[chunk_cursor]));
