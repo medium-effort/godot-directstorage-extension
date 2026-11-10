@@ -2180,6 +2180,130 @@ Microsoft::WRL::ComPtr<ID3D12CommandQueue> ds_win32_get_d3d12_command_queue() {
 	return s_d3d12_command_queue;
 }
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+bool ds_win32_debug_probe_texture_region(const RID &p_texture, uint32_t p_subresource,
+		uint32_t p_top, uint32_t p_bottom, const String &p_path, uint64_t p_offset,
+		uint32_t p_size, uint32_t p_uncompressed_size, String &r_error) {
+	r_error = String();
+	ID3D12Resource *resource = nullptr;
+	D3D12_RESOURCE_DESC desc = {};
+	uint64_t native_format = 0;
+	bool rd_available = false;
+	if (!ds_win32_query_destination_resource_on_render_thread(false, p_texture, resource, desc, native_format, rd_available) ||
+			resource == nullptr) {
+		r_error = "probe: could not resolve the destination texture to an ID3D12Resource.";
+		return false;
+	}
+	Microsoft::WRL::ComPtr<ID3D12Device> device = ds_win32_get_d3d12_device();
+	if (!device) {
+		r_error = "probe: no D3D12 device.";
+		return false;
+	}
+	Microsoft::WRL::ComPtr<IDStorageFactory> factory;
+	HRESULT hr = DStorageGetFactory(IID_PPV_ARGS(&factory));
+	if (FAILED(hr) || !factory) {
+		r_error = "probe: DStorageGetFactory failed 0x" + String::num_uint64(static_cast<uint32_t>(hr), 16) + ".";
+		return false;
+	}
+
+	std::wstring wide_path(reinterpret_cast<const wchar_t *>(p_path.utf16().get_data()));
+	Microsoft::WRL::ComPtr<IDStorageFile> file;
+	hr = factory->OpenFile(wide_path.c_str(), IID_PPV_ARGS(&file));
+	if (FAILED(hr) || !file) {
+		r_error = "probe: OpenFile failed 0x" + String::num_uint64(static_cast<uint32_t>(hr), 16) + ".";
+		return false;
+	}
+
+	Microsoft::WRL::ComPtr<IDStorageQueue1> queue;
+	DSTORAGE_QUEUE_DESC queue_desc = {};
+	queue_desc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+	queue_desc.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
+	queue_desc.Priority = DSTORAGE_PRIORITY_NORMAL;
+	queue_desc.Name = "M0RegionProbe";
+	queue_desc.Device = device.Get();
+	hr = factory->CreateQueue(&queue_desc, IID_PPV_ARGS(&queue));
+	if (FAILED(hr) || !queue) {
+		file->Close();
+		r_error = "probe: CreateQueue failed 0x" + String::num_uint64(static_cast<uint32_t>(hr), 16) + ".";
+		return false;
+	}
+
+	HANDLE completion_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	HANDLE error_event = queue->GetErrorEvent();
+	if (!completion_event || !error_event) {
+		if (completion_event) {
+			CloseHandle(completion_event);
+		}
+		queue->Close();
+		file->Close();
+		r_error = "probe: could not create the completion event.";
+		return false;
+	}
+
+	DSTORAGE_REQUEST request = {};
+	request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+	request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION;
+	request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
+	request.Source.File.Source = file.Get();
+	request.Source.File.Offset = p_offset;
+	request.Source.File.Size = p_size;
+	request.Destination.Texture.Resource = resource;
+	request.Destination.Texture.SubresourceIndex = p_subresource;
+	D3D12_BOX region = {};
+	region.left = 0;
+	region.top = p_top;
+	region.front = 0;
+	region.right = static_cast<UINT>(desc.Width);
+	region.bottom = p_bottom;
+	region.back = 1;
+	request.Destination.Texture.Region = region;
+	request.UncompressedSize = p_uncompressed_size;
+	request.Name = "M0RegionProbe";
+
+	queue->EnqueueRequest(&request);
+	queue->EnqueueSetEvent(completion_event);
+	queue->Submit();
+
+	HANDLE waits[2] = { completion_event, error_event };
+	const DWORD wait_result = WaitForMultipleObjects(2, waits, FALSE, 5000);
+	bool completed = false;
+	if (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_OBJECT_0 + 1) {
+		// A signalled error event MUST be consumed: the queue stops processing
+		// until RetrieveErrorRecord runs, so the completion event would never
+		// fire and every failure would look like a timeout. WaitForMultipleObjects
+		// already reset whichever auto-reset handle it returned.
+		DSTORAGE_ERROR_RECORD record = {};
+		if (wait_result == WAIT_OBJECT_0 + 1) {
+			queue->RetrieveErrorRecord(&record);
+		} else if (WaitForSingleObject(error_event, 0) == WAIT_OBJECT_0) {
+			queue->RetrieveErrorRecord(&record);
+		}
+		if (record.FailureCount > 0 || FAILED(record.FirstFailure.HResult)) {
+			r_error = "probe: FailureCount=" + String::num_int64(record.FailureCount) +
+					" HResult=0x" + String::num_uint64(static_cast<uint32_t>(record.FirstFailure.HResult), 16) +
+					" CommandType=" + String::num_int64(static_cast<int64_t>(record.FirstFailure.CommandType)) +
+					" RequestName='" + String(record.FirstFailure.Request.RequestName) + "'.";
+			completed = false;
+		} else {
+			// The record was consumed (or was never pending); the completion event
+			// may still be the one that has to fire.
+			completed = wait_result == WAIT_OBJECT_0 ||
+					WaitForSingleObject(completion_event, 2000) == WAIT_OBJECT_0;
+			if (!completed) {
+				r_error = "probe: error event consumed with FailureCount=0 but the completion event never fired.";
+			}
+		}
+	} else {
+		r_error = "probe: timed out waiting for the queue (wait_result=" + String::num_int64(static_cast<int64_t>(wait_result)) + ").";
+	}
+
+	queue->Close();
+	file->Close();
+	CloseHandle(completion_event);
+	return completed;
+}
+#endif
+
 // Shared DirectStorage runtime probe state. `is_available()` loads the
 // runtime DLLs to verify factory/queue creation, then stashes the still-loaded
 // modules here instead of unloading them. `initialize()` claims them for the

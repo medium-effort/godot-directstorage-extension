@@ -38,6 +38,20 @@ void ds_win32_invalidate_d3d12_device();
 // called from module deinit: a ComPtr destroyed during
 // DLL_PROCESS_DETACH releases under the loader lock and deadlocks the driver.
 void ds_win32_release_static_d3d12_state();
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+// M0 spike seam (never bound in _bind_methods()): submits ONE raw
+// DSTORAGE_REQUEST with DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION + GDeflate
+// into a row range of one subresource, on a private queue, and reports whether
+// the runtime accepted and completed it. The staging buffer size must already be
+// configured: it is locked (E_DSTORAGE_STAGING_BUFFER_LOCKED) once a queue
+// exists, so the test sets dsgd_extension/staging_buffer_size_mb and re-inits
+// DSContext instead of resizing here. Delete with the milestone if the runtime
+// refuses sub-mip row ranges.
+bool ds_win32_debug_probe_texture_region(const RID &p_texture, uint32_t p_subresource,
+		uint32_t p_top, uint32_t p_bottom, const String &p_path, uint64_t p_offset,
+		uint32_t p_size, uint32_t p_uncompressed_size, String &r_error);
+#endif
 #endif
 
 class Win32Backend : public PlatformBackend {
