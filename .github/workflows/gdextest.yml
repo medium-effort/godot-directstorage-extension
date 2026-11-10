@@ -129,6 +129,18 @@ jobs:
             scons-${{ matrix.os }}-${{ github.ref_name }}-
             scons-${{ matrix.os }}-
 
+      - name: Count restored SCons cache entries
+        # How many files the archive actually had, counted BEFORE the build. The
+        # build writes its own entries into this same directory, so a later count
+        # would report the cold build's output as if it had been restored. The
+        # "Summarize SCons cache" step prints this next to "0 retrieved", which is
+        # otherwise ambiguous between an empty archive and keys written by another
+        # machine. CacheDir stores one file per entry (<2 hex>/<signature>) plus
+        # build-signature.json, so a healthy tree reads in the thousands and the
+        # signal is "~0" versus "many", never an exact object count.
+        shell: bash
+        run: echo "SCONS_CACHE_ENTRIES=$(find .scons-cache -type f 2>/dev/null | wc -l | tr -d ' ')" >> "$GITHUB_ENV"
+
       - name: Build extension and tests
         id: build
         # Do not hardcode arch= here: macos-latest is arm64 and passing x86_64

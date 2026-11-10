@@ -17,6 +17,12 @@ nothing at all. Two different cold builds are kept apart on purpose:
   * an entry was restored but its objects no longer match the build signature:
     that is the expensive surprise, so it also emits a warning annotation.
 
+`SCONS_CACHE_ENTRIES` (counted by the workflow immediately after the restore,
+before the build writes into the same directory) is what tells the collapsed
+block whether the archive was populated at all. Without it, "0 retrieved" cannot
+distinguish "nothing to reuse" from "keys written by another machine", which are
+different problems with different fixes.
+
 Never fails the job: a summary must not turn a green build red.
 """
 
@@ -46,6 +52,29 @@ SHA_PATTERN = re.compile(r"-sha-([0-9a-f]{7,40})")
 CACHE_MISS = "miss"
 CACHE_REUSED = "reused"
 CACHE_STALE = "stale"
+
+# The build-signature fields whose value reaches a compiler command line
+# (directly, or through the expansion of $CCCOM/$CXXCOM), or the target path.
+# Only those can rotate an object's cache key: SCons keys a cached node on
+# File.get_cachedir_bsig(), i.e. the children's content signatures + the expanded
+# action command + the target's internal path. Everything else the signature
+# records is bookkeeping - `tools` lists the tools SCons *detected* on the
+# machine (Tool/javah.py exists() is just env.Detect('javah')), and LINKFLAGS
+# never appears on a compile line - so a change there cannot by itself explain
+# rejected objects.
+OBJECT_KEY_FIELDS = frozenset({
+    "platform",
+    "target",
+    "arch",
+    "dev_build",
+    "cc",
+    "cxx",
+    "ccflags",
+    "cflags",
+    "cxxflags",
+    "defines",
+    "cpppath",
+})
 
 
 def _env(name: str) -> str:
@@ -175,6 +204,9 @@ def format_details(
         ("objects", objects),
         ("build", format_elapsed(args.elapsed_seconds)),
     ]
+    entries = _env("SCONS_CACHE_ENTRIES")
+    if entries.isdigit():
+        rows.append(("entries", f"{int(entries):,} cache files after restore"))
     if signature_line:
         rows.append(("signature", f"`{signature_line}`"))
 
@@ -184,7 +216,36 @@ def format_details(
     lines.append("")
 
     if deltas:
-        lines.append("Build signature changed (this is why cached objects were rejected):")
+        changed = {delta.partition(" ")[0] for delta in deltas}
+        if retrieved == 0:
+            # Nothing came back, not even the generated sources whose entries do
+            # not depend on compiler flags at all, so naming one changed field as
+            # "the" cause would be a guess presented as a diagnosis. The restored
+            # entry count separates the two shapes this can have: an archive full
+            # of entries whose keys this build never computes, versus nothing to
+            # reuse in the first place.
+            if entries.isdigit() and entries != "0":
+                lines.append(
+                    f"The restored archive held {int(entries):,} entries, but none matched this build's "
+                    "keys - a whole key-space mismatch, not one changed field. Recorded differences:"
+                )
+            elif entries == "0":
+                lines.append(
+                    "The restored archive was empty - nothing to reuse, so this is a cache-restore "
+                    "problem rather than a build-input change. Recorded differences:"
+                )
+            else:
+                lines.append(
+                    "The restored entry held no key for any object this build needed - a whole key-space "
+                    "mismatch, not one changed field. Recorded differences:"
+                )
+        elif changed & OBJECT_KEY_FIELDS:
+            lines.append("Build signature changed (this is why cached objects were rejected):")
+        else:
+            lines.append(
+                "Build signature changed, but no field that reaches the compile command or the target "
+                "path moved, so this cannot by itself explain the rejected objects. Recorded differences:"
+            )
         lines.append("")
         for delta in deltas:
             # SCons reports the construction-variable name in lower case; spell it
@@ -278,7 +339,7 @@ def main() -> int:
             "::warning title=SCons cache rejected::"
             f"A restored cache entry no longer matched this build's signature; "
             f"{compiled:,} of {retrieved + compiled:,} objects were recompiled. "
-            "The build-signature delta in the job summary names the field that changed."
+            "The build-signature delta in the job summary lists the recorded differences."
         )
 
     return 0
