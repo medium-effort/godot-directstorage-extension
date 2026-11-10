@@ -11,6 +11,11 @@ Invoked by:
   .vscode/build_remote.ps1   after a successful build (local or remote)
   .vscode/sync_addon.ps1     standalone, without building
 
+The files come from this checkout unless --source-root names another one (a
+worktree of the same repository). With an external source the copy test is
+content-based instead of mtime-based: a worktree's artifacts are usually older
+than what is already deployed, so mtime would copy nothing.
+
 Targets (each runs only when its variable is configured):
   addon     SYNC_ADDON_DIR            addon dir  -> external project's addon
   copyable  SYNC_ADDON_COPYABLE_DIR   addon dir  -> <base>/directstorage_accelerator
@@ -27,6 +32,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 
 ADDON_REL = os.path.join("project", "addons", "directstorage_accelerator")
 MANIFEST_REL = os.path.join(ADDON_REL, "bin", "build_manifest.json")
@@ -124,7 +130,40 @@ def safe_copy_file(src_file, dst_file, dry_run=False):
             raise
 
 
-def sync_changed_files(src_dir, dst_dir, file_filter=None, dry_run=False, log=None):
+def file_contents_equal(left_path, right_path, chunk_size=1 << 20):
+    """Byte-for-byte comparison, for when mtimes cannot be trusted."""
+    with open(left_path, "rb") as left, open(right_path, "rb") as right:
+        while True:
+            left_chunk = left.read(chunk_size)
+            right_chunk = right.read(chunk_size)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
+def should_copy_file(src_file, dst_file, content_compare=False):
+    """Whether dst_file must be replaced from src_file.
+
+    mtime is the cheap default: inside one working tree a rebuild always makes
+    the source newer. Across checkouts it means nothing, so content_compare
+    decides by bytes instead.
+    """
+    if not os.path.exists(dst_file):
+        return True
+    try:
+        src_stat = os.stat(src_file)
+        dst_stat = os.stat(dst_file)
+        if src_stat.st_size != dst_stat.st_size:
+            return True
+        if content_compare:
+            return not file_contents_equal(src_file, dst_file)
+        return src_stat.st_mtime > dst_stat.st_mtime + 0.1
+    except Exception:
+        return True
+
+
+def sync_changed_files(src_dir, dst_dir, file_filter=None, dry_run=False, log=None, content_compare=False):
     """Copy files that are new, different in size, or newer; return the count."""
     log = log or Log()
     copied_count = 0
@@ -148,19 +187,7 @@ def sync_changed_files(src_dir, dst_dir, file_filter=None, dry_run=False, log=No
             src_file = os.path.join(root, f)
             dst_file = os.path.join(target_root, f)
 
-            should_copy = False
-            if not os.path.exists(dst_file):
-                should_copy = True
-            else:
-                try:
-                    src_stat = os.stat(src_file)
-                    dst_stat = os.stat(dst_file)
-                    if src_stat.st_mtime > dst_stat.st_mtime + 0.1 or src_stat.st_size != dst_stat.st_size:
-                        should_copy = True
-                except Exception:
-                    should_copy = True
-
-            if should_copy:
+            if should_copy_file(src_file, dst_file, content_compare):
                 try:
                     safe_copy_file(src_file, dst_file, dry_run)
                     copied_count += 1
@@ -215,6 +242,21 @@ def src_files_filter(rel_path, filename):
     if fname_lower == "dspkg_encryption_key.h":
         return False
     return True
+
+
+def without_manifest(file_filter):
+    """Drop bin/build_manifest.json from a copy pass.
+
+    patch_manifest() writes the authoritative (post-sync) copy after the copy
+    pass, so comparing the deployed manifest against the source one would
+    re-copy it on every run and report a phantom change.
+    """
+    def filtered(rel_path, filename):
+        if filename.lower() == "build_manifest.json":
+            return False
+        return file_filter(rel_path, filename)
+
+    return filtered
 
 
 def clean_excluded_files(dst_dir, file_filter, dry_run=False, log=None):
@@ -311,7 +353,7 @@ def describe_wrong_addon_target(target):
     return ""
 
 
-def sync_addon_target(addon_dir, env, log, dry_run):
+def sync_addon_target(addon_dir, env, log, dry_run, content_compare=False):
     """addon dir -> SYNC_ADDON_DIR."""
     target = env.get("SYNC_ADDON_DIR", "").strip()
     result = TargetResult("addon", target)
@@ -333,11 +375,12 @@ def sync_addon_target(addon_dir, env, log, dry_run):
         )
         return result
 
+    copy_filter = without_manifest(addon_files_filter) if content_compare else addon_files_filter
     try:
         if not dry_run:
             os.makedirs(target, exist_ok=True)
         clean_excluded_files(target, addon_files_filter, dry_run, log)
-        result.copied = sync_changed_files(addon_dir, target, addon_files_filter, dry_run, log)
+        result.copied = sync_changed_files(addon_dir, target, copy_filter, dry_run, log, content_compare)
         result.synced = True
         state = "would copy" if dry_run else "copied"
         log.info(f"addon    : {state} {result.copied} file(s) -> {target}")
@@ -347,7 +390,7 @@ def sync_addon_target(addon_dir, env, log, dry_run):
     return result
 
 
-def sync_copyable_target(addon_dir, src_dir, env, log, dry_run):
+def sync_copyable_target(addon_dir, src_dir, env, log, dry_run, content_compare=False):
     """addon dir + src/ -> SYNC_ADDON_COPYABLE_DIR."""
     base = env.get("SYNC_ADDON_COPYABLE_DIR", "").strip()
     addon_target = os.path.join(base, "directstorage_accelerator") if base else ""
@@ -359,16 +402,17 @@ def sync_copyable_target(addon_dir, src_dir, env, log, dry_run):
         log.info("copyable : skipped (SYNC_ADDON_COPYABLE_DIR is not configured)")
         return result
 
+    copy_filter = without_manifest(addon_files_filter) if content_compare else addon_files_filter
     try:
         if not dry_run:
             os.makedirs(addon_target, exist_ok=True)
         clean_excluded_files(addon_target, addon_files_filter, dry_run, log)
-        result.copied = sync_changed_files(addon_dir, addon_target, addon_files_filter, dry_run, log)
+        result.copied = sync_changed_files(addon_dir, addon_target, copy_filter, dry_run, log, content_compare)
 
         if not dry_run:
             os.makedirs(src_target, exist_ok=True)
         clean_excluded_files(src_target, src_files_filter, dry_run, log)
-        result.src_copied = sync_changed_files(src_dir, src_target, src_files_filter, dry_run, log)
+        result.src_copied = sync_changed_files(src_dir, src_target, src_files_filter, dry_run, log, content_compare)
 
         result.synced = True
         state = "would copy" if dry_run else "copied"
@@ -380,7 +424,7 @@ def sync_copyable_target(addon_dir, src_dir, env, log, dry_run):
     return result
 
 
-def sync_test_target(project_dir, env, log, dry_run):
+def sync_test_target(project_dir, env, log, dry_run, content_compare=False):
     """project/ -> SYNC_TEST_DIR (full project mirror)."""
     target = env.get("SYNC_TEST_DIR", "").strip()
     result = TargetResult("test", target)
@@ -392,7 +436,8 @@ def sync_test_target(project_dir, env, log, dry_run):
     try:
         if not dry_run:
             os.makedirs(target, exist_ok=True)
-        result.copied = sync_changed_files(project_dir, target, None, dry_run, log)
+        copy_filter = without_manifest(lambda rel_path, filename: True) if content_compare else None
+        result.copied = sync_changed_files(project_dir, target, copy_filter, dry_run, log, content_compare)
         result.synced = True
         state = "would copy" if dry_run else "copied"
         log.info(f"test     : {state} {result.copied} file(s) -> {target}")
@@ -406,12 +451,15 @@ def sync_test_target(project_dir, env, log, dry_run):
 # Manifest
 # --------------------------------------------------------------------------- #
 
-def patch_manifest(results, repo_root, env, log, dry_run):
+def patch_manifest(results, source_root, repo_root, env, log, dry_run):
     """Record the sync outcome in build_manifest.json and deploy the patched copy.
 
-    Single writer: SCons only produces the build half of this file now.
+    Single writer: SCons only produces the build half of this file now. The file
+    patched is the one that describes the copied artifacts (source_root), so
+    publishing another worktree never rewrites this checkout's record of its own
+    build.
     """
-    manifest_path = os.path.join(repo_root, MANIFEST_REL)
+    manifest_path = os.path.join(source_root, MANIFEST_REL)
     attempted = [r for r in results if r.attempted]
     if not attempted:
         return
@@ -481,16 +529,30 @@ def patch_manifest(results, repo_root, env, log, dry_run):
         log.info("manifest : would record sync result (dry run)")
         return
 
+    # The manifest describes the build it sits next to. Publishing another
+    # checkout must not rewrite that checkout's file, so an external source
+    # writes a temporary copy that is only deployed, never kept.
+    in_place = os.path.normcase(os.path.normpath(source_root)) == os.path.normcase(os.path.normpath(repo_root))
+    written_path = manifest_path
+    if not in_place:
+        handle, written_path = tempfile.mkstemp(prefix="dsgd_manifest_", suffix=".json")
+        os.close(handle)
+
     try:
-        with open(manifest_path, "w", encoding="utf-8") as f:
+        with open(written_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as exc:
         log.warn(f"could not write build manifest ({exc})")
+        if not in_place:
+            try:
+                os.remove(written_path)
+            except Exception:
+                pass
         return
 
     # Deploy the patched manifest next to each mirrored copy (as SCons used to).
-    addon_dir = os.path.join(repo_root, ADDON_REL)
-    project_dir = os.path.join(repo_root, "project")
+    addon_dir = os.path.join(source_root, ADDON_REL)
+    project_dir = os.path.join(source_root, "project")
     destinations = []
     for result in attempted:
         if not result.synced:
@@ -505,10 +567,16 @@ def patch_manifest(results, repo_root, env, log, dry_run):
     for dst in destinations:
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            safe_copy_file(manifest_path, dst)
+            safe_copy_file(written_path, dst)
             log.detail(f"manifest -> {dst}")
         except Exception as exc:
             log.warn(f"failed to deploy manifest to {dst}: {exc}")
+
+    if not in_place:
+        try:
+            os.remove(written_path)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -543,10 +611,21 @@ def main(argv=None):
                              f"(default: {DEFAULT_FATAL}; use 'none' for warn-only)")
     parser.add_argument("--repo-root", default=None, help="repository root (default: parent of tools/)")
     parser.add_argument("--env-file", default=None, help="configuration file (default: <repo>/.env)")
+    parser.add_argument("--source-root", default=None, dest="source_root",
+                        help="checkout to copy from (default: this one), typically a worktree path")
+    parser.add_argument("--source-label", default="", dest="source_label",
+                        help="name of --source-root for the log (default: derived from the path)")
     args = parser.parse_args(argv)
 
     repo_root = os.path.abspath(args.repo_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     load_env_file(repo_root, args.env_file)
+
+    source_root = os.path.abspath(args.source_root) if args.source_root else repo_root
+    same_checkout = os.path.normcase(os.path.normpath(source_root)) == os.path.normcase(os.path.normpath(repo_root))
+    # mtimes are only comparable inside one working tree; a worktree's artifact
+    # is usually older than the deployed copy, so mtime would never replace it.
+    content_compare = not same_checkout
+    source_label = args.source_label.strip() or ("current checkout" if same_checkout else source_root)
 
     targets = parse_targets(args.targets)
     fatal = {name.strip().lower() for name in (args.fatal_targets or "").split(",") if name.strip()}
@@ -554,12 +633,15 @@ def main(argv=None):
         fatal = set()
 
     log = Log(args.verbose)
-    addon_dir = os.path.join(repo_root, ADDON_REL)
-    src_dir = os.path.join(repo_root, "src")
-    project_dir = os.path.join(repo_root, "project")
+    addon_dir = os.path.join(source_root, ADDON_REL)
+    src_dir = os.path.join(source_root, "src")
+    project_dir = os.path.join(source_root, "project")
+
+    if content_compare:
+        log.info(f"source   : {source_label} ({source_root}); comparing file contents, not mtimes")
 
     if not os.path.isdir(addon_dir):
-        log.warn(f"addon directory not found: {addon_dir}")
+        log.warn(f"addon directory not found in sync source {source_label}: {addon_dir}")
         return 1
 
     if args.dry_run:
@@ -567,13 +649,13 @@ def main(argv=None):
 
     results = []
     if "test" in targets:
-        results.append(sync_test_target(project_dir, os.environ, log, args.dry_run))
+        results.append(sync_test_target(project_dir, os.environ, log, args.dry_run, content_compare))
     if "copyable" in targets:
-        results.append(sync_copyable_target(addon_dir, src_dir, os.environ, log, args.dry_run))
+        results.append(sync_copyable_target(addon_dir, src_dir, os.environ, log, args.dry_run, content_compare))
     if "addon" in targets:
-        results.append(sync_addon_target(addon_dir, os.environ, log, args.dry_run))
+        results.append(sync_addon_target(addon_dir, os.environ, log, args.dry_run, content_compare))
 
-    patch_manifest(results, repo_root, os.environ, log, args.dry_run)
+    patch_manifest(results, source_root, repo_root, os.environ, log, args.dry_run)
 
     # Orphan report for the addon mirror (files the addon no longer contains).
     if "addon" in targets:
@@ -599,7 +681,8 @@ def main(argv=None):
 
     print(
         f"[sync] SUMMARY targets={','.join(r.name for r in attempted)} "
-        f"copied={copied_total} src_copied={src_total} failed={','.join(failed)}",
+        f"copied={copied_total} src_copied={src_total} failed={','.join(failed)}"
+        + (f" source={source_label}" if content_compare else ""),
         flush=True,
     )
 

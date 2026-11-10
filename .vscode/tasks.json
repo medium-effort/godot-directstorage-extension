@@ -219,6 +219,8 @@
                 "Bypass",
                 "-File",
                 "${workspaceFolder}/.vscode/sync_addon.ps1",
+                "-Source",
+                "${input:syncSource}",
                 "-Verbose"
             ],
             "group": "build",
@@ -386,6 +388,12 @@
                 }
             ],
             "default": "1.3.0"
+        },
+        {
+            "id": "syncSource",
+            "type": "promptString",
+            "description": "Sync source: worktree name, branch, or path ('current' = this checkout)",
+            "default": "current"
         }
     ]
 }
