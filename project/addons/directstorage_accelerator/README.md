@@ -12,6 +12,20 @@ The importer converts `.png`, `.jpg`, `.jpeg`, and `.webp` sources into `.dstex`
 
 Three presets are provided: **3D (Streaming)** (the default), **CPU / ImageTexture (2D, UI, Decals)** (uncompressed, no mipmaps, CPU-loaded), and **Project Default**, which follows `dsgd_extension/default_import_profile`. Existing `.import` files keep their stored values on reimport; the project setting only affects new imports. A pure 2D project should normally use Godot's own Texture2D importer instead of this addon.
 
+### GDeflate compression level
+
+`compression/gdeflate_level` (1-12) trades importer time for a smaller `.dstex`. The level is applied at import only: it changes the stored bytes, not the runtime decompression cost, which is per-byte identical at every level. On the default path the payload is already block-compressed (S3TC/BC1), so the gains flatten quickly. Measured on 8 logical cores, mip 0 of a 4096x4096 albedo (8 MiB S3TC payload) with the addon's own compressor:
+
+| Level | `.dstex` payload | vs level 1 | Compression time |
+| --- | --- | --- | --- |
+| 1 (default) | 3,240,912 B | - | 187 ms |
+| 3 | 3,187,260 B | -1.7% | 193 ms |
+| 6 | 3,083,248 B | -4.9% | 238 ms |
+| 9 | 2,975,292 B | -8.2% | 1126 ms |
+| 12 | 2,959,824 B | -8.7% | 2526 ms |
+
+End to end for the same asset (decode, 13 mip levels, BC1, `.dstex` write), level 6 costs +11% import time for a 4.7% smaller file, and level 12 costs 6.1x for 8.4%. Levels 9-12 are the libdeflate cliff: avoid them for interactive or CI reimports. The practical range is 1-6, and low-entropy ORM/mask textures gain even less (2.1% at level 12 on a 2048x2048 ORM). Keep the default when reimport time matters, and raise it only when distribution size is the higher priority.
+
 During export, imported `.dstex` files are bundled into `res://textures.dspkg` (version 3 or version 4 with encrypted TOC) along with per-entry GPU mip metadata and entry flags. The runtime resource loader resolves texture paths directly from that archive without requiring individual `.dstex` files in the exported PCK.
 
 ### Native library reload (GDExtension)

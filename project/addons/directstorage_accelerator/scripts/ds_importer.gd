@@ -52,7 +52,10 @@ const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "c
 ## - [b]compression/color_space[/b]: Linear or sRGB storage flag.
 ## - [b]compress/normal_map[/b]: Normalize and renormalize as a normal map.
 ## - [b]compress/channel_pack[/b]: sRGB-friendly or optimized channel packing.
-## - [b]compression/gdeflate_level[/b]: GDeflate compression level (1-12).
+## - [b]compression/gdeflate_level[/b]: GDeflate compression level (1-12), import-time
+##   only. Levels 1-6 are the practical range; 9-12 cost 5-13x compression time for
+##   under 9% of the .dstex size on block-compressed payloads. The level does not
+##   change runtime decompression cost; see the addon README for the measured table.
 ## - [b]mipmaps/generate[/b]: Generate a full mip chain.
 ## - [b]process/size_limit[/b]: Resize the longer edge before mip generation.
 ## - [b]process/channel_remap/red|green|blue|alpha[/b]: Swizzle, invert, or replace channels (e.g. pack PBR masks, flip normal-map Y).
