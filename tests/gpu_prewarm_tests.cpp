@@ -295,6 +295,67 @@ bool stage_npot_dspkg(const char *p_npot_dstex_path, const char *p_control_dstex
     return publish_textures_dspkg(p_dspkg_path, p_npot_virtual, p_control_virtual);
 }
 
+// Chunked staging for the GPU prewarm test: two 1024x1024 entries in one
+// archive, one incompressible (noise -> NONE raw row-slice chunks) and one
+// compressible (solid -> GDeflate chunks). 256 KiB chunks give 16 row-range
+// requests per texture. Publishes res://textures.dspkg directly.
+bool stage_chunked_gpu_dspkg(const char *p_noise_dstex_path, const char *p_solid_dstex_path,
+        const char *p_dspkg_path, const char *p_noise_virtual, const char *p_solid_virtual) {
+    constexpr int kChunkedSize = 1024;
+    constexpr int kChunkKb = 256;
+    godot::PackedByteArray noise;
+    noise.resize(static_cast<int64_t>(kChunkedSize) * static_cast<int64_t>(kChunkedSize) * 4);
+    {
+        uint8_t *writer = noise.ptrw();
+        uint32_t state = 0x9E3779B9u;
+        for (int64_t i = 0; i < noise.size(); ++i) {
+            state = state * 1664525u + 1013904223u;
+            writer[i] = static_cast<uint8_t>(state >> 24);
+        }
+    }
+    godot::PackedByteArray solid;
+    solid.resize(static_cast<int64_t>(kChunkedSize) * static_cast<int64_t>(kChunkedSize) * 4);
+    memset(solid.ptrw(), 0x7F, static_cast<size_t>(solid.size()));
+
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    if (dstex.is_null()) {
+        return false;
+    }
+    if (dstex->write_to_file(godot::String(p_noise_dstex_path), noise, kChunkedSize, kChunkedSize,
+                godot::Image::FORMAT_RGBA8, 1, 1, false, false, 0, 0, 0, kChunkKb) != godot::OK) {
+        return false;
+    }
+    if (dstex->write_to_file(godot::String(p_solid_dstex_path), solid, kChunkedSize, kChunkedSize,
+                godot::Image::FORMAT_RGBA8, 1, 1, false, false, 0, 0, 0, kChunkKb) != godot::OK) {
+        return false;
+    }
+    godot::Dictionary noise_header = dstex->read_header(godot::String(p_noise_dstex_path));
+    godot::Dictionary solid_header = dstex->read_header(godot::String(p_solid_dstex_path));
+    if (noise_header.is_empty() || solid_header.is_empty() ||
+            !(bool)noise_header.get("chunked", false) || !(bool)solid_header.get("chunked", false)) {
+        return false;
+    }
+    godot::Ref<godot::DSPkg> builder;
+    builder.instantiate();
+    if (builder.is_null()) {
+        return false;
+    }
+    if (builder->create(godot::String(p_dspkg_path)) != godot::OK) {
+        return false;
+    }
+    if (builder->add_texture(godot::String(p_noise_virtual), godot::String(p_noise_dstex_path)) != godot::OK) {
+        return false;
+    }
+    if (builder->add_texture(godot::String(p_solid_virtual), godot::String(p_solid_dstex_path)) != godot::OK) {
+        return false;
+    }
+    if (builder->finalize() != godot::OK) {
+        return false;
+    }
+    return publish_textures_dspkg(p_dspkg_path, p_noise_virtual, p_solid_virtual);
+}
+
 // Deterministic *natural* (unpadded) block bytes for a linear-only RD format.
 // Arbitrary block bytes are valid BC4/BC5 data (each block is an independent
 // endpoint pair plus indices), and using them instead of a compressor output
@@ -610,6 +671,108 @@ GDEX_TEST_T(gpu_prewarm, dma_fills_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
     // ImageTexture the CPU fallback would have built.
     godot::Ref<godot::Texture2DRD> gpu = tex;
     GDEX_EXPECT_TRUE(gpu.is_valid());
+}
+
+GDEX_TEST_T(gpu_prewarm, chunked_dma_fills_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
+    if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
+        GDEX_SKIP("DSContext/DSTextureCache classes unavailable");
+    }
+    if (godot::DSContext *pre = godot::DSContext::get_singleton()) {
+        pre->shutdown_ds();
+    }
+    godot::DSContext *ds = require_singleton_context(ctx);
+    if (!ds->initialize_ds() || !ds->is_initialized()) {
+        GDEX_SKIP("DSContext backend unavailable (initialize_ds failed)");
+    }
+    if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+        GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver)");
+    }
+    if (!godot::DSPreloader::is_gpu_prewarm_available()) {
+        GDEX_SKIP("GPU prewarm unavailable (no live D3D12 RenderingDevice)");
+    }
+    godot::DSTextureCache *cache = new_test_cache(ctx);
+    godot::DSPreloader::shutdown();
+
+    const char *noise_dstex_path = "user://gdextest_gpu_chunked_noise.dstex";
+    const char *solid_dstex_path = "user://gdextest_gpu_chunked_solid.dstex";
+    const char *dspkg_path = "user://gdextest_gpu_chunked.dspkg";
+    const char *noise_virtual_path = "res://gdextest_gpu_chunked_noise.png";
+    const char *solid_virtual_path = "res://gdextest_gpu_chunked_solid.png";
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps) {
+        ps->set_setting("dsgd_extension/force_archive_resolution", true);
+    }
+    ctx.add_teardown([ds, ps]() {
+        if (ps) {
+            ps->set_setting("dsgd_extension/force_archive_resolution", false);
+        }
+        ds->shutdown_ds();
+        remove_abs("res://textures.dspkg");
+        remove_abs("user://gdextest_gpu_chunked_noise.dstex");
+        remove_abs("user://gdextest_gpu_chunked_solid.dstex");
+        remove_abs("user://gdextest_gpu_chunked.dspkg");
+        godot::DSPreloader::shutdown();
+    });
+    if (!stage_chunked_gpu_dspkg(noise_dstex_path, solid_dstex_path, dspkg_path, noise_virtual_path, solid_virtual_path)) {
+        GDEX_ABORT_TEST("chunked textures.dspkg staging failed");
+    }
+
+    // Both entries must resolve as chunked before the prewarm runs: this is
+    // what routes them to the per-chunk row-range GPU path instead of the
+    // single-request path (or the CPU fallback).
+    {
+        godot::Ref<godot::DSPkg> probe;
+        probe.instantiate();
+        GDEX_ASSERT_TRUE(probe.is_valid());
+        GDEX_ASSERT_EQ((int64_t)probe->open(godot::String("res://textures.dspkg")), (int64_t)godot::OK);
+        for (const char *entry_path : { noise_virtual_path, solid_virtual_path }) {
+            GDEX_ASSERT_TRUE(probe->has_texture(godot::String(entry_path)));
+            godot::Dictionary info = probe->get_entry_info(godot::String(entry_path));
+            GDEX_EXPECT_TRUE((bool)info.get("chunked", false));
+        }
+    }
+
+    godot::PackedStringArray paths;
+    paths.push_back(godot::String(noise_virtual_path));
+    paths.push_back(godot::String(solid_virtual_path));
+    uint64_t tag = 0;
+    try {
+        tag = cache->prewarm_gpu_async(paths, 16, true);
+    } catch (const std::exception &e) {
+        GDEX_FAIL(std::string("prewarm_gpu_async threw: ") + e.what());
+    } catch (...) {
+        GDEX_FAIL("prewarm_gpu_async threw an unknown exception.");
+    }
+    GDEX_ASSERT_TRUE(tag != 0);
+
+    const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() + 30000;
+    bool settled = false;
+    try {
+        settled = drive_prewarm_to_settled(ds, cache, tag, deadline);
+    } catch (const std::exception &e) {
+        GDEX_FAIL(std::string("drive loop threw: ") + e.what());
+    } catch (...) {
+        GDEX_FAIL("drive loop threw an unknown exception.");
+    }
+    if (!settled) {
+        godot::Vector2i progress = ds->get_prewarm_progress(tag);
+        GDEX_FAIL(std::string("Chunked GPU prewarm tag did not settle (done=") +
+                std::to_string(progress.x) + ", total=" + std::to_string(progress.y) + ").");
+    }
+    GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(tag), 0);
+
+    // Both residents must be VRAM-backed Texture2DRD: the NONE path (noise)
+    // and the GDeflate path (solid) each fanned out to 16 row-range requests,
+    // and neither may have fallen back to the CPU ImageTexture route.
+    for (const char *entry_path : { noise_virtual_path, solid_virtual_path }) {
+        godot::Ref<godot::Texture2D> tex =
+                cache->get_cached(godot::String(entry_path), godot::DSTextureCache::CACHE_MODE_REUSE);
+        GDEX_ASSERT_TRUE(tex.is_valid());
+        GDEX_EXPECT_EQ(tex->get_width(), 1024);
+        GDEX_EXPECT_EQ(tex->get_height(), 1024);
+        godot::Ref<godot::Texture2DRD> gpu = tex;
+        GDEX_EXPECT_TRUE(gpu.is_valid());
+    }
 }
 
 GDEX_TEST_T(gpu_prewarm, linear_formats_fill_vram_texture, TAG_INTEGRATION | TAG_SLOW) {

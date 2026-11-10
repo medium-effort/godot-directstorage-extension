@@ -167,7 +167,9 @@ public:
 	// path uploads - an sRGB-pairable color format, or a linear-only block
 	// format that carries 3D material data (BC4/BC5). Uncompressed and float
 	// data formats (R8/RG8/RGB8, the R16 family, floats, BC6H) stay on the
-	// memory path. Non-multiple-of-4 payloads are eligible; the GPU wrap reports
+	// memory path. Chunked payloads are eligible: they upload through
+	// per-chunk row-range requests in either codec (GDeflate or NONE raw row
+	// slices). Non-multiple-of-4 payloads are eligible; the GPU wrap reports
 	// their padded storage size (GODOT_QUIRKS.md Q79), so as_image_texture is
 	// the documented way to get authoring dimensions.
 	static bool is_gpu_prewarm_eligible(const Payload &p_payload);

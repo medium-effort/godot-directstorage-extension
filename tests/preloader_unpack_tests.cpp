@@ -300,6 +300,73 @@ GDEX_TEST(preloader_gpu, eligibility_accepts_npot) {
 	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(equal));
 }
 
+GDEX_TEST(preloader_gpu, eligibility_accepts_chunked) {
+	// Chunked payloads upload through per-chunk row-range GPU requests, so a
+	// sane chunk table is eligible in both codecs (GDeflate and NONE raw row
+	// slices); a corrupt table stays on the memory path.
+	godot::DSPreloader::Payload base;
+	base.engine_path = "res://test_gpu_chunked.png";
+	base.width = 1024;
+	base.height = 1024;
+	base.mip_count = 2;
+	base.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_BPTC_RGBA);
+	base.is_v2 = true;
+	base.mip_offsets.resize(2);
+	base.mip_sizes.resize(2);
+	base.mip_uncompressed_sizes.resize(2);
+	base.mip_row_pitches.resize(2);
+	base.mip_row_pitches[0] = 4096;
+	base.mip_row_pitches[1] = 2048;
+	base.chunked = true;
+	base.mip_chunk_counts.resize(2);
+	base.mip_chunk_counts[0] = 4;
+	base.mip_chunk_counts[1] = 1;
+	// Mip 0: 4 chunks of 64 rows x 4096 pitch; mip 1 is single-chunk and
+	// holds no table entries (same convention as expand_requests).
+	base.chunk_offsets.resize(4);
+	base.chunk_compressed_sizes.resize(4);
+	base.chunk_uncompressed_sizes.resize(4);
+	for (int64_t i = 0; i < 4; ++i) {
+		base.chunk_offsets[i] = i * 1000;
+		base.chunk_compressed_sizes[i] = 1000;
+		base.chunk_uncompressed_sizes[i] = 262144;
+	}
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(base));
+
+	// NONE codec (raw row slices) is eligible too.
+	godot::DSPreloader::Payload none = base;
+	none.compression_format = static_cast<uint8_t>(godot::DSCompressionFormat::NONE);
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(none));
+
+	// Zstd has no GPU row-range upload: memory path.
+	godot::DSPreloader::Payload zstd = base;
+	zstd.compression_format = static_cast<uint8_t>(godot::DSCompressionFormat::ZSTD);
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(zstd));
+
+	// Ragged table (uncompressed sizes out of sync with offsets).
+	godot::DSPreloader::Payload ragged = base;
+	ragged.chunk_uncompressed_sizes.resize(3);
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(ragged));
+
+	// Chunk size that is not a whole number of rows.
+	godot::DSPreloader::Payload partial_row = base;
+	partial_row.chunk_uncompressed_sizes[2] = 262145;
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(partial_row));
+
+	// Chunk counts that overrun the table.
+	godot::DSPreloader::Payload overrun = base;
+	overrun.mip_chunk_counts[0] = 5;
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(overrun));
+
+	// Chunked flag with only single-chunk mips and no table entries.
+	godot::DSPreloader::Payload single = base;
+	single.mip_chunk_counts[0] = 1;
+	single.chunk_offsets.clear();
+	single.chunk_compressed_sizes.clear();
+	single.chunk_uncompressed_sizes.clear();
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(single));
+}
+
 GDEX_TEST(preloader_gpu, npot_header_logical_semantics) {
 	// Companion lock-in: v2 cannot express a logical size, so the loader's GPU
 	// branch can only meet needs_size_override through a v3 payload. This pins

@@ -2,9 +2,10 @@
 // and reassemble the chunk buffers into a footprint per mip before building the
 // texture.
 //
-// Chunked GPU prewarm is intentionally CPU-routed for now (see
-// is_gpu_prewarm_eligible), so this is the prewarm path every chunked asset takes
-// by default. Headless-safe: it uses the memory/CPU route.
+// This test drives prewarm_async(), which always takes the memory/CPU route.
+// Chunked payloads are also GPU-eligible through prewarm_gpu_async() (per-chunk
+// row-range requests; see gpu_prewarm.chunked_dma_fills_vram_texture).
+// Headless-safe: it uses the memory/CPU route.
 
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
