@@ -1,4 +1,5 @@
 #include "ds_win32_backend.h"
+#include "../../core/ds_backend_config.h"
 #include "../../core/ds_context.h"
 #include "../../core/ds_error_handler.h"
 #include "../../core/ds_profiler.h"
@@ -2587,8 +2588,10 @@ void Win32Backend::apply_dstorage_configuration() {
 	}
 
 	DSContext *ctx = DSContext::get_singleton();
-	bool disable_gpu = ctx ? ctx->get_disable_gpu_decompression() : false;
-	bool file_buffering = s_desired_file_buffering.load();
+	DSBackendConfigOptions options;
+	options.disable_gpu_decompression = ctx ? ctx->get_disable_gpu_decompression() : false;
+	options.disable_gpu_decompression_metacommand = ctx ? ctx->get_disable_gpu_decompression_metacommand() : false;
+	options.force_file_buffering = s_desired_file_buffering.load();
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	// Benchmark seams (never bound, debug/dev only). The production decision
 	// comes from the asset volume's media class; the env switches let the probe
@@ -2596,30 +2599,31 @@ void Win32Backend::apply_dstorage_configuration() {
 	OS *bench_os = OS::get_singleton();
 	if (bench_os) {
 		if (bench_os->get_environment("DSGD_BENCH_FILE_BUFFERING") == "1") {
-			file_buffering = true;
+			options.force_file_buffering = true;
 		} else if (bench_os->get_environment("DSGD_BENCH_DISABLE_FILE_BUFFERING") == "1") {
-			file_buffering = false;
+			options.force_file_buffering = false;
 		}
 	}
 #endif
+	const DSResolvedBackendConfig resolved = resolve_backend_config(options);
 
 	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
 	if (s_dstorage_configured_module == current_module) {
-		if (s_applied_file_buffering.load() != file_buffering) {
+		if (s_applied_file_buffering.load() != resolved.force_file_buffering) {
 			UtilityFunctions::push_warning("[DirectStorage] I/O mode changed after the runtime was configured (requested " +
-					String(file_buffering ? "buffered" : "unbuffered") +
+					String(resolved.force_file_buffering ? "buffered" : "unbuffered") +
 					"); keeping the already-applied mode. Initialize DirectStorage before any capability probe, or point it at the same volume.");
 		}
 		return;
 	}
 
 	HRESULT hr = E_FAIL;
-	if (file_buffering) {
+	if (resolved.force_file_buffering) {
 		DSTORAGE_CONFIGURATION1 buffered_config = {};
-		buffered_config.DisableTelemetry = TRUE;
-		buffered_config.DisableGpuDecompression = disable_gpu;
-		buffered_config.DisableGpuDecompressionMetacommand = disable_gpu;
-		buffered_config.DisableBypassIO = TRUE;
+		buffered_config.DisableTelemetry = resolved.disable_telemetry ? TRUE : FALSE;
+		buffered_config.DisableGpuDecompression = resolved.disable_gpu_decompression ? TRUE : FALSE;
+		buffered_config.DisableGpuDecompressionMetacommand = resolved.disable_gpu_decompression_metacommand ? TRUE : FALSE;
+		buffered_config.DisableBypassIO = resolved.disable_bypass_io ? TRUE : FALSE;
 		buffered_config.ForceFileBuffering = TRUE;
 		hr = DStorageSetConfiguration1(&buffered_config);
 		if (SUCCEEDED(hr)) {
@@ -2630,9 +2634,9 @@ void Win32Backend::apply_dstorage_configuration() {
 		}
 	} else {
 		DSTORAGE_CONFIGURATION config = {};
-		config.DisableTelemetry = TRUE;
-		config.DisableGpuDecompression = disable_gpu;
-		config.DisableGpuDecompressionMetacommand = disable_gpu;
+		config.DisableTelemetry = resolved.disable_telemetry ? TRUE : FALSE;
+		config.DisableGpuDecompression = resolved.disable_gpu_decompression ? TRUE : FALSE;
+		config.DisableGpuDecompressionMetacommand = resolved.disable_gpu_decompression_metacommand ? TRUE : FALSE;
 
 		hr = DStorageSetConfiguration(&config);
 		if (FAILED(hr)) {
@@ -2645,7 +2649,7 @@ void Win32Backend::apply_dstorage_configuration() {
 	// Recorded either way: once a factory exists this call cannot succeed on the same
 	// instance, so retrying it would only repeat the failure log.
 	s_dstorage_configured_module = current_module;
-	s_applied_file_buffering.store(file_buffering);
+	s_applied_file_buffering.store(resolved.force_file_buffering);
 	s_dstorage_config_apply_count.fetch_add(1);
 }
 

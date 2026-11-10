@@ -596,6 +596,40 @@ GDEX_TEST_T(context_lifecycle, auto_tune_setting_toggle_and_defaults, TAG_INTEGR
         ds->call(godot::StringName("get_auto_tune_for_integrated_gpu"))));
 }
 
+// The driver-metacommand switch is a separate binding from the GPU/CPU switch:
+// a build that couples them again would silently remove the only way to compare
+// the two GPU decompression implementations on one machine.
+GDEX_TEST_T(context_lifecycle, metacommand_toggle_is_independent_of_gpu_decompression, TAG_INTEGRATION) {
+    godot::Object *ds = require_singleton(ctx, "DSContext");
+    GDEX_ASSERT_TRUE(ds->has_method(godot::StringName("get_disable_gpu_decompression_metacommand")));
+    GDEX_ASSERT_TRUE(ds->has_method(godot::StringName("set_disable_gpu_decompression_metacommand")));
+
+    const bool original_gpu = static_cast<bool>(
+        ds->call(godot::StringName("get_disable_gpu_decompression")));
+    const bool original_meta = static_cast<bool>(
+        ds->call(godot::StringName("get_disable_gpu_decompression_metacommand")));
+    ctx.add_teardown([ds, original_gpu, original_meta]() {
+        ds->call(godot::StringName("set_disable_gpu_decompression"), original_gpu);
+        ds->call(godot::StringName("set_disable_gpu_decompression_metacommand"), original_meta);
+    });
+
+    // Metacommand off alone: GPU decompression stays enabled.
+    ds->call(godot::StringName("set_disable_gpu_decompression"), false);
+    ds->call(godot::StringName("set_disable_gpu_decompression_metacommand"), true);
+    GDEX_EXPECT_TRUE(static_cast<bool>(
+        ds->call(godot::StringName("get_disable_gpu_decompression_metacommand"))));
+    GDEX_EXPECT_FALSE(static_cast<bool>(
+        ds->call(godot::StringName("get_disable_gpu_decompression"))));
+
+    // GPU decompression off alone: the metacommand switch reports its own value.
+    ds->call(godot::StringName("set_disable_gpu_decompression"), true);
+    ds->call(godot::StringName("set_disable_gpu_decompression_metacommand"), false);
+    GDEX_EXPECT_TRUE(static_cast<bool>(
+        ds->call(godot::StringName("get_disable_gpu_decompression"))));
+    GDEX_EXPECT_FALSE(static_cast<bool>(
+        ds->call(godot::StringName("get_disable_gpu_decompression_metacommand"))));
+}
+
 GDEX_TEST_T(context_lifecycle, gpu_adapter_info_schema_and_uma_invariants, TAG_INTEGRATION) {
     godot::Object *ds = require_singleton(ctx, "DSContext");
 

@@ -115,6 +115,10 @@
 			<return type="bool" />
 			<description>Returns whether GPU decompression has been disabled.</description>
 		</method>
+		<method name="get_disable_gpu_decompression_metacommand" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether the driver's optimized GPU decompression metacommand has been disabled, i.e. the reference implementation is used instead.</description>
+		</method>
 		<method name="get_drive_info" qualifiers="const">
 			<return type="Dictionary" />
 			<param index="0" name="path" type="String" default="res://" />
@@ -267,6 +271,11 @@
 			<param index="0" name="disable" type="bool" />
 			<description>Enables or disables GPU decompression for subsequent initialization and requests.</description>
 		</method>
+		<method name="set_disable_gpu_decompression_metacommand">
+			<return type="void" />
+			<param index="0" name="disable" type="bool" />
+			<description>Keeps GPU decompression enabled but forces the reference implementation instead of the driver's optimized metacommand. Affects the next initialization, so it can be used to compare both GPU paths on the same machine.</description>
+		</method>
 		<method name="set_prewarm_total">
 			<return type="void" />
 			<param index="0" name="tag" type="int" />
@@ -308,6 +317,9 @@
 		</member>
 		<member name="disable_gpu_decompression" type="bool" setter="set_disable_gpu_decompression" getter="get_disable_gpu_decompression" default="false">
 			If [code]true[/code], forces DirectStorage runtime to perform CPU decompression instead of GPU decompression shaders.
+		</member>
+		<member name="disable_gpu_decompression_metacommand" type="bool" setter="set_disable_gpu_decompression_metacommand" getter="get_disable_gpu_decompression_metacommand" default="false">
+			If [code]true[/code], DirectStorage uses the reference GPU decompression implementation instead of the driver's optimized metacommand. Independent of [member disable_gpu_decompression]: leave that [code]false[/code] to compare both GPU paths, and set this when the optimized path misbehaves or measures slower.
 		</member>
 		<member name="queue_capacity" type="int" setter="set_queue_capacity" getter="get_queue_capacity" default="512">
 			The maximum request capacity for the DirectStorage queue. The default is [code]512[/code].

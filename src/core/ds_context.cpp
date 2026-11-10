@@ -956,6 +956,9 @@ bool DSContext::initialize_ds_locked() {
 		if (dsgd_settings::has_setting("disable_gpu_decompression", "disable_gpu_decompression")) {
 			disable_gpu_decompression.store(static_cast<bool>(dsgd_settings::get_setting("disable_gpu_decompression", "disable_gpu_decompression")));
 		}
+		if (dsgd_settings::has_setting("disable_gpu_decompression_metacommand", "disable_gpu_decompression_metacommand")) {
+			disable_gpu_decompression_metacommand.store(static_cast<bool>(dsgd_settings::get_setting("disable_gpu_decompression_metacommand", "disable_gpu_decompression_metacommand")));
+		}
 		if (dsgd_settings::has_setting("queue_capacity", "queue_capacity")) {
 			Variant v = dsgd_settings::get_setting("queue_capacity", "queue_capacity");
 			uint32_t configured_cap = static_cast<uint32_t>(v);
@@ -1816,6 +1819,14 @@ bool DSContext::get_disable_gpu_decompression() const {
 	return disable_gpu_decompression.load();
 }
 
+void DSContext::set_disable_gpu_decompression_metacommand(bool p_disable) {
+	disable_gpu_decompression_metacommand.store(p_disable);
+}
+
+bool DSContext::get_disable_gpu_decompression_metacommand() const {
+	return disable_gpu_decompression_metacommand.load();
+}
+
 void DSContext::set_auto_tune_for_integrated_gpu(bool p_enable) {
 	auto_tune_for_integrated_gpu.store(p_enable);
 }
@@ -1844,6 +1855,7 @@ void DSContext::_debug_set_initialization_window_hook_for_testing(const std::fun
 bool DSContext::_debug_config_fields_are_atomic_for_testing() const {
 	return ds_is_atomic_type<decltype(staging_buffer_size_mb)>::value &&
 			ds_is_atomic_type<decltype(disable_gpu_decompression)>::value &&
+			ds_is_atomic_type<decltype(disable_gpu_decompression_metacommand)>::value &&
 			ds_is_atomic_type<decltype(auto_tune_for_integrated_gpu)>::value &&
 			ds_is_atomic_type<decltype(queue_capacity)>::value;
 }
@@ -1925,6 +1937,9 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_disable_gpu_decompression", "disable"), &DSContext::set_disable_gpu_decompression);
 	ClassDB::bind_method(D_METHOD("get_disable_gpu_decompression"), &DSContext::get_disable_gpu_decompression);
 
+	ClassDB::bind_method(D_METHOD("set_disable_gpu_decompression_metacommand", "disable"), &DSContext::set_disable_gpu_decompression_metacommand);
+	ClassDB::bind_method(D_METHOD("get_disable_gpu_decompression_metacommand"), &DSContext::get_disable_gpu_decompression_metacommand);
+
 	ClassDB::bind_method(D_METHOD("set_auto_tune_for_integrated_gpu", "enable"), &DSContext::set_auto_tune_for_integrated_gpu);
 	ClassDB::bind_method(D_METHOD("get_auto_tune_for_integrated_gpu"), &DSContext::get_auto_tune_for_integrated_gpu);
 
@@ -1933,6 +1948,7 @@ void DSContext::_bind_methods() {
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "staging_buffer_size_mb"), "set_staging_buffer_size_mb", "get_staging_buffer_size_mb");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disable_gpu_decompression"), "set_disable_gpu_decompression", "get_disable_gpu_decompression");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disable_gpu_decompression_metacommand"), "set_disable_gpu_decompression_metacommand", "get_disable_gpu_decompression_metacommand");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_tune_for_integrated_gpu"), "set_auto_tune_for_integrated_gpu", "get_auto_tune_for_integrated_gpu");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "queue_capacity"), "set_queue_capacity", "get_queue_capacity");
 

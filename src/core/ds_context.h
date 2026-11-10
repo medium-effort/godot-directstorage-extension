@@ -55,6 +55,10 @@ private:
 	// every access below goes through an explicit .load()/.store().
 	std::atomic<uint32_t> staging_buffer_size_mb{ 128 };
 	std::atomic<bool> disable_gpu_decompression{ false };
+	// Independent of the switch above: keeps GPU decompression enabled while
+	// forcing the reference implementation instead of the driver's optimized
+	// metacommand, so the two can be compared on the same machine.
+	std::atomic<bool> disable_gpu_decompression_metacommand{ false };
 	// Reduction-only UMA auto-tune (see initialize_ds_locked): when true and
 	// the active adapter is an integrated/UMA GPU, effective staging/queue
 	// are clamped down to the UMA caps. Explicit low values pass through
@@ -250,6 +254,9 @@ public:
 
 	void set_disable_gpu_decompression(bool p_disable);
 	bool get_disable_gpu_decompression() const;
+
+	void set_disable_gpu_decompression_metacommand(bool p_disable);
+	bool get_disable_gpu_decompression_metacommand() const;
 
 	void set_auto_tune_for_integrated_gpu(bool p_enable);
 	bool get_auto_tune_for_integrated_gpu() const;
