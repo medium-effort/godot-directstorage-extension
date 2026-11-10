@@ -95,6 +95,10 @@
 			<return type="bool" />
 			<description>Returns whether integrated-GPU auto-tune is enabled (see [member auto_tune_for_integrated_gpu]).</description>
 		</method>
+		<method name="get_auto_tune_for_low_vram_gpu" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether low-VRAM discrete-GPU staging auto-tune is enabled (see [member auto_tune_for_low_vram_gpu]).</description>
+		</method>
 		<method name="get_capability_report" qualifiers="const">
 			<return type="Dictionary" />
 			<description>Returns a comprehensive [Dictionary] detailing the active backend, Direct3D 12 device status, GPU decompression support tier, GPU decompression enabled status, queue capacity, staging buffer configuration, and DXGI adapter identity ([code]adapter_name[/code], [code]adapter_vendor[/code], [code]dedicated_vram_mb[/code], [code]shared_system_mb[/code], [code]software_adapter[/code], [code]integrated_gpu_guess[/code]).</description>
@@ -266,6 +270,11 @@
 			<param index="0" name="enable" type="bool" />
 			<description>Enables or disables integrated-GPU auto-tune (see [member auto_tune_for_integrated_gpu]). When enabled and the PC's graphics share system RAM instead of having dedicated VRAM, the effective staging buffer and queue capacity are lowered to 64 MiB / 256 at initialization. Never raises values; set [code]false[/code] to use your configured values exactly.</description>
 		</method>
+		<method name="set_auto_tune_for_low_vram_gpu">
+			<return type="void" />
+			<param index="0" name="enable" type="bool" />
+			<description>Enables or disables low-VRAM discrete-GPU staging auto-tune (see [member auto_tune_for_low_vram_gpu]). When enabled, a discrete adapter's effective staging buffer is capped by dedicated VRAM (32 MiB under 2 GiB, 64 MiB under 8 GiB; 8 GiB and above are untouched). Never raises values and never changes the queue; set [code]false[/code] to use your configured value exactly.</description>
+		</method>
 		<method name="set_disable_gpu_decompression">
 			<return type="void" />
 			<param index="0" name="disable" type="bool" />
@@ -314,6 +323,9 @@
 	<members>
 		<member name="auto_tune_for_integrated_gpu" type="bool" setter="set_auto_tune_for_integrated_gpu" getter="get_auto_tune_for_integrated_gpu" default="true">
 			Automatically shrinks DirectStorage memory usage on integrated GPUs (laptop/handheld graphics that share system RAM instead of having their own VRAM). When [code]true[/code] and such a GPU is detected, the effective staging buffer and queue capacity are lowered to 64 MiB / 256 at startup, and the log states the before/after values. Only ever lowers, never raises: values you set below the caps pass through untouched, your saved settings are never rewritten, and discrete-GPU PCs are unaffected. Set [code]false[/code] for full manual control.
+		</member>
+		<member name="auto_tune_for_low_vram_gpu" type="bool" setter="set_auto_tune_for_low_vram_gpu" getter="get_auto_tune_for_low_vram_gpu" default="true">
+			Caps DirectStorage staging memory on discrete GPUs with little dedicated VRAM. When [code]true[/code], the effective staging buffer is capped at 64 MiB on 2-8 GiB cards and 32 MiB under 2 GiB, and the log states the before/after values. 8 GiB and above are unaffected, the queue is never changed, and a lower configured value passes through untouched. This is independent of [member auto_tune_for_integrated_gpu]. Set [code]false[/code] to use your configured value on every GPU.
 		</member>
 		<member name="disable_gpu_decompression" type="bool" setter="set_disable_gpu_decompression" getter="get_disable_gpu_decompression" default="false">
 			If [code]true[/code], forces DirectStorage runtime to perform CPU decompression instead of GPU decompression shaders.

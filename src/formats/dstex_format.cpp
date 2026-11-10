@@ -1804,6 +1804,37 @@ Dictionary DSTex::read_header(const String &p_path) {
 			static_cast<int>(get_gacl_transform(header.reserved)) :
 			static_cast<int>(DSGaclTransform::NONE);
 
+	// Smallest staging buffer (dsgd_extension/staging_buffer_size_mb) that keeps
+	// every request this file can produce inside DirectStorage's limit:
+	//  - chunked v3: one request per chunk, so the largest chunk wins;
+	//  - NONE compression: one request covers the whole chain;
+	//  - otherwise: the backend splits per mip when the chain would not fit, so
+	//    the largest single mip is the floor.
+	// This is a *requirement*, not the request count: an author can compare it
+	// with the configured staging size without re-deriving the split rules.
+	uint64_t min_staging_bytes = 0;
+	if (header.version == 1) {
+		min_staging_bytes = std::max<uint64_t>(header.compressed_size, header.original_size);
+	} else if (header.version == 3 && chunked) {
+		const int64_t chunk_total = chunk_compressed_sizes.size();
+		for (int64_t i = 0; i < chunk_total && i < chunk_uncompressed_sizes.size(); ++i) {
+			min_staging_bytes = std::max<uint64_t>(min_staging_bytes,
+					std::max<uint64_t>(static_cast<uint32_t>(chunk_compressed_sizes[i]),
+							static_cast<uint32_t>(chunk_uncompressed_sizes[i])));
+		}
+	} else if (header.version == 3 && get_compression_format(header.reserved) == DSCompressionFormat::NONE) {
+		// v2 has no capability word (reserved == 0 reads as NONE), so the NONE
+		// branch must be v3-only: v2 payloads are always GDeflate.
+		min_staging_bytes = header.original_size;
+	} else {
+		for (int64_t i = 0; i < mip_sizes.size(); ++i) {
+			min_staging_bytes = std::max<uint64_t>(min_staging_bytes,
+					std::max<uint64_t>(static_cast<uint32_t>(mip_sizes[i]),
+							static_cast<uint32_t>(mip_uncompressed_sizes[i])));
+		}
+	}
+	result["min_staging_bytes"] = static_cast<int64_t>(min_staging_bytes);
+
 	file->close();
 	return result;
 }

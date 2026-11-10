@@ -579,21 +579,39 @@ GDEX_TEST_T(context_lifecycle, auto_tune_setting_toggle_and_defaults, TAG_INTEGR
     const bool default_auto_tune = static_cast<bool>(
         ds->call(godot::StringName("get_auto_tune_for_integrated_gpu")));
     GDEX_EXPECT_TRUE(default_auto_tune);
+    // Independent low-VRAM policy defaults on as well; the two settings must not
+    // be aliases of each other.
+    const bool default_low_vram = static_cast<bool>(
+        ds->call(godot::StringName("get_auto_tune_for_low_vram_gpu")));
+    GDEX_EXPECT_TRUE(default_low_vram);
 
     // Ensure state cleans up on teardown
-    ctx.add_teardown([ds, default_auto_tune]() {
+    ctx.add_teardown([ds, default_auto_tune, default_low_vram]() {
         ds->call(godot::StringName("set_auto_tune_for_integrated_gpu"), default_auto_tune);
+        ds->call(godot::StringName("set_auto_tune_for_low_vram_gpu"), default_low_vram);
     });
 
     // Toggle off
     ds->call(godot::StringName("set_auto_tune_for_integrated_gpu"), false);
     GDEX_EXPECT_FALSE(static_cast<bool>(
         ds->call(godot::StringName("get_auto_tune_for_integrated_gpu"))));
+    // Flipping one policy must leave the other alone.
+    GDEX_EXPECT_TRUE(static_cast<bool>(
+        ds->call(godot::StringName("get_auto_tune_for_low_vram_gpu"))));
+
+    ds->call(godot::StringName("set_auto_tune_for_low_vram_gpu"), false);
+    GDEX_EXPECT_FALSE(static_cast<bool>(
+        ds->call(godot::StringName("get_auto_tune_for_low_vram_gpu"))));
+    GDEX_EXPECT_FALSE(static_cast<bool>(
+        ds->call(godot::StringName("get_auto_tune_for_integrated_gpu"))));
 
     // Toggle back on
     ds->call(godot::StringName("set_auto_tune_for_integrated_gpu"), true);
+    ds->call(godot::StringName("set_auto_tune_for_low_vram_gpu"), true);
     GDEX_EXPECT_TRUE(static_cast<bool>(
         ds->call(godot::StringName("get_auto_tune_for_integrated_gpu"))));
+    GDEX_EXPECT_TRUE(static_cast<bool>(
+        ds->call(godot::StringName("get_auto_tune_for_low_vram_gpu"))));
 }
 
 // The driver-metacommand switch is a separate binding from the GPU/CPU switch:

@@ -64,6 +64,11 @@ private:
 	// are clamped down to the UMA caps. Explicit low values pass through
 	// untouched; set false to use configured values verbatim.
 	std::atomic<bool> auto_tune_for_integrated_gpu{ true };
+	// Reduction-only low-VRAM auto-tune (see initialize_ds_locked): when true
+	// and the active adapter is discrete, effective staging is capped by
+	// dedicated VRAM (32 MiB below 2 GiB, 64 MiB below 8 GiB). Independent of
+	// auto_tune_for_integrated_gpu, which keeps its integrated/UMA scope.
+	std::atomic<bool> auto_tune_for_low_vram_gpu{ true };
 	// Must match the ProjectSetting default registered in register_types.cpp
 	// ("dsgd_extension/queue_capacity" = 512); the setting wins at init,
 	// this is only the no-setting fallback.
@@ -154,10 +159,10 @@ public:
 	static constexpr uint32_t MIN_STAGING_BUFFER_SIZE_MB = 1;
 	static constexpr uint32_t MAX_STAGING_BUFFER_SIZE_MB = 2048;
 	// Staging buffer and queue capacity defaults: these stay fixed, user-overridable
-	// baseline settings. When auto_tune_for_integrated_gpu is enabled (default true)
-	// and the active GPU is an integrated/UMA adapter, effective runtime values are
-	// clamped down to UMA_MAX_STAGING_BUFFER_SIZE_MB and UMA_MAX_QUEUE_CAPACITY at
-	// initialization, leaving discrete-GPU defaults and lower user settings untouched.
+	// baseline settings. Auto-tune is two independent, reduction-only policies:
+	// auto_tune_for_integrated_gpu clamps an integrated/UMA adapter's effective
+	// staging and queue to UMA_MAX_*; auto_tune_for_low_vram_gpu caps a discrete
+	// adapter's staging by dedicated VRAM. Both leave lower user settings untouched.
 	static constexpr uint16_t DEFAULT_QUEUE_CAPACITY = 512;
 	static constexpr uint16_t MIN_QUEUE_CAPACITY = 128;
 	static constexpr uint16_t MAX_QUEUE_CAPACITY = 8192;
@@ -171,6 +176,24 @@ public:
 	}
 	static uint16_t clamp_queue_capacity(uint32_t p_capacity) {
 		return static_cast<uint16_t>(std::clamp<uint32_t>(p_capacity, MIN_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY));
+	}
+
+	// Reduction-only staging cap (MiB) for DISCRETE adapters by dedicated VRAM;
+	// 0 means "no cap". The caller applies it only when the adapter is available
+	// and not integrated. 64 MiB still fits the largest common request (a
+	// 4096x4096 RGBA8 mip), so the cap never turns a previously working 4K asset
+	// into a load failure on a tier that can render one.
+	static uint32_t low_vram_staging_cap_mb(int64_t p_dedicated_vram_mb) {
+		if (p_dedicated_vram_mb <= 0) {
+			return 0;
+		}
+		if (p_dedicated_vram_mb < 2048) {
+			return 32;
+		}
+		if (p_dedicated_vram_mb < 8192) {
+			return 64;
+		}
+		return 0;
 	}
 
 	static DSContext *get_singleton();
@@ -260,6 +283,9 @@ public:
 
 	void set_auto_tune_for_integrated_gpu(bool p_enable);
 	bool get_auto_tune_for_integrated_gpu() const;
+
+	void set_auto_tune_for_low_vram_gpu(bool p_enable);
+	bool get_auto_tune_for_low_vram_gpu() const;
 
 	void set_queue_capacity(uint16_t p_capacity);
 	uint16_t get_queue_capacity() const;

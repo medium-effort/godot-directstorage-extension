@@ -967,30 +967,60 @@ bool DSContext::initialize_ds_locked() {
 		if (dsgd_settings::has_setting("auto_tune_for_integrated_gpu", "auto_tune_for_integrated_gpu")) {
 			auto_tune_for_integrated_gpu.store(static_cast<bool>(dsgd_settings::get_setting("auto_tune_for_integrated_gpu", "auto_tune_for_integrated_gpu")));
 		}
+		if (dsgd_settings::has_setting("auto_tune_for_low_vram_gpu", "auto_tune_for_low_vram_gpu")) {
+			auto_tune_for_low_vram_gpu.store(static_cast<bool>(dsgd_settings::get_setting("auto_tune_for_low_vram_gpu", "auto_tune_for_low_vram_gpu")));
+		}
 	}
 
 #ifdef _WIN32
-	// UMA auto-tune: reduction-only clamp of the *effective* values. Runs
-	// before backend creation so every consumer (queue setup, staging
-	// checks, stream flush budget) observes the clamped values. Members
-	// are reloaded from ProjectSettings on every init, so an explicit
-	// user configuration is never lost — only the in-effect copy shrinks.
-	if (auto_tune_for_integrated_gpu.load() && is_integrated_gpu()) {
+	// Staging auto-tune is two independent, reduction-only policies, each with
+	// its own setting so neither changes the other's scope:
+	//  - auto_tune_for_integrated_gpu: integrated/UMA adapter -> staging + queue;
+	//  - auto_tune_for_low_vram_gpu: DISCRETE adapter -> staging by dedicated VRAM.
+	// Both run before backend creation so every consumer (queue setup, staging
+	// checks, stream flush budget) observes the clamped values. Members are
+	// reloaded from ProjectSettings on every init, so an explicit user
+	// configuration is never lost - only the in-effect copy shrinks.
+	//
+	// The DirectStorage factory owns up to four staging buffers at the sized
+	// value (system, upload heap, and two VRAM staging buffers on the
+	// GPU-decompression path), so the 128 MiB default is up to ~512 MiB of
+	// residency; that is the residency the low-VRAM tier caps protect.
+	if (auto_tune_for_integrated_gpu.load() || auto_tune_for_low_vram_gpu.load()) {
+		const Dictionary adapter = get_gpu_adapter_info();
+		const bool adapter_available = static_cast<bool>(adapter.get("available", false));
+		const bool integrated = static_cast<bool>(adapter.get("is_uma", false)) ||
+				static_cast<bool>(adapter.get("integrated_gpu_guess", false));
+		const int64_t dedicated_mb = static_cast<int64_t>(adapter.get("dedicated_vram_mb", static_cast<int64_t>(0)));
 		const uint32_t requested_staging = staging_buffer_size_mb.load();
 		const uint16_t requested_queue = queue_capacity.load();
-		const uint32_t clamped_staging = std::min<uint32_t>(requested_staging, UMA_MAX_STAGING_BUFFER_SIZE_MB);
-		const uint16_t clamped_queue = std::min<uint16_t>(requested_queue, UMA_MAX_QUEUE_CAPACITY);
+		uint32_t clamped_staging = requested_staging;
+		uint16_t clamped_queue = requested_queue;
+
+		if (auto_tune_for_integrated_gpu.load() && integrated) {
+			clamped_staging = std::min<uint32_t>(clamped_staging, UMA_MAX_STAGING_BUFFER_SIZE_MB);
+			clamped_queue = std::min<uint16_t>(clamped_queue, UMA_MAX_QUEUE_CAPACITY);
+			if (clamped_staging != requested_staging || clamped_queue != requested_queue) {
+				UtilityFunctions::print("[DirectStorage] Integrated/UMA GPU detected ('" +
+						String(adapter.get("adapter_name", "unknown")) +
+						"'): auto-tune clamped staging " + String::num_uint64(requested_staging) +
+						"->" + String::num_uint64(clamped_staging) + " MiB, queue " +
+						String::num_uint64(requested_queue) + "->" + String::num_uint64(clamped_queue) +
+						" (dsgd_extension/auto_tune_for_integrated_gpu=true; set false to use configured values).");
+			}
+		} else if (auto_tune_for_low_vram_gpu.load() && adapter_available && !integrated) {
+			const uint32_t cap_mb = low_vram_staging_cap_mb(dedicated_mb);
+			if (cap_mb > 0 && clamped_staging > cap_mb) {
+				clamped_staging = cap_mb;
+				UtilityFunctions::print("[DirectStorage] Low-VRAM GPU detected ('" +
+						String(adapter.get("adapter_name", "unknown")) + "', dedicated VRAM " +
+						String::num_int64(dedicated_mb) + " MiB): auto-tune clamped staging " +
+						String::num_uint64(requested_staging) + "->" + String::num_uint64(clamped_staging) +
+						" MiB (dsgd_extension/auto_tune_for_low_vram_gpu=true; set false to use the configured value).");
+			}
+		}
 		staging_buffer_size_mb.store(clamped_staging);
 		queue_capacity.store(clamped_queue);
-		if (clamped_staging != requested_staging || clamped_queue != requested_queue) {
-			Dictionary adapter = get_gpu_adapter_info();
-			UtilityFunctions::print("[DirectStorage] Integrated/UMA GPU detected ('" +
-					String(adapter.get("adapter_name", "unknown")) +
-					"'): auto-tune clamped staging " + String::num_uint64(requested_staging) +
-					"->" + String::num_uint64(clamped_staging) + " MiB, queue " +
-					String::num_uint64(requested_queue) + "->" + String::num_uint64(clamped_queue) +
-					" (dsgd_extension/auto_tune_for_integrated_gpu=true; set false to use configured values).");
-		}
 	}
 #endif
 
@@ -1835,6 +1865,14 @@ bool DSContext::get_auto_tune_for_integrated_gpu() const {
 	return auto_tune_for_integrated_gpu.load();
 }
 
+void DSContext::set_auto_tune_for_low_vram_gpu(bool p_enable) {
+	auto_tune_for_low_vram_gpu.store(p_enable);
+}
+
+bool DSContext::get_auto_tune_for_low_vram_gpu() const {
+	return auto_tune_for_low_vram_gpu.load();
+}
+
 void DSContext::set_queue_capacity(uint16_t p_capacity) {
 	queue_capacity.store(clamp_queue_capacity(p_capacity > 0 ? p_capacity : DEFAULT_QUEUE_CAPACITY));
 }
@@ -1857,6 +1895,7 @@ bool DSContext::_debug_config_fields_are_atomic_for_testing() const {
 			ds_is_atomic_type<decltype(disable_gpu_decompression)>::value &&
 			ds_is_atomic_type<decltype(disable_gpu_decompression_metacommand)>::value &&
 			ds_is_atomic_type<decltype(auto_tune_for_integrated_gpu)>::value &&
+			ds_is_atomic_type<decltype(auto_tune_for_low_vram_gpu)>::value &&
 			ds_is_atomic_type<decltype(queue_capacity)>::value;
 }
 
@@ -1943,6 +1982,9 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_auto_tune_for_integrated_gpu", "enable"), &DSContext::set_auto_tune_for_integrated_gpu);
 	ClassDB::bind_method(D_METHOD("get_auto_tune_for_integrated_gpu"), &DSContext::get_auto_tune_for_integrated_gpu);
 
+	ClassDB::bind_method(D_METHOD("set_auto_tune_for_low_vram_gpu", "enable"), &DSContext::set_auto_tune_for_low_vram_gpu);
+	ClassDB::bind_method(D_METHOD("get_auto_tune_for_low_vram_gpu"), &DSContext::get_auto_tune_for_low_vram_gpu);
+
 	ClassDB::bind_method(D_METHOD("set_queue_capacity", "capacity"), &DSContext::set_queue_capacity);
 	ClassDB::bind_method(D_METHOD("get_queue_capacity"), &DSContext::get_queue_capacity);
 
@@ -1950,6 +1992,7 @@ void DSContext::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disable_gpu_decompression"), "set_disable_gpu_decompression", "get_disable_gpu_decompression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disable_gpu_decompression_metacommand"), "set_disable_gpu_decompression_metacommand", "get_disable_gpu_decompression_metacommand");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_tune_for_integrated_gpu"), "set_auto_tune_for_integrated_gpu", "get_auto_tune_for_integrated_gpu");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_tune_for_low_vram_gpu"), "set_auto_tune_for_low_vram_gpu", "get_auto_tune_for_low_vram_gpu");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "queue_capacity"), "set_queue_capacity", "get_queue_capacity");
 
 	BIND_ENUM_CONSTANT(INIT_STATUS_UNINITIALIZED);

@@ -495,11 +495,6 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	var mip_count: int = (img.get_mipmap_count() + 1) if img.has_mipmaps() else 1
 	raw_data = _pad_texture_data(raw_data, width, height, format, mip_count)
 	var gdeflate_level: int = int(options.get("compression/gdeflate_level", options.get("compression/level", 1)))
-	var configured_staging_mb: float = float(ProjectSettings.get_setting("dsgd_extension/staging_buffer_size_mb", 128.0))
-	var staging_mb: float = configured_staging_mb if configured_staging_mb > 0.0 else 128.0
-	if raw_data.size() > int(staging_mb * 1024.0 * 1024.0) and not _staging_warnings.has(source_file):
-		_staging_warnings[source_file] = true
-		push_warning("[DirectStorage Importer] Asset '" + source_file + "' requires " + str(ceili(float(raw_data.size()) / 1048576.0)) + " MiB of staging memory, but DirectStorage is configured for " + str(staging_mb) + " MiB. Increase Project Settings > DirectStorage > Staging Buffer Size.")
 
 	var is_srgb: bool = int(color_options["color_space"]) == COLOR_SPACE_SRGB
 	var as_image_texture: bool = bool(options.get("compatibility/as_image_texture", false))
@@ -511,6 +506,23 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	if write_err != OK:
 		push_error("[DirectStorage Importer] Failed to write .dstex file to: " + out_file_path)
 		return write_err
+
+	# Staging is per *request*, not per texture. The Windows backend splits a
+	# GDeflate chain into per-mip requests (or per-chunk for chunked payloads),
+	# and any request whose compressed or uncompressed data exceeds the staging
+	# buffer fails with E_DSTORAGE_REQUEST_TOO_LARGE. read_header() reports the
+	# exact floor for this file, so the warning can name the value to configure
+	# instead of the old whole-chain estimate (which over-warned on every
+	# multi-mip texture that the runtime splits anyway).
+	var configured_staging_mb: float = float(ProjectSettings.get_setting("dsgd_extension/staging_buffer_size_mb", 128.0))
+	var staging_mb: float = configured_staging_mb if configured_staging_mb > 0.0 else 128.0
+	var header: Dictionary = dstex.read_header(out_file_path)
+	if not header.is_empty():
+		var required_bytes: int = int(header.get("min_staging_bytes", 0))
+		if required_bytes > 0 and float(required_bytes) > staging_mb * 1048576.0 and not _staging_warnings.has(source_file):
+			_staging_warnings[source_file] = true
+			var required_mb := ceili(float(required_bytes) / 1048576.0)
+			push_warning("[DirectStorage Importer] Asset '" + source_file + "' needs at least " + str(required_mb) + " MiB of DirectStorage staging memory (its largest single request) but dsgd_extension/staging_buffer_size_mb is " + str(staging_mb) + " MiB. DirectStorage/D3D12 loads of this asset will fail until that setting is at least " + str(required_mb) + " MiB or the texture is made smaller; non-Windows and CPU-fallback loads are unaffected.")
 
 	gen_files.append(out_file_path)
 	print("[DirectStorage Importer] Imported ", source_file, " -> ", out_file_path, " (Mode: ", effective_codec, ", GDeflate Level: ", gdeflate_level, ", As ImageTexture: ", as_image_texture, ")")
