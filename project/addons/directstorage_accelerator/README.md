@@ -14,6 +14,17 @@ Three presets are provided: **3D (Streaming)** (the default), **CPU / ImageTextu
 
 During export, imported `.dstex` files are bundled into `res://textures.dspkg` (version 3 or version 4 with encrypted TOC) along with per-entry GPU mip metadata and entry flags. The runtime resource loader resolves texture paths directly from that archive without requiring individual `.dstex` files in the exported PCK.
 
+### Native library reload (GDExtension)
+
+The native half (`bin/dsgd_64*.dll`) is a GDExtension library, so it can be reloaded without restarting the editor. In Godot 4.7 open **Project Settings > GDExtension** and press the reload button on the `directstorage_accelerator.gdextension` row. The editor also reloads it automatically when you return to the window after rebuilding, and only then - saving the file is not enough.
+
+A reload unloads and reopens the library, so the addon's native singletons (`DSContext`, `DSErrorHandler`, `DSProfiler`, `DSTextureCache`) are rebuilt from scratch; the editor plugin re-initializes the DirectStorage backend as soon as that happens.
+
+- On Windows the editor runs the library from a hidden copy beside it (`bin/~dsgd_64.debug.dll`), which is why rebuilding over a running editor works. The DirectStorage runtime DLLs (`dstorage.dll`, `dstoragecore.dll`) are not copied, so switching runtime versions still needs the staged restart described under **Runtime Install & License**.
+- A failed reload (half-written build, missing dependency) leaves the extension unloaded until the next successful reload or an editor restart. The button ignores the result, so check the Output panel. An extension that never loaded at editor start is not listed in that tab at all.
+- A reload cannot re-initialize an extension whose minimum initialization level is below the scene level; this addon initializes at scene level, so it reloads cleanly.
+- Two copies of the library in the same project cannot both own the DirectStorage classes. The plugin warns at startup with both paths when it detects that, and with the expected manifest when the native half is missing altogether.
+
 ## Runtime Install & License
 
 The DirectStorage runtime (`dstorage.dll`, `dstoragecore.dll`) is not bundled with this addon. Enable the plugin, then open **Tools > DSGD Tools... > Manage DirectStorage Runtime...** to download a pinned official Microsoft package, review its license, and choose the active version.

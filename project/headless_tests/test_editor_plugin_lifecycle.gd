@@ -49,13 +49,47 @@ func _init() -> void:
 
 	# The pack scan entry must be registered and removed symmetrically, or the
 	# Project > Tools item survives a plugin toggle as a dangling callable.
-	for required_token in ["add_tool_menu_item", "remove_tool_menu_item"]:
+	# Registration moved to a submenu (add_tool_submenu_item); removal is still
+	# the editor's remove_tool_menu_item(), which deletes a registered submenu.
+	for required_token in ["add_tool_submenu_item", "remove_tool_menu_item"]:
 		if not required_token in source_code:
 			push_error("[Test Lifecycle] FAIL: ds_plugin.gd does not contain " + required_token)
 			quit(1)
 			return
 	if not FileAccess.file_exists("res://addons/directstorage_accelerator/tools/dspkg_pack_scan_dialog.tscn"):
 		push_error("[Test Lifecycle] FAIL: pack scan dialog scene is missing")
+		quit(1)
+		return
+
+	# The native half is reloadable. A reload rebuilds the native singletons in
+	# their uninitialized state, and the manual Project Settings > GDExtension
+	# path calls GDExtensionManager.reload_extension() directly - that emits
+	# extension_loaded but not extensions_reloaded. The plugin must watch both,
+	# drop the connections on exit, and re-initialize on idle rather than inside
+	# the manager's synchronous signal emission.
+	if not "func _sync_native_reload_signals" in source_code:
+		push_error("[Test Lifecycle] FAIL: ds_plugin.gd has no reload-signal wiring; a manual GDExtension reload would leave DSContext uninitialized")
+		quit(1)
+		return
+	if not "_sync_native_reload_signals(true)" in _function_body(source_code, "_enter_tree"):
+		push_error("[Test Lifecycle] FAIL: _enter_tree() does not connect the reload signals")
+		quit(1)
+		return
+	if not "_sync_native_reload_signals(false)" in _function_body(source_code, "_exit_tree"):
+		push_error("[Test Lifecycle] FAIL: _exit_tree() does not disconnect the reload signals")
+		quit(1)
+		return
+	for required_signal in ["\"extension_loaded\"", "\"extensions_reloaded\""]:
+		if not required_signal in source_code:
+			push_error("[Test Lifecycle] FAIL: ds_plugin.gd does not handle the signal " + required_signal)
+			quit(1)
+			return
+	if not "ClassDB.class_exists(\"DSContext\")" in _function_body(source_code, "_reinitialize_native_backend_after_reload"):
+		push_error("[Test Lifecycle] FAIL: the reload handler does not check whether the DirectStorage classes exist, so an unrelated extension load could initialize this backend")
+		quit(1)
+		return
+	if not "call_deferred" in _function_body(source_code, "_queue_native_reinit"):
+		push_error("[Test Lifecycle] FAIL: the reload handler is not deferred; it would initialize DirectStorage inside GDExtensionManager.reload_extension()")
 		quit(1)
 		return
 
@@ -80,6 +114,17 @@ func _init() -> void:
 		EditorInterface.set_plugin_enabled("directstorage_accelerator", true)
 		if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
 			push_error("[Test Lifecycle] FAIL: Autoload missing after re-enabling plugin via EditorInterface")
+			quit(1)
+			return
+
+		# The wiring must be live on the manager, not just present in the source:
+		# this instance has just re-entered the tree.
+		if not _expect_plugin_connections():
+			quit(1)
+			return
+		var ds_context = Engine.get_singleton("DSContext")
+		if ds_context != null and not ds_context.is_initialized():
+			push_error("[Test Lifecycle] FAIL: DSContext exists but is uninitialized after the plugin was enabled")
 			quit(1)
 			return
 
@@ -143,3 +188,30 @@ static func _function_body(source: String, func_name: String) -> String:
 	if next_func < 0:
 		return rest
 	return rest.substr(0, next_func)
+
+
+## Asserts the enabled plugin is connected to every reload signal this engine
+## exposes. The plugin instance is not reachable from here, so connections are
+## matched by the callable's owning script path, not by object identity.
+static func _expect_plugin_connections() -> bool:
+	var manager = Engine.get_singleton("GDExtensionManager")
+	if manager == null:
+		return true
+
+	for signal_name in ["extension_loaded", "extensions_reloaded"]:
+		if not manager.has_signal(signal_name):
+			continue
+		var connected := false
+		for connection in manager.get_signal_connection_list(signal_name):
+			var callable: Callable = connection["callable"]
+			var target = callable.get_object()
+			if target == null:
+				continue
+			var target_script: Script = target.get_script()
+			if target_script != null and target_script.resource_path == PLUGIN_SCRIPT_PATH:
+				connected = true
+				break
+		if not connected:
+			push_error("[Test Lifecycle] FAIL: the enabled plugin is not connected to GDExtensionManager." + signal_name)
+			return false
+	return true

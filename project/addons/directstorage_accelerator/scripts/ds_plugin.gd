@@ -36,6 +36,9 @@ const LEGACY_EXPORT_OPTIONS := {
 	"directstorage/steampipe_1mb_alignment": "dsgd_extension/steampipe_1mb_alignment",
 	"dsgd_extension/include_third_party_notices": "dsgd_extension/include_dsgd_license_file",
 }
+## Must match the entry symbol in `src/register_types.cpp`; it is how a loaded
+## library is identified as this addon when it has been copied or renamed.
+const EXTENSION_ENTRY_SYMBOL: String = "directstorage_accelerator_init"
 
 var _importer: EditorImportPlugin = null
 var _export_plugin: EditorExportPlugin = null
@@ -44,6 +47,9 @@ var _verify_dialog: Window = null
 var _runtime_dialog: Window = null
 var _migration_dialog: Window = null
 var _tools_submenu: PopupMenu = null
+## One deferred re-initialization at a time: `extension_loaded` and
+## `extensions_reloaded` can both fire for the same reload.
+var _native_reinit_queued: bool = false
 
 
 ## Registers the autoload, import plugin, export plugin, and DirectStorage
@@ -107,9 +113,13 @@ func _enter_tree() -> void:
 	if not scene_closed.is_connected(_on_scene_closed):
 		scene_closed.connect(_on_scene_closed)
 
+	_report_extension_state()
+	_sync_native_reload_signals(true)
+
 	var ds_context = Engine.get_singleton("DSContext")
 	if ds_context:
 		ds_context.initialize_ds()
+		_warn_if_runtime_missing(ds_context)
 
 
 ## Unregisters the import plugin, export plugin, and tool menu item when the
@@ -152,6 +162,7 @@ func _exit_tree() -> void:
 		scene_changed.disconnect(_on_scene_changed)
 	if scene_closed.is_connected(_on_scene_closed):
 		scene_closed.disconnect(_on_scene_closed)
+	_sync_native_reload_signals(false)
 	_checked_scenes.clear()
 
 	print(
@@ -198,6 +209,196 @@ func _migrate_export_option_keys() -> void:
 			changed = true
 	if changed:
 		config.save(PRESET_PATH)
+
+
+## Connects or disconnects the reload notifications of the native half.
+##
+## A GDExtension reload - Project Settings > GDExtension > Reload (Godot 4.7+),
+## or the editor's automatic reload when focus returns after a rebuild - unloads
+## the library and loads it again. The engine runs the SCENE terminator and then
+## the initializer, so the addon ends up with fresh DSContext/DSErrorHandler/
+## DSProfiler/DSTextureCache singletons in their default (uninitialized) state.
+## Nothing re-enters this plugin on the manual path: that tab calls
+## GDExtensionManager.reload_extension() directly, which emits neither
+## `extensions_reloaded` nor the deferred script reload the automatic path
+## performs. Without this wiring the editor would keep an uninitialized backend
+## until the first DirectStorage call lazily initializes it.
+##
+## `extension_loaded` (Godot 4.4+) is emitted per extension on both paths;
+## `extensions_reloaded` (Godot 4.3+) only on the automatic path, and is kept so
+## the older editors this addon supports still re-initialize after a reload.
+func _sync_native_reload_signals(p_connect: bool) -> void:
+	var manager: Object = Engine.get_singleton("GDExtensionManager")
+	if manager == null:
+		return
+
+	if manager.has_signal("extension_loaded"):
+		if p_connect and not manager.is_connected("extension_loaded", _on_native_extension_loaded):
+			manager.connect("extension_loaded", _on_native_extension_loaded)
+		elif not p_connect and manager.is_connected("extension_loaded", _on_native_extension_loaded):
+			manager.disconnect("extension_loaded", _on_native_extension_loaded)
+
+	if manager.has_signal("extensions_reloaded"):
+		if p_connect and not manager.is_connected("extensions_reloaded", _on_native_extensions_reloaded):
+			manager.connect("extensions_reloaded", _on_native_extensions_reloaded)
+		elif not p_connect and manager.is_connected("extensions_reloaded", _on_native_extensions_reloaded):
+			manager.disconnect("extensions_reloaded", _on_native_extensions_reloaded)
+
+
+## Reports a missing, duplicated, or relocated native half once per plugin start.
+##
+## All three states look the same from GDScript - the editor simply has a ClassDB
+## without the DirectStorage classes, or two libraries fighting over them ("class
+## already registered" in the Output panel) - and all three are common install
+## mistakes. Naming the manifest and the loaded paths turns a silent failure into
+## something fixable. It lives in the editor plugin rather than ds_runtime.gd
+## because that script is shared with exported games, where the extension is
+## loaded from the PCK and there is no addon folder to compare against.
+func _report_extension_state() -> void:
+	var manager = Engine.get_singleton("GDExtensionManager")
+	if manager == null:
+		return
+
+	var expected_dir := AUTOLOAD_PATH.get_base_dir().get_base_dir()
+	var expected_manifest := _find_addon_manifest()
+	var matching := PackedStringArray()
+	for extension_path in manager.get_loaded_extensions():
+		var config := ConfigFile.new()
+		if config.load(extension_path) != OK:
+			continue
+		if String(config.get_value("configuration", "entry_symbol", "")) == EXTENSION_ENTRY_SYMBOL:
+			matching.append(extension_path)
+
+	if matching.size() > 1:
+		push_warning(
+			"[DirectStorage] %d copies of the native library are loaded and only one can own the DirectStorage classes. Disable or remove all but one: %s"
+			% [matching.size(), ", ".join(matching)]
+		)
+		return
+
+	if matching.size() == 1:
+		if matching[0].get_base_dir().simplify_path() != expected_dir:
+			push_warning(
+				"[DirectStorage] The native library is loaded from %s but this addon expects %s. Disable the stale copy, then reload the extension."
+				% [matching[0], expected_manifest if not expected_manifest.is_empty() else expected_dir]
+			)
+		return
+
+	push_warning(
+		"[DirectStorage] The native library is not loaded, so DSContext and the importer's native classes are unavailable. Build and deploy the addon, then use Project Settings > GDExtension > Reload (Godot 4.7+) or restart the editor. Expected manifest: %s"
+		% (expected_manifest if not expected_manifest.is_empty() else expected_dir)
+	)
+
+
+## Returns this addon's .gdextension manifest, or "" when it is not on disk.
+## The directory is fixed (the addon's preloads and autoload already assume it),
+## but the file name is looked up so a renamed manifest keeps working. With more
+## than one manifest present the choice has to be deterministic: prefer the one
+## named after the addon folder, then the first in sorted order, because
+## DirAccess lists in filesystem order and that order differs between hosts.
+func _find_addon_manifest() -> String:
+	var addon_dir := AUTOLOAD_PATH.get_base_dir().get_base_dir()
+	var dir := DirAccess.open(addon_dir)
+	if dir == null:
+		return ""
+
+	var candidates := PackedStringArray()
+	dir.list_dir_begin()
+	var entry := dir.get_next()
+	while not entry.is_empty():
+		if not dir.current_is_dir() and entry.get_extension() == "gdextension":
+			candidates.append(entry)
+		entry = dir.get_next()
+	dir.list_dir_end()
+
+	if candidates.is_empty():
+		return ""
+	candidates.sort()
+	var preferred := addon_dir.get_file() + ".gdextension"
+	if candidates.has(preferred):
+		return addon_dir.path_join(preferred)
+	return addon_dir.path_join(candidates[0])
+
+
+## Re-initializes the backend when a single extension has been (re)loaded.
+##
+## Deferred on purpose: `GDExtensionManager::reload_extension()` emits this
+## signal synchronously, from inside the editor's GDExtension tab handler, while
+## the manager is still finishing the reload. Bringing a D3D12 device and the
+## DirectStorage worker threads up inside that call would run arbitrary work in
+## the middle of the manager's reload; the deferred call runs on idle instead,
+## and it also collapses the two signals into one attempt.
+func _on_native_extension_loaded(_p_extension: Variant) -> void:
+	_queue_native_reinit()
+
+
+## Re-initializes the backend after the editor reloaded one or more extensions.
+## This is the automatic focus-in path, kept for Godot 4.3 where the per
+## extension `extension_loaded` signal does not exist yet.
+func _on_native_extensions_reloaded() -> void:
+	_queue_native_reinit()
+
+
+## Queues exactly one deferred re-initialization.
+func _queue_native_reinit() -> void:
+	if _native_reinit_queued:
+		return
+	_native_reinit_queued = true
+	_reinitialize_native_backend_after_reload.call_deferred()
+
+
+## Re-runs initialize_ds() when a reload left this editor session with an
+## uninitialized singleton. Idempotent: an initialized context is left alone.
+##
+## The ClassDB check is the filter that makes an unrelated extension's load a
+## no-op, so `extension_loaded` needs no identity matching on its argument:
+## GDExtension exposes only get_minimum_library_initialization_level() and
+## is_library_open() to GDScript, and its `resource_path` is still empty while
+## the signal is emitted for a first load, because GDExtensionManager calls
+## set_path() only after emitting it. DSContext exists only while this library
+## is loaded, which is exactly the question that matters here.
+func _reinitialize_native_backend_after_reload() -> void:
+	_native_reinit_queued = false
+	if not ClassDB.class_exists("DSContext"):
+		return
+
+	var ds_context = Engine.get_singleton("DSContext")
+	if ds_context == null or ds_context.is_initialized():
+		return
+
+	if ds_context.initialize_ds():
+		print(
+			"[DirectStorage] Native extension reloaded; backend re-initialized (%s)."
+			% ds_context.get_active_backend_name()
+		)
+	else:
+		push_warning(
+			"[DirectStorage] Native extension reloaded but the DirectStorage backend could not be re-initialized."
+		)
+
+
+## Warns once per editor start when the fallback is caused by a missing runtime.
+##
+## The CPU fallback is a supported mode, so the engine only prints the reason and
+## a deliberately CPU-only project stays quiet. The backend is identified with
+## `is_supported()` rather than by its name: the fallback backend reports
+## "SoftwareFallback" through get_name(), which is not the string the engine's
+## console message prints. `get_runtime_info()["version"]` is used instead of
+## ["loaded"] on purpose: "loaded" means "these modules are mapped in this
+## process", which is also false in a headless or non-D3D12 editor that has the
+## DLLs on disk, so it would false-positive there. The version probe reads the
+## file from the search directories without loading it and returns "Unavailable"
+## only when dstoragecore.dll is not found; the non-Windows stub returns an empty
+## dictionary, so this never fires on Linux or macOS.
+func _warn_if_runtime_missing(p_ds_context: Object) -> void:
+	if not p_ds_context.is_initialized() or p_ds_context.is_supported():
+		return
+	if String(p_ds_context.get_runtime_info().get("version", "")) != "Unavailable":
+		return
+
+	push_warning(
+		"[DirectStorage] DirectStorage runtime DLLs are not installed, so this project runs on the CPU fallback (no NVMe acceleration, no GPU decompression). Open Tools > DSGD Tools... > Manage DirectStorage Runtime... to install one, then restart the editor."
+	)
 
 
 ## Registers the project-wide import profile used by the DirectStorage importer.
