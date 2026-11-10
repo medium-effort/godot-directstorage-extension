@@ -307,18 +307,19 @@ static func map_texture_params(params: Dictionary) -> Array:
 	return [mapped, "Default DirectStorage parameters applied", true]
 
 
-## Import parameters for one migration action (dialog ACTION_LABELS order).
+## Import parameters one migration action actually decides. A delta, not a full preset: the adopt
+## path merges it over DS_DEFAULTS itself, while the upgrade path rewrites only these keys and keeps
+## every other [params] line (gdeflate_level, as_image_texture, mipmaps/*, process/*) intact.
 static func action_mapped_params(action: int) -> Dictionary:
-	var mapped := DS_DEFAULTS.duplicate()
 	match action:
 		ACTION_VRAM_UNCOMPRESSED:
-			mapped["compression/mode"] = "1"
-			mapped["compression/high_quality"] = "false"
+			return {"compression/mode": "1", "compression/high_quality": "false"}
 		ACTION_NORMAL_MAP:
-			mapped.merge(_color_options(true, true), true)
+			return _color_options(true, true)
+		ACTION_VRAM_COMPRESSED:
+			return {"compression/mode": "0", "compression/high_quality": "false"}
 		_:
-			pass
-	return mapped
+			return {}
 
 
 ## Default action for a scanned entry, from the parameters the mapper produced.

@@ -671,7 +671,7 @@ func _test_upgrade_parameter_preservation() -> bool:
 		+ "importer_version=4\n"
 		+ "uid=\"uid://ds_migration_trap_uid\"\n\n"
 		+ "[params]\n\n"
-		+ "compression/mode=0\n"
+		+ "compression/mode=1\n"
 		+ "compression/source=0\n"
 		+ "compression/gdeflate_level=1\n"
 	)
@@ -679,7 +679,7 @@ func _test_upgrade_parameter_preservation() -> bool:
 	ok = _check(_param_value(trapped, "compress/normal_map") == "1", "a user normal map beats the legacy source") and ok
 	ok = _check(_param_value(trapped, "compression/color_space") == "0", "a user normal map sets linear colour space") and ok
 	ok = _check(not trapped.contains("compression/source="), "the legacy source key is removed in the trap case") and ok
-	ok = _check(_param_value(trapped, "compression/mode") == "0", "a normal-map action leaves the mode alone") and ok
+	ok = _check(_param_value(trapped, "compression/mode") == "1", "a normal-map action leaves an uncompressed asset's mode alone") and ok
 
 	# 4. The mode predicate used by the dialog.
 	ok = _check(CORE.action_mode_for_entry({"mode": "upgrade", "base_mode": "upgrade"}, 2) == "upgrade", "an upgrade row stays on upgrade") and ok
@@ -701,8 +701,8 @@ func _test_upgrade_parameter_preservation() -> bool:
 		+ "compression/color_space=1\n"
 		+ "compress/normal_map=0\n"
 		+ "compress/channel_pack=0\n"
-		+ "compression/gdeflate_level=1\n"
-		+ "compatibility/as_image_texture=false\n"
+		+ "compression/gdeflate_level=3\n"
+		+ "compatibility/as_image_texture=true\n"
 		+ "mipmaps/generate=true\n"
 		+ "process/size_limit=0\n"
 	)
@@ -712,8 +712,8 @@ func _test_upgrade_parameter_preservation() -> bool:
 		"compression/color_space": "1",
 		"compress/normal_map": "0",
 		"compress/channel_pack": "0",
-		"compression/gdeflate_level": "1",
-		"compatibility/as_image_texture": "false",
+		"compression/gdeflate_level": "3",
+		"compatibility/as_image_texture": "true",
 	}
 	var untouched: String = CORE.rewrite_import(custom_v5.to_utf8_buffer(), "upgrade", own_params).get_string_from_utf8()
 	var diff := _changed_lines(custom_v5, untouched)
@@ -725,6 +725,8 @@ func _test_upgrade_parameter_preservation() -> bool:
 	var composed: String = CORE.rewrite_import(custom_v5.to_utf8_buffer(), composed_mode, CORE.action_mapped_params(CORE.ACTION_VRAM_UNCOMPRESSED)).get_string_from_utf8()
 	ok = _check(composed_mode == "upgrade", "composition keeps the upgrade mode") and ok
 	ok = _check(_param_value(composed, "compression/mode") == "1", "composition applies the chosen action") and ok
+	ok = _check(_param_value(composed, "compression/gdeflate_level") == "3", "composition keeps the asset's gdeflate_level") and ok
+	ok = _check(_param_value(composed, "compatibility/as_image_texture") == "true", "composition keeps the asset's as_image_texture") and ok
 	ok = _check(_param_value(composed, "mipmaps/generate") == "true", "composition keeps mipmaps/generate") and ok
 	ok = _check(_param_value(composed, "process/size_limit") == "0", "composition keeps process/size_limit") and ok
 
