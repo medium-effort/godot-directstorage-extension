@@ -43,12 +43,84 @@ static constexpr uint64_t MAX_PREWARM_REQUEST_BYTES = 512ULL * 1024ULL * 1024ULL
 // flush-attempts every request of its textures, so an 8K chunked texture (tens
 // of chunk requests) must not share a callback with dozens of siblings. 64
 // keeps the worst case near one queue-budget slice (queue_capacity / 2 = 256 at
-// the 512 default) while packing small textures efficiently.
+// the 512 default) while packing small textures efficiently. The effective cap
+// is additionally lowered to half the queue capacity by prewarm_gpu_async().
 static constexpr size_t kGpuPrewarmRequestsPerCallback = 64;
 
+// Single walk over a chunked payload's chunk table, in mip order. This is the
+// ONE definition of the GPU upload shape: eligibility, request counting and
+// request construction all consume it, so they cannot drift apart.
+//
+// Calls p_visit(mip, chunk_index, row, rows) for every upload unit:
+//   chunk_index >= 0 - one row-range chunk; `row` is its starting row inside
+//                      the mip and `rows` its height.
+//   chunk_index == -1 - a single-chunk mip, uploaded as a whole-subresource
+//                      request (its chunk-table entry does not exist).
+//
+// Returns false when the table does not exactly cover the payload: array
+// lengths disagree, a mip's chunk count overruns or undershoots the table, a
+// pitch is unusable, a chunk size is not a whole number of rows, or a mip's
+// chunks do not sum to its footprint. Callers treat false as "ineligible".
+template <typename Fn>
+static bool walk_gpu_upload_units(const DSPreloader::Payload &p_meta, Fn &&p_visit) {
+	const int64_t mips = static_cast<int64_t>(p_meta.mip_count);
+	if (mips <= 0) {
+		return false;
+	}
+	if (p_meta.mip_chunk_counts.size() < mips || p_meta.mip_row_pitches.size() < mips) {
+		return false;
+	}
+	const int64_t table_size = p_meta.chunk_offsets.size();
+	if (p_meta.chunk_compressed_sizes.size() != table_size ||
+			p_meta.chunk_uncompressed_sizes.size() != table_size) {
+		return false;
+	}
+	int64_t cursor = 0;
+	for (int64_t mip = 0; mip < mips; ++mip) {
+		const int32_t count = p_meta.mip_chunk_counts[mip];
+		// Single-chunk mips have no chunk-table entries (same convention as
+		// expand_requests and the loader path).
+		if (count <= 1) {
+			if (!p_visit(static_cast<uint32_t>(mip), static_cast<int64_t>(-1), 0u, 0u)) {
+				return false;
+			}
+			continue;
+		}
+		const int32_t pitch = p_meta.mip_row_pitches[mip];
+		if (pitch <= 0) {
+			return false;
+		}
+		if (cursor + count > table_size) {
+			return false;
+		}
+		uint32_t row = 0;
+		for (int32_t c = 0; c < count; ++c) {
+			const int64_t chunk_index = cursor + c;
+			const int64_t uncompressed = static_cast<int64_t>(p_meta.chunk_uncompressed_sizes[chunk_index]);
+			const int64_t compressed = static_cast<int64_t>(p_meta.chunk_compressed_sizes[chunk_index]);
+			if (uncompressed <= 0 || uncompressed > UINT32_MAX || compressed <= 0 || compressed > UINT32_MAX) {
+				return false;
+			}
+			if (uncompressed % pitch != 0) {
+				return false;
+			}
+			const uint32_t rows = static_cast<uint32_t>(uncompressed / pitch);
+			if (rows == 0 || !p_visit(static_cast<uint32_t>(mip), chunk_index, row, rows)) {
+				return false;
+			}
+			row += rows;
+		}
+		if (static_cast<uint64_t>(row) * static_cast<uint64_t>(pitch) !=
+				static_cast<uint64_t>(p_meta.mip_uncompressed_sizes[mip])) {
+			return false;
+		}
+		cursor += count;
+	}
+	return cursor == table_size;
+}
+
 // Request fan-out the GPU path will stage for one payload: 1 for plain
-// payloads, one per mip for single-chunk mips plus one per chunk for
-// multi-chunk mips. Mirrors the alloc_gpu_item_on_render_thread shape so the
+// payloads, otherwise one per upload unit. Mirrors walk_gpu_upload_units so the
 // per-callback slicer budgets in requests, not textures. A whole texture is
 // never split across callbacks (pending entries attach all requests in one
 // alloc), so an estimate above the cap still rides as one oversized chunk and
@@ -58,11 +130,27 @@ static size_t count_gpu_requests_for_payload(const DSPreloader::Payload &p_meta)
 		return 1;
 	}
 	size_t total = 0;
-	for (int64_t i = 0; i < (int64_t)p_meta.mip_count; ++i) {
-		const int32_t count = p_meta.mip_chunk_counts.size() > i ? p_meta.mip_chunk_counts[i] : 1;
-		total += static_cast<size_t>(count > 1 ? count : 1);
+	const bool shaped = walk_gpu_upload_units(p_meta,
+			[&total](uint32_t, int64_t, uint32_t, uint32_t) {
+				++total;
+				return true;
+			});
+	// A malformed table is rejected by is_gpu_prewarm_eligible() before it can be
+	// queued; counting it as one keeps a stray entry from stalling the tag.
+	return (shaped && total > 0) ? total : 1;
+}
+
+// Terminal accounting for GPU prewarm units the DSContext will never count
+// itself: an alloc that failed before enqueueing, or requests abandoned mid
+// fan-out. The tag total counts one unit per interned request (#0247), so a
+// texture that fans out to N requests must contribute N here as well.
+static void count_gpu_shortfall(DSContext *p_ctx, uint64_t p_tag, size_t p_units) {
+	if (p_ctx == nullptr) {
+		return;
 	}
-	return total > 0 ? total : 1;
+	for (size_t i = 0; i < p_units; ++i) {
+		p_ctx->count_stream_terminal_failure(p_tag);
+	}
 }
 
 // Full Godot mip chain length for Image::create_from_data(use_mipmaps=true).
@@ -1170,40 +1258,13 @@ bool DSPreloader::is_gpu_prewarm_eligible(const Payload &p_payload) {
 				p_payload.compression_format != static_cast<uint8_t>(DSCompressionFormat::NONE)) {
 			return false;
 		}
-		if (p_payload.mip_chunk_counts.size() < mips || p_payload.mip_row_pitches.size() < mips ||
-				p_payload.chunk_offsets.size() != p_payload.chunk_compressed_sizes.size() ||
-				p_payload.chunk_uncompressed_sizes.size() != p_payload.chunk_offsets.size()) {
-			return false;
-		}
-		int64_t chunk_cursor = 0;
-		const int64_t chunk_total = p_payload.chunk_offsets.size();
-		for (int64_t i = 0; i < mips; ++i) {
-			const int32_t count = p_payload.mip_chunk_counts[i];
-			if (count <= 1) {
-				// Single-chunk mips have no chunk-table entries (same
-				// convention as expand_requests and the loader path).
-				continue;
-			}
-			if (chunk_cursor + count > chunk_total) {
-				return false;
-			}
-			const int32_t pitch = p_payload.mip_row_pitches[i];
-			if (pitch <= 0) {
-				return false;
-			}
-			for (int64_t c = 0; c < count; ++c) {
-				const int64_t uncompressed = (int64_t)p_payload.chunk_uncompressed_sizes[chunk_cursor + c];
-				const int64_t compressed = (int64_t)p_payload.chunk_compressed_sizes[chunk_cursor + c];
-				if (uncompressed <= 0 || uncompressed > UINT32_MAX || compressed <= 0 || compressed > UINT32_MAX ||
-						uncompressed % pitch != 0) {
-					return false;
-				}
-			}
-			chunk_cursor += count;
-		}
-		if (chunk_cursor != chunk_total) {
-			return false;
-		}
+		// The walker is the single definition of a valid upload shape, so it
+		// validates the table (lengths, coverage, pitches, row alignment, mip
+		// sums) and the alloc path cannot disagree with this decision.
+		return walk_gpu_upload_units(p_payload,
+				[](uint32_t, int64_t, uint32_t, uint32_t) {
+					return true;
+				});
 	}
 	return true;
 }
@@ -1442,6 +1503,12 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 		// textures are never split: an item that would overflow the request
 		// cap starts the next chunk (an oversized single texture rides alone
 		// and the render-side queue-budget guard diverts it if needed).
+		// The cap is the smaller of the fixed per-callback constant and half the
+		// queue capacity, so a caller that lowers queue_capacity cannot get a
+		// callback that stages the entire queue in one go.
+		const size_t callback_request_cap = std::min<size_t>(
+				kGpuPrewarmRequestsPerCallback,
+				static_cast<size_t>(std::max<uint32_t>(1, ctx->get_queue_capacity() / 2)));
 		{
 			GpuChunk part;
 			part.tag = tag;
@@ -1450,7 +1517,7 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 				const size_t item_requests = count_gpu_requests_for_payload(chunk.items[i].meta);
 				const bool item_overflow = !part.items.empty() &&
 						(part.items.size() >= (size_t)chunk_size ||
-								part_requests + item_requests > kGpuPrewarmRequestsPerCallback);
+								part_requests + item_requests > callback_request_cap);
 				if (item_overflow) {
 					s.gpu_chunks.push_back(part);
 					part = GpuChunk();
@@ -1465,7 +1532,17 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 			}
 		}
 	}
-	ctx->set_prewarm_total(tag, enqueued + (int)gpu_items.size());
+	// Total counts one unit per staged request on BOTH paths, because DSContext
+	// counts a request when it finalizes. A chunked GPU texture therefore
+	// contributes its whole fan-out, not one: counting textures here made
+	// progress clamp to 100% early and let is_prewarm_complete() return true
+	// while most of a texture's chunks were still in flight (#0247). Paths that
+	// drop a texture before enqueueing add the difference via count_gpu_shortfall().
+	int gpu_units = 0;
+	for (size_t i = 0; i < gpu_items.size(); ++i) {
+		gpu_units += static_cast<int>(count_gpu_requests_for_payload(gpu_items[i].meta));
+	}
+	ctx->set_prewarm_total(tag, enqueued + gpu_units);
 	if (enqueued > 0) {
 		ctx->flush_stream_async();
 	}
@@ -1493,7 +1570,8 @@ void DSPreloader::pump_gpu_prewarm() {
 				if (it != s.pending.end()) {
 					it->second.gpu_failed = true;
 				}
-				ctx->count_stream_terminal_failure(dead_chunk.tag);
+				count_gpu_shortfall(ctx, dead_chunk.tag,
+						count_gpu_requests_for_payload(dead_chunk.items[i].meta));
 			}
 		}
 		if (!s.gpu_chunk_in_flight && !s.gpu_chunks.empty() && is_gpu_prewarm_available()) {
@@ -1529,17 +1607,13 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 	// Re-validate: availability may have changed between pump and alloc.
 	if (!is_gpu_prewarm_eligible(m)) {
 		mark_gpu_item_failed(p_item.pending_id);
-		if (p_ctx != nullptr) {
-			p_ctx->count_stream_terminal_failure(p_tag);
-		}
+		count_gpu_shortfall(p_ctx, p_tag, count_gpu_requests_for_payload(m));
 		return;
 	}
 	const int img_fmt = DSTex::rd_format_to_godot_format((int)m.pixel_format);
 	if (img_fmt == Image::FORMAT_MAX || !DSTex::is_format_supported(img_fmt)) {
 		mark_gpu_item_failed(p_item.pending_id);
-		if (p_ctx != nullptr) {
-			p_ctx->count_stream_terminal_failure(p_tag);
-		}
+		count_gpu_shortfall(p_ctx, p_tag, count_gpu_requests_for_payload(m));
 		return;
 	}
 
@@ -1568,9 +1642,7 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 	if (!tex_rid.is_valid()) {
 		UtilityFunctions::push_warning("DSPreloader: GPU texture_create failed for '", m.engine_path, "'; sync load remains available.");
 		mark_gpu_item_failed(p_item.pending_id);
-		if (p_ctx != nullptr) {
-			p_ctx->count_stream_terminal_failure(p_tag);
-		}
+		count_gpu_shortfall(p_ctx, p_tag, count_gpu_requests_for_payload(m));
 		return;
 	}
 	uint64_t native = p_rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, tex_rid, 0);
@@ -1578,15 +1650,14 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 		UtilityFunctions::push_warning("DSPreloader: GPU native format query failed for '", m.engine_path, "'; sync load remains available.");
 		p_rd->free_rid(tex_rid);
 		mark_gpu_item_failed(p_item.pending_id);
-		if (p_ctx != nullptr) {
-			p_ctx->count_stream_terminal_failure(p_tag);
-		}
+		count_gpu_shortfall(p_ctx, p_tag, count_gpu_requests_for_payload(m));
 		return;
 	}
 
-	// Loader-style GPU upload: one request per mip for plain payloads, one
-	// request per chunk (row-range destination) for chunked payloads. The
-	// backend validates each subresource range against the created texture.
+	// Loader-style GPU upload: a plain payload keeps one request spanning all
+	// mips; a chunked payload emits one row-range request per chunk (and a
+	// whole-subresource request per single-chunk mip). The backend validates
+	// each subresource range against the created texture.
 	Vector<Ref<DSRequest>> uploads;
 	auto make_upload = [&](uint64_t p_upload_offset, uint32_t p_size, uint32_t p_uncompressed,
 			uint32_t p_first_subresource, uint32_t p_subresource_count) -> Ref<DSRequest> {
@@ -1610,50 +1681,22 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 
 	bool chunk_layout_ok = true;
 	if (m.chunked) {
-		// One request per chunk. A single-chunk mip keeps the whole-
-		// subresource destination: its chunk table entry does not exist.
-		int64_t chunk_cursor = 0;
-		for (uint32_t mip = 0; mip < m.mip_count; ++mip) {
-			const int32_t chunk_count = m.mip_chunk_counts.size() > static_cast<int64_t>(mip) ? m.mip_chunk_counts[mip] : 1;
-			const int32_t pitch = m.mip_row_pitches.size() > static_cast<int64_t>(mip) ? m.mip_row_pitches[mip] : 0;
-			if (chunk_count <= 1) {
-				make_upload(static_cast<uint64_t>(m.mip_offsets[mip]),
-						static_cast<uint32_t>(m.mip_sizes[mip]),
-						static_cast<uint32_t>(m.mip_uncompressed_sizes[mip]), mip, 1);
-				continue;
-			}
-			if (pitch <= 0) {
-				chunk_layout_ok = false;
-				break;
-			}
-			uint32_t row = 0;
-			for (int32_t c = 0; c < chunk_count; ++c, ++chunk_cursor) {
-				if (chunk_cursor >= m.chunk_offsets.size() ||
-						chunk_cursor >= m.chunk_compressed_sizes.size() ||
-						chunk_cursor >= m.chunk_uncompressed_sizes.size()) {
-					chunk_layout_ok = false;
-					break;
-				}
-				const uint32_t uncompressed = static_cast<uint32_t>(m.chunk_uncompressed_sizes[chunk_cursor]);
-				if (uncompressed % static_cast<uint32_t>(pitch) != 0) {
-					chunk_layout_ok = false;
-					break;
-				}
-				Ref<DSRequest> req = make_upload(static_cast<uint64_t>(m.chunk_offsets[chunk_cursor]),
-						static_cast<uint32_t>(m.chunk_compressed_sizes[chunk_cursor]), uncompressed, mip, 1);
-				const uint32_t rows = uncompressed / static_cast<uint32_t>(pitch);
-				req->set_texture_region(row, row + rows);
-				row += rows;
-			}
-			if (!chunk_layout_ok || static_cast<uint64_t>(row) * static_cast<uint64_t>(pitch) !=
-					static_cast<uint64_t>(m.mip_uncompressed_sizes[mip])) {
-				chunk_layout_ok = false;
-				break;
-			}
-		}
-		if (chunk_layout_ok && chunk_cursor != static_cast<int64_t>(m.chunk_offsets.size())) {
-			chunk_layout_ok = false;
-		}
+		// One request per upload unit: a row-range request per chunk, and a
+		// whole-subresource request for a single-chunk mip (no table entry).
+		chunk_layout_ok = walk_gpu_upload_units(m,
+				[&](uint32_t p_mip, int64_t p_chunk_index, uint32_t p_row, uint32_t p_rows) -> bool {
+					if (p_chunk_index < 0) {
+						make_upload(static_cast<uint64_t>(m.mip_offsets[p_mip]),
+								static_cast<uint32_t>(m.mip_sizes[p_mip]),
+								static_cast<uint32_t>(m.mip_uncompressed_sizes[p_mip]), p_mip, 1);
+						return true;
+					}
+					Ref<DSRequest> req = make_upload(static_cast<uint64_t>(m.chunk_offsets[p_chunk_index]),
+							static_cast<uint32_t>(m.chunk_compressed_sizes[p_chunk_index]),
+							static_cast<uint32_t>(m.chunk_uncompressed_sizes[p_chunk_index]), p_mip, 1);
+					req->set_texture_region(p_row, p_row + p_rows);
+					return true;
+				});
 	} else {
 		const uint64_t start_offset = static_cast<uint64_t>(m.mip_offsets[0]);
 		const uint64_t last_idx = static_cast<uint64_t>(m.mip_count - 1);
@@ -1673,9 +1716,9 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 		UtilityFunctions::push_warning("DSPreloader: GPU payload layout out of range for '", m.engine_path, "'; sync load remains available.");
 		p_rd->free_rid(tex_rid);
 		mark_gpu_item_failed(p_item.pending_id);
-		if (p_ctx != nullptr) {
-			p_ctx->count_stream_terminal_failure(p_tag);
-		}
+		// Nothing was enqueued, so the DSContext will never count this texture:
+		// charge its whole fan-out to the tag so progress can still settle.
+		count_gpu_shortfall(p_ctx, p_tag, count_gpu_requests_for_payload(m));
 		return;
 	}
 	// Queue-budget guard (loader parity): a chunked texture fans out to many
@@ -1688,32 +1731,57 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 			UtilityFunctions::push_warning("DSPreloader: ", uploads.size(), " GPU prewarm requests exceed the queue budget (", queue_capacity, ") for '", m.engine_path, "'; sync load remains available.");
 			p_rd->free_rid(tex_rid);
 			mark_gpu_item_failed(p_item.pending_id);
-			p_ctx->count_stream_terminal_failure(p_tag);
+			count_gpu_shortfall(p_ctx, p_tag, static_cast<size_t>(uploads.size()));
 			return;
 		}
 	}
 
-	for (int i = 0; i < uploads.size(); ++i) {
-		if (p_ctx == nullptr || !p_ctx->enqueue_request(uploads[i], true)) {
-			// Cancelled tag (already terminal-counted): release the texture,
-			// drop the pending entry via the failed flag.
-			p_rd->free_rid(tex_rid);
-			mark_gpu_item_failed(p_item.pending_id);
-			return;
-		}
-	}
-	{
+	// Attaches the accepted requests (and the destination RID) to the pending
+	// entry. False means the entry vanished (shutdown / rescan).
+	auto attach_uploads = [&](int p_count) -> bool {
 		std::lock_guard<std::mutex> lock(state().mutex);
 		std::unordered_map<int64_t, Tracked>::iterator it = state().pending.find(p_item.pending_id);
 		if (it == state().pending.end()) {
-			// Entry vanished (shutdown/rescan): release, nothing to attach.
+			return false;
+		}
+		it->second.gpu_tex_rid = tex_rid;
+		for (int i = 0; i < p_count; ++i) {
+			it->second.requests.push_back(uploads[i]);
+		}
+		return true;
+	};
+
+	// Enqueue the whole fan-out. A failure means the tag was cancelled (or the
+	// context shut down) mid-loop.
+	int enqueued_uploads = 0;
+	while (enqueued_uploads < uploads.size() &&
+			p_ctx != nullptr &&
+			p_ctx->enqueue_request(uploads[enqueued_uploads], true)) {
+		enqueued_uploads++;
+	}
+	if (enqueued_uploads < uploads.size()) {
+		// Requests accepted before the failure are already staged (and may
+		// already be DMA-ing into tex_rid), so the RID must survive until they
+		// retire: attach them, mark the item failed and let poll_completed()
+		// orphan the RID after the last request is terminal (#0246). The units
+		// that never reached the queue are charged to the tag here.
+		count_gpu_shortfall(p_ctx, p_tag, static_cast<size_t>(uploads.size() - enqueued_uploads));
+		mark_gpu_item_failed(p_item.pending_id);
+		if (enqueued_uploads == 0) {
+			// Nothing references the texture yet, so releasing it is safe.
 			p_rd->free_rid(tex_rid);
 			return;
 		}
-		it->second.gpu_tex_rid = tex_rid;
-		for (int i = 0; i < uploads.size(); ++i) {
-			it->second.requests.push_back(uploads[i]);
+		if (!attach_uploads(enqueued_uploads)) {
+			UtilityFunctions::push_warning("DSPreloader: prewarmed GPU texture '", m.engine_path, "' lost its pending entry mid fan-out; leaking its RID rather than freeing it under staged DMA.");
 		}
+		return;
+	}
+	if (!attach_uploads(static_cast<int>(uploads.size()))) {
+		// Entry vanished after the whole fan-out was staged. A staged or
+		// submitted request still targets tex_rid, so freeing here would let DMA
+		// write into freed VRAM: leak deliberately instead (the documented rule).
+		UtilityFunctions::push_warning("DSPreloader: prewarmed GPU texture '", m.engine_path, "' has no pending entry after enqueue; leaking its RID rather than freeing it under staged DMA.");
 	}
 }
 
@@ -1750,7 +1818,7 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 			if (it != s.pending.end()) {
 				it->second.gpu_failed = true;
 			}
-			ctx->count_stream_terminal_failure(chunk.tag);
+			count_gpu_shortfall(ctx, chunk.tag, count_gpu_requests_for_payload(chunk.items[i].meta));
 		}
 		s.gpu_chunk_in_flight = false;
 		return;
@@ -1764,7 +1832,7 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 				it->second.gpu_failed = true;
 			}
 			if (ctx != nullptr) {
-				ctx->count_stream_terminal_failure(chunk.tag);
+				count_gpu_shortfall(ctx, chunk.tag, count_gpu_requests_for_payload(chunk.items[i].meta));
 			}
 		}
 		s.gpu_chunk_in_flight = false;
@@ -2106,6 +2174,10 @@ Ref<DSRequest> DSPreloader::_get_gpu_prewarm_request_for_testing(uint64_t p_tag)
 		}
 	}
 	return Ref<DSRequest>();
+}
+
+int64_t DSPreloader::_count_gpu_requests_for_testing(const Payload &p_payload) {
+	return static_cast<int64_t>(count_gpu_requests_for_payload(p_payload));
 }
 #endif
 

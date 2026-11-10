@@ -759,7 +759,38 @@ GDEX_TEST_T(gpu_prewarm, chunked_dma_fills_vram_texture, TAG_INTEGRATION | TAG_S
         GDEX_FAIL(std::string("Chunked GPU prewarm tag did not settle (done=") +
                 std::to_string(progress.x) + ", total=" + std::to_string(progress.y) + ").");
     }
-    GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(tag), 0);
+    // The tag total must count one unit per staged request, not one per texture
+    // (#0247). With two 16-chunk textures that means 32 units, so a regression
+    // to texture-granular totals shows up here as total == 2 and a progress bar
+    // that reads 100% while most of the DMA is still in flight.
+    {
+        int64_t expected_units = 0;
+        for (const char *dstex_path : { noise_dstex_path, solid_dstex_path }) {
+            godot::Ref<godot::DSTex> probe;
+            probe.instantiate();
+            godot::Dictionary header = probe->read_header(godot::String(dstex_path));
+            GDEX_ASSERT_TRUE(header.has("mip_chunk_counts"));
+            const godot::PackedInt32Array counts = header["mip_chunk_counts"];
+            for (int64_t mip = 0; mip < counts.size(); ++mip) {
+                expected_units += counts[mip] > 1 ? counts[mip] : 1;
+            }
+        }
+        GDEX_EXPECT_GT(expected_units, static_cast<int64_t>(2));
+        const godot::Vector2i progress = ds->get_prewarm_progress(tag);
+        GDEX_EXPECT_EQ(static_cast<int64_t>(progress.y), expected_units);
+        GDEX_EXPECT_EQ(static_cast<int64_t>(progress.x), expected_units);
+    }
+    // Settle on the build queue too: the native tag flag can turn true while an
+    // entry is still waiting for poll_completed() to wrap its RID.
+    {
+        const uint64_t build_deadline = godot::Time::get_singleton()->get_ticks_msec() + 10000;
+        while (godot::DSPreloader::get_unbuilt_prewarm_count(tag) > 0 &&
+                godot::Time::get_singleton()->get_ticks_msec() < build_deadline) {
+            cache->poll_completed(tag, 0, 0);
+            godot::OS::get_singleton()->delay_msec(20);
+        }
+        GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(tag), 0);
+    }
 
     // Both residents must be VRAM-backed Texture2DRD: the NONE path (noise)
     // and the GDeflate path (solid) each fanned out to 16 row-range requests,

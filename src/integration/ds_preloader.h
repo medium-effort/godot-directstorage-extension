@@ -242,6 +242,10 @@ public:
 	// Never bound in _bind_methods(): the GDScript surface is unchanged.
 	static RID _get_gpu_prewarm_rid_for_testing(uint64_t p_tag);
 	static Ref<DSRequest> _get_gpu_prewarm_request_for_testing(uint64_t p_tag);
+	// Test-only: the GPU upload fan-out the tag accounting depends on (#0247).
+	// A chunked payload must report one unit per staged request, because the
+	// context counts a request when it finalizes.
+	static int64_t _count_gpu_requests_for_testing(const Payload &p_payload);
 #endif
 
 	friend struct PreloaderUnpackTest;

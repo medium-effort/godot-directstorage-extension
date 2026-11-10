@@ -317,6 +317,11 @@ GDEX_TEST(preloader_gpu, eligibility_accepts_chunked) {
 	base.mip_row_pitches.resize(2);
 	base.mip_row_pitches[0] = 4096;
 	base.mip_row_pitches[1] = 2048;
+	// The walker checks that each mip's chunks sum to its footprint, so the
+	// fixture must be internally consistent: 4 chunks x 64 rows x 4096 pitch,
+	// then a single-chunk mip whose size is not inspected.
+	base.mip_uncompressed_sizes[0] = 4 * 64 * 4096;
+	base.mip_uncompressed_sizes[1] = 131072;
 	base.chunked = true;
 	base.mip_chunk_counts.resize(2);
 	base.mip_chunk_counts[0] = 4;
@@ -365,6 +370,72 @@ GDEX_TEST(preloader_gpu, eligibility_accepts_chunked) {
 	single.chunk_compressed_sizes.clear();
 	single.chunk_uncompressed_sizes.clear();
 	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(single));
+}
+
+GDEX_TEST_T(preloader_gpu, chunked_request_fan_out_is_counted_per_request, TAG_UNIT) {
+#if !defined(DEBUG_ENABLED) && !defined(DEV_ENABLED)
+	(void)ctx;
+	GDEX_SKIP("The prewarm fan-out seam is compiled out of release builds.");
+#else
+	// #0247 lock-in: the prewarm tag total must count one unit per staged
+	// request, because DSContext counts a request when it finalizes. Counting a
+	// chunked texture as one made progress clamp to 100% early and let
+	// is_prewarm_complete() report done while its chunks were still in flight.
+	godot::DSPreloader::Payload plain;
+	plain.engine_path = "res://test_fan_out_plain.png";
+	plain.width = 256;
+	plain.height = 256;
+	plain.mip_count = 1;
+	plain.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_BPTC_RGBA);
+	plain.is_v2 = true;
+	plain.mip_offsets.resize(1);
+	plain.mip_sizes.resize(1);
+	plain.mip_uncompressed_sizes.resize(1);
+	GDEX_EXPECT_EQ(godot::DSPreloader::_count_gpu_requests_for_testing(plain), static_cast<int64_t>(1));
+
+	// Two mips: mip 0 splits into 4 chunks, mip 1 is single-chunk and owns no
+	// table entries, so the fan-out is 5 requests (never 2).
+	godot::DSPreloader::Payload chunked = plain;
+	chunked.width = 1024;
+	chunked.height = 1024;
+	chunked.mip_count = 2;
+	chunked.mip_offsets.resize(2);
+	chunked.mip_sizes.resize(2);
+	chunked.mip_uncompressed_sizes.resize(2);
+	chunked.mip_uncompressed_sizes[0] = 4 * 262144;
+	chunked.mip_uncompressed_sizes[1] = 262144;
+	chunked.mip_row_pitches.resize(2);
+	chunked.mip_row_pitches[0] = 4096;
+	chunked.mip_row_pitches[1] = 4096;
+	chunked.chunked = true;
+	chunked.mip_chunk_counts.resize(2);
+	chunked.mip_chunk_counts[0] = 4;
+	chunked.mip_chunk_counts[1] = 1;
+	chunked.chunk_offsets.resize(4);
+	chunked.chunk_compressed_sizes.resize(4);
+	chunked.chunk_uncompressed_sizes.resize(4);
+	for (int64_t i = 0; i < 4; ++i) {
+		chunked.chunk_offsets[i] = i * 1000;
+		chunked.chunk_compressed_sizes[i] = 1000;
+		chunked.chunk_uncompressed_sizes[i] = 262144;
+	}
+	GDEX_EXPECT_EQ(godot::DSPreloader::_count_gpu_requests_for_testing(chunked), static_cast<int64_t>(5));
+	// The same payload must still be eligible: the counter and the eligibility
+	// walk share one definition, so a shape that counts 5 is a shape that uploads.
+	GDEX_EXPECT_TRUE(godot::DSPreloader::is_gpu_prewarm_eligible(chunked));
+
+	// NONE chunks are plain row slices: identical fan-out.
+	godot::DSPreloader::Payload none = chunked;
+	none.compression_format = static_cast<uint8_t>(godot::DSCompressionFormat::NONE);
+	GDEX_EXPECT_EQ(godot::DSPreloader::_count_gpu_requests_for_testing(none), static_cast<int64_t>(5));
+
+	// A malformed table is ineligible and counts as one unit, so a stray entry
+	// that reaches the tag still settles instead of stalling it.
+	godot::DSPreloader::Payload ragged = chunked;
+	ragged.chunk_uncompressed_sizes.resize(3);
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_gpu_prewarm_eligible(ragged));
+	GDEX_EXPECT_EQ(godot::DSPreloader::_count_gpu_requests_for_testing(ragged), static_cast<int64_t>(1));
+#endif
 }
 
 GDEX_TEST(preloader_gpu, npot_header_logical_semantics) {
