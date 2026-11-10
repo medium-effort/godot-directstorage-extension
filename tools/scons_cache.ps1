@@ -249,8 +249,8 @@ function Write-CacheWarning {
     Write-Host ("[cache] WARNING: the SCons cache is " + $stats.MiB + " MiB in " + $stats.Files + " files (~" + $genText + " builds), above the " + $softMiB + " MiB soft limit.") -ForegroundColor Yellow
     Write-Host ("[cache] SCons never evicts cache entries; only manual pruning bounds it.") -ForegroundColor Yellow
     Write-Host ("[cache] Free space now: prune to the limit, or reset the cache entirely:") -ForegroundColor Yellow
-    Write-Host ("[cache]   powershell -File tools/scons_cache.ps1 -Prune -MaxMiB " + $softMiB)
-    Write-Host ("[cache]   powershell -File tools/scons_cache.ps1 -Clean")
+    Write-Host ("[cache]   powershell -File tools/scons_cache.ps1 -Action Prune -MaxMiB " + $softMiB)
+    Write-Host ("[cache]   powershell -File tools/scons_cache.ps1 -Action Clean")
     if ($state -eq 'hard') {
         Write-Host ("[cache] HARD LIMIT REACHED (" + $hardMiB + " MiB): clean the cache before the next build.") -ForegroundColor Red
     }
@@ -411,7 +411,7 @@ switch ($Action) {
         if (-not $deleted) {
             Write-Host ("[cache] WARNING: recreated the cache, but could not remove the old tree: " + $trash) -ForegroundColor Yellow
             Write-Host ("[cache] cause: " + $lastError) -ForegroundColor Yellow
-            Write-Host ("[cache] retry: powershell -File tools/scons_cache.ps1 -Status  (then delete that folder by hand)") -ForegroundColor Yellow
+            Write-Host ("[cache] retry: powershell -File tools/scons_cache.ps1 -Action Status  (then delete that folder by hand)") -ForegroundColor Yellow
             exit 5
         }
 
