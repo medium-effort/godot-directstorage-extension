@@ -425,7 +425,9 @@ above matters.
 | `dsgd_extension/bundle_textures_dspkg` | add-on export option | whether an archive is built at all |
 | `dsgd_extension/enforce_archive_pairing` | add-on export option | publishes a random archive id; off publishes `0` and disables the check |
 | `dsgd_extension/steampipe_1mb_alignment` | add-on export option | 1 MiB payload chunking so a changed texture only rewrites the chunks it occupies (smaller SteamPipe deltas); off by default |
-| `dsgd_extension/include_third_party_notices` | add-on export option | copies `THIRD_PARTY_NOTICES.txt` next to the exported binaries as `dsgd_THIRD_PARTY_NOTICES.txt`; on by default |
+| `dsgd_extension/include_dsgd_license_file` | add-on export option | writes `dsgd_LICENSE.txt` (project license + third-party components of `dsgd_64.dll`); on by default |
+| `dsgd_extension/include_directstorage_license_file` | add-on export option | writes the Microsoft DirectStorage runtime license and notices as `DIRECTSTORAGE_LICENSE.txt`; on by default |
+| `dsgd_extension/merge_license_files` | add-on export option | when both files are included, appends the runtime texts to `dsgd_LICENSE.txt` and skips the separate file; on by default |
 
 ### Build inputs
 

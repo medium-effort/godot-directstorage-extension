@@ -3,8 +3,9 @@ DSGD - third-party notices
 
 The native library shipped with this addon (dsgd_64.dll, libdsgd_64.so,
 libdsgd_64.dylib) includes the components listed below. The Microsoft
-DirectStorage runtime (dstorage.dll, dstoragecore.dll) is not bundled: it is
-installed separately and used under Microsoft's license.
+DirectStorage runtime (dstorage.dll, dstoragecore.dll) is a separate Microsoft
+component governed by Microsoft's license; its license and notices are not part
+of this file and are deployed separately when enabled in the export settings.
 
 ==============================================================================
 1. GDeflate

@@ -35,11 +35,31 @@ var _policy: GDScript = _load_policy()
 const OPTION_BUNDLE_DSPKG: StringName = &"dsgd_extension/bundle_textures_dspkg"
 const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"dsgd_extension/enforce_archive_pairing"
 const OPTION_STEAMPIPE_1MB_ALIGNMENT: StringName = &"dsgd_extension/steampipe_1mb_alignment"
-const OPTION_INCLUDE_THIRD_PARTY_NOTICES: StringName = &"dsgd_extension/include_third_party_notices"
+const OPTION_INCLUDE_DSGD_LICENSE_FILE: StringName = &"dsgd_extension/include_dsgd_license_file"
+const OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE: StringName = &"dsgd_extension/include_directstorage_license_file"
+const OPTION_MERGE_LICENSE_FILES: StringName = &"dsgd_extension/merge_license_files"
+## Retired key. Read only as a fallback when a preset was never migrated.
+const OPTION_LEGACY_INCLUDE_THIRD_PARTY_NOTICES: StringName = &"dsgd_extension/include_third_party_notices"
 
-## Binary distributions ship the notice next to the executable.
+## Binary distributions ship these files next to the executable. The DSGD file
+## is the package-level bundle (project license + third-party components); the
+## DirectStorage file carries Microsoft's runtime license and notices.
+const ADDON_LICENSE_SOURCE: String = "res://addons/directstorage_accelerator/LICENSE"
 const THIRD_PARTY_NOTICES_SOURCE: String = "res://addons/directstorage_accelerator/THIRD_PARTY_NOTICES.txt"
-const THIRD_PARTY_NOTICES_EXPORT_NAME: String = "dsgd_THIRD_PARTY_NOTICES.txt"
+const DSGD_LICENSE_EXPORT_NAME: String = "dsgd_LICENSE.txt"
+const DIRECTSTORAGE_LICENSE_EXPORT_NAME: String = "DIRECTSTORAGE_LICENSE.txt"
+## Retired name from before the DSGD license file existed. Removed on the first
+## export after an upgrade so the directory never carries two notice files.
+const LEGACY_THIRD_PARTY_NOTICES_EXPORT_NAME: String = "dsgd_THIRD_PARTY_NOTICES.txt"
+
+## Runtime texts live beside the installed runtime. The installer writes the
+## exact package LICENSE.txt / NOTICES.txt accepted by the user.
+const ADDON_RUNTIME_BIN: String = "res://addons/directstorage_accelerator/bin"
+const RUNTIME_ACTIVE_PATH: String = ADDON_RUNTIME_BIN + "/.runtime.json"
+const RUNTIME_VERSIONS_DIR: String = ADDON_RUNTIME_BIN + "/.versions"
+const RUNTIME_LICENSE_FILE: String = "LICENSE.txt"
+const RUNTIME_NOTICES_FILE: String = "NOTICES.txt"
+const NOTICE_SEPARATOR: String = "=============================================================================="
 
 ## The archive key is delivered inside the encrypted PCK at this virtual path.
 ## The file never exists on disk: it is a 48-byte add_file() entry only.
@@ -97,7 +117,9 @@ var _is_debug_export: bool = false
 var _bundle_dspkg_enabled: bool = false
 var _enforce_pairing_enabled: bool = true
 var _steampipe_1mb_alignment_enabled: bool = false
-var _include_third_party_notices: bool = true
+var _include_dsgd_license_file: bool = true
+var _include_directstorage_license_file: bool = true
+var _merge_license_files: bool = true
 var _archive_key: PackedByteArray = PackedByteArray()
 var _archive_id: int = 0
 var _archive_name: String = "textures.dspkg"
@@ -151,7 +173,27 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 		},
 		{
 			"option": {
-				"name": OPTION_INCLUDE_THIRD_PARTY_NOTICES,
+				"name": OPTION_INCLUDE_DSGD_LICENSE_FILE,
+				"type": TYPE_BOOL,
+				"hint": PROPERTY_HINT_NONE,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT
+			},
+			"default_value": true,
+		},
+		{
+			"option": {
+				"name": OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE,
+				"type": TYPE_BOOL,
+				"hint": PROPERTY_HINT_NONE,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT
+			},
+			"default_value": true,
+		},
+		{
+			"option": {
+				"name": OPTION_MERGE_LICENSE_FILES,
 				"type": TYPE_BOOL,
 				"hint": PROPERTY_HINT_NONE,
 				"hint_string": "",
@@ -160,6 +202,20 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 			"default_value": true,
 		}
 	]
+
+## Export options have no tooltip field, so the warning text is the only place
+## the dialog can explain an interaction. Keep it to combinations that actually
+## change the result.
+func _get_export_option_warning(_platform: EditorExportPlatform, option: String) -> String:
+	var include_dsgd := _option_bool(OPTION_INCLUDE_DSGD_LICENSE_FILE, true)
+	var include_runtime := _option_bool(OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE, true)
+	if option == String(OPTION_MERGE_LICENSE_FILES):
+		if _option_bool(OPTION_MERGE_LICENSE_FILES, true) and not (include_dsgd and include_runtime):
+			return "Merge has no effect unless both license files are included."
+	elif option == String(OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE):
+		if include_runtime and _resolve_directstorage_texts(false).is_empty():
+			return "No DirectStorage runtime license texts were found. Install a runtime through Tools > DSGD Tools... > Manage DirectStorage Runtime."
+	return ""
 
 ## Starts the archive for the current export and decides the protection outcome.
 func _export_begin(features: PackedStringArray, is_debug: bool, path: String, flags: int) -> void:
@@ -198,10 +254,11 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
-	var notices_option: Variant = get_option(OPTION_INCLUDE_THIRD_PARTY_NOTICES)
-	# A preset created before this option existed has no key and returns nil;
-	# treat that as the default (on) instead of silently disabling the notice.
-	_include_third_party_notices = true if notices_option == null else bool(notices_option)
+	# A preset created before an option existed has no key and returns nil;
+	# treat that as the default instead of silently disabling an output.
+	_include_dsgd_license_file = _option_bool(OPTION_INCLUDE_DSGD_LICENSE_FILE, true)
+	_include_directstorage_license_file = _option_bool(OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE, true)
+	_merge_license_files = _option_bool(OPTION_MERGE_LICENSE_FILES, true)
 
 	_archive_entries.clear()
 	_skipped_payloads = 0
@@ -542,7 +599,7 @@ func _resolve_dstex_path(path: String) -> String:
 ## Native DLLs (dsgd_64, dstorage) are exported flat by Godot itself.
 func _export_end() -> void:
 	_notice_runtime_license()
-	_deploy_third_party_notices()
+	_sync_notice_files()
 	var dspkg_ok := true
 	if _archive_failed:
 		dspkg_ok = false
@@ -608,36 +665,239 @@ func _export_end() -> void:
 
 ## The runtime is redistributed under Microsoft's license. Print a notice rather
 ## than a warning: this is an informational obligation on the game developer,
-## not a defect in the export.
+## not a defect in the export. Microsoft's own NuGet targets copy only the DLLs;
+## the exporter can deploy the texts when the option is enabled.
 func _notice_runtime_license() -> void:
-	var runtime_dir := "res://addons/directstorage_accelerator/bin"
-	if not FileAccess.file_exists(runtime_dir.path_join("dstorage.dll")):
+	if not FileAccess.file_exists(ADDON_RUNTIME_BIN.path_join("dstorage.dll")):
 		return
-	print("[DirectStorage Exporter] NOTICE: the Microsoft DirectStorage runtime is redistributed under Microsoft's license. You are responsible for complying with that license and for including its EULA and NOTICES.txt when you distribute this build. The package texts are extracted to res://addons/directstorage_accelerator/bin/.versions/<version>/.")
+	print("[DirectStorage Exporter] NOTICE: dstorage.dll and dstoragecore.dll are Microsoft DirectStorage redistributables governed by Microsoft's license. Microsoft's own NuGet build targets copy only the DLLs; the license texts travel in the runtime package. You remain responsible for your distribution terms.")
 
 
-## Copies the addon's third-party notice next to the exported binaries.
+## Reconciles the notice files in the export directory with this preset.
 ##
-## The notice is self-contained (full license texts), because the addon package
-## carries no thirdparty/ source tree. A missing file or a failed copy is a
-## warning, not an export failure: the binaries are still usable, and failing
-## an entire export over a text file would be disproportionate.
-func _deploy_third_party_notices() -> void:
-	if not _include_third_party_notices:
-		return
+## Managed files are removed first, then the enabled set is written, so an
+## option turned off (or a merge-mode switch) cannot leave a stale file behind.
+## Missing sources and failed writes are warnings, not export failures: the
+## binaries remain usable and a text file is not worth failing a build over.
+func _sync_notice_files() -> void:
 	if _target_export_dir.is_empty():
-		push_warning("[DirectStorage Exporter] Third-party notices are enabled but the export directory is unknown; the notice was not deployed.")
+		if _include_dsgd_license_file or _include_directstorage_license_file:
+			push_warning("[DirectStorage Exporter] License files are enabled but the export directory is unknown; no license file was deployed.")
 		return
-	var source := ProjectSettings.globalize_path(THIRD_PARTY_NOTICES_SOURCE)
-	if not FileAccess.file_exists(source):
-		push_warning("[DirectStorage Exporter] Third-party notice is missing at '" + THIRD_PARTY_NOTICES_SOURCE + "'. Run a build to copy it from the repository root, or disable dsgd_extension/include_third_party_notices. The notice was not deployed.")
-		return
-	var target := _target_export_dir.path_join(THIRD_PARTY_NOTICES_EXPORT_NAME)
-	var err := DirAccess.copy_absolute(source, target)
-	if err != OK:
-		push_warning("[DirectStorage Exporter] Failed to deploy third-party notices to '" + target + "': " + error_string(err) + ".")
+
+	_remove_managed_notice_files()
+
+	var written: PackedStringArray = []
+	var merged_runtime := false
+
+	var dsgd_sections: Array[Dictionary] = []
+	if _include_dsgd_license_file:
+		dsgd_sections = _collect_dsgd_license_sections()
+
+	var runtime_texts: Dictionary = {}
+	if _include_directstorage_license_file:
+		runtime_texts = _resolve_directstorage_texts()
+
+	if _include_dsgd_license_file and not dsgd_sections.is_empty():
+		var merge_runtime := _merge_license_files and not runtime_texts.is_empty()
+		if merge_runtime:
+			dsgd_sections.append_array(_collect_directstorage_sections(runtime_texts))
+		var header := _notice_header("DSGD - license and notices", dsgd_sections)
+		if _write_notice_file(_target_export_dir.path_join(DSGD_LICENSE_EXPORT_NAME), _compose_notice_file(header, dsgd_sections)):
+			written.append(DSGD_LICENSE_EXPORT_NAME)
+			merged_runtime = merge_runtime
+	elif _include_dsgd_license_file:
+		push_warning("[DirectStorage Exporter] The DSGD license file is enabled but neither '" + ADDON_LICENSE_SOURCE + "' nor '" + THIRD_PARTY_NOTICES_SOURCE + "' could be read. No file was written.")
+
+	if _include_directstorage_license_file and not merged_runtime:
+		if runtime_texts.is_empty():
+			push_warning("[DirectStorage Exporter] The DirectStorage license file is enabled but the runtime texts could not be resolved. Install a runtime through Tools > DSGD Tools... > Manage DirectStorage Runtime, or disable dsgd_extension/include_directstorage_license_file.")
+		else:
+			var runtime_sections := _collect_directstorage_sections(runtime_texts)
+			var header := _notice_header("DirectStorage - license and notices", runtime_sections)
+			if _write_notice_file(_target_export_dir.path_join(DIRECTSTORAGE_LICENSE_EXPORT_NAME), _compose_notice_file(header, runtime_sections)):
+				written.append(DIRECTSTORAGE_LICENSE_EXPORT_NAME)
+
+	if written.is_empty():
+		print("[DirectStorage Exporter] Notices: none (managed license files removed).")
+	elif merged_runtime:
+		print("[DirectStorage Exporter] Notices: ", DSGD_LICENSE_EXPORT_NAME, " (DirectStorage runtime texts merged).")
 	else:
-		print("[DirectStorage Exporter] Deployed third-party notices to: ", target)
+		print("[DirectStorage Exporter] Notices: ", ", ".join(written), ".")
+
+
+## Project license and the components inside dsgd_64.dll. Both describe the same
+## artifact, so they are one file; a reader never needs one without the other.
+func _collect_dsgd_license_sections() -> Array[Dictionary]:
+	var sections: Array[Dictionary] = []
+	var license_data := _read_notice_source(ADDON_LICENSE_SOURCE)
+	if license_data.is_empty():
+		push_warning("[DirectStorage Exporter] DSGD license text is missing at '" + ADDON_LICENSE_SOURCE + "'. Run a build to copy LICENSE from the repository root.")
+	else:
+		sections.append({"title": "DSGD license", "data": license_data})
+	var notices_data := _read_notice_source(THIRD_PARTY_NOTICES_SOURCE)
+	if notices_data.is_empty():
+		push_warning("[DirectStorage Exporter] Third-party notices are missing at '" + THIRD_PARTY_NOTICES_SOURCE + "'. Run a build to copy it from the repository root.")
+	else:
+		sections.append({"title": "Third-party components of dsgd_64.dll", "data": notices_data})
+	return sections
+
+
+## Microsoft's LICENSE.txt and NOTICES.txt, in the package's own document order.
+func _collect_directstorage_sections(runtime: Dictionary) -> Array[Dictionary]:
+	var sections: Array[Dictionary] = []
+	var version := String(runtime.get("version", "unknown"))
+	var license_data := _read_notice_source(String(runtime.get("license_path", "")))
+	if license_data.is_empty():
+		push_warning("[DirectStorage Exporter] Could not read the DirectStorage runtime license text for version " + version + ".")
+	else:
+		sections.append({"title": "Microsoft DirectStorage runtime license (version %s)" % version, "data": license_data})
+	var notices_data := _read_notice_source(String(runtime.get("notices_path", "")))
+	if notices_data.is_empty():
+		push_warning("[DirectStorage Exporter] Could not read the DirectStorage runtime notices for version " + version + ".")
+	else:
+		sections.append({"title": "Microsoft DirectStorage runtime third-party notices (version %s)" % version, "data": notices_data})
+	return sections
+
+
+## Resolves the texts for the runtime that is actually installed. The active
+## version marker is authoritative; with no marker, a single version directory
+## is unambiguous enough to use. Ambiguous installs are skipped rather than
+## guessed, because shipping the wrong version's terms is worse than none.
+func _resolve_directstorage_texts(warn_on_failure: bool = true) -> Dictionary:
+	var active_version := _read_active_runtime_version()
+	var candidates: PackedStringArray = []
+	if not active_version.is_empty():
+		candidates.append(RUNTIME_VERSIONS_DIR.path_join(active_version))
+
+	var versions_dir := DirAccess.open(ProjectSettings.globalize_path(RUNTIME_VERSIONS_DIR))
+	if versions_dir != null:
+		for sub_dir in versions_dir.get_directories():
+			var candidate := RUNTIME_VERSIONS_DIR.path_join(sub_dir)
+			if not candidates.has(candidate):
+				candidates.append(candidate)
+
+	var found: Array[Dictionary] = []
+	for candidate in candidates:
+		var license_path := ProjectSettings.globalize_path(candidate.path_join(RUNTIME_LICENSE_FILE))
+		var notices_path := ProjectSettings.globalize_path(candidate.path_join(RUNTIME_NOTICES_FILE))
+		if FileAccess.file_exists(license_path) and FileAccess.file_exists(notices_path):
+			found.append({
+				"version": candidate.get_file(),
+				"license_path": license_path,
+				"notices_path": notices_path,
+			})
+
+	if found.is_empty():
+		return {}
+	if not active_version.is_empty():
+		for entry in found:
+			if String(entry["version"]) == active_version:
+				return entry
+		if warn_on_failure:
+			push_warning("[DirectStorage Exporter] The active DirectStorage runtime '" + active_version + "' has no license texts at '" + RUNTIME_VERSIONS_DIR + "'. No runtime license file was written.")
+		return {}
+	if found.size() == 1:
+		return found[0]
+	if warn_on_failure:
+		var names := PackedStringArray()
+		for entry in found:
+			names.append(String(entry["version"]))
+		push_warning("[DirectStorage Exporter] Multiple DirectStorage runtime versions carry license texts (" + ", ".join(names) + ") and none is marked active. Set an active runtime through Manage DirectStorage Runtime; no runtime license file was written.")
+	return {}
+
+
+func _read_active_runtime_version() -> String:
+	var path := ProjectSettings.globalize_path(RUNTIME_ACTIVE_PATH)
+	if not FileAccess.file_exists(path):
+		return ""
+	var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(path))
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return ""
+	var data: Dictionary = parsed
+	return String(data.get("active", ""))
+
+
+func _notice_header(title: String, sections: Array[Dictionary]) -> PackedStringArray:
+	var lines := PackedStringArray()
+	lines.append(title)
+	lines.append(NOTICE_SEPARATOR)
+	lines.append("Generated by the DSGD exporter. Do not edit.")
+	lines.append("")
+	for index in sections.size():
+		lines.append("  %d. %s" % [index + 1, String(sections[index]["title"])])
+	lines.append(NOTICE_SEPARATOR)
+	return lines
+
+
+## Concatenates the documents byte-for-byte. No timestamp: two exports of the
+## same inputs must produce identical files.
+func _compose_notice_file(header: PackedStringArray, sections: Array[Dictionary]) -> PackedByteArray:
+	var output := PackedByteArray()
+	output.append_array(("\n".join(header) + "\n").to_utf8_buffer())
+	for section in sections:
+		output.append_array(("\n" + NOTICE_SEPARATOR + "\n").to_utf8_buffer())
+		output.append_array((String(section["title"]) + "\n").to_utf8_buffer())
+		output.append_array((NOTICE_SEPARATOR + "\n\n").to_utf8_buffer())
+		var data: PackedByteArray = section["data"]
+		output.append_array(data)
+		output.append_array("\n".to_utf8_buffer())
+	return output
+
+
+## Reads a notice source as bytes so its text stays verbatim. A UTF-8 BOM is
+## stripped: it would otherwise land in the middle of a concatenated file.
+func _read_notice_source(path: String) -> PackedByteArray:
+	if path.is_empty():
+		return PackedByteArray()
+	var global_path := ProjectSettings.globalize_path(path) if path.begins_with("res://") else path
+	if not FileAccess.file_exists(global_path):
+		return PackedByteArray()
+	var data := FileAccess.get_file_as_bytes(global_path)
+	if data.size() >= 3 and data[0] == 0xEF and data[1] == 0xBB and data[2] == 0xBF:
+		data = data.slice(3)
+	return data
+
+
+func _write_notice_file(target: String, data: PackedByteArray) -> bool:
+	var file := FileAccess.open(target, FileAccess.WRITE)
+	if file == null:
+		push_warning("[DirectStorage Exporter] Could not open '" + target + "' for writing: " + error_string(FileAccess.get_open_error()) + ".")
+		return false
+	file.store_buffer(data)
+	var write_error := file.get_error()
+	file.close()
+	if write_error != OK:
+		push_warning("[DirectStorage Exporter] Failed to write '" + target + "': " + error_string(write_error) + ".")
+		return false
+	return true
+
+
+## Removes every exporter-owned notice name, including the retired one, before
+## the current settings write their set. Exact names only: a game's own
+## LICENSE.txt / NOTICES.txt must never be touched.
+func _remove_managed_notice_files() -> void:
+	var managed: PackedStringArray = [
+		DSGD_LICENSE_EXPORT_NAME,
+		DIRECTSTORAGE_LICENSE_EXPORT_NAME,
+		LEGACY_THIRD_PARTY_NOTICES_EXPORT_NAME,
+	]
+	for file_name in managed:
+		var target := _target_export_dir.path_join(file_name)
+		if not FileAccess.file_exists(target):
+			continue
+		var remove_error := DirAccess.remove_absolute(target)
+		if remove_error != OK and FileAccess.file_exists(target):
+			push_warning("[DirectStorage Exporter] Could not remove stale license file '" + target + "': " + error_string(remove_error) + ".")
+
+
+func _option_bool(option: StringName, default_value: bool) -> bool:
+	var value: Variant = get_option(option)
+	if value == null and option == OPTION_INCLUDE_DSGD_LICENSE_FILE:
+		value = get_option(OPTION_LEGACY_INCLUDE_THIRD_PARTY_NOTICES)
+	if value == null:
+		return default_value
+	return bool(value)
 
 
 ## Writer round-trip: install the key this export generated, then open the

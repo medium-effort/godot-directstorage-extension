@@ -23,7 +23,7 @@ The DirectStorage runtime (`dstorage.dll`, `dstoragecore.dll`) is not bundled wi
 - Only the 1.3 stable runtime is offered by default. Runtimes newer than 1.3 (including the 1.4 preview) are hidden from the version list; set the `DSGD_ALLOW_DOWNLOAD_RUNTIME_ABOVE_1_POINT_3=1` environment variable and restart the editor to show them. Those are development runtimes: the preview license grants no redistribution rights, so do not commit or ship their DLLs.
 - Runtime DLLs must be installed before exporting; the export dependencies reference them.
 
-The runtime is Microsoft-licensed and is not bundled or re-licensed by this addon. When you ship `dstorage.dll` / `dstoragecore.dll` with a game, you are responsible for complying with Microsoft's EULA and for including its `LICENSE.txt` and `NOTICES.txt`. The installer extracts both into `bin/.versions/<version>/` so the exact texts are available to include.
+The runtime is Microsoft-licensed and is not bundled or re-licensed by this addon. When you ship `dstorage.dll` / `dstoragecore.dll` with a game, you are responsible for complying with Microsoft's EULA and for including its `LICENSE.txt` and `NOTICES.txt`. The installer extracts both into `bin/.versions/<version>/`, and the export option `dsgd_extension/include_directstorage_license_file` can copy them next to the exported binaries.
 
 ## Direct GPU Decompression & Fallback
 
@@ -104,14 +104,16 @@ Why that matters for DirectStorage settings:
 
 ## Export Preset Options
 
-The exporter adds four options to every Windows Desktop preset, on the **Options** tab (`Project -> Export... -> Windows Desktop -> Options`):
+The exporter adds six options to every Windows Desktop preset, on the **Options** tab (`Project -> Export... -> Windows Desktop -> Options`):
 
 | Export Option | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `dsgd_extension/bundle_textures_dspkg` | `bool` | `true` | Bundles exported textures into `textures.dspkg` for unbuffered DirectStorage DMA loading. |
 | `dsgd_extension/enforce_archive_pairing` | `bool` | `true` | Publishes a random 64-bit archive id per export and compares it, in full, when the runtime opens the archive. Set to `false` only for local tooling: it publishes `0`, which skips the check in that build, and writes an archive carrying id `0` that any build expecting a real id rejects. |
 | `dsgd_extension/steampipe_1mb_alignment` | `bool` | `false` | Aligns texture payloads to 1 MiB chunks for SteamPipe differential patching efficiency. |
-| `dsgd_extension/include_third_party_notices` | `bool` | `true` | Copies the addon's `THIRD_PARTY_NOTICES.txt` next to the exported binaries as `dsgd_THIRD_PARTY_NOTICES.txt`. |
+| `dsgd_extension/include_dsgd_license_file` | `bool` | `true` | Writes `dsgd_LICENSE.txt` next to the exported binaries, containing the project license and the third-party components of `dsgd_64.dll`. Disable when you carry those attributions in-game instead; the source texts stay in the addon folder. |
+| `dsgd_extension/include_directstorage_license_file` | `bool` | `true` | Writes Microsoft's DirectStorage runtime `LICENSE.txt` and `NOTICES.txt` for the active runtime version as `DIRECTSTORAGE_LICENSE.txt`. |
+| `dsgd_extension/merge_license_files` | `bool` | `true` | When both license files are included, appends the DirectStorage runtime texts to `dsgd_LICENSE.txt` and skips the separate runtime file. No effect when fewer than two files are included. |
 
 Encryption is not one of those options. It comes entirely from the same preset's **Encryption** tab (`Project -> Export... -> Windows Desktop -> Encryption`), next to Options. The add-on keeps no encryption toggle and no key field of its own, and caches nothing from the preset, because one plugin instance serves every preset of an "Export All" run.
 
@@ -172,7 +174,7 @@ A source build can compile the archive key into the extension binary (`DSPKG_ENC
 
 This addon/extension (DSGD) is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft. Microsoft and DirectStorage are trademarks of the Microsoft group of companies. The DirectStorage runtime is installed under Microsoft's license and is not bundled with this addon/extension; see Runtime Install & License.
 
-Third-party license texts and attributions are in `THIRD_PARTY_NOTICES.txt`, shipped with the addon and copied next to exported binaries as `dsgd_THIRD_PARTY_NOTICES.txt`.
+Third-party license texts and attributions are in `THIRD_PARTY_NOTICES.txt`; the project's own license is in `LICENSE`. Both ship with the addon and are copied next to exported binaries as `dsgd_LICENSE.txt` (with the DirectStorage runtime texts appended when merging is enabled) or as a separate `DIRECTSTORAGE_LICENSE.txt`. The exporter removes and rewrites those files on every export, so the directory always matches the preset.
 
 
 

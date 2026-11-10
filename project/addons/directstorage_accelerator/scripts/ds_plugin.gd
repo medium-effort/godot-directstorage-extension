@@ -28,11 +28,13 @@ const LEGACY_IMPORT_PROFILE_SETTING: String = "directstorage/import/default_prof
 
 ## Export plugin options are stored in export_presets.cfg under their option
 ## name, so renaming the constants hides the old values from get_option().
-## This map carries them across once.
+## This map carries them across once. It also retires options whose meaning
+## changed: the old third-party toggle became the DSGD license file.
 const LEGACY_EXPORT_OPTIONS := {
 	"directstorage/bundle_textures_dspkg": "dsgd_extension/bundle_textures_dspkg",
 	"directstorage/enforce_archive_pairing": "dsgd_extension/enforce_archive_pairing",
 	"directstorage/steampipe_1mb_alignment": "dsgd_extension/steampipe_1mb_alignment",
+	"dsgd_extension/include_third_party_notices": "dsgd_extension/include_dsgd_license_file",
 }
 
 var _importer: EditorImportPlugin = null
