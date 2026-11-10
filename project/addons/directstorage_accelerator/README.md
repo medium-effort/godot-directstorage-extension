@@ -58,6 +58,12 @@ When running on Windows with a Direct3D 12 `RenderingDevice` (`--rendering-drive
 
 The file I/O mode is chosen from the volume that holds the assets. NTFS volumes on NVMe, SATA, or ATA buses use DirectStorage's default unbuffered path (BypassIO when the OS and drivers allow it). Rotational volumes automatically switch to buffered file I/O with `ForceFileBuffering` and BypassIO disabled, so the Windows cache and read-ahead are used; this is the supported configuration for hard drives. The choice is process-wide and is taken from the volume passed to `initialize_ds_for_path()`, or from `res://` for default startup. Initialize DirectStorage before querying capabilities; a capability probe that runs first fixes the I/O mode from `res://`.
 
+### Frame cost on low-end GPUs (measured)
+
+Compression buys disk bandwidth and spends GPU time. On a GTX 1050 Ti at 1920x1080, streaming 32 uncompressed 1024x1024 textures added about 0.02 ms to the median frame, while the same textures as GDeflate added about 0.36 ms at idle and about 1.06 ms while a synthetic GPU load was running; the 95th-percentile frame was 12-15 ms worse during the compressed stream. Throughput moves the other way: the compressed set delivered 2.06 GB/s of logical bytes versus 1.70 GB/s uncompressed at idle, and the two converged (about 1.4-1.5 GB/s) under load.
+
+If you are frame-bound on a low-end or integrated GPU rather than bandwidth-bound, set `dsgd_extension/disable_gpu_decompression` so decoding happens on the CPU, and budget for the tail. The writer's uncompressed fallback only covers textures GDeflate cannot shrink, so it is not a general substitute for compressible art. Reproduce with `project/benchmark/bench_gpu_contention.gd`; these numbers are machine-specific and only comparable within one run set.
+
 ## Runtime API
 
 The native classes are documented in Godot's Editor Help and support Ctrl-click navigation from GDScript. The main entry points are:
