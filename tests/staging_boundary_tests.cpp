@@ -17,6 +17,7 @@
 
 #include "core/ds_context.h"
 #include "core/ds_request.h"
+#include "formats/dspkg_format.h"
 #include "formats/dstex_format.h"
 #include "integration/ds_resource_format_loader.h"
 
@@ -323,6 +324,58 @@ GDEX_TEST_T(staging_boundary, legacy_requirement_exceeds_default, TAG_INTEGRATIO
 	GDEX_EXPECT_FALSE(static_cast<bool>(header["chunked"]));
 	const int64_t required = static_cast<int64_t>(header["min_staging_bytes"]);
 	GDEX_EXPECT_TRUE(required > static_cast<int64_t>(godot::DSContext::DEFAULT_STAGING_BUFFER_SIZE_MB) * 1024 * 1024);
+}
+
+GDEX_TEST_T(staging_boundary, archive_chunked_loads_at_default_32, TAG_INTEGRATION | TAG_SLOW) {
+	if (!gpu_ready(ctx)) {
+		return;
+	}
+	StagingScope scope;
+	scope.apply(32);
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (!ds->is_d3d12_backend()) {
+		GDEX_SKIP("D3D12 backend unavailable after staging re-init.");
+	}
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	GDEX_ASSERT_TRUE(ps != nullptr);
+	const char *dstex_path = "user://gdextest_staging_archive.dstex";
+	track_cleanup(ctx, dstex_path);
+	ps->set_setting("dsgd_extension/force_archive_resolution", true);
+	ctx.add_teardown([ds, ps]() {
+		if (ps != nullptr) {
+			ps->set_setting("dsgd_extension/force_archive_resolution", false);
+		}
+		// Windows locks: the archive cannot be removed while a batch still owns
+		// its handle, so shut DirectStorage down first (same rule as the fixture
+		// archive staging suites).
+		ds->shutdown_ds();
+		godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+	});
+
+	// 16 MiB source, two 8 MiB chunks, packaged into a v5 archive as the
+	// exporter would, then loaded through the archive consumer at 32 MiB staging.
+	const godot::PackedByteArray source = make_noise(kTwoK, kTwoK, 1, godot::Image::FORMAT_RGBA8);
+	GDEX_ASSERT_TRUE(write_texture(dstex_path, source, kTwoK, kTwoK, godot::Image::FORMAT_RGBA8, 1, 8192));
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_EQ(builder->create(godot::String("res://textures.dspkg")), godot::OK);
+	GDEX_ASSERT_EQ(builder->add_texture(godot::String("res://gdextest_staging_archive.dstex"),
+						   godot::String(dstex_path)),
+			godot::OK);
+	GDEX_ASSERT_EQ(builder->finalize(), godot::OK);
+
+	// Anti-vacuity: the entry really is a chunked v5 entry before the load.
+	godot::Ref<godot::DSPkg> probe;
+	probe.instantiate();
+	GDEX_ASSERT_EQ(probe->open(godot::String("res://textures.dspkg")), godot::OK);
+	const godot::Dictionary info = probe->get_entry_info(godot::String("res://gdextest_staging_archive.dstex"));
+	GDEX_ASSERT_TRUE(!info.is_empty());
+	GDEX_EXPECT_EQ(static_cast<int64_t>(info["format_version"]), static_cast<int64_t>(5));
+	GDEX_EXPECT_TRUE(static_cast<bool>(info["chunked"]));
+
+	const godot::Ref<godot::Texture2D> texture = load_texture("res://gdextest_staging_archive.dstex");
+	GDEX_ASSERT_TRUE(texture.is_valid());
+	GDEX_ASSERT_TRUE(gpu_readback_matches(texture, source));
 }
 
 GDEX_TEST_T(staging_boundary, cpu_two_k_chunked_loads_at_default, TAG_INTEGRATION) {

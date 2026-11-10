@@ -362,6 +362,7 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 	DSTexHeaderV3Ext v3_ext = {};
 	// v1/v2 carry no codec field, so their payload is GDeflate by definition.
 	DSCompressionFormat payload_format = DSCompressionFormat::GDEFLATE;
+	uint64_t header_capabilities = 0;
 	if (header.version == 3) {
 		if (bulk.size() < static_cast<int64_t>(sizeof(DSTexHeaderV3))) {
 			return false;
@@ -399,13 +400,7 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 			return false;
 		}
 		payload_format = format;
-		if ((capabilities & DSTEX_CAP_CHUNKED) != 0) {
-			// The chunk tables themselves are not in the bulk header read; the
-			// payload builder re-reads them through DSTex::read_header (the same
-			// validated parser the loader uses) when it sees this flag.
-			r_out.chunked = true;
-		}
-		r_out.capabilities = capabilities;
+		header_capabilities = capabilities;
 		if (format == DSCompressionFormat::NONE && header.compressed_size != header.original_size) {
 			UtilityFunctions::push_error("DSTex: NONE-compressed header sizes must match.");
 			return false;
@@ -538,12 +533,14 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 			return false;
 		}
 		// The capability must be set iff a mip is actually chunked (same contract
-		// as DSTex::read_header); the chunk tables themselves are read later.
-		if (((r_out.capabilities & DSTEX_CAP_CHUNKED) != 0) != any_chunked_mip) {
+		// as DSTex::read_header); the chunk tables themselves are read later by
+		// the payload builder through DSTex::read_header.
+		if (((header_capabilities & DSTEX_CAP_CHUNKED) != 0) != any_chunked_mip) {
 			UtilityFunctions::push_error("DSTex: v3 CAP_CHUNKED does not match the mip table.");
 			return false;
 		}
-		r_out.chunked = any_chunked_mip;
+		filled.capabilities = header_capabilities;
+		filled.chunked = any_chunked_mip;
 	} else {
 		UtilityFunctions::push_error("DSTex: Unsupported texture version.");
 		return false;
@@ -763,6 +760,10 @@ bool DSPreloader::validate_payload(const Payload &p_payload) {
 			return false;
 		}
 		if (p_payload.chunked) {
+			if (p_payload.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
+				UtilityFunctions::push_warning("DSPreloader: only GDeflate payloads may be chunked for '", p_payload.engine_path, "'; skipping prewarm.");
+				return false;
+			}
 			if (p_payload.mip_chunk_counts.size() < mips ||
 					p_payload.chunk_compressed_sizes.size() != p_payload.chunk_offsets.size() ||
 					p_payload.chunk_uncompressed_sizes.size() != p_payload.chunk_offsets.size()) {
@@ -1834,7 +1835,14 @@ void DSPreloader::complete_cpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 				if (request_cursor >= p_entry.requests.size() ||
 						p_entry.requests[request_cursor].is_null() ||
 						p_entry.requests[request_cursor]->get_status() != DSRequest::STATUS_COMPLETED) {
-					UtilityFunctions::print_verbose("DSPreloader: Prewarm texture '", p_entry.meta.engine_path, "' did not complete; dropping (sync load remains available).");
+					const int64_t status = (request_cursor < p_entry.requests.size() && p_entry.requests[request_cursor].is_valid())
+							? static_cast<int64_t>(p_entry.requests[request_cursor]->get_status())
+							: -1;
+					const godot::String why = (request_cursor < p_entry.requests.size() && p_entry.requests[request_cursor].is_valid())
+							? p_entry.requests[request_cursor]->get_error_message()
+							: godot::String("missing request");
+					UtilityFunctions::push_warning("DSPreloader: chunked prewarm request did not complete (status ", status,
+							", '", why, "') for '", p_entry.meta.engine_path, "'; dropping (sync load remains available).");
 					return;
 				}
 				const PackedByteArray chunk = p_entry.requests[request_cursor]->get_destination_buffer();
