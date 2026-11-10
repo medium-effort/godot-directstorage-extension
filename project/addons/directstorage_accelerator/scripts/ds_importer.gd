@@ -53,9 +53,11 @@ const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "c
 ## - [b]compress/normal_map[/b]: Normalize and renormalize as a normal map.
 ## - [b]compress/channel_pack[/b]: sRGB-friendly or optimized channel packing.
 ## - [b]compression/gdeflate_level[/b]: GDeflate compression level (1-12), import-time
-##   only. Levels 1-6 are the practical range; 9-12 cost 5-13x compression time for
-##   under 9% of the .dstex size on block-compressed payloads. The level does not
-##   change runtime decompression cost; see the addon README for the measured table.
+##   only. Defaults to 3 for every preset: on block-compressed payloads that buys
+##   ~1-2% for tens of milliseconds per stream, and on uncompressed payloads (the
+##   CPU / ImageTexture preset) 6-27% for a similar cost. Levels 1-6 are the
+##   practical range; 9-12 cost 5-13x compression time. The level does not change
+##   runtime decompression cost; see the addon README for the measured tables.
 ## - [b]compression/chunk_size_kb[/b]: split each mip into independent GDeflate
 ##   chunks of at most this many uncompressed KiB (0 = one stream per mip). Chunks
 ##   decouple the DirectStorage staging requirement from the texture size.
@@ -170,7 +172,7 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 		},
 		{
 			"name": "compression/gdeflate_level",
-			"default_value": 1,
+			"default_value": 3,
 			"property_hint": PROPERTY_HINT_RANGE,
 			"hint_string": "1,12,1,prefer_slider",
 		},

@@ -18,17 +18,66 @@ Three presets are provided: **3D (Streaming)** (the default), **CPU / ImageTextu
 
 | Level | `.dstex` payload | vs level 1 | Compression time |
 | --- | --- | --- | --- |
-| 1 (default) | 3,240,912 B | - | 187 ms |
-| 3 | 3,187,260 B | -1.7% | 193 ms |
+| 1 | 3,240,912 B | - | 187 ms |
+| 3 (3D default) | 3,187,260 B | -1.7% | 193 ms |
 | 6 | 3,083,248 B | -4.9% | 238 ms |
 | 9 | 2,975,292 B | -8.2% | 1126 ms |
 | 12 | 2,959,824 B | -8.7% | 2526 ms |
+
+The same sweep on two other map types from a production 3D project (8 MiB S3TC payloads, 4096x4096), to show how the gain depends on entropy:
+
+| Level | ORM payload | vs level 1 | Normal payload | vs level 1 |
+| --- | --- | --- | --- | --- |
+| 1 | 5,912,908 B | - | 5,208,268 B | - |
+| 3 | 5,869,528 B | -0.7% | 5,118,716 B | -1.7% |
+| 6 | 5,679,348 B | -4.0% | 5,018,660 B | -3.6% |
+| 9 | 5,535,556 B | -6.4% | 4,833,756 B | -7.2% |
+
+Albedo gains most, low-entropy ORM masks least.
+
+Stylized/hand-painted art gains considerably more at the same levels, because its flat color regions leave more redundancy than photographic albedo. Measured the same way (S3TC payloads, 8 logical cores), on a second 3D project whose assets are imported by Godot's own importer, so these model what this addon would produce for the same art:
+
+| Asset | S3TC payload | L1 | L3 | L6 | L9 |
+| --- | --- | --- | --- | --- | --- |
+| moss albedo 2048x2048 | 2,097,152 B | 470,496 B | -14.5% | -24.7% | -31.3% |
+| moss normal 2048x2048 | 2,097,152 B | 553,096 B | -7.5% | -13.6% | -19.6% |
+| grass albedo 1024x1024 | 524,288 B | 222,828 B | -3.2% | -6.9% | -13.2% |
+| leaves ORM 1024x1024 | 524,288 B | 347,636 B | -0.8% | -3.1% | -5.8% |
+| menu background 1920x1080 | 1,036,800 B | 515,632 B | -2.2% | -4.7% | -9.7% |
+
+Encode time at level 3 stays within a few percent there (moss albedo 34.9 to 36.0 ms, moss normal 34.8 to 35.3 ms), while level 6 roughly doubles it (66.8 and 54.5 ms) and level 9 is 10-12x. So the ordering holds across both projects — albedo gains most, ORM least — but the absolute payoff of level 3 depends on how stylized the art is: around 1-2% on photographic block-compressed albedo, up to 14.5% on flat-shaded stylized albedo.
+
+Uncompressed payloads (the CPU / ImageTexture path, `compression/mode=1`) behave differently: there is much more redundancy left for GDeflate to find, so the same levels can buy more. Two sets of base-level RGBA8 payloads, because they answer different questions.
+
+What this project actually ships on that path — the only two `mode=1` assets, both tiny, and the one `as_image_texture` asset (which is block-compressed, not uncompressed):
+
+| Asset | Payload | L1 | L3 | L6 |
+| --- | --- | --- | --- | --- |
+| icon 128x128 (`mode=1`) | 65,536 B | 44,016 B | 43,996 B (-0.05%) | 43,316 B (-1.6%) |
+| crosshair 32x32 (`mode=1`) | 4,096 B | 392 B | 292 B (-25.5%) | 280 B (-28.6%) |
+| spotlight 256x256 (`as_image_texture`, S3TC) | 32,768 B | 16,724 B | 16,568 B (-0.9%) | 16,256 B (-2.8%) |
+
+Those assets total about 68 KiB of raw payload, so the level is worth bytes, not kilobytes, on them: the icon is 67% entropy and barely moves, and the crosshair's 100-byte saving is noise at any level.
+
+Large uncompressed textures are the case where the level pays. These rows are 2D-profile *models*: production 3D sources re-read as RGBA8 (they are block-compressed in that project), so treat them as what a film, lightmap, or photo-backed UI texture would cost, not as shipped 2D art:
+
+| Asset | Raw RGBA8 | L1 | L3 | L6 | L9 |
+| --- | --- | --- | --- | --- | --- |
+| floor 512x512 (model) | 1,048,576 B | 43,872 B | -27.0% | -33.0% | -32.0% |
+| particle 512x512 (model) | 1,048,576 B | 66,972 B | -15.9% | -23.4% | -24.7% |
+| splash 1024x233 (model) | 954,368 B | 17,136 B | +0.4% | -7.4% | -7.9% |
+| albedo 4096x4096 (model) | 67,108,864 B | 12,263,368 B | -6.1% | -8.8% | -18.7% |
+| ORM 4096x4096 (model) | 67,108,864 B | 23,040,224 B | -6.2% | -11.8% | -16.7% |
+
+Encode time on that path: levels 1-6 are within noise for the small assets (7.5 / 7.0 / 6.7 ms for the 512x512 model, 4.1 / 5.5 / 4.1 ms for the icon) and +15% / +43% for the 64 MiB ones (1.04 / 1.20 / 1.49 s); level 9 is 10x (`10.2 s`).
+
+Both paths therefore default to level `3`. It is the last point that is close to free, and it is the point where further levels start costing two to four times the extra time for two to four times the saved bytes. On block-compressed art that is a small but free win; on uncompressed art it is either noise (small sprites) or a real 6-12% (large textures). Levels 9-12 are the libdeflate cliff in both cases: raise the level beyond 3 only when distribution size is worth more to you than reimport time.
 
 ### Chunked payloads
 
 `compression/chunk_size_kb` (default `8192`) splits each mip into independent GDeflate chunks of at most that many uncompressed KiB; `0` restores one stream per mip. DirectStorage requires every request to fit the staging buffer, so one stream per mip forced `staging_buffer_size_mb` to grow with the largest mip (a 4096x4096 RGBA8 mip is 64 MiB, an 8192x8192 mip is 256 MiB). Chunks decouple the two: the staging floor becomes the largest chunk (8 MiB by default), and the importer warns with the exact number when an asset still exceeds the configured staging size. Chunked textures are stored in v3 `.dstex` files and v5 `.dspkg` archives; the GPU path uploads each chunk as a row-range texture request and the CPU path reassembles the per-chunk streams. Prewarm supports chunked payloads through the System RAM path; direct-to-VRAM GPU prewarm still uses the per-mip path, so it stays on un-chunked textures for now.
 
-End to end for the same asset (decode, 13 mip levels, BC1, `.dstex` write), level 6 costs +11% import time for a 4.7% smaller file, and level 12 costs 6.1x for 8.4%. Levels 9-12 are the libdeflate cliff: avoid them for interactive or CI reimports. The practical range is 1-6, and low-entropy ORM/mask textures gain even less (2.1% at level 12 on a 2048x2048 ORM). Keep the default when reimport time matters, and raise it only when distribution size is the higher priority.
+End to end for the same asset (decode, 13 mip levels, BC1, `.dstex` write), level 6 costs +11% import time for a 4.7% smaller file, and level 12 costs 6.1x for 8.4%. Levels 9-12 are the libdeflate cliff: avoid them for interactive or CI reimports.
 
 During export, imported `.dstex` files are bundled into `res://textures.dspkg` (version 3 or version 4 with encrypted TOC) along with per-entry GPU mip metadata and entry flags. The runtime resource loader resolves texture paths directly from that archive without requiring individual `.dstex` files in the exported PCK.
 

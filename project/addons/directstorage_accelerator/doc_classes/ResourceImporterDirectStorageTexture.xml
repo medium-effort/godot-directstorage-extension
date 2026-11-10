@@ -15,10 +15,10 @@
 	<tutorials>
 	</tutorials>
 	<members>
-		<member name="compression/gdeflate_level" type="int" setter="" getter="" default="1">
+		<member name="compression/gdeflate_level" type="int" setter="" getter="" default="3">
 			The Microsoft GDeflate compression level applied to the texture data payload in the generated [code].dstex[/code] file, ranging from [code]1[/code] through [code]12[/code].
-			Lower values (such as the default [code]1[/code]) maximize encoding speed in the editor and provide the highest DirectStorage decompression throughput.
-			Higher values achieve smaller file sizes on disk at the cost of slower import times and increased decompression workload.
+			Defaults to [code]3[/code], which is close to free in encode time and already captures a meaningful share of the reduction on both paths: roughly [code]1[/code] to [code]2[/code] percent on block-compressed payloads (VRAM Compressed) and [code]6[/code] to [code]27[/code] percent on uncompressed payloads (VRAM Uncompressed).
+			Higher values achieve smaller file sizes on disk at the cost of slower import times, steeply so from [code]9[/code] upward. The level does not change runtime decompression cost, which is per-byte identical at every level.
 		</member>
 		<member name="compression/chunk_size_kb" type="int" setter="" getter="" default="8192">
 			Splits each mip into independent GDeflate chunks of at most this many uncompressed kibibytes; [code]0[/code] keeps one stream per mip.
