@@ -95,6 +95,14 @@ public:
 		PackedInt32Array mip_sizes; // v2 per-mip compressed sizes
 		PackedInt32Array mip_uncompressed_sizes; // v2 per-mip footprint sizes
 		PackedInt32Array mip_row_pitches; // v2 per-mip 256B pitches
+		// Chunked v3 payloads: per-mip chunk counts plus the flat chunk table.
+		// CPU prewarm expands one request per chunk; chunk tables are re-read
+		// from the validated header parser, not cached in PayloadHeader.
+		bool chunked = false;
+		PackedInt32Array mip_chunk_counts;
+		PackedInt64Array chunk_offsets;
+		PackedInt32Array chunk_compressed_sizes;
+		PackedInt32Array chunk_uncompressed_sizes;
 	};
 
 	// Header cache entry for one .dstex file. Plain struct — no Dictionary,
@@ -124,6 +132,8 @@ public:
 		uint64_t file_len = 0; // FileAccess::get_length at fill (0 = unknown/missing)
 		uint64_t generation = 0; // header_cache_generation at publish
 		bool open_failed = false; // true = failure entry, served without opening
+		uint64_t capabilities = 0; // v3 capability word (0 for v1/v2)
+		bool chunked = false; // capabilities carried DSTEX_CAP_CHUNKED
 		int64_t mip_offsets[16] = {};
 		int32_t mip_sizes[16] = {};
 		int32_t mip_uncompressed_sizes[16] = {};

@@ -199,16 +199,15 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 	if (info.is_empty()) {
 		return false;
 	}
-	// Preload stages GDeflate and raw-NONE requests only. A v5 entry that needs
-	// Zstd, GACL or chunk reassembly must fail closed here rather than be
-	// prewarmed with the wrong codec/destination shape.
+	// Preload stages GDeflate and raw-NONE requests. Zstd and GACL still fail
+	// closed; chunked entries are staged with their chunk table (CPU prewarm
+	// expands one request per chunk and validate_payload checks the table).
 	const int entry_compression_format = (int)info.get("compression_format", 1);
 	if ((int)info.get("entry_kind", 0) != static_cast<int>(DSPkgEntryKind::TEXTURE) ||
 			(entry_compression_format != static_cast<int>(DSCompressionFormat::GDEFLATE) &&
 					entry_compression_format != static_cast<int>(DSCompressionFormat::NONE)) ||
-			(int)info.get("gacl_transform", 0) != static_cast<int>(DSGaclTransform::NONE) ||
-			(bool)info.get("chunked", false)) {
-		UtilityFunctions::push_error("DirectStorage Preloader: Entry requires the GPU path or Step 5 CPU support; preload skipped: " + p_engine_path);
+			(int)info.get("gacl_transform", 0) != static_cast<int>(DSGaclTransform::NONE)) {
+		UtilityFunctions::push_error("DirectStorage Preloader: Entry requires a GDeflate/NONE, non-GACL payload; preload skipped: " + p_engine_path);
 		return false;
 	}
 	r_out.engine_path = p_engine_path;
@@ -247,6 +246,11 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 	r_out.mip_sizes = (PackedInt32Array)info.get("mip_sizes", PackedInt32Array());
 	r_out.mip_uncompressed_sizes = (PackedInt32Array)info.get("mip_uncompressed_sizes", PackedInt32Array());
 	r_out.mip_row_pitches = (PackedInt32Array)info.get("mip_row_pitches", PackedInt32Array());
+	r_out.chunked = (bool)info.get("chunked", false);
+	r_out.mip_chunk_counts = (PackedInt32Array)info.get("mip_chunk_counts", PackedInt32Array());
+	r_out.chunk_offsets = (PackedInt64Array)info.get("chunk_offsets", PackedInt64Array());
+	r_out.chunk_compressed_sizes = (PackedInt32Array)info.get("chunk_compressed_sizes", PackedInt32Array());
+	r_out.chunk_uncompressed_sizes = (PackedInt32Array)info.get("chunk_uncompressed_sizes", PackedInt32Array());
 	return true;
 }
 
@@ -396,12 +400,12 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 		}
 		payload_format = format;
 		if ((capabilities & DSTEX_CAP_CHUNKED) != 0) {
-			// The header cache is a single header + mip-table read; chunk tables
-			// are not available here, and the capability must be set iff a mip is
-			// actually chunked.
-			UtilityFunctions::push_error("DSTex: Preload does not support chunked v3 payloads until Step 5.");
-			return false;
+			// The chunk tables themselves are not in the bulk header read; the
+			// payload builder re-reads them through DSTex::read_header (the same
+			// validated parser the loader uses) when it sees this flag.
+			r_out.chunked = true;
 		}
+		r_out.capabilities = capabilities;
 		if (format == DSCompressionFormat::NONE && header.compressed_size != header.original_size) {
 			UtilityFunctions::push_error("DSTex: NONE-compressed header sizes must match.");
 			return false;
@@ -482,6 +486,7 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 		// Each table entry is a uint32 and there are at most 16 of them, so the
 		// sums cannot overflow uint64 and need no guard of their own.
 		DSTexMipEntryV2 entries[DSTEX_MAX_MIP_COUNT];
+		bool any_chunked_mip = false;
 		uint64_t previous_end = dstex_header_size(header.version) +
 				static_cast<uint64_t>(header.mip_count) * sizeof(DSTexMipEntryV2);
 		previous_end = (previous_end + 511) & ~uint64_t(511);
@@ -505,10 +510,7 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 					return false;
 				}
 				if (mip_entry.chunk_count > 1) {
-					// The preloader's header cache is a single bulk read of the
-					// header + mip table; chunk tables are not available here.
-					UtilityFunctions::push_error("DSTex: Preload does not support chunked v3 payloads until Step 5.");
-					return false;
+					any_chunked_mip = true;
 				}
 				if (mip_entry.offset % 512 != 0 ||
 						mip_entry.row_pitch == 0 || mip_entry.row_pitch % 256 != 0) {
@@ -535,6 +537,13 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 			UtilityFunctions::push_error("DSTex: Mip table does not match the header totals or the declared mip layout.");
 			return false;
 		}
+		// The capability must be set iff a mip is actually chunked (same contract
+		// as DSTex::read_header); the chunk tables themselves are read later.
+		if (((r_out.capabilities & DSTEX_CAP_CHUNKED) != 0) != any_chunked_mip) {
+			UtilityFunctions::push_error("DSTex: v3 CAP_CHUNKED does not match the mip table.");
+			return false;
+		}
+		r_out.chunked = any_chunked_mip;
 	} else {
 		UtilityFunctions::push_error("DSTex: Unsupported texture version.");
 		return false;
@@ -614,6 +623,25 @@ void DSPreloader::payload_from_header(const String &p_engine_path, const String 
 		data_offset = (data_offset + 511) & ~uint64_t(511);
 	}
 	r_out.data_offset = data_offset;
+
+	r_out.chunked = p_header.chunked;
+	if (r_out.chunked) {
+		// The header cache deliberately keeps only the fixed header + mip table.
+		// Chunk tables are variable length, so a chunked payload re-reads them
+		// through the validated parser (one extra open+parse per prewarm of a
+		// chunked texture; these are the minority and prewarm is batched).
+		Ref<DSTex> dstex_reader;
+		dstex_reader.instantiate();
+		Dictionary header_info = dstex_reader->read_header(p_dstex_path);
+		if (header_info.is_empty()) {
+			r_out.chunked = false;
+			return;
+		}
+		r_out.mip_chunk_counts = (PackedInt32Array)header_info.get("mip_chunk_counts", PackedInt32Array());
+		r_out.chunk_offsets = (PackedInt64Array)header_info.get("chunk_offsets", PackedInt64Array());
+		r_out.chunk_compressed_sizes = (PackedInt32Array)header_info.get("chunk_compressed_sizes", PackedInt32Array());
+		r_out.chunk_uncompressed_sizes = (PackedInt32Array)header_info.get("chunk_uncompressed_sizes", PackedInt32Array());
+	}
 }
 
 bool DSPreloader::fill_from_dstex_file(const String &p_engine_path, const String &p_dstex_path, Payload &r_out) {
@@ -734,6 +762,51 @@ bool DSPreloader::validate_payload(const Payload &p_payload) {
 			UtilityFunctions::push_warning("DSPreloader: v2 mip footprints exceed the prewarm buffer cap for '", p_payload.engine_path, "'; skipping prewarm.");
 			return false;
 		}
+		if (p_payload.chunked) {
+			if (p_payload.mip_chunk_counts.size() < mips ||
+					p_payload.chunk_compressed_sizes.size() != p_payload.chunk_offsets.size() ||
+					p_payload.chunk_uncompressed_sizes.size() != p_payload.chunk_offsets.size()) {
+				UtilityFunctions::push_warning("DSPreloader: Incomplete chunk table for '", p_payload.engine_path, "'; skipping prewarm.");
+				return false;
+			}
+			int64_t chunk_cursor = 0;
+			for (int64_t mip = 0; mip < mips; ++mip) {
+				const int32_t count = p_payload.mip_chunk_counts[mip];
+				if (count < 1) {
+					UtilityFunctions::push_warning("DSPreloader: Invalid chunk count for '", p_payload.engine_path, "'; skipping prewarm.");
+					return false;
+				}
+				if (count <= 1) {
+					continue;
+				}
+				uint64_t compressed_sum = 0;
+				uint64_t uncompressed_sum = 0;
+				for (int32_t c = 0; c < count; ++c, ++chunk_cursor) {
+					if (chunk_cursor >= p_payload.chunk_compressed_sizes.size() ||
+							chunk_cursor >= p_payload.chunk_uncompressed_sizes.size()) {
+						UtilityFunctions::push_warning("DSPreloader: Chunk table ends early for '", p_payload.engine_path, "'; skipping prewarm.");
+						return false;
+					}
+					const int32_t compressed = p_payload.chunk_compressed_sizes[chunk_cursor];
+					const int32_t uncompressed = p_payload.chunk_uncompressed_sizes[chunk_cursor];
+					if (compressed <= 0 || uncompressed <= 0) {
+						UtilityFunctions::push_warning("DSPreloader: Invalid chunk size for '", p_payload.engine_path, "'; skipping prewarm.");
+						return false;
+					}
+					compressed_sum += static_cast<uint64_t>(compressed);
+					uncompressed_sum += static_cast<uint64_t>(uncompressed);
+				}
+				if (compressed_sum != static_cast<uint64_t>(p_payload.mip_sizes[mip]) ||
+						uncompressed_sum != static_cast<uint64_t>(p_payload.mip_uncompressed_sizes[mip])) {
+					UtilityFunctions::push_warning("DSPreloader: Chunk sums do not match mip ", mip, " for '", p_payload.engine_path, "'; skipping prewarm.");
+					return false;
+				}
+			}
+			if (chunk_cursor != p_payload.chunk_offsets.size()) {
+				UtilityFunctions::push_warning("DSPreloader: Chunk table overruns its mip counts for '", p_payload.engine_path, "'; skipping prewarm.");
+				return false;
+			}
+		}
 	} else {
 		if (p_payload.compressed_size == 0 || p_payload.compressed_size > UINT32_MAX || p_payload.original_size == 0 || p_payload.original_size > UINT32_MAX) {
 			UtilityFunctions::push_warning("DSPreloader: Invalid v1 payload size for '", p_payload.engine_path, "'; skipping prewarm.");
@@ -768,6 +841,50 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 		return true;
 	}
 	r_out.reserve((int64_t)p_payload.mip_count);
+	if (p_payload.chunked) {
+		// One request per chunk so each stream gets its own destination buffer;
+		// complete_cpu_entry() concatenates the buffers back into one footprint
+		// per mip before build_texture() sees them.
+		int64_t chunk_cursor = 0;
+		for (uint32_t i = 0; i < p_payload.mip_count; ++i) {
+			const int32_t count = p_payload.mip_chunk_counts.size() > static_cast<int64_t>(i)
+					? p_payload.mip_chunk_counts[i]
+					: 1;
+			if (count <= 1) {
+				Ref<DSRequest> req;
+				req.instantiate();
+				req->set_file_path(p_payload.file_path);
+				req->set_offset(static_cast<uint64_t>(p_payload.mip_offsets[i]));
+				req->set_size(static_cast<uint32_t>(p_payload.mip_sizes[i]));
+				req->set_uncompressed_size(static_cast<uint32_t>(p_payload.mip_uncompressed_sizes[i]));
+				req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+				req->set_cancellation_tag(p_tag);
+				req->get_destination_buffer_ref().resize(static_cast<int64_t>(p_payload.mip_uncompressed_sizes[i]));
+				r_out.push_back(req);
+				continue;
+			}
+			for (int32_t c = 0; c < count; ++c, ++chunk_cursor) {
+				if (chunk_cursor >= p_payload.chunk_offsets.size() ||
+						chunk_cursor >= p_payload.chunk_compressed_sizes.size() ||
+						chunk_cursor >= p_payload.chunk_uncompressed_sizes.size()) {
+					r_out.clear();
+					return false;
+				}
+				Ref<DSRequest> req;
+				req.instantiate();
+				req->set_file_path(p_payload.file_path);
+				req->set_offset(static_cast<uint64_t>(p_payload.chunk_offsets[chunk_cursor]));
+				req->set_size(static_cast<uint32_t>(p_payload.chunk_compressed_sizes[chunk_cursor]));
+				req->set_uncompressed_size(static_cast<uint32_t>(p_payload.chunk_uncompressed_sizes[chunk_cursor]));
+				req->set_compression_format(DSRequest::COMPRESSION_GDEFLATE);
+				req->set_cancellation_tag(p_tag);
+				req->get_destination_buffer_ref().resize(
+						static_cast<int64_t>(p_payload.chunk_uncompressed_sizes[chunk_cursor]));
+				r_out.push_back(req);
+			}
+		}
+		return r_out.size() > 0;
+	}
 	// Raw table pointers hoisted: per-mip operator[] on Packed*Array pays
 	// a bounds check + CoW read-lock probe per access (4 per mip); plain
 	// pointer reads return identical values with no per-iteration
@@ -996,6 +1113,11 @@ static bool ds_prewarm_format_eligible(int p_rd_format) {
 
 bool DSPreloader::is_gpu_prewarm_eligible(const Payload &p_payload) {
 	if (!p_payload.is_v2) {
+		return false;
+	}
+	if (p_payload.chunked) {
+		// Chunked payloads prewarm through the CPU path for now: callers route
+		// GPU-ineligible payloads to System RAM prewarm, which expands chunks.
 		return false;
 	}
 	if (p_payload.as_image_texture) {
@@ -1688,12 +1810,60 @@ void DSPreloader::complete_cpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 	r_stored = 0;
 	r_entry_bytes = 0;
 	std::vector<PackedByteArray> buffers;
-	for (int r = 0; r < p_entry.requests.size(); ++r) {
-		if (p_entry.requests[r].is_null() || p_entry.requests[r]->get_status() != DSRequest::STATUS_COMPLETED) {
-			UtilityFunctions::print_verbose("DSPreloader: Prewarm texture '", p_entry.meta.engine_path, "' did not complete; dropping (sync load remains available).");
+	if (p_entry.meta.chunked) {
+		int64_t request_cursor = 0;
+		for (uint32_t mip = 0; mip < p_entry.meta.mip_count; ++mip) {
+			const int32_t count = p_entry.meta.mip_chunk_counts.size() > static_cast<int64_t>(mip)
+					? p_entry.meta.mip_chunk_counts[mip]
+					: 1;
+			if (count <= 1) {
+				if (request_cursor >= p_entry.requests.size() ||
+						p_entry.requests[request_cursor].is_null() ||
+						p_entry.requests[request_cursor]->get_status() != DSRequest::STATUS_COMPLETED) {
+					UtilityFunctions::print_verbose("DSPreloader: Prewarm texture '", p_entry.meta.engine_path, "' did not complete; dropping (sync load remains available).");
+					return;
+				}
+				buffers.push_back(p_entry.requests[request_cursor]->get_destination_buffer());
+				++request_cursor;
+				continue;
+			}
+			PackedByteArray footprint;
+			footprint.resize(static_cast<int64_t>(p_entry.meta.mip_uncompressed_sizes[mip]));
+			uint64_t written = 0;
+			for (int32_t c = 0; c < count; ++c, ++request_cursor) {
+				if (request_cursor >= p_entry.requests.size() ||
+						p_entry.requests[request_cursor].is_null() ||
+						p_entry.requests[request_cursor]->get_status() != DSRequest::STATUS_COMPLETED) {
+					UtilityFunctions::print_verbose("DSPreloader: Prewarm texture '", p_entry.meta.engine_path, "' did not complete; dropping (sync load remains available).");
+					return;
+				}
+				const PackedByteArray chunk = p_entry.requests[request_cursor]->get_destination_buffer();
+				if (chunk.size() <= 0 ||
+						written + static_cast<uint64_t>(chunk.size()) > static_cast<uint64_t>(footprint.size())) {
+					UtilityFunctions::push_warning("DSPreloader: Chunk buffer does not fit mip ", (int64_t)mip, " for '", p_entry.meta.engine_path, "'; dropping prewarmed texture.");
+					return;
+				}
+				memcpy(footprint.ptrw() + written, chunk.ptr(), static_cast<size_t>(chunk.size()));
+				written += static_cast<uint64_t>(chunk.size());
+			}
+			if (written != static_cast<uint64_t>(footprint.size())) {
+				UtilityFunctions::push_warning("DSPreloader: Chunk reassembly size mismatch for '", p_entry.meta.engine_path, "'; dropping prewarmed texture.");
+				return;
+			}
+			buffers.push_back(footprint);
+		}
+		if (request_cursor != p_entry.requests.size()) {
+			UtilityFunctions::push_warning("DSPreloader: Unconsumed prewarm requests for '", p_entry.meta.engine_path, "'; dropping prewarmed texture.");
 			return;
 		}
-		buffers.push_back(p_entry.requests[r]->get_destination_buffer());
+	} else {
+		for (int r = 0; r < p_entry.requests.size(); ++r) {
+			if (p_entry.requests[r].is_null() || p_entry.requests[r]->get_status() != DSRequest::STATUS_COMPLETED) {
+				UtilityFunctions::print_verbose("DSPreloader: Prewarm texture '", p_entry.meta.engine_path, "' did not complete; dropping (sync load remains available).");
+				return;
+			}
+			buffers.push_back(p_entry.requests[r]->get_destination_buffer());
+		}
 	}
 	Ref<Texture2D> tex = build_texture(p_entry.meta, buffers);
 	if (!tex.is_valid()) {

@@ -20,6 +20,10 @@
 			Lower values (such as the default [code]1[/code]) maximize encoding speed in the editor and provide the highest DirectStorage decompression throughput.
 			Higher values achieve smaller file sizes on disk at the cost of slower import times and increased decompression workload.
 		</member>
+		<member name="compression/chunk_size_kb" type="int" setter="" getter="" default="8192">
+			Splits each mip into independent GDeflate chunks of at most this many uncompressed kibibytes; [code]0[/code] keeps one stream per mip.
+			Chunks bound the largest DirectStorage request, so a large texture no longer forces the staging buffer to hold a whole mip. Block-compressed formats keep every chunk boundary on a 4-row block boundary.
+		</member>
 		<member name="compression/color_space" type="int" setter="" getter="" default="1">
 			Selects the color space stored in the [code].dstex[/code] header:
 			[b]Linear:[/b] Linear data such as normal maps, roughness, metallic, masks, or lookup tables. The loader creates a linear (UNORM) GPU format.

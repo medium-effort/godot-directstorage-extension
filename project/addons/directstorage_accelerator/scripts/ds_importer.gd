@@ -56,6 +56,9 @@ const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "c
 ##   only. Levels 1-6 are the practical range; 9-12 cost 5-13x compression time for
 ##   under 9% of the .dstex size on block-compressed payloads. The level does not
 ##   change runtime decompression cost; see the addon README for the measured table.
+## - [b]compression/chunk_size_kb[/b]: split each mip into independent GDeflate
+##   chunks of at most this many uncompressed KiB (0 = one stream per mip). Chunks
+##   decouple the DirectStorage staging requirement from the texture size.
 ## - [b]mipmaps/generate[/b]: Generate a full mip chain.
 ## - [b]process/size_limit[/b]: Resize the longer edge before mip generation.
 ## - [b]process/channel_remap/red|green|blue|alpha[/b]: Swizzle, invert, or replace channels (e.g. pack PBR masks, flip normal-map Y).
@@ -170,6 +173,12 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 			"default_value": 1,
 			"property_hint": PROPERTY_HINT_RANGE,
 			"hint_string": "1,12,1,prefer_slider",
+		},
+		{
+			"name": "compression/chunk_size_kb",
+			"default_value": 8192,
+			"property_hint": PROPERTY_HINT_RANGE,
+			"hint_string": "0,65536,1024,or_greater",
 		},
 		{
 			"name": "mipmaps/generate",
@@ -495,6 +504,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	var mip_count: int = (img.get_mipmap_count() + 1) if img.has_mipmaps() else 1
 	raw_data = _pad_texture_data(raw_data, width, height, format, mip_count)
 	var gdeflate_level: int = int(options.get("compression/gdeflate_level", options.get("compression/level", 1)))
+	var chunk_size_kb: int = int(options.get("compression/chunk_size_kb", 8192))
 
 	var is_srgb: bool = int(color_options["color_space"]) == COLOR_SPACE_SRGB
 	var as_image_texture: bool = bool(options.get("compatibility/as_image_texture", false))
@@ -502,7 +512,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	# The codec may round dimensions itself; logical dims never exceed storage.
 	var v3_logical_width := mini(logical_width, width)
 	var v3_logical_height := mini(logical_height, height)
-	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level, is_srgb, as_image_texture, v3_logical_width, v3_logical_height)
+	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level, is_srgb, as_image_texture, v3_logical_width, v3_logical_height, 0, chunk_size_kb)
 	if write_err != OK:
 		push_error("[DirectStorage Importer] Failed to write .dstex file to: " + out_file_path)
 		return write_err
