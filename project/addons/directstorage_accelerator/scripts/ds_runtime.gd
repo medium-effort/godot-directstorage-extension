@@ -72,6 +72,13 @@ signal prewarm_finished(tag: int)
 var _tracked_tags: Dictionary = {}
 ## Tags already reported finished (prevents duplicate `prewarm_finished`).
 var _finished_tags: Dictionary = {}
+## True while DSProfiler has a frame-time window open for the current load.
+var _frame_window_open: bool = false
+## Lazily resolved DSProfiler singleton + frame-window capability (probed once,
+## compatible with older builds that lack the methods).
+var _profiler: Object = null
+var _profiler_probed: bool = false
+var _has_frame_window: bool = false
 ## Set once the missing-stream-API warning has been emitted (avoids spamming).
 var _stream_api_missing_warned: bool = false
 ## Background texture-ingestion task (`WorkerThreadPool` task ID, -1 = idle).
@@ -547,7 +554,24 @@ func _process(delta: float) -> void:
 				_drain_reported = true
 				# Counters intentionally NOT reset here; Settings resets them at
 				# benchmark start and reads them in its end-of-load summary.
-	# 4. Emit per-tag progress / finished for tracked tags.
+	# 4. Frame-time impact: sample every frame and bracket the streaming window
+	# with DSProfiler, so the before/during means cover exactly the frames the
+	# load occupies. Byte-throughput metrics cannot answer "did this hitch?".
+	if not _profiler_probed:
+		_profiler_probed = true
+		if ClassDB.class_exists("DSProfiler"):
+			_profiler = Engine.get_singleton("DSProfiler")
+			_has_frame_window = _profiler != null and _profiler.has_method("record_frame") and _profiler.has_method("begin_load_window") and _profiler.has_method("end_load_window")
+	if _has_frame_window:
+		_profiler.record_frame(delta)
+		var streaming_active: bool = not _tracked_tags.is_empty() or ctx.has_stream_pending()
+		if streaming_active and not _frame_window_open:
+			_frame_window_open = true
+			_profiler.begin_load_window()
+		elif not streaming_active and _frame_window_open:
+			_frame_window_open = false
+			_profiler.end_load_window()
+	# 5. Emit per-tag progress / finished for tracked tags.
 	_poll_prewarm_progress(ctx)
 
 

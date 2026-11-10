@@ -96,6 +96,35 @@ DSProfiler::~DSProfiler() {
 	}
 }
 
+void DSProfiler::record_frame(double p_delta_seconds) {
+	if (p_delta_seconds < 0.0) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(profiler_mutex);
+	frame_window.record_frame(p_delta_seconds * 1000000.0);
+}
+
+void DSProfiler::begin_load_window() {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
+	frame_window.begin_window();
+}
+
+void DSProfiler::end_load_window() {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
+	frame_window.end_window();
+}
+
+Dictionary DSProfiler::get_frame_window_stats() const {
+	std::lock_guard<std::mutex> lock(profiler_mutex);
+	Dictionary stats;
+	stats["active"] = frame_window.is_active();
+	stats["mean_frame_before_usec"] = frame_window.mean_before_usec();
+	stats["mean_frame_during_usec"] = frame_window.mean_during_usec();
+	stats["frame_count"] = frame_window.frame_count();
+	stats["completed_windows"] = frame_window.completed_windows();
+	return stats;
+}
+
 void DSProfiler::record_workload(uint64_t p_bytes, uint64_t p_duration_us) {
 	PendingBatchMetrics metrics = pending_batch_metrics;
 	pending_batch_metrics = PendingBatchMetrics();
@@ -366,6 +395,10 @@ void DSProfiler::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_last_throughput_mbps"), &DSProfiler::get_last_throughput_mbps);
 	ClassDB::bind_method(D_METHOD("get_last_bytes"), &DSProfiler::get_last_bytes);
 	ClassDB::bind_method(D_METHOD("get_last_duration_us"), &DSProfiler::get_last_duration_us);
+	ClassDB::bind_method(D_METHOD("record_frame", "delta_seconds"), &DSProfiler::record_frame);
+	ClassDB::bind_method(D_METHOD("begin_load_window"), &DSProfiler::begin_load_window);
+	ClassDB::bind_method(D_METHOD("end_load_window"), &DSProfiler::end_load_window);
+	ClassDB::bind_method(D_METHOD("get_frame_window_stats"), &DSProfiler::get_frame_window_stats);
 	ClassDB::bind_method(D_METHOD("set_queue_depth", "depth"), &DSProfiler::set_queue_depth);
 	ClassDB::bind_method(D_METHOD("get_queue_depth"), &DSProfiler::get_queue_depth);
 	ClassDB::bind_method(D_METHOD("register_performance_monitors"), &DSProfiler::register_performance_monitors);

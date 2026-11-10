@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 GDEX_TEST_T(diagnostics, monitor_registration_holds_no_extension_mutex, TAG_INTEGRATION) {
@@ -75,4 +76,36 @@ GDEX_TEST_T(diagnostics, monitor_registration_holds_no_extension_mutex, TAG_INTE
     (void)ctx;
     GDEX_SKIP("The monitor-registration seam is compiled out of release builds.");
 #endif
+}
+
+// DSRuntime feeds the frame-time window through the registered DSProfiler
+// singleton, so the bound surface and the aggregation are one contract: a
+// missing binding silently disables the only metric that can report a hitch.
+GDEX_TEST_T(diagnostics, frame_window_bindings_and_aggregation, TAG_INTEGRATION) {
+    godot::DSProfiler *profiler = godot::DSProfiler::get_singleton();
+    if (profiler == nullptr) {
+        GDEX_SKIP("DSProfiler singleton absent: real extension not loaded in this fixture.");
+    }
+    GDEX_EXPECT_TRUE(profiler->has_method("record_frame"));
+    GDEX_EXPECT_TRUE(profiler->has_method("begin_load_window"));
+    GDEX_EXPECT_TRUE(profiler->has_method("end_load_window"));
+    GDEX_EXPECT_TRUE(profiler->has_method("get_frame_window_stats"));
+
+    // 60 idle frames define the baseline exactly: the ring keeps only the most
+    // recent 60, so frames recorded by earlier suites cannot influence it.
+    for (int i = 0; i < 60; i++) {
+        profiler->call("record_frame", 0.010);
+    }
+    profiler->call("begin_load_window");
+    for (int i = 0; i < 8; i++) {
+        profiler->call("record_frame", 0.033);
+    }
+    profiler->call("end_load_window");
+
+    const godot::Dictionary stats = profiler->call("get_frame_window_stats");
+    GDEX_EXPECT_FALSE(static_cast<bool>(stats["active"]));
+    GDEX_EXPECT_TRUE(std::fabs(static_cast<double>(stats["mean_frame_before_usec"]) - 10000.0) < 1e-6);
+    GDEX_EXPECT_TRUE(std::fabs(static_cast<double>(stats["mean_frame_during_usec"]) - 33000.0) < 1e-6);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(stats["frame_count"]), static_cast<int64_t>(8));
+    GDEX_EXPECT_TRUE(static_cast<int64_t>(stats["completed_windows"]) >= static_cast<int64_t>(1));
 }

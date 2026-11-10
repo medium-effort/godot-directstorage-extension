@@ -9,6 +9,24 @@
 	<tutorials>
 	</tutorials>
 	<methods>
+		<method name="begin_load_window">
+			<return type="void" />
+			<description>
+				Opens a frame-time window for the current streaming load. Pair it with [method end_load_window]; a second call while a window is already open is ignored so the frames already counted are kept.
+			</description>
+		</method>
+		<method name="end_load_window">
+			<return type="void" />
+			<description>
+				Closes the frame-time window opened by [method begin_load_window] and stores the mean frame time before and during the load plus the frame count. A call without an open window is ignored.
+			</description>
+		</method>
+		<method name="get_frame_window_stats" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns frame-time impact metrics for the current or last streaming window: [code]active[/code], [code]mean_frame_before_usec[/code] (mean of the last 60 idle frames), [code]mean_frame_during_usec[/code], [code]frame_count[/code], and [code]completed_windows[/code]. These show whether streaming caused a hitch, which the byte-throughput metrics cannot answer.
+			</description>
+		</method>
 		<method name="get_last_bytes" qualifiers="const">
 			<return type="int" />
 			<description>
@@ -43,6 +61,13 @@
 			<return type="Array" />
 			<description>
 				Returns an [Array] containing previously recorded [DSProfilerResult] instances representing profiling history.
+			</description>
+		</method>
+		<method name="record_frame">
+			<return type="void" />
+			<param index="0" name="delta_seconds" type="float" />
+			<description>
+				Samples one frame's duration in seconds. DSRuntime calls this once per frame; it is also safe to call from a custom game loop.
 			</description>
 		</method>
 		<method name="record_result">
