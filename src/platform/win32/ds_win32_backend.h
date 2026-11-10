@@ -494,6 +494,12 @@ public:
 	// second load cycle must raise it again; a process-wide latch did not. Never
 	// bound in _bind_methods().
 	static int _debug_dstorage_config_apply_count();
+	// Test-only seam: the byte count last handed to
+	// IDStorageFactory::SetStagingBufferSize (0 before the first successful
+	// init). The factory exposes no getter, so this is the only way to prove the
+	// effective setting actually reached the runtime. Never bound in
+	// _bind_methods().
+	static int64_t _debug_last_applied_staging_bytes();
 	// Test-only seam: path and search flags of the most recent runtime-DLL load
 	// attempt, failed attempts included, so the hardened search policy can be
 	// pinned without a second copy of the runtime loaded into the process.

@@ -53,7 +53,7 @@ private:
 	// context (main, resource-loader worker, or the enqueue path), while the
 	// setters are callable from any thread. Plain scalars here were a data race;
 	// every access below goes through an explicit .load()/.store().
-	std::atomic<uint32_t> staging_buffer_size_mb{ 128 };
+	std::atomic<uint32_t> staging_buffer_size_mb{ 32 };
 	std::atomic<bool> disable_gpu_decompression{ false };
 	// Independent of the switch above: keeps GPU decompression enabled while
 	// forcing the reference implementation instead of the driver's optimized
@@ -155,7 +155,7 @@ protected:
 	static void _bind_methods();
 
 public:
-	static constexpr uint32_t DEFAULT_STAGING_BUFFER_SIZE_MB = 128;
+	static constexpr uint32_t DEFAULT_STAGING_BUFFER_SIZE_MB = 32;
 	static constexpr uint32_t MIN_STAGING_BUFFER_SIZE_MB = 1;
 	static constexpr uint32_t MAX_STAGING_BUFFER_SIZE_MB = 2048;
 	// Staging buffer and queue capacity defaults: these stay fixed, user-overridable

@@ -524,7 +524,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	# exact floor for this file, so the warning can name the value to configure
 	# instead of the old whole-chain estimate (which over-warned on every
 	# multi-mip texture that the runtime splits anyway).
-	var configured_staging_mb: float = float(ProjectSettings.get_setting("dsgd_extension/staging_buffer_size_mb", 128.0))
+	var configured_staging_mb: float = float(ProjectSettings.get_setting("dsgd_extension/staging_buffer_size_mb", 32.0))
 	var staging_mb: float = configured_staging_mb if configured_staging_mb > 0.0 else 128.0
 	var header: Dictionary = dstex.read_header(out_file_path)
 	if not header.is_empty():

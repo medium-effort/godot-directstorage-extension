@@ -336,8 +336,8 @@
 		<member name="queue_capacity" type="int" setter="set_queue_capacity" getter="get_queue_capacity" default="512">
 			The maximum request capacity for the DirectStorage queue. The default is [code]512[/code].
 		</member>
-		<member name="staging_buffer_size_mb" type="int" setter="set_staging_buffer_size_mb" getter="get_staging_buffer_size_mb" default="128">
-			The size in megabytes of each staging buffer allocated by DirectStorage.
+		<member name="staging_buffer_size_mb" type="int" setter="set_staging_buffer_size_mb" getter="get_staging_buffer_size_mb" default="32">
+			The size in megabytes of each staging buffer allocated by DirectStorage. Chunked textures bound a request at one chunk (8 MiB by default), so the default covers that; raise it only for legacy un-chunked assets whose largest mip exceeds the buffer. The value is locked once the runtime is initialized, and the memory-class auto-tune settings can lower the effective size.
 		</member>
 	</members>
 	<signals>

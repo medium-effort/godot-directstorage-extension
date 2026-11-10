@@ -77,6 +77,10 @@ struct DSRuntimeProbe {
 static std::mutex s_dstorage_config_mutex;
 static HMODULE s_dstorage_configured_module = nullptr;
 static std::atomic<int> s_dstorage_config_apply_count{ 0 };
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+// Test-only: last byte count handed to SetStagingBufferSize (no factory getter).
+static std::atomic<int64_t> s_last_applied_staging_bytes{ 0 };
+#endif
 // Desired I/O mode for the one-shot DStorageSetConfiguration call. Set from
 // the asset volume's media class immediately before the runtime is configured,
 // so a rotational volume can request ForceFileBuffering while flash keeps the
@@ -3429,6 +3433,9 @@ bool Win32Backend::initialize(const String &p_path) {
 			staging_bytes = UINT32_MAX;
 		}
 		factory->SetStagingBufferSize(static_cast<UINT32>(staging_bytes));
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		s_last_applied_staging_bytes.store(static_cast<int64_t>(staging_bytes));
+#endif
 
 		DSTORAGE_QUEUE_DESC queueDesc = {};
 		queueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
@@ -5499,6 +5506,14 @@ bool Win32Backend::_debug_queue_error_read_can_enter_for_testing() {
 int Win32Backend::_debug_dstorage_config_apply_count() {
 #ifdef _WIN32
 	return s_dstorage_config_apply_count.load();
+#else
+	return 0;
+#endif
+}
+
+int64_t Win32Backend::_debug_last_applied_staging_bytes() {
+#ifdef _WIN32
+	return s_last_applied_staging_bytes.load();
 #else
 	return 0;
 #endif

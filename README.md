@@ -74,7 +74,7 @@ The extension provides configurable project settings in Godot under the `dsgd_ex
 
 | Setting | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
-| `dsgd_extension/staging_buffer_size_mb` | `int` | `128` | Staging buffer size in megabytes allocated by DirectStorage for unbuffered DMA transfers (editor range: `16`–`2048` MiB). Increase this if loading very large textures or high-resolution mip streams whose compressed payloads exceed the buffer. |
+| `dsgd_extension/staging_buffer_size_mb` | `int` | `32` | Staging buffer size in megabytes allocated by DirectStorage for unbuffered DMA transfers (editor range: `16`-`2048` MiB). Chunked textures bound a request at one chunk (8 MiB by default), so the default is sized for that; raise it only for legacy un-chunked assets whose mip exceeds the buffer. |
 | `dsgd_extension/disable_gpu_decompression` | `bool` | `false` | When `true`, disables D3D12 GPU compute decompression and forces fallback to multi-threaded CPU software decompression. Useful for debugging, compatibility testing, or profiling. |
 | `dsgd_extension/disable_gpu_decompression_metacommand` | `bool` | `false` | When `true`, keeps GPU decompression enabled but forces the reference implementation instead of the driver's optimized metacommand. Independent of `disable_gpu_decompression`, so the two GPU paths can be compared on the same machine; use it when the optimized path misbehaves or measures slower. Applies to the next DirectStorage initialization. |
 | `dsgd_extension/queue_capacity` | `int` | `512` | Maximum request capacity allocated for the hardware DirectStorage queue (editor range: `128`–`8192`). Dictates the upper bound of simultaneous in-flight storage requests. |
