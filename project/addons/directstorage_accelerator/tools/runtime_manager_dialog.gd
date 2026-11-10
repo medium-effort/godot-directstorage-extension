@@ -24,9 +24,13 @@ const LICENSE_DIALOG_SCENE_PATH: String = "res://addons/directstorage_accelerato
 ## installer still accepts any version its package table knows about.
 const BASELINE_MAJOR: int = 1
 const BASELINE_MINOR: int = 3
-const ALLOW_ABOVE_BASELINE_ENV: String = "DSGD_ALLOW_DOWNLOAD_RUNTIME_ABOVE_1_POINT_3"
+## Persisted opt-in for preview runtimes. The dialog checkbox is the only
+## writer; the value lives in project.godot, so the choice survives a restart
+## and is shared with the rest of the team.
+const SHOW_PREVIEW_SETTING: String = "dsgd_extension/show_preview_runtimes"
 
 @onready var _version_option: OptionButton = %VersionOption
+@onready var _show_preview_check: CheckBox = %ShowPreviewCheck
 @onready var _active_label: Label = %ActiveLabel
 @onready var _status_label: Label = %StatusLabel
 @onready var _install_button: Button = %InstallButton
@@ -36,9 +40,6 @@ const ALLOW_ABOVE_BASELINE_ENV: String = "DSGD_ALLOW_DOWNLOAD_RUNTIME_ABOVE_1_PO
 
 var _installer: Node = null
 var _license_dialog: Window = null
-## Package entries filtered out of the dropdown because they are newer than the
-## baseline and the developer has not opted in. Drives the status hint.
-var _gated_hidden: int = 0
 
 
 func _ready() -> void:
@@ -46,11 +47,20 @@ func _ready() -> void:
 	add_child(_installer)
 	_installer.install_finished.connect(_on_install_finished)
 	_installer.license_required.connect(_on_license_required)
+	# Authored text is a design-time default; the baseline lives in the constants
+	# above, so the label is rebuilt here to keep the two from drifting apart.
+	_show_preview_check.text = "Show preview runtimes (newer than %d.%d)" % [BASELINE_MAJOR, BASELINE_MINOR]
+	_show_preview_check.button_pressed = _show_preview_versions()
+	_show_preview_check.toggled.connect(_on_show_preview_toggled)
 	_version_option.item_selected.connect(_on_version_selected)
 	_install_button.pressed.connect(_on_install_pressed)
 	_restart_button.pressed.connect(_on_restart_pressed)
 	if is_instance_valid(_d3d12_button):
 		_d3d12_button.pressed.connect(_on_d3d12_pressed)
+	# A Window does not close itself when the title-bar X is pressed: the engine
+	# only emits close_requested, so without this the X would do nothing while
+	# the bottom button works.
+	close_requested.connect(hide)
 	_close_button.pressed.connect(hide)
 	_populate_versions()
 	_refresh()
@@ -61,6 +71,11 @@ func open() -> void:
 	# immediate open() would refresh before @onready bindings exist.
 	if not is_node_ready():
 		await ready
+	# The setting is project data: it may have been edited in Project Settings
+	# while this instance was closed, so re-read it instead of trusting the
+	# checkbox state.
+	_show_preview_check.set_pressed_no_signal(_show_preview_versions())
+	_populate_versions()
 	_refresh()
 	popup_centered()
 
@@ -68,22 +83,30 @@ func open() -> void:
 ## Rebuilds the version list from the installer's package table. The scene's
 ## authored items are only the design-time default; the real list is conditional
 ## (entries newer than the baseline are opt-in), so it is regenerated here.
+## The current selection is restored when it is still listed, so toggling the
+## preview opt-in does not move the user to a different version.
 func _populate_versions() -> void:
+	var previous := _selected_version()
 	_version_option.clear()
-	_gated_hidden = 0
-	var allow_above := _allow_above_baseline()
+	# Cleared here, not only when the list turns out empty: a repopulate after
+	# the "No runtime available" state must not inherit its disabled flag.
+	_version_option.disabled = false
+	var show_preview := _show_preview_versions()
+	var pinned := _pinned_versions(INSTALLER_SCRIPT.get_state())
 	var versions: Dictionary = INSTALLER_SCRIPT.get_versions()
 	var keys: Array = versions.keys()
 	keys.sort_custom(func(a, b): return _version_sort_key(String(a)) < _version_sort_key(String(b)))
 	for key in keys:
 		var version := String(key)
-		if _is_above_baseline(version) and not allow_above:
-			_gated_hidden += 1
+		if not _should_show_version(version, show_preview, pinned):
 			continue
 		var meta: Dictionary = versions[key]
 		var label := version + (" (preview)" if bool(meta.get("preview", false)) else " (stable)")
 		_version_option.add_item(label)
-		_version_option.set_item_metadata(_version_option.item_count - 1, version)
+		var index := _version_option.item_count - 1
+		_version_option.set_item_metadata(index, version)
+		if version == previous:
+			_version_option.select(index)
 	if _version_option.item_count == 0:
 		# Only reachable when the manifest is empty and the fallback was stripped.
 		_version_option.add_item("No runtime available")
@@ -91,9 +114,32 @@ func _populate_versions() -> void:
 		_version_option.disabled = true
 
 
-static func _allow_above_baseline() -> bool:
-	var raw := OS.get_environment(ALLOW_ABOVE_BASELINE_ENV).strip_edges().to_lower()
-	return raw in ["1", "true", "yes", "on"]
+static func _show_preview_versions() -> bool:
+	return bool(ProjectSettings.get_setting(SHOW_PREVIEW_SETTING, false))
+
+
+## Versions the project already has on disk or in use: active, staged (pending)
+## and downloaded. They stay listed even when previews are hidden, so turning
+## the opt-in off can never make an installed runtime unselectable.
+static func _pinned_versions(state: Dictionary) -> PackedStringArray:
+	var pinned := PackedStringArray()
+	for key in ["active", "pending"]:
+		var value := String(state.get(key, ""))
+		if not value.is_empty() and not pinned.has(value):
+			pinned.append(value)
+	var cached: PackedStringArray = state.get("cached", PackedStringArray())
+	for value in cached:
+		if not pinned.has(value):
+			pinned.append(value)
+	return pinned
+
+
+## A package is listed when it is at or below the baseline, when the developer
+## opted in, or when the project already has it (see _pinned_versions).
+static func _should_show_version(version: String, show_preview: bool, pinned: PackedStringArray) -> bool:
+	if show_preview or not _is_above_baseline(version):
+		return true
+	return pinned.has(version)
 
 
 ## Parses the numeric release prefix of a package key. Pre-release/build suffixes
@@ -144,9 +190,6 @@ func _refresh() -> void:
 
 	_update_actions(state)
 
-	if _gated_hidden > 0:
-		_status_label.text += "\n%d runtime version(s) newer than %d.%d are hidden. Set %s=1 and restart the editor to show them." % [_gated_hidden, BASELINE_MAJOR, BASELINE_MINOR, ALLOW_ABOVE_BASELINE_ENV]
-
 
 func _update_actions(state: Dictionary) -> void:
 	var version := _selected_version()
@@ -188,6 +231,23 @@ func _selected_version() -> String:
 
 func _on_version_selected(_index: int) -> void:
 	_update_actions(INSTALLER_SCRIPT.get_state())
+
+
+## Persists the preview opt-in and rebuilds the list. A failed save is rolled
+## back on both the setting and the control: leaving the checkbox ticked would
+## promise a state that disappears on the next start.
+func _on_show_preview_toggled(pressed: bool) -> void:
+	ProjectSettings.set_setting(SHOW_PREVIEW_SETTING, pressed)
+	var error := ProjectSettings.save()
+	if error != OK:
+		ProjectSettings.set_setting(SHOW_PREVIEW_SETTING, not pressed)
+		_show_preview_check.set_pressed_no_signal(not pressed)
+		_populate_versions()
+		_refresh()
+		_status_label.text = "Could not save the preview-runtime setting: %s" % error_string(error)
+		return
+	_populate_versions()
+	_refresh()
 
 
 func _on_install_pressed() -> void:
