@@ -29,6 +29,24 @@ bool align_up(uint64_t p_value, uint64_t p_alignment, uint64_t &r_result) {
 	return true;
 }
 
+// True for the 4x4 block formats: a chunk boundary must fall on a block row so
+// the runtime can express it as a legal TEXTURE_REGION box.
+bool dstex_is_block_format(int p_format) {
+	switch (p_format) {
+		case Image::FORMAT_DXT1:
+		case Image::FORMAT_DXT3:
+		case Image::FORMAT_DXT5:
+		case Image::FORMAT_RGTC_R:
+		case Image::FORMAT_RGTC_RG:
+		case Image::FORMAT_BPTC_RGBA:
+		case Image::FORMAT_BPTC_RGBF:
+		case Image::FORMAT_BPTC_RGBFU:
+			return true;
+		default:
+			return false;
+	}
+}
+
 } // namespace
 
 DSTexMipLayout DSTex::get_mip_layout(uint32_t p_width, uint32_t p_height, int p_format) {
@@ -917,7 +935,7 @@ void DSTex::remap_channels(const Ref<Image> &p_image, int p_red, int p_green, in
 }
 
 void DSTex::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level", "is_srgb", "as_image_texture", "logical_width", "logical_height", "depth_or_layers"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1), DEFVAL(false), DEFVAL(false), DEFVAL(0), DEFVAL(0), DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("write_to_file", "path", "raw_data", "width", "height", "format", "mip_count", "compression_level", "is_srgb", "as_image_texture", "logical_width", "logical_height", "depth_or_layers", "chunk_size_kb"), &DSTex::write_to_file, DEFVAL(1), DEFVAL(1), DEFVAL(false), DEFVAL(false), DEFVAL(0), DEFVAL(0), DEFVAL(0), DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("read_header", "path"), &DSTex::read_header);
 	ClassDB::bind_method(D_METHOD("read_from_file", "path"), &DSTex::read_from_file);
 	ClassDB::bind_method(D_METHOD("get_file_info", "path"), &DSTex::get_file_info);
@@ -1244,7 +1262,7 @@ bool DSTex::gacl_transform_matches_pixel_format(DSGaclTransform p_transform, int
 	}
 }
 
-Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level, bool p_is_srgb, bool p_as_image_texture, int p_logical_width, int p_logical_height, int p_depth_or_layers) {
+Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_data, int p_width, int p_height, int p_format, int p_mip_count, int p_compression_level, bool p_is_srgb, bool p_as_image_texture, int p_logical_width, int p_logical_height, int p_depth_or_layers, int p_chunk_size_kb) {
 	if (p_raw_data.size() == 0 || p_width <= 0 || p_height <= 0 || p_mip_count <= 0 || p_mip_count > static_cast<int>(DSTEX_MAX_MIP_COUNT)) {
 		return ERR_INVALID_PARAMETER;
 	}
@@ -1309,40 +1327,107 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 
 	Ref<GDeflateCompressor> compressor;
 	compressor.instantiate();
-	std::vector<PackedByteArray> compressed_mips;
-	compressed_mips.reserve(mip_count);
+	// Per-mip chunk payloads. chunk_size_kb == 0 keeps the historic one-stream
+	// per mip layout; a non-zero target splits a mip into row-aligned chunks so
+	// no single request has to stage the whole mip. Each chunk is an independent
+	// GDeflate stream, which is what lets the runtime upload a row range.
+	const uint64_t chunk_target_bytes = p_chunk_size_kb > 0
+			? static_cast<uint64_t>(p_chunk_size_kb) * 1024ULL
+			: 0;
+	const bool block_format = dstex_is_block_format(p_format);
+	std::vector<std::vector<PackedByteArray>> chunk_payloads;
+	std::vector<std::vector<uint32_t>> chunk_uncompressed_sizes;
+	chunk_payloads.reserve(mip_count);
+	chunk_uncompressed_sizes.reserve(mip_count);
+	bool any_chunked = false;
 	uint64_t source_offset = 0;
 	uint64_t total_compressed_size = 0;
-	for (const DSTexMipLayout &layout : layouts) {
+	for (int mip = 0; mip < mip_count; ++mip) {
+		const DSTexMipLayout &layout = layouts[mip];
 		const uint64_t source_mip_size = input_is_footprint_aligned ? layout.footprint_size : layout.source_size;
 		if (source_mip_size > input_size || source_offset > input_size - source_mip_size) {
 			return ERR_INVALID_DATA;
 		}
 
-		PackedByteArray compressed_mip = compressor->compress(build_footprint(layout, source_offset), p_compression_level);
-		if (compressed_mip.size() == 0 || compressed_mip.size() > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-				total_compressed_size > std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(compressed_mip.size())) {
-			UtilityFunctions::push_error("DSTex: Failed to compress texture mip.");
-			return ERR_INVALID_DATA;
+		PackedByteArray footprint = build_footprint(layout, source_offset);
+
+		uint64_t rows_per_chunk = layout.row_count;
+		if (chunk_target_bytes > 0 && layout.row_pitch > 0) {
+			rows_per_chunk = std::max<uint64_t>(1, chunk_target_bytes / layout.row_pitch);
+			if (block_format) {
+				// A later TEXTURE_REGION box must land on 4x4 block rows, so a
+				// chunk boundary is a multiple of 4 rows. The final chunk of a
+				// mip may be shorter.
+				rows_per_chunk -= rows_per_chunk % 4ULL;
+				if (rows_per_chunk == 0) {
+					rows_per_chunk = 4;
+				}
+			}
+			if (rows_per_chunk >= layout.row_count) {
+				rows_per_chunk = layout.row_count;
+			}
 		}
-		compressed_mips.push_back(compressed_mip);
-		total_compressed_size += static_cast<uint64_t>(compressed_mip.size());
+
+		std::vector<PackedByteArray> chunks;
+		std::vector<uint32_t> chunk_sizes;
+		const uint64_t chunk_count = rows_per_chunk >= layout.row_count
+				? 1
+				: (layout.row_count + rows_per_chunk - 1) / rows_per_chunk;
+		chunks.reserve(static_cast<size_t>(chunk_count));
+		chunk_sizes.reserve(static_cast<size_t>(chunk_count));
+		if (chunk_count == 1) {
+			PackedByteArray compressed_mip = compressor->compress(footprint, p_compression_level);
+			if (compressed_mip.size() == 0 || compressed_mip.size() > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+					total_compressed_size > std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(compressed_mip.size())) {
+				UtilityFunctions::push_error("DSTex: Failed to compress texture mip.");
+				return ERR_INVALID_DATA;
+			}
+			chunks.push_back(compressed_mip);
+			chunk_sizes.push_back(static_cast<uint32_t>(layout.footprint_size));
+			total_compressed_size += static_cast<uint64_t>(compressed_mip.size());
+		} else {
+			any_chunked = true;
+			for (uint64_t row = 0; row < layout.row_count; row += rows_per_chunk) {
+				const uint64_t rows = std::min(rows_per_chunk, layout.row_count - row);
+				const uint64_t chunk_bytes = rows * layout.row_pitch;
+				PackedByteArray slice;
+				slice.resize(static_cast<int64_t>(chunk_bytes));
+				memcpy(slice.ptrw(), footprint.ptr() + row * layout.row_pitch, static_cast<size_t>(chunk_bytes));
+				PackedByteArray compressed_chunk = compressor->compress(slice, p_compression_level);
+				if (compressed_chunk.size() == 0 || compressed_chunk.size() > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+						total_compressed_size > std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(compressed_chunk.size()) ||
+						chunk_bytes > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+					UtilityFunctions::push_error("DSTex: Failed to compress texture chunk.");
+					return ERR_INVALID_DATA;
+				}
+				chunks.push_back(compressed_chunk);
+				chunk_sizes.push_back(static_cast<uint32_t>(chunk_bytes));
+				total_compressed_size += static_cast<uint64_t>(compressed_chunk.size());
+			}
+		}
+		chunk_payloads.push_back(std::move(chunks));
+		chunk_uncompressed_sizes.push_back(std::move(chunk_sizes));
 		source_offset += source_mip_size;
 	}
 
 	// Compression is not a benefit when the codec expands the payload: shipping
 	// the GDeflate stream would cost more disk bytes AND still require a
-	// decompression at load. Store the footprint bytes verbatim instead. NONE
-	// has no representation in the v2 layout (v2 carries no codec field), so
-	// this decision forces the v3 header below.
+	// decompression at load. Store the footprint bytes verbatim instead. NONE has
+	// no representation in the v2 layout (v2 carries no codec field), so this
+	// decision forces the v3 header below. A raw payload is one stream per mip,
+	// so any chunk table built above is dropped.
 	const bool store_uncompressed = total_compressed_size >= footprint_size;
 	if (store_uncompressed) {
-		compressed_mips.clear();
-		compressed_mips.reserve(mip_count);
+		chunk_payloads.clear();
+		chunk_payloads.reserve(mip_count);
+		chunk_uncompressed_sizes.clear();
+		chunk_uncompressed_sizes.reserve(mip_count);
+		any_chunked = false;
 		uint64_t raw_offset = 0;
 		for (const DSTexMipLayout &layout : layouts) {
 			const uint64_t source_mip_size = input_is_footprint_aligned ? layout.footprint_size : layout.source_size;
-			compressed_mips.push_back(build_footprint(layout, raw_offset));
+			chunk_payloads.push_back({ build_footprint(layout, raw_offset) });
+			chunk_uncompressed_sizes.push_back({ static_cast<uint32_t>(layout.footprint_size) });
 			raw_offset += source_mip_size;
 		}
 		total_compressed_size = footprint_size;
@@ -1362,9 +1447,6 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	header.mip_count = static_cast<uint32_t>(mip_count);
 	header.original_size = footprint_size;
 	header.compressed_size = total_compressed_size;
-	// v3 capability word: inline GDeflate, or NONE when the fallback above
-	// decided the raw footprints are the smaller payload. Never GACL.
-	header.reserved = static_cast<uint64_t>(store_uncompressed ? DSCompressionFormat::NONE : DSCompressionFormat::GDEFLATE);
 
 	// NPOT logical size (Phase 3 item 2): 0 means "same as storage". A
 	// logical size that differs from storage upgrades the file to v3 rev1;
@@ -1393,15 +1475,19 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		v3_ext.reserved0 = 0;
 		needs_v3 = true;
 	}
-	// An uncompressed payload must be v3: v2 has no codec field, so a NONE
-	// decision written as v2 would read back as GDeflate.
 	if (store_uncompressed) {
+		// An uncompressed payload must be v3: v2 has no codec field, so a NONE
+		// decision written as v2 would read back as GDeflate.
 		needs_v3 = true;
 	}
+	// A chunk table is a v3 construct, so chunking forces the v3 layout too.
+	needs_v3 = needs_v3 || any_chunked;
 	header.version = needs_v3 ? 3 : 2;
-	if (!needs_v3) {
-		header.reserved = 0;
-	}
+	header.reserved = needs_v3
+			? (store_uncompressed
+					  ? static_cast<uint64_t>(DSCompressionFormat::NONE)
+					  : (static_cast<uint64_t>(DSCompressionFormat::GDEFLATE) | (any_chunked ? DSTEX_CAP_CHUNKED : 0)))
+			: 0;
 
 	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::WRITE);
 	if (file.is_null() || !file->is_open()) {
@@ -1473,54 +1559,108 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	}
 
 	uint64_t header_size = needs_v3 ? sizeof(DSTexHeaderV3) : sizeof(DSTexHeader);
-	uint64_t data_offset = header_size + (sizeof(DSTexMipEntryV2) * static_cast<uint64_t>(mip_count));
+	uint64_t chunk_table_bytes = 0;
+	for (const std::vector<PackedByteArray> &chunks : chunk_payloads) {
+		if (chunks.size() > 1) {
+			const uint64_t entries_bytes = static_cast<uint64_t>(chunks.size()) * sizeof(DSChunkEntry);
+			if (chunk_table_bytes > std::numeric_limits<uint64_t>::max() - entries_bytes) {
+				remove_partial();
+				return ERR_INVALID_DATA;
+			}
+			chunk_table_bytes += entries_bytes;
+		}
+	}
+	uint64_t data_offset = header_size + (sizeof(DSTexMipEntryV2) * static_cast<uint64_t>(mip_count)) + chunk_table_bytes;
 	if (!align_up(data_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, data_offset)) {
 		remove_partial();
 		return ERR_INVALID_DATA;
 	}
 	std::vector<DSTexMipEntryV2> mip_entries;
+	std::vector<std::vector<DSChunkEntry>> chunk_entries;
 	mip_entries.reserve(mip_count);
+	chunk_entries.reserve(mip_count);
 	uint64_t running_offset = data_offset;
 	for (int i = 0; i < mip_count; ++i) {
-		DSTexMipEntryV2 mip_entry{};
-		mip_entry.offset = running_offset;
-		mip_entry.compressed_size = static_cast<uint32_t>(compressed_mips[i].size());
-		mip_entry.uncompressed_size = static_cast<uint32_t>(layouts[i].footprint_size);
-		mip_entry.row_pitch = static_cast<uint32_t>(layouts[i].row_pitch);
-		// v3 reuses the reserved word as chunk_count: 1 = inline payload.
-		mip_entry.chunk_count = needs_v3 ? 1 : 0;
-		mip_entries.push_back(mip_entry);
-		if (running_offset > std::numeric_limits<uint64_t>::max() - compressed_mips[i].size() ||
-				!align_up(running_offset + compressed_mips[i].size(), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_offset)) {
+		// Parser contract: a mip starts 512-aligned, its first chunk starts at
+		// the mip offset, and every later chunk is 8-aligned.
+		if (!align_up(running_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_offset)) {
 			remove_partial();
 			return ERR_INVALID_DATA;
 		}
+		DSTexMipEntryV2 mip_entry{};
+		mip_entry.offset = running_offset;
+		mip_entry.uncompressed_size = static_cast<uint32_t>(layouts[i].footprint_size);
+		mip_entry.row_pitch = static_cast<uint32_t>(layouts[i].row_pitch);
+		// v3 reuses the reserved word as chunk_count: 1 = inline payload.
+		mip_entry.chunk_count = needs_v3 ? static_cast<uint32_t>(chunk_payloads[i].size()) : 0;
+		uint64_t mip_compressed_total = 0;
+		std::vector<DSChunkEntry> entries;
+		entries.reserve(chunk_payloads[i].size());
+		for (size_t chunk_index = 0; chunk_index < chunk_payloads[i].size(); ++chunk_index) {
+			if (chunk_index > 0 && !align_up(running_offset, 8, running_offset)) {
+				remove_partial();
+				return ERR_INVALID_DATA;
+			}
+			DSChunkEntry entry{};
+			entry.offset = running_offset;
+			entry.compressed_size = static_cast<uint32_t>(chunk_payloads[i][chunk_index].size());
+			entry.uncompressed_size = chunk_uncompressed_sizes[i][chunk_index];
+			entries.push_back(entry);
+			mip_compressed_total += entry.compressed_size;
+			if (running_offset > std::numeric_limits<uint64_t>::max() - entry.compressed_size) {
+				remove_partial();
+				return ERR_INVALID_DATA;
+			}
+			running_offset += entry.compressed_size;
+		}
+		if (mip_compressed_total > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+			remove_partial();
+			return ERR_INVALID_DATA;
+		}
+		mip_entry.compressed_size = static_cast<uint32_t>(mip_compressed_total);
+		mip_entries.push_back(mip_entry);
+		chunk_entries.push_back(std::move(entries));
 	}
 	for (const DSTexMipEntryV2 &mip_entry : mip_entries) {
 		if (!write_bytes(reinterpret_cast<const uint8_t *>(&mip_entry), sizeof(DSTexMipEntryV2))) {
 			return fail_write("mip table");
 		}
 	}
-	for (int i = 0; i < mip_count; ++i) {
-		// seek() returns void in godot-cpp, so verify the position instead. A
-		// silently failed seek would write at the wrong offset, and the final
-		// size check alone could still pass if the last payload lands correctly.
-		file->seek(mip_entries[i].offset);
-		if (file->get_position() != mip_entries[i].offset) {
-			return fail_write("payload offset");
+	for (const std::vector<DSChunkEntry> &entries : chunk_entries) {
+		if (entries.size() <= 1) {
+			continue;
 		}
-		if (!write_bytes(compressed_mips[i].ptr(), static_cast<uint64_t>(compressed_mips[i].size()))) {
-			return fail_write("payload");
+		for (const DSChunkEntry &entry : entries) {
+			if (!write_bytes(reinterpret_cast<const uint8_t *>(&entry), sizeof(DSChunkEntry))) {
+				return fail_write("chunk table");
+			}
+		}
+	}
+	for (size_t i = 0; i < chunk_payloads.size(); ++i) {
+		for (size_t chunk_index = 0; chunk_index < chunk_payloads[i].size(); ++chunk_index) {
+			// seek() returns void in godot-cpp, so verify the position instead. A
+			// silently failed seek would write at the wrong offset, and the final
+			// size check alone could still pass if the last payload lands correctly.
+			file->seek(chunk_entries[i][chunk_index].offset);
+			if (file->get_position() != chunk_entries[i][chunk_index].offset) {
+				return fail_write("payload offset");
+			}
+			if (!write_bytes(chunk_payloads[i][chunk_index].ptr(),
+						static_cast<uint64_t>(chunk_payloads[i][chunk_index].size()))) {
+				return fail_write("payload");
+			}
 		}
 	}
 
 	// A short write that store_buffer() did not report would still ship a file
 	// whose header and mip table parse fine. Verify the exact expected size.
 	uint64_t expected_end = 0;
-	for (const DSTexMipEntryV2 &mip_entry : mip_entries) {
-		const uint64_t mip_end = mip_entry.offset + mip_entry.compressed_size;
-		if (mip_end > expected_end) {
-			expected_end = mip_end;
+	for (const std::vector<DSChunkEntry> &entries : chunk_entries) {
+		for (const DSChunkEntry &entry : entries) {
+			const uint64_t chunk_end = entry.offset + entry.compressed_size;
+			if (chunk_end > expected_end) {
+				expected_end = chunk_end;
+			}
 		}
 	}
 	file->seek_end();
