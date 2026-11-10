@@ -207,6 +207,13 @@ struct DSPkgStagedEntry {
 	PackedInt32Array mip_sizes;           // TOC compressed mip sizes
 	PackedInt32Array mip_uncompressed_sizes;
 	PackedInt32Array mip_row_pitches;
+	// Chunked v3 sources: per-mip chunk counts plus the flat chunk table, all
+	// offsets absolute inside the .dstex (rebased into the archive on write).
+	bool chunked = false;
+	PackedInt32Array mip_chunk_counts;
+	PackedInt64Array source_chunk_offsets;
+	PackedInt32Array source_chunk_compressed_sizes;
+	PackedInt32Array source_chunk_uncompressed_sizes;
 };
 
 class DSPkg : public Resource {

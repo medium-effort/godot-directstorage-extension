@@ -473,6 +473,22 @@ bool staged_source_is_unchanged(const DSPkgStagedEntry &p_entry, const Dictionar
 		r_reason = "mip offset table changed";
 		return false;
 	}
+	if (p_entry.chunked) {
+		const PackedInt32Array chunk_counts = p_header.get("mip_chunk_counts", PackedInt32Array());
+		const PackedInt64Array chunk_offsets = p_header.get("chunk_offsets", PackedInt64Array());
+		const PackedInt32Array chunk_compressed = p_header.get("chunk_compressed_sizes", PackedInt32Array());
+		const PackedInt32Array chunk_uncompressed = p_header.get("chunk_uncompressed_sizes", PackedInt32Array());
+		if (!(chunk_counts == p_entry.mip_chunk_counts) ||
+				!(chunk_offsets == p_entry.source_chunk_offsets) ||
+				!(chunk_compressed == p_entry.source_chunk_compressed_sizes) ||
+				!(chunk_uncompressed == p_entry.source_chunk_uncompressed_sizes)) {
+			r_reason = "chunk table changed";
+			return false;
+		}
+	} else if (p_header.get("chunked", false)) {
+		r_reason = "source became chunked";
+		return false;
+	}
 	uint32_t logical_width = p_header.get("logical_width", 0);
 	uint32_t logical_height = p_header.get("logical_height", 0);
 	if (logical_width != p_entry.logical_width || logical_height != p_entry.logical_height) {
@@ -753,27 +769,61 @@ Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_pa
 		source_metadata["version"] = dstex_version;
 	}
 
-	// v4 archives store inline GDeflate mip payloads only. A v3 source with a
-	// NONE payload is staged as-is and forces the archive to v5 (the only
-	// layout that carries a per-entry codec); Zstd/GACL/chunked payloads have
-	// no representation in either layout, so they fail closed here instead of
-	// writing an entry the readers must reject.
+	// v4 archives store inline GDeflate mip payloads only. A NONE payload has a
+	// per-entry codec only in v5, so it forces v5; chunked GDeflate is staged
+	// with its chunk table and also forces v5. Zstd/GACL has no representation
+	// in either layout, so it fails closed here.
 	if (dstex_version == 3) {
 		const int src_compression = dstex_header.get("compression_format", 1);
 		const int src_gacl = dstex_header.get("gacl_transform", 0);
-		const bool src_chunked = dstex_header.get("chunked", false);
 		if ((src_compression != static_cast<int>(DSCompressionFormat::GDEFLATE) &&
 					src_compression != static_cast<int>(DSCompressionFormat::NONE)) ||
-				src_gacl != static_cast<int>(DSGaclTransform::NONE) || src_chunked) {
-			UtilityFunctions::push_error("DSPkg: v3 .dstex uses Zstd/GACL/chunked payloads that no archive layout can represent: ", p_dstex_path);
+				src_gacl != static_cast<int>(DSGaclTransform::NONE)) {
+			UtilityFunctions::push_error("DSPkg: v3 .dstex uses Zstd/GACL payloads that archives cannot represent: ", p_dstex_path);
 			return ERR_UNAVAILABLE;
 		}
 		entry.compression_format = static_cast<uint8_t>(src_compression);
 		PackedInt32Array src_chunk_counts = dstex_header.get("mip_chunk_counts", PackedInt32Array());
-		for (int64_t ci = 0; ci < src_chunk_counts.size(); ++ci) {
-			if (src_chunk_counts[ci] != 1) {
-				UtilityFunctions::push_error("DSPkg: v3 .dstex has chunked mips that v4 archives cannot represent: ", p_dstex_path);
-				return ERR_UNAVAILABLE;
+		const bool src_chunked = dstex_header.get("chunked", false);
+		if (src_chunked && src_compression != static_cast<int>(DSCompressionFormat::GDEFLATE)) {
+			UtilityFunctions::push_error("DSPkg: only GDeflate .dstex payloads may be chunked: ", p_dstex_path);
+			return ERR_INVALID_DATA;
+		}
+		if (src_chunked) {
+			PackedInt64Array src_chunk_offsets = dstex_header.get("chunk_offsets", PackedInt64Array());
+			PackedInt32Array src_chunk_compressed = dstex_header.get("chunk_compressed_sizes", PackedInt32Array());
+			PackedInt32Array src_chunk_uncompressed = dstex_header.get("chunk_uncompressed_sizes", PackedInt32Array());
+			if (src_chunk_counts.size() != static_cast<int64_t>(mip_count) || src_chunk_offsets.size() == 0 ||
+					src_chunk_compressed.size() != src_chunk_offsets.size() ||
+					src_chunk_uncompressed.size() != src_chunk_offsets.size()) {
+				UtilityFunctions::push_error("DSPkg: chunked .dstex has an incomplete chunk table: ", p_dstex_path);
+				return ERR_INVALID_DATA;
+			}
+			uint64_t expected_chunks = 0;
+			for (int64_t mip = 0; mip < src_chunk_counts.size(); ++mip) {
+				if (src_chunk_counts[mip] < 1 || src_chunk_counts[mip] > static_cast<int32_t>(DSTEX_MAX_CHUNKS_PER_MIP)) {
+					UtilityFunctions::push_error("DSPkg: chunked .dstex has an invalid chunk count: ", p_dstex_path);
+					return ERR_INVALID_DATA;
+				}
+				if (src_chunk_counts[mip] > 1) {
+					expected_chunks += static_cast<uint64_t>(src_chunk_counts[mip]);
+				}
+			}
+			if (expected_chunks != static_cast<uint64_t>(src_chunk_offsets.size())) {
+				UtilityFunctions::push_error("DSPkg: chunked .dstex chunk table does not match its mip counts: ", p_dstex_path);
+				return ERR_INVALID_DATA;
+			}
+			entry.chunked = true;
+			entry.mip_chunk_counts = src_chunk_counts;
+			entry.source_chunk_offsets = src_chunk_offsets;
+			entry.source_chunk_compressed_sizes = src_chunk_compressed;
+			entry.source_chunk_uncompressed_sizes = src_chunk_uncompressed;
+		} else {
+			for (int64_t ci = 0; ci < src_chunk_counts.size(); ++ci) {
+				if (src_chunk_counts[ci] != 1) {
+					UtilityFunctions::push_error("DSPkg: .dstex has chunked mips without the chunked capability: ", p_dstex_path);
+					return ERR_INVALID_DATA;
+				}
 			}
 		}
 	}
@@ -815,6 +865,41 @@ Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_pa
 				return ERR_INVALID_DATA;
 			}
 		}
+	}
+	// A chunked payload is staged chunk by chunk, so its archive span includes
+	// the 8-byte inter-chunk alignment and is not the sum of the mip sizes.
+	if (entry.chunked) {
+		uint64_t chunk_span = 0;
+		int64_t chunk_cursor = 0;
+		for (uint32_t mip = 0; mip < mip_count; ++mip) {
+			if (mip > 0 && !align_up(chunk_span, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, chunk_span)) {
+				UtilityFunctions::push_error("DSPkg: chunked payload span alignment overflow: ", p_dstex_path);
+				return ERR_INVALID_DATA;
+			}
+			const int32_t count = entry.mip_chunk_counts[mip];
+			if (count <= 1) {
+				if (!checked_add(chunk_span, static_cast<uint64_t>(static_cast<uint32_t>(source_mip_sizes[mip])), chunk_span)) {
+					UtilityFunctions::push_error("DSPkg: chunked payload span overflow: ", p_dstex_path);
+					return ERR_INVALID_DATA;
+				}
+				continue;
+			}
+			for (int32_t c = 0; c < count; ++c) {
+				if (c > 0 && !align_up(chunk_span, 8, chunk_span)) {
+					UtilityFunctions::push_error("DSPkg: chunked payload span alignment overflow: ", p_dstex_path);
+					return ERR_INVALID_DATA;
+				}
+				if (chunk_cursor >= entry.source_chunk_compressed_sizes.size() ||
+						!checked_add(chunk_span,
+								static_cast<uint64_t>(static_cast<uint32_t>(entry.source_chunk_compressed_sizes[chunk_cursor])),
+								chunk_span)) {
+					UtilityFunctions::push_error("DSPkg: chunked payload span overflow: ", p_dstex_path);
+					return ERR_INVALID_DATA;
+				}
+				++chunk_cursor;
+			}
+		}
+		payload_size = chunk_span;
 	}
 
 	entry.resource_path = p_resource_path;
@@ -922,14 +1007,17 @@ Error DSPkg::finalize() {
 	}
 
 	// v5 is emitted when an entry needs an entry extension (an NPOT logical-size
-	// TLV) or a payload codec v4 cannot express. v4 has no per-entry codec
-	// field, so it is GDeflate-only; a NONE payload therefore forces v5.
-	// Archives without either stay v4 byte-identical.
+	// TLV), a payload codec v4 cannot express (NONE), or a chunk table. Archives
+	// without any of these stay v4 byte-identical.
 	bool write_v5 = false;
 	for (uint32_t i = 0; i < count; ++i) {
 		const DSPkgStagedEntry &entry = *sorted_entries[i];
-		if (entry_logical_tlv_size(entry) > 0 ||
+		if (entry.chunked || entry_logical_tlv_size(entry) > 0 ||
 				entry.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
+			write_v5 = true;
+			break;
+		}
+	}
 			write_v5 = true;
 			break;
 		}
@@ -964,6 +1052,24 @@ Error DSPkg::finalize() {
 			if (!checked_add(entry_size, ext_size, entry_size)) {
 				UtilityFunctions::push_error("DSPkg: Entry extension size overflow.");
 				return ERR_INVALID_PARAMETER;
+			}
+			if (item.chunked) {
+				// v5 chunk tables follow the mip table inside the same entry.
+				uint64_t chunk_entries = 0;
+				for (int64_t mip = 0; mip < item.mip_chunk_counts.size(); ++mip) {
+					if (item.mip_chunk_counts[mip] > 1) {
+						if (!checked_add(chunk_entries, static_cast<uint64_t>(item.mip_chunk_counts[mip]), chunk_entries)) {
+							UtilityFunctions::push_error("DSPkg: Chunk table size overflow.");
+							return ERR_INVALID_PARAMETER;
+						}
+					}
+				}
+				uint64_t chunk_bytes = 0;
+				if (!checked_multiply(chunk_entries, sizeof(DSChunkEntry), chunk_bytes) ||
+						!checked_add(entry_size, chunk_bytes, entry_size)) {
+					UtilityFunctions::push_error("DSPkg: Chunk table size overflow.");
+					return ERR_INVALID_PARAMETER;
+				}
 			}
 		}
 		if (!checked_add(entry_size, path_len, entry_size) || !checked_add(entry_table_size, entry_size, entry_table_size)) {
@@ -1027,7 +1133,10 @@ Error DSPkg::finalize() {
 
 		const bool per_mip_payload = write_gpu_metadata && item.gpu_metadata && mips_count > 1;
 		uint64_t comp_size = 0;
-		if (per_mip_payload) {
+		if (item.chunked) {
+			// add_texture() already computed the chunk-laid-out span.
+			comp_size = item.payload_size;
+		} else if (per_mip_payload) {
 			uint64_t running_mip_span = 0;
 			for (uint32_t mip = 0; mip < mips_count; ++mip) {
 				if (mip > 0) {
@@ -1103,44 +1212,84 @@ Error DSPkg::finalize() {
 				UtilityFunctions::push_error("DSPkg: Mip data offset overflow.");
 				return ERR_INVALID_PARAMETER;
 			}
-			uint64_t running_mip_offset = 0;
+			// Build the mip table and (v5) chunk table together so offsets mirror
+			// the payload copy below: 512-aligned mip starts, 8-aligned chunks,
+			// chunk 0 exactly at the mip offset.
+			std::vector<DSPkgMipEntry> mip_entries_local;
+			std::vector<DSChunkEntry> chunk_entries_local;
+			mip_entries_local.reserve(mips_count);
+			uint64_t mip_cursor = 0;
+			int64_t chunk_cursor = 0;
 			for (uint32_t mip = 0; mip < mips_count; ++mip) {
 				if (per_mip_payload && mip > 0) {
-					if (!align_up(running_mip_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_mip_offset)) {
+					if (!align_up(mip_cursor, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, mip_cursor)) {
 						UtilityFunctions::push_error("DSPkg: Mip span alignment overflow.");
 						return ERR_INVALID_PARAMETER;
 					}
 				}
-				uint64_t mip_size = static_cast<uint64_t>(mip_sizes_entry[mip]);
-				if (!checked_add(running_mip_offset, mip_size, running_mip_offset) || running_mip_offset > comp_size) {
-					UtilityFunctions::push_error("DSPkg: Invalid compressed mip metadata.");
-					return ERR_INVALID_DATA;
-				}
-			}
-			uint64_t mip_offset = 0;
-			for (uint32_t mip = 0; mip < mips_count; ++mip) {
-				if (per_mip_payload && mip > 0) {
-					align_up(mip_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, mip_offset);
-				}
 				DSPkgMipEntry mip_entry{};
 				uint64_t md_off = 0;
-				if (!checked_add(mip_data_offset, mip_offset, md_off)) {
+				if (!checked_add(mip_data_offset, mip_cursor, md_off)) {
 					UtilityFunctions::push_error("DSPkg: Mip data offset overflow.");
 					return ERR_INVALID_PARAMETER;
 				}
 				mip_entry.offset = md_off;
-				mip_entry.compressed_size = mip_sizes_entry[mip];
 				if (item.gpu_metadata) {
 					mip_entry.uncompressed_size = mip_uncompressed_sizes[mip];
 					mip_entry.row_pitch = mip_row_pitches[mip];
 				}
-				// v5 reuses the reserved word as chunk_count: 1 = inline. This
-				// writer only stages inline payloads (chunked v3 sources are
-				// rejected by add_texture), so v5 entries set 1 while v4
-				// entries keep the reserved zero.
-				mip_entry.chunk_count = write_v5 ? 1 : 0;
-				writer.put_buffer(reinterpret_cast<const uint8_t *>(&mip_entry), sizeof(DSPkgMipEntry));
-				mip_offset += mip_entry.compressed_size;
+				const uint32_t chunk_count = write_v5
+						? (item.chunked ? static_cast<uint32_t>(item.mip_chunk_counts[mip]) : 1u)
+						: 0u;
+				mip_entry.chunk_count = chunk_count;
+				if (chunk_count > 1) {
+					uint64_t chunk_sum = 0;
+					for (uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
+						if (chunk > 0 && !align_up(mip_cursor, 8, mip_cursor)) {
+							UtilityFunctions::push_error("DSPkg: Chunk span alignment overflow.");
+							return ERR_INVALID_PARAMETER;
+						}
+						if (chunk_cursor >= item.source_chunk_compressed_sizes.size() ||
+								chunk_cursor >= item.source_chunk_uncompressed_sizes.size()) {
+							UtilityFunctions::push_error("DSPkg: Chunk table does not match the mip counts.");
+							return ERR_INVALID_DATA;
+						}
+						DSChunkEntry entry{};
+						uint64_t chunk_off = 0;
+						if (!checked_add(mip_data_offset, mip_cursor, chunk_off)) {
+							UtilityFunctions::push_error("DSPkg: Chunk data offset overflow.");
+							return ERR_INVALID_PARAMETER;
+						}
+						entry.offset = chunk_off;
+						entry.compressed_size = static_cast<uint32_t>(item.source_chunk_compressed_sizes[chunk_cursor]);
+						entry.uncompressed_size = static_cast<uint32_t>(item.source_chunk_uncompressed_sizes[chunk_cursor]);
+						if (!checked_add(chunk_sum, entry.compressed_size, chunk_sum) ||
+								!checked_add(mip_cursor, entry.compressed_size, mip_cursor)) {
+							UtilityFunctions::push_error("DSPkg: Chunk span overflow.");
+							return ERR_INVALID_PARAMETER;
+						}
+						chunk_entries_local.push_back(entry);
+						++chunk_cursor;
+					}
+					mip_entry.compressed_size = static_cast<uint32_t>(chunk_sum);
+				} else {
+					mip_entry.compressed_size = mip_sizes_entry[mip];
+					if (!checked_add(mip_cursor, mip_entry.compressed_size, mip_cursor)) {
+						UtilityFunctions::push_error("DSPkg: Invalid compressed mip metadata.");
+						return ERR_INVALID_DATA;
+					}
+				}
+				mip_entries_local.push_back(mip_entry);
+			}
+			if (mip_cursor > comp_size) {
+				UtilityFunctions::push_error("DSPkg: Mip/chunk layout exceeds the entry payload size.");
+				return ERR_INVALID_DATA;
+			}
+			for (const DSPkgMipEntry &entry : mip_entries_local) {
+				writer.put_buffer(reinterpret_cast<const uint8_t *>(&entry), sizeof(DSPkgMipEntry));
+			}
+			for (const DSChunkEntry &entry : chunk_entries_local) {
+				writer.put_buffer(reinterpret_cast<const uint8_t *>(&entry), sizeof(DSChunkEntry));
 			}
 		}
 
@@ -1248,6 +1397,12 @@ Error DSPkg::finalize() {
 		header_v5.header_size = DSPKG_HEADER_SIZE_V5;
 		header_v5.toc_entry_size = DSPKG_FIXED_ENTRY_SIZE_V5;
 		header_v5.capabilities = 0;
+		for (uint32_t i = 0; i < count; ++i) {
+			if (sorted_entries[i]->chunked) {
+				header_v5.capabilities |= DSPKG_CAP_CHUNKED;
+				break;
+			}
+		}
 		header_v5.extension_offset = 0;
 		header_v5.extension_size = 0;
 		header_v5.reserved2 = 0;
@@ -1413,7 +1568,81 @@ Error DSPkg::finalize() {
 		}
 
 		const uint32_t mips = item.mip_count;
-		if (write_gpu_metadata && item.gpu_metadata && mips > 1) {
+		if (item.chunked) {
+			// Mirror add_texture's chunk span: 512-aligned mip starts, 8-aligned
+			// chunks after the first, each streamed from its source offset.
+			int64_t chunk_cursor = 0;
+			for (uint32_t mip = 0; mip < mips; ++mip) {
+				if (mip > 0) {
+					uint64_t aligned_mip_offset = 0;
+					if (!align_up(payload_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, aligned_mip_offset)) {
+						UtilityFunctions::push_error("DSPkg: Chunked payload mip alignment overflow.");
+						source->close();
+						file->close();
+						return ERR_INVALID_PARAMETER;
+					}
+					write_zero_padding(payload_offset, aligned_mip_offset);
+					payload_offset = aligned_mip_offset;
+				}
+				const uint32_t chunk_count = static_cast<uint32_t>(item.mip_chunk_counts[mip]);
+				if (chunk_count <= 1) {
+					const uint64_t mip_size = static_cast<uint64_t>(static_cast<uint32_t>(item.mip_sizes[mip]));
+					if (!stream_source_range(source.ptr(), static_cast<uint64_t>(item.source_mip_offsets[mip]), mip_size)) {
+						source->close();
+						if (write_failed) {
+							return fail_write("payload");
+						}
+						file->close();
+						return ERR_FILE_CORRUPT;
+					}
+					if (!checked_add(payload_offset, mip_size, payload_offset)) {
+						UtilityFunctions::push_error("DSPkg: Chunked payload offset overflow.");
+						source->close();
+						file->close();
+						return ERR_INVALID_PARAMETER;
+					}
+					continue;
+				}
+				for (uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
+					if (chunk > 0) {
+						uint64_t aligned_chunk_offset = 0;
+						if (!align_up(payload_offset, 8, aligned_chunk_offset)) {
+							UtilityFunctions::push_error("DSPkg: Chunked payload chunk alignment overflow.");
+							source->close();
+							file->close();
+							return ERR_INVALID_PARAMETER;
+						}
+						write_zero_padding(payload_offset, aligned_chunk_offset);
+						payload_offset = aligned_chunk_offset;
+					}
+					if (chunk_cursor >= item.source_chunk_offsets.size() ||
+							chunk_cursor >= item.source_chunk_compressed_sizes.size()) {
+						UtilityFunctions::push_error("DSPkg: Chunk table does not match the staged source.");
+						source->close();
+						file->close();
+						return ERR_INVALID_DATA;
+					}
+					const uint64_t chunk_size = static_cast<uint64_t>(
+							static_cast<uint32_t>(item.source_chunk_compressed_sizes[chunk_cursor]));
+					if (!stream_source_range(source.ptr(),
+								static_cast<uint64_t>(item.source_chunk_offsets[chunk_cursor]), chunk_size)) {
+						source->close();
+						if (write_failed) {
+							return fail_write("payload");
+						}
+						file->close();
+						return ERR_FILE_CORRUPT;
+					}
+					if (!checked_add(payload_offset, chunk_size, payload_offset)) {
+						UtilityFunctions::push_error("DSPkg: Chunked payload offset overflow.");
+						source->close();
+						file->close();
+						return ERR_INVALID_PARAMETER;
+					}
+					++chunk_cursor;
+				}
+			}
+		} else if (write_gpu_metadata && item.gpu_metadata && mips > 1) {
 			// v1 containers keep one contiguous payload, so mip slices are read
 			// at cumulative offsets; v2/v3-inline containers point at each mip directly.
 			uint64_t contiguous_cursor = 0;

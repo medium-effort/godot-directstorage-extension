@@ -455,9 +455,9 @@ func _apply_steampipe_alignment() -> void:
 		push_warning("[DirectStorage Exporter] Active DSPkg binary does not support 'set_bin_packing_enabled'; archive will fall back to strict 1MB alignment.")
 
 ## Reads v2/v3 per-mip footprint data so DSPkg can preserve GPU upload layouts.
-## v3 GDeflate-inline files share the v2 footprint layout; v3 chunked/Zstd/GACL
-## payloads are rejected here (the v4 archive cannot represent them) so the
-## archiver falls back to the header-only path instead of staging bad slices.
+## v3 GDeflate-inline files share the v2 footprint layout. Chunked v3 files are
+## staged with their chunk table into a v5 archive; only Zstd/GACL still has no
+## archive representation, so those fall back to the header-only path.
 func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
 	if not ClassDB.class_exists("DSTex"):
 		return {}
@@ -469,8 +469,8 @@ func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
 	if version != 2 and version != 3:
 		return {}
 	if version == 3:
-		if int(metadata.get("compression_format", 1)) != 1 or int(metadata.get("gacl_transform", 0)) != 0 or bool(metadata.get("chunked", false)):
-			push_warning("[DirectStorage Exporter] v3 payload in '" + dstex_path + "' needs Zstd/GACL/chunked support the v4 archive lacks; bundling without GPU mip metadata.")
+		if int(metadata.get("compression_format", 1)) != 1 or int(metadata.get("gacl_transform", 0)) != 0:
+			push_warning("[DirectStorage Exporter] v3 payload in '" + dstex_path + "' needs Zstd/GACL support archives do not have; bundling without GPU mip metadata.")
 			return {}
 	var mip_count := int(metadata.get("mip_count", 0))
 	var mip_sizes: PackedInt32Array = metadata.get("mip_sizes", PackedInt32Array())
