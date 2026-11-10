@@ -39,9 +39,10 @@ const ACTION_NORMAL_MAP := 3
 ## First 4 bytes of a readable .dstex file ("DTEX").
 const DSTEX_MAGIC := [0x44, 0x54, 0x45, 0x58]
 
-## Artifact suffixes cleanup is allowed to delete. Anything else - notably the live .dstex -
-## is a current destination, so an unknown suffix is left on disk (fails closed).
-const CLEANUP_SUFFIXES := [".ctex", ".ctex.md5"]
+## Artifact suffixes cleanup is allowed to delete: a superseded .ctex and the checksum Godot
+## writes beside it. Anything else - notably the live .dstex family - is a current destination,
+## so an unknown suffix is left on disk (fails closed).
+const CLEANUP_SUFFIXES := [".ctex", ".md5"]
 
 const DS_DEFAULTS := {
 	"compression/mode": "0",
@@ -812,45 +813,56 @@ static func verify_migration(entries: Array) -> Array[Dictionary]:
 
 
 ## The subset of `selected` scan entries whose post-reimport verification passed.
-## Keeps the scan dictionaries (and therefore old_dests) intact for the cleanup.
+## Keeps the scan dictionaries (and therefore old_dests) intact for the cleanup, and attaches the
+## verification's `new_dests`: the scan entries are what carry `old_dests`, the verify results are
+## what carry `new_dests`, so the current-destination guard needs both halves in one dictionary.
 static func filter_verified_entries(selected: Array, verify_results: Array) -> Array:
 	var verified := {}
 	for v in verify_results:
 		if bool(v.get("verified", false)):
-			verified[str(v.get("source", ""))] = true
+			verified[str(v.get("source", ""))] = v
 
 	var out: Array = []
 	for e in selected:
-		if verified.has(str(e.get("source", ""))):
-			out.append(e)
+		var src := str(e.get("source", ""))
+		if not verified.has(src):
+			continue
+		var kept: Dictionary = e.duplicate()
+		kept["new_dests"] = verified[src].get("new_dests", [])
+		out.append(kept)
 	return out
 
 
 ## Deletes superseded .ctex artifacts for entries whose migration verified. Three guards:
-## only .ctex/.ctex.md5 (never the live .dstex family), only inside res://.godot/imported/,
-## and never a path that is still a current destination (new_dests).
+## only a .ctex and the .md5 checksum beside it (never the live .dstex family), only inside
+## res://.godot/imported/, and never a path that is still a current destination (new_dests).
 static func cleanup_old_artifacts(verified_entries: Array) -> Array[Dictionary]:
 	var results: Array[Dictionary] = []
-	var allowed_dir := ProjectSettings.globalize_path("res://.godot/imported").replace("\\", "/").to_lower()
+	var allowed_dir := _cleanup_key("res://.godot/imported")
 
 	for e in verified_entries:
 		var src_res := str(e.get("source", ""))
 		var deleted: Array[String] = []
 		var old_dests: Array = e.get("old_dests", [])
 
-		# Current destinations, normalised the same way as the candidates below.
+		# Current destinations, normalised the same way as the candidates below. A kept artifact
+		# also keeps the checksum beside it.
 		var keep := {}
 		for nd in e.get("new_dests", []):
 			var nds := str(nd).strip_edges()
-			if not nds.is_empty():
-				keep[ProjectSettings.globalize_path(nds).replace("\\", "/").to_lower()] = true
+			if nds.is_empty():
+				continue
+			keep[_cleanup_key(nds)] = true
+			var nd_md5 := _md5_sidecar_path(nds)
+			if not nd_md5.is_empty():
+				keep[_cleanup_key(nd_md5)] = true
 
 		for od in old_dests:
 			var ods := str(od).strip_edges()
 			if ods.is_empty():
 				continue
 			# The .md5 sidecar goes through the same predicate as its main artifact.
-			for cand in [ods, ods + ".md5"]:
+			for cand in _cleanup_candidates(ods):
 				var cand_s := str(cand)
 				var abs_path := ProjectSettings.globalize_path(cand_s).replace("\\", "/")
 				var low := abs_path.to_lower()
@@ -869,6 +881,34 @@ static func cleanup_old_artifacts(verified_entries: Array) -> Array[Dictionary]:
 		})
 
 	return results
+
+
+## Lower-cased absolute form used by every cleanup path comparison.
+static func _cleanup_key(res_path: String) -> String:
+	return ProjectSettings.globalize_path(res_path).replace("\\", "/").to_lower()
+
+
+## The checksum sidecar Godot writes for an imported artifact: `<stem>.md5`, where the stem is
+## the destination with its artifact extension removed (`foo-hash.ctex` pairs with `foo-hash.md5`,
+## not `foo-hash.ctex.md5`). Returns "" when the destination has no extension.
+static func _md5_sidecar_path(dest: String) -> String:
+	var base := dest.get_file()
+	if base.get_extension().is_empty():
+		return ""
+	return dest.get_base_dir().path_join(base.get_basename() + ".md5")
+
+
+## The artifacts a superseded destination may delete: the destination and its checksum. Only a
+## .ctex yields candidates - the live .dstex family never does, so cleanup cannot reach it.
+static func _cleanup_candidates(dest: String) -> Array[String]:
+	var out: Array[String] = []
+	if not dest.to_lower().ends_with(".ctex"):
+		return out
+	out.append(dest)
+	var md5 := _md5_sidecar_path(dest)
+	if not md5.is_empty():
+		out.append(md5)
+	return out
 
 
 ## True when a lower-cased absolute path is an artifact cleanup may delete.
@@ -950,14 +990,15 @@ static func restore_from_zip(zip_res_path: String) -> Dictionary:
 			results.append({"source": src_res, "status": "failed", "reason": "Failed to restore %s" % imp_res})
 			continue
 
-		# Clean up the .dstex artifacts the migrated sidecar produced
+		# Clean up the .dstex artifacts the migrated sidecar produced, plus the checksum Godot
+		# writes beside each one (`<stem>.md5`, not `<artifact>.dstex.md5`).
 		for d in dests:
 			var abs_d := ProjectSettings.globalize_path(d).replace("\\", "/")
 			if abs_d.to_lower().ends_with(".dstex") and abs_d.to_lower().begins_with(allowed_imported_dir + "/") and not abs_d.contains(".."):
 				if FileAccess.file_exists(abs_d):
 					DirAccess.remove_absolute(abs_d)
-				var d_md5 := abs_d + ".md5"
-				if FileAccess.file_exists(d_md5):
+				var d_md5 := _md5_sidecar_path(abs_d)
+				if not d_md5.is_empty() and FileAccess.file_exists(d_md5):
 					DirAccess.remove_absolute(d_md5)
 
 		reimport_sources.append(src_res)

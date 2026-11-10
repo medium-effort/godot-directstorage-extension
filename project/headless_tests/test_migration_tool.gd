@@ -495,13 +495,17 @@ func _test_cleanup_scope() -> bool:
 	print("--- Test 6: Cleanup Scope ---")
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("res://.godot/imported"))
 
+	# Godot names an artifact's checksum from its stem: `x.ctex` pairs with `x.md5`.
 	var superseded := "res://.godot/imported/test_cleanup_old.ctex"
+	var superseded_md5 := "res://.godot/imported/test_cleanup_old.md5"
 	var live := "res://.godot/imported/test_cleanup_live.dstex"
+	var live_md5 := "res://.godot/imported/test_cleanup_live.md5"
 	var keep_me := "res://.godot/imported/test_cleanup_keep.ctex"
+	var keep_me_md5 := "res://.godot/imported/test_cleanup_keep.md5"
 	var unverified := "res://.godot/imported/test_cleanup_unverified.ctex"
 	var outside := "res://test_migration_v5_tmp/test_cleanup_outside.ctex"
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("res://test_migration_v5_tmp"))
-	for p in [superseded, superseded + ".md5", live, live + ".md5", keep_me, unverified, outside]:
+	for p in [superseded, superseded_md5, live, live_md5, keep_me, keep_me_md5, unverified, outside]:
 		_write_text_file(p, "CLEANUP_FIXTURE")
 
 	var ok := true
@@ -513,20 +517,20 @@ func _test_cleanup_scope() -> bool:
 	}])
 	var deleted_live: Array = del_live[0].get("deleted", [])
 	ok = _check(FileAccess.file_exists(live), "live .dstex survives cleanup") and ok
-	ok = _check(FileAccess.file_exists(live + ".md5"), "live .dstex.md5 survives cleanup") and ok
+	ok = _check(FileAccess.file_exists(live_md5), "live .dstex checksum survives cleanup") and ok
 	ok = _check(deleted_live.is_empty(), "nothing reported deleted for a live .dstex") and ok
 
-	# 2. Positive control: a superseded .ctex pair is still removed, and reported.
+	# 2. Positive control: a superseded .ctex and its checksum are still removed, and reported.
 	var del_ctex: Array = CORE.cleanup_old_artifacts([{
 		"source": "res://test_assets/test.png",
 		"old_dests": [superseded],
 	}])
 	var deleted_ctex: Array = del_ctex[0].get("deleted", [])
 	ok = _check(not FileAccess.file_exists(superseded), "superseded .ctex is deleted") and ok
-	ok = _check(not FileAccess.file_exists(superseded + ".md5"), "superseded .ctex.md5 is deleted") and ok
+	ok = _check(not FileAccess.file_exists(superseded_md5), "superseded .ctex checksum is deleted") and ok
 	ok = _check(deleted_ctex.size() == 2, "both deleted paths are reported") and ok
 
-	# 3. The new_dests keep-set: a .ctex that is a current destination survives.
+	# 3. The new_dests keep-set: a .ctex that is a current destination survives with its checksum.
 	var del_keep: Array = CORE.cleanup_old_artifacts([{
 		"source": "res://test_assets/test.png",
 		"old_dests": [keep_me],
@@ -534,6 +538,7 @@ func _test_cleanup_scope() -> bool:
 	}])
 	var deleted_keep: Array = del_keep[0].get("deleted", [])
 	ok = _check(FileAccess.file_exists(keep_me), "a path listed in new_dests is kept") and ok
+	ok = _check(FileAccess.file_exists(keep_me_md5), "a kept artifact keeps its checksum") and ok
 	ok = _check(deleted_keep.is_empty(), "a kept path is not reported deleted") and ok
 
 	# 4. Containment: nothing outside res://.godot/imported is ever touched.
@@ -545,29 +550,34 @@ func _test_cleanup_scope() -> bool:
 	ok = _check(FileAccess.file_exists(outside), "a .ctex outside .godot/imported is untouched") and ok
 	ok = _check(deleted_out.is_empty(), "an outside path is not reported deleted") and ok
 
-	# 5. The verified-subset filter keeps exactly the verified entries, intact.
+	# 5. The verified-subset filter keeps exactly the verified entries, intact, and carries the
+	#    verification's new_dests so the keep-set sees what the production call path supplies.
 	var selected := [
 		{"source": "res://a.png", "old_dests": [superseded]},
 		{"source": "res://b.png", "old_dests": [unverified]},
 		{"source": "res://c.png", "old_dests": [outside]},
 	]
 	var verify_results := [
-		{"source": "res://a.png", "verified": true},
-		{"source": "res://b.png", "verified": false},
-		{"source": "res://c.png", "verified": true},
+		{"source": "res://a.png", "verified": true, "new_dests": [live]},
+		{"source": "res://b.png", "verified": false, "new_dests": [live]},
+		{"source": "res://c.png", "verified": true, "new_dests": []},
 	]
 	var filtered: Array = CORE.filter_verified_entries(selected, verify_results)
 	ok = _check(filtered.size() == 2, "filter keeps exactly the verified entries") and ok
 	ok = _check(not filtered.is_empty() and filtered[0].has("old_dests"), "filter keeps the scan entries intact") and ok
+	ok = _check(not filtered.is_empty() and filtered[0].get("new_dests", []).has(live), "filter carries the verification's new_dests") and ok
+	ok = _check(not selected[0].has("new_dests"), "filter does not mutate the caller's entry") and ok
 
 	# 6. Composition: the caller's real path leaves the unverified entry alone.
 	_write_text_file(superseded, "CLEANUP_FIXTURE")
+	_write_text_file(superseded_md5, "CLEANUP_FIXTURE")
 	_write_text_file(unverified, "CLEANUP_FIXTURE")
 	CORE.cleanup_old_artifacts(CORE.filter_verified_entries(selected, verify_results))
 	ok = _check(FileAccess.file_exists(unverified), "an unverified entry's .ctex is not cleaned") and ok
 	ok = _check(not FileAccess.file_exists(superseded), "a verified entry's superseded .ctex is cleaned") and ok
+	ok = _check(not FileAccess.file_exists(superseded_md5), "the cleaned .ctex takes its checksum with it") and ok
 
-	for p in [superseded, superseded + ".md5", live, live + ".md5", keep_me, unverified, outside]:
+	for p in [superseded, superseded_md5, live, live_md5, keep_me, keep_me_md5, unverified, outside]:
 		if FileAccess.file_exists(p):
 			DirAccess.remove_absolute(ProjectSettings.globalize_path(p))
 

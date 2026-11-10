@@ -138,8 +138,11 @@ func _test_restore_rejects_manifest_chosen_paths() -> void:
 
 	# Pre-restore state: the asset is currently migrated, so its sidecar names a .dstex that the
 	# rollback is supposed to delete. The ZIP above still holds the original texture sidecar.
+	# Godot writes an artifact's checksum from its stem: `x.dstex` pairs with `x.md5`.
 	var dstex := "res://.godot/imported/test_restore_orphan.dstex"
+	var dstex_md5 := "res://.godot/imported/test_restore_orphan.md5"
 	var unrelated_dstex := "res://.godot/imported/test_restore_unrelated.dstex"
+	var unrelated_md5 := "res://.godot/imported/test_restore_unrelated.md5"
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("res://.godot/imported"))
 	var migrated := (
 		"[remap]\n\n"
@@ -158,8 +161,9 @@ func _test_restore_rejects_manifest_chosen_paths() -> void:
 		_cleanup(tmp_abs)
 		return
 	_write(dstex, "DTEXORPHAN")
-	_write(dstex + ".md5", "ORPHANMD5")
+	_write(dstex_md5, "ORPHANMD5")
 	_write(unrelated_dstex, "DTEXOTHER")
+	_write(unrelated_md5, "OTHERMD5")
 
 	var res: Dictionary = CORE.restore_from_zip(zip_path)
 	var results: Array = res.get("results", [])
@@ -197,8 +201,9 @@ func _test_restore_rejects_manifest_chosen_paths() -> void:
 
 	# The rollback must delete the artifacts the migration created, and only those.
 	_check(not FileAccess.file_exists(dstex), "the rollback deletes the .dstex the migration created")
-	_check(not FileAccess.file_exists(dstex + ".md5"), "the rollback deletes that .dstex.md5")
+	_check(not FileAccess.file_exists(dstex_md5), "the rollback deletes that .dstex's checksum")
 	_check(FileAccess.file_exists(unrelated_dstex), "the rollback leaves an unrelated .dstex alone")
+	_check(FileAccess.file_exists(unrelated_md5), "the rollback leaves that .dstex's checksum alone")
 
 	_cleanup(tmp_abs)
 
@@ -216,8 +221,9 @@ func _cleanup(tmp_abs: String) -> void:
 			if rm != OK:
 				push_warning("cleanup: could not remove %s (err %d)" % [p, rm])
 	for art in ["res://.godot/imported/test_restore_orphan.dstex",
-			"res://.godot/imported/test_restore_orphan.dstex.md5",
-			"res://.godot/imported/test_restore_unrelated.dstex"]:
+			"res://.godot/imported/test_restore_orphan.md5",
+			"res://.godot/imported/test_restore_unrelated.dstex",
+			"res://.godot/imported/test_restore_unrelated.md5"]:
 		if FileAccess.file_exists(art):
 			var arm := DirAccess.remove_absolute(ProjectSettings.globalize_path(art))
 			if arm != OK:
