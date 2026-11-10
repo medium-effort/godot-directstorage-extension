@@ -2170,4 +2170,98 @@ GDEX_TEST_T(dspkg, steampipe_1mib_chunk_isolation, TAG_INTEGRATION) {
 }
 #endif
 
+// The v4/v5 headers share their field order through offset 64, so one 64-byte
+// read decodes the versions for either layout.
+bool read_archive_header_versions(const char *p_path, int &r_version, int64_t &r_min_reader) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	godot::PackedByteArray head = file->get_buffer(sizeof(godot::DSPkgHeader));
+	file->close();
+	if (head.size() != static_cast<int64_t>(sizeof(godot::DSPkgHeader))) {
+		return false;
+	}
+	godot::DSPkgHeader header = {};
+	memcpy(&header, head.ptr(), sizeof(header));
+	r_version = static_cast<int>(header.version);
+	r_min_reader = static_cast<int64_t>(header.min_reader_version);
+	return true;
+}
+
+bool build_single_texture_archive(const char *p_dstex_path, const char *p_dspkg_path, const char *p_entry_path) {
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	if (builder.is_null()) {
+		return false;
+	}
+	if (builder->create(godot::String(p_dspkg_path), 0ULL) != godot::OK) {
+		return false;
+	}
+	if (builder->add_texture(godot::String(p_entry_path), godot::String(p_dstex_path)) != godot::OK) {
+		return false;
+	}
+	return builder->finalize() == godot::OK;
+}
+
+// DSPkg v4 has no per-entry codec field, so a NONE texture must upgrade the
+// archive to v5 instead of being rejected or silently relabelled as GDeflate.
+// GDeflate-only archives must stay v4 and byte-identical.
+GDEX_TEST_T(dspkg, none_texture_forces_v5_archive, TAG_INTEGRATION) {
+	const char *dstex_none = "user://gdextest_v5_none.dstex";
+	const char *dstex_gz = "user://gdextest_v4_gdeflate.dstex";
+	const char *pkg_none = "user://gdextest_v5_none.dspkg";
+	const char *pkg_gz = "user://gdextest_v4_gdeflate.dspkg";
+	const char *entry_none = "res://gdextest_v5_none.png";
+	const char *entry_gz = "res://gdextest_v4_gdeflate.png";
+	remove_temp_file(dstex_none);
+	remove_temp_file(dstex_gz);
+	remove_temp_file(pkg_none);
+	remove_temp_file(pkg_gz);
+
+	GDEX_ASSERT_TRUE(write_temp_dstex_incompressible(dstex_none, 256, 256, 1, 256 * 256 * 4));
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_gz, 256, 256, 1, 256 * 256 * 4));
+
+	godot::Ref<godot::DSTex> tex_reader;
+	tex_reader.instantiate();
+	GDEX_ASSERT_EQ((int)tex_reader->read_header(godot::String(dstex_none))["compression_format"],
+			static_cast<int>(godot::DSCompressionFormat::NONE));
+	GDEX_ASSERT_EQ((int)tex_reader->read_header(godot::String(dstex_gz))["compression_format"],
+			static_cast<int>(godot::DSCompressionFormat::GDEFLATE));
+
+	GDEX_ASSERT_TRUE(build_single_texture_archive(dstex_none, pkg_none, entry_none));
+	GDEX_ASSERT_TRUE(build_single_texture_archive(dstex_gz, pkg_gz, entry_gz));
+
+	int none_version = 0;
+	int gz_version = 0;
+	int64_t none_min_reader = 0;
+	int64_t gz_min_reader = 0;
+	GDEX_ASSERT_TRUE(read_archive_header_versions(pkg_none, none_version, none_min_reader));
+	GDEX_ASSERT_TRUE(read_archive_header_versions(pkg_gz, gz_version, gz_min_reader));
+	GDEX_EXPECT_EQ(none_version, 5);
+	GDEX_EXPECT_EQ(none_min_reader, static_cast<int64_t>(5));
+	GDEX_EXPECT_EQ(gz_version, 4);
+	GDEX_EXPECT_EQ(gz_min_reader, static_cast<int64_t>(4));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_EQ((int64_t)reader->open(godot::String(pkg_none)), static_cast<int64_t>(godot::OK));
+	godot::Dictionary info = reader->get_entry_info(godot::String(entry_none));
+	GDEX_EXPECT_EQ((int)info["compression_format"], static_cast<int>(godot::DSCompressionFormat::NONE));
+
+	// The archived bytes are the source payload verbatim: no relabelling, no
+	// second compression pass.
+	godot::PackedByteArray archived_bytes =
+			godot::PackedByteArray(reader->read_texture(godot::String(entry_none))["compressed_data"]);
+	godot::PackedByteArray expected_bytes =
+			godot::PackedByteArray(tex_reader->read_from_file(godot::String(dstex_none))["compressed_data"]);
+	GDEX_ASSERT_EQ(archived_bytes.size(), expected_bytes.size());
+	GDEX_EXPECT_EQ(memcmp(archived_bytes.ptr(), expected_bytes.ptr(), static_cast<size_t>(expected_bytes.size())), 0);
+
+	remove_temp_file(dstex_none);
+	remove_temp_file(dstex_gz);
+	remove_temp_file(pkg_none);
+	remove_temp_file(pkg_gz);
+}
+
 

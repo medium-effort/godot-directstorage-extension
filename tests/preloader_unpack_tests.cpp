@@ -54,6 +54,12 @@ struct PreloaderUnpackTest {
 		return DSPreloader::resolve_payload(p_engine_path, r_out);
 	}
 
+	// Memory-path request expansion. expand_requests() is private (ds_preloader.h);
+	// the friend already exists, so the NONE-codec plumbing needs no new seam.
+	static bool expand(const DSPreloader::Payload &p_payload, uint64_t p_tag, Vector<Ref<DSRequest>> &r_out) {
+		return DSPreloader::expand_requests(p_payload, p_tag, r_out);
+	}
+
 	// Injects one already-terminal CPU prewarm entry straight into the pending
 	// table. This is the only way to drive poll_completed() with a non-empty
 	// table without a backend, disk I/O or a real stream: the friend access
@@ -988,4 +994,68 @@ GDEX_TEST(preloader_validation, writer_guard) {
 	GDEX_EXPECT_EQ(static_cast<int64_t>(dstex->write_to_file(godot::String(kParityGuard), small, 8, 8,
 			godot::Image::FORMAT_R8, 1, 1)),
 			static_cast<int64_t>(godot::OK));
+}
+
+// The memory prewarm path must carry the container's codec. A NONE payload
+// (written when GDeflate loses to the raw footprint) labelled as GDeflate is
+// exactly what makes the uncompressed fallback unloadable.
+GDEX_TEST(preloader_unpack, none_v2_payload_expands_to_none_requests) {
+	godot::DSPreloader::Payload meta;
+	meta.engine_path = "res://test_none_v2.png";
+	meta.file_path = "user://test_none_v2.dstex";
+	meta.width = 64;
+	meta.height = 64;
+	meta.mip_count = 1;
+	meta.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGBA8);
+	meta.is_v2 = true;
+	meta.original_size = 64 * 64 * 4;
+	meta.compressed_size = 64 * 64 * 4;
+	meta.compression_format = static_cast<uint8_t>(godot::DSCompressionFormat::NONE);
+	meta.data_offset = 512;
+	meta.mip_offsets.push_back(512);
+	meta.mip_sizes.push_back(64 * 64 * 4);
+	meta.mip_uncompressed_sizes.push_back(64 * 64 * 4);
+	meta.mip_row_pitches.push_back(64 * 4);
+
+	GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::validate(meta));
+	godot::Vector<godot::Ref<godot::DSRequest>> requests;
+	GDEX_ASSERT_TRUE(godot::PreloaderUnpackTest::expand(meta, 7, requests));
+	GDEX_ASSERT_EQ(requests.size(), 1);
+	GDEX_EXPECT_EQ(static_cast<int>(requests[0]->get_compression_format()),
+			static_cast<int>(godot::DSRequest::COMPRESSION_NONE));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(requests[0]->get_size()), static_cast<int64_t>(64 * 64 * 4));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(requests[0]->get_uncompressed_size()), static_cast<int64_t>(64 * 64 * 4));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(requests[0]->get_offset()), static_cast<int64_t>(512));
+
+	// Positive control: the same payload declared as GDeflate stays GDeflate.
+	meta.compression_format = static_cast<uint8_t>(godot::DSCompressionFormat::GDEFLATE);
+	GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::validate(meta));
+	requests.clear();
+	GDEX_ASSERT_TRUE(godot::PreloaderUnpackTest::expand(meta, 7, requests));
+	GDEX_ASSERT_EQ(requests.size(), 1);
+	GDEX_EXPECT_EQ(static_cast<int>(requests[0]->get_compression_format()),
+			static_cast<int>(godot::DSRequest::COMPRESSION_GDEFLATE));
+}
+
+GDEX_TEST(preloader_unpack, none_v1_payload_expands_to_none_request) {
+	godot::DSPreloader::Payload meta;
+	meta.engine_path = "res://test_none_v1.png";
+	meta.file_path = "user://test_none_v1.dstex";
+	meta.width = 64;
+	meta.height = 64;
+	meta.mip_count = 1;
+	meta.pixel_format = godot::DSTex::godot_format_to_rd_format(godot::Image::FORMAT_RGBA8);
+	meta.is_v2 = false;
+	meta.data_offset = 28;
+	meta.original_size = 64 * 64 * 4;
+	meta.compressed_size = 64 * 64 * 4;
+	meta.compression_format = static_cast<uint8_t>(godot::DSCompressionFormat::NONE);
+
+	GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::validate(meta));
+	godot::Vector<godot::Ref<godot::DSRequest>> requests;
+	GDEX_ASSERT_TRUE(godot::PreloaderUnpackTest::expand(meta, 8, requests));
+	GDEX_ASSERT_EQ(requests.size(), 1);
+	GDEX_EXPECT_EQ(static_cast<int>(requests[0]->get_compression_format()),
+			static_cast<int>(godot::DSRequest::COMPRESSION_NONE));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(requests[0]->get_offset()), static_cast<int64_t>(28));
 }
