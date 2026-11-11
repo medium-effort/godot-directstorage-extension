@@ -198,6 +198,17 @@ static bool dxgi_format_is_block_compressed(DXGI_FORMAT p_format) {
 	}
 }
 
+// A row-range request addresses ONE subresource, so every box coordinate is
+// subresource-relative: DSTORAGE_DESTINATION_TEXTURE_REGION::Region is in
+// pixels of that subresource, and a mip's dimensions are
+// max(1, resource dimension >> mip). The subresource index packs
+// mip + array_slice * MipLevels, so the mip is the modulo. One definition keeps
+// the validation site and the D3D12_BOX site from disagreeing.
+static uint32_t subresource_mip_index(UINT p_first_subresource, UINT64 p_mip_levels) {
+	const uint32_t levels = static_cast<uint32_t>(std::max<uint64_t>(1, p_mip_levels));
+	return static_cast<uint32_t>(p_first_subresource % levels);
+}
+
 struct DSChunkBoundary {
 	uint64_t source_offset = 0;
 	uint64_t source_size = 0;
@@ -4258,7 +4269,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 					const uint32_t region_top = p_child->get_texture_region_top();
 					const uint32_t region_bottom = p_child->get_texture_region_bottom();
 					if (region_bottom > region_top) {
-						const uint32_t mip_index = static_cast<uint32_t>(first_subresource % mip_levels);
+						const uint32_t mip_index = subresource_mip_index(first_subresource, mip_levels);
 						const uint32_t mip_height = static_cast<uint32_t>(std::max<uint64_t>(1, texture_desc.Height >> mip_index));
 						if (texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
 							destination_error = "Win32Backend: row-range texture uploads require a 2D texture.";
@@ -4317,11 +4328,16 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	} else if (texture_row_region) {
 		request.Destination.Texture.Resource = destination_texture;
 		request.Destination.Texture.SubresourceIndex = p_child->get_first_subresource();
+		// The row band lives inside one subresource, so the horizontal span is
+		// that subresource's width, not mip 0's (a mip-0 width here is 2^mip
+		// times too wide, and DirectStorage rejects the box with E_INVALIDARG).
+		const uint32_t mip_index = subresource_mip_index(
+				static_cast<UINT>(p_child->get_first_subresource()), dest_desc.MipLevels);
 		D3D12_BOX region = {};
 		region.left = 0;
 		region.top = p_child->get_texture_region_top();
 		region.front = 0;
-		region.right = static_cast<UINT>(dest_desc.Width);
+		region.right = static_cast<UINT>(std::max<uint64_t>(1, dest_desc.Width >> mip_index));
 		region.bottom = p_child->get_texture_region_bottom();
 		region.back = 1;
 		request.Destination.Texture.Region = region;

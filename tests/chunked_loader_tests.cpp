@@ -29,6 +29,7 @@
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/texture2drd.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
 #include <cstring>
@@ -63,6 +64,36 @@ bool write_chunked(const char *p_path, const godot::PackedByteArray &p_data, int
 	return dstex->write_to_file(godot::String(p_path), p_data, kWidth, kHeight,
 			godot::Image::FORMAT_RGBA8, p_mips, 1, false, p_as_image_texture, 0, 0, 0, 1) == godot::OK;
 }
+
+// Same chain shape at an explicit size and chunk size, so a fixture large enough
+// to split a non-zero mip into several chunks can be built without disturbing
+// the cases above.
+godot::PackedByteArray make_chain_sized(int p_width, int p_height, int p_mips) {
+	godot::PackedByteArray data;
+	int w = p_width;
+	int h = p_height;
+	for (int i = 0; i < p_mips; ++i) {
+		godot::Ref<godot::Image> mip = godot::Image::create(w, h, false, godot::Image::FORMAT_RGBA8);
+		mip->fill(godot::Color(0.1f * static_cast<float>(i + 1), 0.3f, 0.6f, 1.0f));
+		godot::PackedByteArray bytes = mip->get_data();
+		for (int64_t b = 0; b < bytes.size(); ++b) {
+			bytes[b] = static_cast<uint8_t>((bytes[b] + b * 17 + i * 5) & 0xFF);
+		}
+		data.append_array(bytes);
+		w = std::max(1, w / 2);
+		h = std::max(1, h / 2);
+	}
+	return data;
+}
+
+bool write_chunked_sized(const char *p_path, const godot::PackedByteArray &p_data, int p_width,
+		int p_height, int p_mips, int p_chunk_kb, bool p_as_image_texture) {
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	return dstex->write_to_file(godot::String(p_path), p_data, p_width, p_height,
+			godot::Image::FORMAT_RGBA8, p_mips, 1, false, p_as_image_texture, 0, 0, 0, p_chunk_kb) == godot::OK;
+}
+
 
 void track_cleanup(::gdextest::TestContext &ctx, const char *p_path) {
 	const godot::String path(p_path);
@@ -313,6 +344,131 @@ GDEX_TEST_T(chunked_loader, gpu_bc7_row_range_round_trip, TAG_INTEGRATION | TAG_
 		std::string detail;
 		if (!readback_matches_bc7(readback, expected, fixture.height, detail)) {
 			GDEX_FAIL(std::string(fixture.path) + " BC7 row-range readback mismatch (" + detail + ")");
+		}
+	}
+}
+
+// Control for the multi-mip GPU case: the same 512x512 / full-chain / 64 KiB
+// fixture, taken through the CPU path. It pins the per-mip chunk split and
+// proves the payload reassembles byte-for-byte before any D3D12 box is built, so
+// a red GPU case can only be the box. The chain must be FULL: the loader
+// deliberately slices a partial chain to mip 0 without mipmaps
+// (ds_resource_format_loader.cpp:934-947), which would hide the mip this exists
+// to prove.
+GDEX_TEST(chunked_loader, cpu_sized_multi_mip_chunked_chain_round_trip) {
+	const char *path = "user://gdextest_chunk_loader_cpu_sized.dstex";
+	track_cleanup(ctx, path);
+	const godot::PackedByteArray source = make_chain_sized(512, 512, 10);
+	GDEX_ASSERT_TRUE(write_chunked_sized(path, source, 512, 512, 10, 64, true));
+
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	const godot::Dictionary header = dstex->read_header(godot::String(path));
+	GDEX_ASSERT_TRUE(!header.is_empty());
+	GDEX_EXPECT_TRUE(static_cast<bool>(header["chunked"]));
+	godot::UtilityFunctions::print("[sized] compression_format=",
+			static_cast<int64_t>(header.get("compression_format", -1)));
+	// 32 rows per chunk at a 2048-byte pitch; every tail mip fits one chunk.
+	const godot::PackedInt32Array counts = header["mip_chunk_counts"];
+	GDEX_ASSERT_EQ(counts.size(), static_cast<int64_t>(10));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(counts[0]), static_cast<int64_t>(16));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(counts[1]), static_cast<int64_t>(4));
+	for (int64_t mip = 2; mip < counts.size(); ++mip) {
+		GDEX_EXPECT_EQ(static_cast<int64_t>(counts[mip]), static_cast<int64_t>(1));
+	}
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+	godot::Variant result = loader->_load(godot::String(path), godot::String(""), false,
+			godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+	godot::Ref<godot::Texture2D> texture(result);
+	GDEX_ASSERT_TRUE(texture.is_valid());
+	godot::Ref<godot::ImageTexture> image_texture = texture;
+	GDEX_ASSERT_TRUE(image_texture.is_valid());
+	godot::Ref<godot::Image> image = image_texture->get_image();
+	GDEX_ASSERT_TRUE(image.is_valid());
+	GDEX_EXPECT_EQ(static_cast<int64_t>(image->get_width()), static_cast<int64_t>(512));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(image->get_height()), static_cast<int64_t>(512));
+	GDEX_EXPECT_TRUE(image->has_mipmaps());
+	const godot::PackedByteArray decoded = image->get_data();
+	GDEX_ASSERT_EQ(decoded.size(), source.size());
+	GDEX_EXPECT_TRUE(memcmp(decoded.ptr(), source.ptr(), static_cast<size_t>(source.size())) == 0);
+}
+
+// Row-range chunked upload across a mip boundary: a chunked payload emits one
+// request per chunk, and a mip split into several chunks arrives as a sub-box of
+// ONE subresource. The box therefore belongs to that subresource - its rows AND
+// its horizontal span are the target mip's, never mip 0's.
+//
+// The chain is deliberately partial (two mips) and both mips are multi-chunk, so
+// every request for this payload is a row-range request: a full chain's tail
+// mips fit a single chunk and take a different destination shape, which would
+// make this case fail for an unrelated reason.
+GDEX_TEST_T(chunked_loader, gpu_texture_two_mip_chain_round_trip, TAG_INTEGRATION | TAG_SLOW) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	if (!ds->is_initialized() && !ds->initialize_ds()) {
+		GDEX_SKIP("DSContext backend unavailable (initialize_ds failed).");
+	}
+	if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+		GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver).");
+	}
+	godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+	godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	if (rd == nullptr) {
+		GDEX_SKIP("No RenderingDevice for the GPU chunked load.");
+	}
+
+	const char *path = "user://gdextest_chunk_loader_gpu_two_mip.dstex";
+	track_cleanup(ctx, path);
+	const godot::PackedByteArray source = make_chain_sized(512, 512, 2);
+	GDEX_ASSERT_TRUE(write_chunked_sized(path, source, 512, 512, 2, 64, false));
+
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	const godot::Dictionary header = dstex->read_header(godot::String(path));
+	GDEX_ASSERT_TRUE(!header.is_empty());
+	GDEX_EXPECT_TRUE(static_cast<bool>(header["chunked"]));
+	godot::UtilityFunctions::print("[two_mip] compression_format=",
+			static_cast<int64_t>(header.get("compression_format", -1)));
+	// 32 rows per chunk at a 2048-byte pitch, 64 rows per chunk at 1024.
+	const godot::PackedInt32Array counts = header["mip_chunk_counts"];
+	GDEX_ASSERT_EQ(counts.size(), static_cast<int64_t>(2));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(counts[0]), static_cast<int64_t>(16));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(counts[1]), static_cast<int64_t>(4));
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+	godot::Variant result = loader->_load(godot::String(path), godot::String(""), false,
+			godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+	godot::Ref<godot::Texture2D> texture(result);
+	GDEX_ASSERT_TRUE(texture.is_valid());
+	// A CPU fallback here means the batch failed; the GPU path is the coverage.
+	godot::Ref<godot::Texture2DRD> rd_texture = texture;
+	GDEX_ASSERT_TRUE(rd_texture.is_valid());
+	const godot::RID device_rid = rd_texture->get_texture_rd_rid();
+	GDEX_ASSERT_TRUE(device_rid.is_valid());
+
+	const godot::PackedByteArray readback = rd->texture_get_data(device_rid, 0);
+	GDEX_ASSERT_EQ(readback.size(), source.size());
+	if (readback.size() == source.size()) {
+		const bool identical = memcmp(readback.ptr(), source.ptr(), static_cast<size_t>(source.size())) == 0;
+		GDEX_EXPECT_TRUE(identical);
+		if (!identical) {
+			const int64_t mip1_start = 512 * 512 * 4;
+			int64_t first = -1;
+			for (int64_t i = 0; i < readback.size(); ++i) {
+				if (readback[i] != source[i]) {
+					first = i;
+					break;
+				}
+			}
+			GDEX_FAIL(std::string("readback differs from the source at byte ") + std::to_string(first) +
+					" (mip 0 ends at " + std::to_string(mip1_start) + ")");
 		}
 	}
 }
