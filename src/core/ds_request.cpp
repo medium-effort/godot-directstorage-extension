@@ -277,6 +277,10 @@ void DSRequest::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_subresource_count", "count"), &DSRequest::set_subresource_count);
 	ClassDB::bind_method(D_METHOD("get_subresource_count"), &DSRequest::get_subresource_count);
 
+	ClassDB::bind_method(D_METHOD("set_texture_region", "top", "bottom"), &DSRequest::set_texture_region);
+	ClassDB::bind_method(D_METHOD("get_texture_region_top"), &DSRequest::get_texture_region_top);
+	ClassDB::bind_method(D_METHOD("get_texture_region_bottom"), &DSRequest::get_texture_region_bottom);
+
 	ClassDB::bind_method(D_METHOD("set_texture_format", "format"), &DSRequest::set_texture_format);
 	ClassDB::bind_method(D_METHOD("get_texture_format"), &DSRequest::get_texture_format);
 

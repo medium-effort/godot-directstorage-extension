@@ -73,6 +73,14 @@
 			<return type="int" />
 			<description>Returns the native driver texture layout identifier used for destination validation.</description>
 		</method>
+		<method name="get_texture_region_bottom" qualifiers="const">
+			<return type="int" />
+			<description>Returns the row after the last row of the band set by [method set_texture_region], or 0 when the whole subresource is written.</description>
+		</method>
+		<method name="get_texture_region_top" qualifiers="const">
+			<return type="int" />
+			<description>Returns the first row of the band set by [method set_texture_region], or 0 when the whole subresource is written.</description>
+		</method>
 		<method name="get_uncompressed_size" qualifiers="const">
 			<return type="int" />
 			<description>Returns the expected output size in bytes for a compressed request.</description>
@@ -150,6 +158,12 @@
 			<return type="void" />
 			<param index="0" name="layout" type="int" />
 			<description>Sets the native driver texture layout identifier for GPU destination compatibility validation.</description>
+		</method>
+		<method name="set_texture_region">
+			<return type="void" />
+			<param index="0" name="top" type="int" />
+			<param index="1" name="bottom" type="int" />
+			<description>Restricts a [constant DESTINATION_GPU_TEXTURE] request to the row band [param top] (inclusive) to [param bottom] (exclusive) of [member first_subresource]. The payload must contain exactly those rows at the resource's copyable row pitch, which is how an importer-written chunk of a chunked [code].dstex[/code] is laid out. Leave both at 0 to write whole subresources. Prefer the [code].dstex[/code] loader or [DSPreloader] over building chunk requests by hand: they derive the row boundaries from the chunk table and keep every request inside the staging buffer. Ignored with an error when the request is in flight or completed.</description>
 		</method>
 		<method name="set_uncompressed_size">
 			<return type="void" />
