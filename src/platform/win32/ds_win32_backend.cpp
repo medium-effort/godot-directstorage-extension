@@ -2786,6 +2786,13 @@ void Win32Backend::apply_dstorage_configuration() {
 	options.disable_gpu_decompression = ctx ? ctx->get_disable_gpu_decompression() : false;
 	options.disable_gpu_decompression_metacommand = ctx ? ctx->get_disable_gpu_decompression_metacommand() : false;
 	options.force_file_buffering = s_desired_file_buffering.load();
+	options.cpu_decompression_threads = 0;
+	if (ProjectSettings *ps = ProjectSettings::get_singleton()) {
+		const String cpu_threads_key = dsgd_settings::key("cpu_decompression_threads");
+		if (ps->has_setting(cpu_threads_key)) {
+			options.cpu_decompression_threads = static_cast<int32_t>(int64_t(ps->get_setting(cpu_threads_key)));
+		}
+	}
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	// Benchmark seams (never bound, debug/dev only). The production decision
 	// comes from the asset volume's media class; the env switches let the probe
@@ -2819,6 +2826,7 @@ void Win32Backend::apply_dstorage_configuration() {
 		buffered_config.DisableGpuDecompressionMetacommand = resolved.disable_gpu_decompression_metacommand ? TRUE : FALSE;
 		buffered_config.DisableBypassIO = resolved.disable_bypass_io ? TRUE : FALSE;
 		buffered_config.ForceFileBuffering = TRUE;
+		buffered_config.NumBuiltInCpuDecompressionThreads = resolved.cpu_decompression_threads;
 		hr = DStorageSetConfiguration1(&buffered_config);
 		if (SUCCEEDED(hr)) {
 			UtilityFunctions::print("[DirectStorage] File buffering enabled: rotational media uses ForceFileBuffering (BypassIO disabled).");
@@ -2831,6 +2839,7 @@ void Win32Backend::apply_dstorage_configuration() {
 		config.DisableTelemetry = resolved.disable_telemetry ? TRUE : FALSE;
 		config.DisableGpuDecompression = resolved.disable_gpu_decompression ? TRUE : FALSE;
 		config.DisableGpuDecompressionMetacommand = resolved.disable_gpu_decompression_metacommand ? TRUE : FALSE;
+		config.NumBuiltInCpuDecompressionThreads = resolved.cpu_decompression_threads;
 
 		hr = DStorageSetConfiguration(&config);
 		if (FAILED(hr)) {
@@ -3457,7 +3466,16 @@ bool Win32Backend::initialize(const String &p_path) {
 
 	if (SUCCEEDED(hr) && factory) {
 #ifdef DEBUG_ENABLED
-		factory->SetDebugFlags(DSTORAGE_DEBUG_SHOW_ERRORS | DSTORAGE_DEBUG_RECORD_OBJECT_NAMES);
+		UINT32 debug_flags = DSTORAGE_DEBUG_SHOW_ERRORS | DSTORAGE_DEBUG_RECORD_OBJECT_NAMES;
+		// Opt-in only: DebugBreak() without a debugger attached terminates the
+		// process, so the setting must never be on by default.
+		if (ProjectSettings *ps = ProjectSettings::get_singleton()) {
+			const String break_key = dsgd_settings::key("debug_break_on_error");
+			if (ps->has_setting(break_key) && static_cast<bool>(ps->get_setting(break_key))) {
+				debug_flags |= static_cast<UINT32>(DSTORAGE_DEBUG_BREAK_ON_ERROR);
+			}
+		}
+		factory->SetDebugFlags(debug_flags);
 #else
 		factory->SetDebugFlags(DSTORAGE_DEBUG_NONE);
 #endif

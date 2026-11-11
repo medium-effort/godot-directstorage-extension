@@ -1,6 +1,9 @@
 #ifndef DS_BACKEND_CONFIG_H
 #define DS_BACKEND_CONFIG_H
 
+#include <algorithm>
+#include <cstdint>
+
 namespace godot {
 
 // Inputs to the one-shot DirectStorage configuration call. Deliberately free of
@@ -12,6 +15,10 @@ struct DSBackendConfigOptions {
 	bool disable_gpu_decompression_metacommand = false;
 	bool force_file_buffering = false;
 	bool disable_telemetry = true;
+	// Maximum threads the runtime may use to decompress built-in formats on the
+	// CPU (memory destinations always take this path, and GPU destinations do
+	// when GPU decompression is off). 0 keeps the runtime's "system best guess".
+	int32_t cpu_decompression_threads = 0;
 };
 
 struct DSResolvedBackendConfig {
@@ -20,6 +27,7 @@ struct DSResolvedBackendConfig {
 	bool disable_gpu_decompression_metacommand = false;
 	bool disable_bypass_io = false;
 	bool force_file_buffering = false;
+	int32_t cpu_decompression_threads = 0;
 };
 
 // Resolves the two codec switches independently on purpose. Coupling them (the
@@ -34,6 +42,10 @@ inline DSResolvedBackendConfig resolve_backend_config(const DSBackendConfigOptio
 	resolved.force_file_buffering = p_options.force_file_buffering;
 	// ForceFileBuffering is only honoured with BypassIO off.
 	resolved.disable_bypass_io = p_options.force_file_buffering;
+	// 0 means "runtime default"; a negative or absurd project setting must not
+	// reach DSTORAGE_CONFIGURATION. 256 is far above any consumer core count and
+	// still below the runtime's INT32 range.
+	resolved.cpu_decompression_threads = std::clamp<int32_t>(p_options.cpu_decompression_threads, 0, 256);
 	return resolved;
 }
 

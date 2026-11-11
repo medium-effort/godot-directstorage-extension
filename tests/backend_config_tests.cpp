@@ -59,3 +59,19 @@ GDEX_TEST(backend_config, telemetry_flag_is_carried_through) {
 	options.disable_telemetry = false;
 	GDEX_EXPECT_FALSE(godot::resolve_backend_config(options).disable_telemetry);
 }
+
+// CPU decompression thread cap: 0 keeps the runtime default, and a bad project
+// setting must not reach DSTORAGE_CONFIGURATION as a negative or absurd pool.
+GDEX_TEST(backend_config, cpu_decompression_threads_are_clamped) {
+	godot::DSBackendConfigOptions options;
+	GDEX_EXPECT_EQ(static_cast<int64_t>(godot::resolve_backend_config(options).cpu_decompression_threads), static_cast<int64_t>(0));
+
+	options.cpu_decompression_threads = 4;
+	GDEX_EXPECT_EQ(static_cast<int64_t>(godot::resolve_backend_config(options).cpu_decompression_threads), static_cast<int64_t>(4));
+
+	options.cpu_decompression_threads = -8;
+	GDEX_EXPECT_EQ(static_cast<int64_t>(godot::resolve_backend_config(options).cpu_decompression_threads), static_cast<int64_t>(0));
+
+	options.cpu_decompression_threads = 10000;
+	GDEX_EXPECT_EQ(static_cast<int64_t>(godot::resolve_backend_config(options).cpu_decompression_threads), static_cast<int64_t>(256));
+}

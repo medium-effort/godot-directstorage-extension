@@ -65,6 +65,8 @@ static void register_directstorage_project_settings() {
 	register_setting(dsgd_settings::key("staging_buffer_size_mb"), Variant::INT, 32, PROPERTY_HINT_RANGE, "16,2048,16");
 	register_setting(dsgd_settings::key("disable_gpu_decompression"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("disable_gpu_decompression_metacommand"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
+	register_setting(dsgd_settings::key("cpu_decompression_threads"), Variant::INT, 0, PROPERTY_HINT_RANGE, "0,64,1");
+	register_setting(dsgd_settings::key("debug_break_on_error"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("queue_capacity"), Variant::INT, 512, PROPERTY_HINT_RANGE, "128,8192,64");
 	register_setting(dsgd_settings::key("auto_tune_for_integrated_gpu"), Variant::BOOL, true, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("auto_tune_for_low_vram_gpu"), Variant::BOOL, true, PROPERTY_HINT_NONE, "");
