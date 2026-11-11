@@ -256,6 +256,16 @@ static bool validate_gdeflate_stream_size(const String &p_path, uint64_t p_sourc
 }
 #endif // _WIN32
 
+// LEGACY LAYOUT SUPPORT - not a general-purpose splitter.
+//
+// Chunked payloads became the importer default, so a mip carries its own chunk
+// table and the loader issues one request per chunk. This splitter only exists
+// for assets that still store a whole mip as one stream: v1/v2 files and v3
+// files written with chunk_size_kb = 0. It deliberately refuses chunked
+// payloads (see the "chunked" guard below) - do NOT add a chunked branch here,
+// or an already-chunked mip would be split twice and the row offsets would
+// drift. Retire it after an import migration, not because chunking became the
+// default.
 static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t p_capacity, Vector<DSChunkBoundary> &r_chunks) {
 	if (p_path.get_extension().to_lower() != "dstex") {
 		return false;
@@ -337,6 +347,8 @@ static bool get_dstex_mip_chunks(const String &p_path, uint64_t p_payload_offset
 }
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+// Test-only view of the legacy unchunked splitter above, so the v1/v2 layout
+// tests can assert row boundaries without hardware. Not a production path.
 Dictionary Win32Backend::_debug_get_dstex_mip_chunks_for_testing(const String &p_path, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t p_capacity) {
 	Vector<DSChunkBoundary> chunks;
 	if (!get_dstex_mip_chunks(p_path, p_payload_offset, p_payload_size, p_capacity, chunks)) {

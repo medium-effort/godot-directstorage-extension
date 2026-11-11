@@ -59,8 +59,11 @@ const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "c
 ##   practical range; 9-12 cost 5-13x compression time. The level does not change
 ##   runtime decompression cost; see the addon README for the measured tables.
 ## - [b]compression/chunk_size_kb[/b]: split each mip into independent GDeflate
-##   chunks of at most this many uncompressed KiB (0 = one stream per mip). Chunks
-##   decouple the DirectStorage staging requirement from the texture size.
+##   chunks of at most this many uncompressed KiB. Chunks decouple the
+##   DirectStorage staging requirement from the texture size. 0 restores the
+##   legacy one-stream-per-mip layout: the Windows backend must then split the
+##   stream at load time and the staging buffer has to cover a whole mip, so keep
+##   it non-zero for new assets.
 ## - [b]mipmaps/generate[/b]: Generate a full mip chain.
 ## - [b]process/size_limit[/b]: Resize the longer edge before mip generation.
 ## - [b]process/channel_remap/red|green|blue|alpha[/b]: Swizzle, invert, or replace channels (e.g. pack PBR masks, flip normal-map Y).
