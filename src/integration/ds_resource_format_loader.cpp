@@ -596,9 +596,16 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 						const int32_t chunk_count = p_mip_chunk_counts.size() > static_cast<int64_t>(mip) ? p_mip_chunk_counts[mip] : 1;
 						const int32_t pitch = p_mip_row_pitches.size() > static_cast<int64_t>(mip) ? p_mip_row_pitches[mip] : 0;
 						if (chunk_count <= 1) {
-							make_upload(static_cast<uint64_t>(p_mip_offsets[mip]),
+							Ref<DSRequest> req = make_upload(static_cast<uint64_t>(p_mip_offsets[mip]),
 									static_cast<uint32_t>(p_mip_sizes[mip]),
 									static_cast<uint32_t>(p_mip_uncompressed_sizes[mip]), mip, 1);
+							// A single-chunk mip has no chunk-table entry but still
+							// targets ONE subresource: give it the whole-mip row band so
+							// it keeps the row-range destination. A chunked container
+							// cannot use the whole-subresource destination at all - the
+							// backend rebuilds that request from a mip table it refuses
+							// for chunked files.
+							req->set_texture_region(0, std::max<uint32_t>(1u, p_height >> mip));
 							continue;
 						}
 						if (pitch <= 0) {

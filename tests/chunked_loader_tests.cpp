@@ -473,3 +473,62 @@ GDEX_TEST_T(chunked_loader, gpu_texture_two_mip_chain_round_trip, TAG_INTEGRATIO
 	}
 }
 
+// A real chunked paddle: the full mip chain of a 512x512 texture at 64 KiB
+// chunks. The tail mips fit one chunk each, so they have no chunk-table entry;
+// they must still reach the GPU through the row-range destination, because a
+// chunked container cannot use the whole-subresource destination at all. This is
+// the shape the importer writes, so a payload this test cannot load is a payload
+// no real asset can load.
+GDEX_TEST_T(chunked_loader, gpu_texture_full_chain_round_trip, TAG_INTEGRATION | TAG_SLOW) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	if (!ds->is_initialized() && !ds->initialize_ds()) {
+		GDEX_SKIP("DSContext backend unavailable (initialize_ds failed).");
+	}
+	if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+		GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver).");
+	}
+	godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+	godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	if (rd == nullptr) {
+		GDEX_SKIP("No RenderingDevice for the GPU chunked load.");
+	}
+
+	const char *path = "user://gdextest_chunk_loader_gpu_full_chain.dstex";
+	track_cleanup(ctx, path);
+	const godot::PackedByteArray source = make_chain_sized(512, 512, 10);
+	GDEX_ASSERT_TRUE(write_chunked_sized(path, source, 512, 512, 10, 64, false));
+
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	const godot::Dictionary header = dstex->read_header(godot::String(path));
+	GDEX_ASSERT_TRUE(!header.is_empty());
+	GDEX_EXPECT_TRUE(static_cast<bool>(header["chunked"]));
+	const godot::PackedInt32Array counts = header["mip_chunk_counts"];
+	GDEX_ASSERT_EQ(counts.size(), static_cast<int64_t>(10));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(counts[0]), static_cast<int64_t>(16));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(counts[1]), static_cast<int64_t>(4));
+	// The tail mips are the single-chunk ones this case exists for.
+	for (int64_t mip = 2; mip < counts.size(); ++mip) {
+		GDEX_EXPECT_EQ(static_cast<int64_t>(counts[mip]), static_cast<int64_t>(1));
+	}
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+	godot::Variant result = loader->_load(godot::String(path), godot::String(""), false,
+			godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+	godot::Ref<godot::Texture2D> texture(result);
+	GDEX_ASSERT_TRUE(texture.is_valid());
+	godot::Ref<godot::Texture2DRD> rd_texture = texture;
+	GDEX_ASSERT_TRUE(rd_texture.is_valid());
+	const godot::RID device_rid = rd_texture->get_texture_rd_rid();
+	GDEX_ASSERT_TRUE(device_rid.is_valid());
+
+	const godot::PackedByteArray readback = rd->texture_get_data(device_rid, 0);
+	GDEX_ASSERT_EQ(readback.size(), source.size());
+	GDEX_EXPECT_TRUE(memcmp(readback.ptr(), source.ptr(), static_cast<size_t>(source.size())) == 0);
+}
+

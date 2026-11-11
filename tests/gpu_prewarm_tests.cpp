@@ -298,19 +298,32 @@ bool stage_npot_dspkg(const char *p_npot_dstex_path, const char *p_control_dstex
 // Chunked staging for the GPU prewarm test: two 1024x1024 entries in one
 // archive, one incompressible (noise -> NONE raw row-slice chunks) and one
 // compressible (solid -> GDeflate chunks). 256 KiB chunks give 16 row-range
-// requests per texture. Publishes res://textures.dspkg directly.
+// requests per mip at the base level; the noise entry carries a full 3-mip
+// chain, so its 512x512 mip is 4 chunks and its 256x256 mip is a single chunk
+// (a payload with no chunk-table entry for the tail, which still has to reach
+// the GPU). Publishes res://textures.dspkg directly.
 bool stage_chunked_gpu_dspkg(const char *p_noise_dstex_path, const char *p_solid_dstex_path,
-        const char *p_dspkg_path, const char *p_noise_virtual, const char *p_solid_virtual) {
+        const char *p_dspkg_path, const char *p_noise_virtual, const char *p_solid_virtual,
+        godot::PackedByteArray &r_noise_chain) {
     constexpr int kChunkedSize = 1024;
+    constexpr int kChunkedMips = 3;
     constexpr int kChunkKb = 256;
     godot::PackedByteArray noise;
-    noise.resize(static_cast<int64_t>(kChunkedSize) * static_cast<int64_t>(kChunkedSize) * 4);
     {
-        uint8_t *writer = noise.ptrw();
-        uint32_t state = 0x9E3779B9u;
-        for (int64_t i = 0; i < noise.size(); ++i) {
-            state = state * 1664525u + 1013904223u;
-            writer[i] = static_cast<uint8_t>(state >> 24);
+        int width = kChunkedSize;
+        int height = kChunkedSize;
+        for (int mip = 0; mip < kChunkedMips; ++mip) {
+            godot::PackedByteArray level;
+            level.resize(static_cast<int64_t>(width) * static_cast<int64_t>(height) * 4);
+            uint8_t *writer = level.ptrw();
+            uint32_t state = 0x9E3779B9u + static_cast<uint32_t>(mip) * 7919u;
+            for (int64_t i = 0; i < level.size(); ++i) {
+                state = state * 1664525u + 1013904223u;
+                writer[i] = static_cast<uint8_t>(state >> 24);
+            }
+            noise.append_array(level);
+            width = std::max(1, width / 2);
+            height = std::max(1, height / 2);
         }
     }
     godot::PackedByteArray solid;
@@ -323,7 +336,7 @@ bool stage_chunked_gpu_dspkg(const char *p_noise_dstex_path, const char *p_solid
         return false;
     }
     if (dstex->write_to_file(godot::String(p_noise_dstex_path), noise, kChunkedSize, kChunkedSize,
-                godot::Image::FORMAT_RGBA8, 1, 1, false, false, 0, 0, 0, kChunkKb) != godot::OK) {
+                godot::Image::FORMAT_RGBA8, kChunkedMips, 1, false, false, 0, 0, 0, kChunkKb) != godot::OK) {
         return false;
     }
     if (dstex->write_to_file(godot::String(p_solid_dstex_path), solid, kChunkedSize, kChunkedSize,
@@ -336,6 +349,7 @@ bool stage_chunked_gpu_dspkg(const char *p_noise_dstex_path, const char *p_solid
             !(bool)noise_header.get("chunked", false) || !(bool)solid_header.get("chunked", false)) {
         return false;
     }
+    r_noise_chain = noise;
     godot::Ref<godot::DSPkg> builder;
     builder.instantiate();
     if (builder.is_null()) {
@@ -721,6 +735,11 @@ GDEX_TEST_T(gpu_prewarm, chunked_dma_fills_vram_texture, TAG_INTEGRATION | TAG_S
     if (!godot::DSPreloader::is_gpu_prewarm_available()) {
         GDEX_SKIP("GPU prewarm unavailable (no live D3D12 RenderingDevice)");
     }
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("no RenderingDevice for the chunked prewarm readback");
+    }
     godot::DSTextureCache *cache = new_test_cache(ctx);
     godot::DSPreloader::shutdown();
 
@@ -729,6 +748,7 @@ GDEX_TEST_T(gpu_prewarm, chunked_dma_fills_vram_texture, TAG_INTEGRATION | TAG_S
     const char *dspkg_path = "user://gdextest_gpu_chunked.dspkg";
     const char *noise_virtual_path = "res://gdextest_gpu_chunked_noise.png";
     const char *solid_virtual_path = "res://gdextest_gpu_chunked_solid.png";
+    godot::PackedByteArray noise_chain;
     godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
     if (ps) {
         ps->set_setting("dsgd_extension/force_archive_resolution", true);
@@ -744,7 +764,8 @@ GDEX_TEST_T(gpu_prewarm, chunked_dma_fills_vram_texture, TAG_INTEGRATION | TAG_S
         remove_abs("user://gdextest_gpu_chunked.dspkg");
         godot::DSPreloader::shutdown();
     });
-    if (!stage_chunked_gpu_dspkg(noise_dstex_path, solid_dstex_path, dspkg_path, noise_virtual_path, solid_virtual_path)) {
+    if (!stage_chunked_gpu_dspkg(noise_dstex_path, solid_dstex_path, dspkg_path, noise_virtual_path,
+                solid_virtual_path, noise_chain)) {
         GDEX_ABORT_TEST("chunked textures.dspkg staging failed");
     }
 
@@ -791,8 +812,9 @@ GDEX_TEST_T(gpu_prewarm, chunked_dma_fills_vram_texture, TAG_INTEGRATION | TAG_S
                 std::to_string(progress.x) + ", total=" + std::to_string(progress.y) + ").");
     }
     // The tag total must count one unit per staged request, not one per texture
-    // (#0247). With two 16-chunk textures that means 32 units, so a regression
-    // to texture-granular totals shows up here as total == 2 and a progress bar
+    // (#0247). The noise entry fans out to 16 + 4 + 1 units (its 256x256 tail mip
+    // is a single chunk) and the solid entry to 16, so a regression to
+    // texture-granular totals shows up here as total == 2 and a progress bar
     // that reads 100% while most of the DMA is still in flight.
     {
         int64_t expected_units = 0;
@@ -824,8 +846,8 @@ GDEX_TEST_T(gpu_prewarm, chunked_dma_fills_vram_texture, TAG_INTEGRATION | TAG_S
     }
 
     // Both residents must be VRAM-backed Texture2DRD: the NONE path (noise)
-    // and the GDeflate path (solid) each fanned out to 16 row-range requests,
-    // and neither may have fallen back to the CPU ImageTexture route.
+    // and the GDeflate path (solid) each fanned out to row-range requests, and
+    // neither may have fallen back to the CPU ImageTexture route.
     for (const char *entry_path : { noise_virtual_path, solid_virtual_path }) {
         godot::Ref<godot::Texture2D> tex =
                 cache->get_cached(godot::String(entry_path), godot::DSTextureCache::CACHE_MODE_REUSE);
@@ -834,6 +856,23 @@ GDEX_TEST_T(gpu_prewarm, chunked_dma_fills_vram_texture, TAG_INTEGRATION | TAG_S
         GDEX_EXPECT_EQ(tex->get_height(), 1024);
         godot::Ref<godot::Texture2DRD> gpu = tex;
         GDEX_EXPECT_TRUE(gpu.is_valid());
+    }
+
+    // The whole chain must have landed, including the single-chunk tail mips
+    // that carry no chunk-table entry: read the resident back and compare every
+    // mip, not just the base level the residency check covers.
+    {
+        godot::Ref<godot::Texture2D> tex =
+                cache->get_cached(godot::String(noise_virtual_path), godot::DSTextureCache::CACHE_MODE_REUSE);
+        GDEX_ASSERT_TRUE(tex.is_valid());
+        godot::Ref<godot::Texture2DRD> gpu = tex;
+        GDEX_ASSERT_TRUE(gpu.is_valid());
+        const godot::RID rid = gpu->get_texture_rd_rid();
+        GDEX_ASSERT_TRUE(rid.is_valid());
+        const godot::PackedByteArray readback = rd->texture_get_data(rid, 0);
+        GDEX_ASSERT_EQ(readback.size(), noise_chain.size());
+        GDEX_EXPECT_TRUE(memcmp(readback.ptr(), noise_chain.ptr(),
+                static_cast<size_t>(noise_chain.size())) == 0);
     }
 }
 

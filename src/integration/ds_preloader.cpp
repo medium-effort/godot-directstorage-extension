@@ -1733,9 +1733,16 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 		chunk_layout_ok = walk_gpu_upload_units(m,
 				[&](uint32_t p_mip, int64_t p_chunk_index, uint32_t p_row, uint32_t p_rows) -> bool {
 					if (p_chunk_index < 0) {
-						make_upload(static_cast<uint64_t>(m.mip_offsets[p_mip]),
+						// A single-chunk mip has no chunk-table entry but still
+						// targets ONE subresource: upload it as the whole-mip row
+						// band so it keeps the row-range destination. A chunked
+						// container cannot use the whole-subresource destination -
+						// the backend rebuilds that request from a mip table it
+						// refuses for chunked files.
+						Ref<DSRequest> req = make_upload(static_cast<uint64_t>(m.mip_offsets[p_mip]),
 								static_cast<uint32_t>(m.mip_sizes[p_mip]),
 								static_cast<uint32_t>(m.mip_uncompressed_sizes[p_mip]), p_mip, 1);
+						req->set_texture_region(0, std::max<uint32_t>(1u, m.height >> p_mip));
 						return true;
 					}
 					Ref<DSRequest> req = make_upload(static_cast<uint64_t>(m.chunk_offsets[p_chunk_index]),
