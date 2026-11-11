@@ -409,6 +409,37 @@ bool write_linear_dstex(const char *p_path, godot::Image::Format p_format, int p
                    static_cast<int>(p_format), p_mip_count, 1) == godot::OK;
 }
 
+// BC7 chunked fixture for the row-range unit check. 256 wide gives a 1024-byte
+// block row (64 blocks * 16 bytes, already 256-aligned), so a 16 KiB chunk
+// target is exactly 16 block rows. A distinct constant per block row keeps the
+// payload compressible (so the writer keeps the GDeflate chunk path instead of
+// falling back to NONE) and makes any displaced band visible in the readback.
+// For this width the padded footprint and the tight natural image are the same
+// size and bytes, so the padded buffer can be compared as readback_matches_natural
+// expects it.
+bool write_chunked_bc7_dstex(const char *p_path, int p_width, int p_height, int p_chunk_kb,
+        godot::PackedByteArray &r_expected) {
+    const godot::DSTexMipLayout layout = godot::DSTex::get_mip_layout(
+            static_cast<uint32_t>(p_width), static_cast<uint32_t>(p_height),
+            godot::Image::FORMAT_BPTC_RGBA);
+    if (layout.footprint_size == 0 || layout.row_pitch == 0) {
+        return false;
+    }
+    r_expected.resize(static_cast<int64_t>(layout.footprint_size));
+    uint8_t *writer = r_expected.ptrw();
+    for (uint64_t row = 0; row < layout.row_count; ++row) {
+        memset(writer + row * layout.row_pitch, static_cast<int>((row * 37u + 11u) & 0xFFu),
+                static_cast<size_t>(layout.row_pitch));
+    }
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    if (dstex.is_null()) {
+        return false;
+    }
+    return dstex->write_to_file(godot::String(p_path), r_expected, p_width, p_height,
+                   godot::Image::FORMAT_BPTC_RGBA, 1, 1, false, false, 0, 0, 0, p_chunk_kb) == godot::OK;
+}
+
 // Compares an RD readback against the natural payload that went into the
 // fixture. The D3D12 copy path returns either tight rows or 256B-padded rows
 // depending on the format path, so exactly one of those two shapes is accepted
@@ -1005,6 +1036,97 @@ GDEX_TEST_T(gpu_prewarm, bc7_fill_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
     if (!readback_matches_natural(readback, expected, godot::Image::FORMAT_BPTC_RGBA,
                 kLinearTexWidth, kLinearTexHeight, kLinearMipCount, detail)) {
         GDEX_FAIL("BC7 GPU readback mismatch (readback=" + std::to_string(readback.size()) + "): " + detail);
+    }
+}
+
+// Prewarm-side counterpart of the loader row-range check: a chunked BC7 payload
+// fans out to one row-range request per chunk through walk_gpu_upload_units. If
+// that walker keeps its bands in 4x4 block rows, the destination box covers a
+// quarter of the mip's texel rows and the readback mismatches even though every
+// request completes.
+GDEX_TEST_T(gpu_prewarm, chunked_bc7_fill_vram_texture, TAG_INTEGRATION | TAG_SLOW) {
+    if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
+        GDEX_SKIP("DSContext/DSTextureCache classes unavailable");
+    }
+    godot::DSContext *ds = require_singleton_context(ctx);
+    if (!ds->initialize_ds() || !ds->is_initialized()) {
+        GDEX_SKIP("DSContext backend unavailable (initialize_ds failed)");
+    }
+    if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+        GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver)");
+    }
+    if (!godot::DSPreloader::is_gpu_prewarm_available()) {
+        GDEX_SKIP("GPU prewarm unavailable (no live D3D12 RenderingDevice)");
+    }
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("no RenderingDevice for the readback check");
+    }
+    godot::DSTextureCache *cache = new_test_cache(ctx);
+    godot::DSPreloader::shutdown();
+
+    constexpr int kChunkedWidth = 256;
+    constexpr int kChunkedHeight = 256;
+    const char *path = "user://gdextest_gpu_prewarm_bc7_chunked.dstex";
+    ctx.add_teardown([ds, path]() {
+        ds->shutdown_ds();
+        remove_abs(path);
+        godot::DSPreloader::shutdown();
+    });
+
+    godot::PackedByteArray expected;
+    if (!write_chunked_bc7_dstex(path, kChunkedWidth, kChunkedHeight, 16, expected)) {
+        GDEX_ABORT_TEST("chunked BC7 .dstex staging failed");
+    }
+    // Fixture guard: without a real chunk table the prewarm emits one whole-mip
+    // request and never exercises the row-range path.
+    {
+        godot::Ref<godot::DSTex> probe;
+        probe.instantiate();
+        const godot::Dictionary header = probe->read_header(godot::String(path));
+        GDEX_ASSERT_TRUE(!header.is_empty());
+        GDEX_EXPECT_TRUE(static_cast<bool>(header.get("chunked", false)));
+        const godot::PackedInt32Array counts = (godot::PackedInt32Array)header["mip_chunk_counts"];
+        GDEX_ASSERT_EQ(static_cast<int64_t>(counts.size()), static_cast<int64_t>(1));
+        GDEX_EXPECT_EQ(static_cast<int64_t>(counts[0]), static_cast<int64_t>(4));
+    }
+
+    godot::PackedStringArray paths;
+    paths.push_back(godot::String(path));
+    uint64_t tag = 0;
+    try {
+        tag = cache->prewarm_gpu_async(paths, 16, true);
+    } catch (const std::exception &e) {
+        GDEX_FAIL(std::string("prewarm_gpu_async threw: ") + e.what());
+    } catch (...) {
+        GDEX_FAIL("prewarm_gpu_async threw an unknown exception.");
+    }
+    GDEX_ASSERT_TRUE(tag != 0);
+
+    const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() + 20000;
+    if (!drive_prewarm_to_settled(ds, cache, tag, deadline)) {
+        godot::Vector2i progress = ds->get_prewarm_progress(tag);
+        GDEX_FAIL(std::string("chunked BC7 prewarm tag did not settle (done=") +
+                std::to_string(progress.x) + ", total=" + std::to_string(progress.y) + ").");
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::DSPreloader::get_unbuilt_prewarm_count(tag)),
+            static_cast<int64_t>(0));
+
+    godot::Ref<godot::Texture2D> tex = cache->get_cached(godot::String(path),
+            godot::DSTextureCache::CACHE_MODE_REUSE);
+    GDEX_ASSERT_TRUE(tex.is_valid());
+    godot::Ref<godot::Texture2DRD> gpu = tex;
+    GDEX_ASSERT_TRUE(gpu.is_valid());
+    const godot::RID texture_rid = gpu->get_texture_rd_rid();
+    GDEX_ASSERT_TRUE(texture_rid.is_valid());
+
+    const godot::PackedByteArray readback = rd->texture_get_data(texture_rid, 0);
+    std::string detail;
+    if (!readback_matches_natural(readback, expected, godot::Image::FORMAT_BPTC_RGBA,
+                kChunkedWidth, kChunkedHeight, 1, detail)) {
+        GDEX_FAIL("chunked BC7 GPU readback mismatch (readback=" +
+                std::to_string(readback.size()) + "): " + detail);
     }
 }
 

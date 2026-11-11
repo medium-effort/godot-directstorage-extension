@@ -52,8 +52,9 @@ static constexpr size_t kGpuPrewarmRequestsPerCallback = 64;
 // request construction all consume it, so they cannot drift apart.
 //
 // Calls p_visit(mip, chunk_index, row, rows) for every upload unit:
-//   chunk_index >= 0 - one row-range chunk; `row` is its starting row inside
-//                      the mip and `rows` its height.
+//   chunk_index >= 0 - one row-range chunk; `row` is its starting texel row
+//                      inside the mip and `rows` its texel height (the units a
+//                      DSTORAGE_DESTINATION_TEXTURE_REGION box speaks).
 //   chunk_index == -1 - a single-chunk mip, uploaded as a whole-subresource
 //                      request (its chunk-table entry does not exist).
 //
@@ -75,6 +76,7 @@ static bool walk_gpu_upload_units(const DSPreloader::Payload &p_meta, Fn &&p_vis
 			p_meta.chunk_uncompressed_sizes.size() != table_size) {
 		return false;
 	}
+	const int img_fmt = DSTex::rd_format_to_godot_format(static_cast<int>(p_meta.pixel_format));
 	int64_t cursor = 0;
 	for (int64_t mip = 0; mip < mips; ++mip) {
 		const int32_t count = p_meta.mip_chunk_counts[mip];
@@ -93,6 +95,10 @@ static bool walk_gpu_upload_units(const DSPreloader::Payload &p_meta, Fn &&p_vis
 		if (cursor + count > table_size) {
 			return false;
 		}
+		// `row` stays in storage rows (block rows for the 4x4 formats) because
+		// that is the unit of `pitch` and of the byte-sum check below; the
+		// visitor receives texel rows, which is what a D3D12_BOX speaks.
+		const uint32_t mip_height = std::max<uint32_t>(1u, p_meta.height >> static_cast<uint32_t>(mip));
 		uint32_t row = 0;
 		for (int32_t c = 0; c < count; ++c) {
 			const int64_t chunk_index = cursor + c;
@@ -105,7 +111,13 @@ static bool walk_gpu_upload_units(const DSPreloader::Payload &p_meta, Fn &&p_vis
 				return false;
 			}
 			const uint32_t rows = static_cast<uint32_t>(uncompressed / pitch);
-			if (rows == 0 || !p_visit(static_cast<uint32_t>(mip), chunk_index, row, rows)) {
+			uint32_t region_top = 0;
+			uint32_t region_bottom = 0;
+			if (rows == 0 ||
+					!DSTex::get_chunk_texel_region(mip_height, row, rows, img_fmt, region_top, region_bottom)) {
+				return false;
+			}
+			if (!p_visit(static_cast<uint32_t>(mip), chunk_index, region_top, region_bottom - region_top)) {
 				return false;
 			}
 			row += rows;

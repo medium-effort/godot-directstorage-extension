@@ -162,3 +162,60 @@ GDEX_TEST_T(dstex_v3_chunks, non_dstex_path_returns_empty, TAG_UNIT) {
 	GDEX_SKIP("Win32 chunk splitter seam unavailable (non-Windows or release build)");
 #endif
 }
+
+// A chunk's upload unit is counted in the container's storage rows (block rows
+// for the 4x4 formats) but the request destination is a D3D12_BOX, which speaks
+// texel rows. This pins the translation and the mip-edge clamp that the loader
+// and the prewarm walker share.
+GDEX_TEST_T(dstex_v3_chunks, chunk_texel_region_units, TAG_UNIT) {
+	(void)ctx;
+	uint32_t top = 0;
+	uint32_t bottom = 0;
+
+	// 256-wide BC7: 64 block rows for a 256-high mip; 16 block rows per chunk.
+	GDEX_EXPECT_TRUE(godot::DSTex::get_chunk_texel_region(256, 0, 16,
+			godot::Image::FORMAT_BPTC_RGBA, top, bottom));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(top), static_cast<int64_t>(0));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(bottom), static_cast<int64_t>(64));
+	GDEX_EXPECT_TRUE(godot::DSTex::get_chunk_texel_region(256, 48, 16,
+			godot::Image::FORMAT_BPTC_RGBA, top, bottom));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(top), static_cast<int64_t>(192));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(bottom), static_cast<int64_t>(256));
+
+	// 256x200 BC7: 50 block rows, so the tail chunk is 2 block rows = 8 texels
+	// and ends exactly on the mip edge.
+	GDEX_EXPECT_TRUE(godot::DSTex::get_chunk_texel_region(200, 48, 2,
+			godot::Image::FORMAT_BPTC_RGBA, top, bottom));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(top), static_cast<int64_t>(192));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(bottom), static_cast<int64_t>(200));
+
+	// Linear formats are one for one.
+	GDEX_EXPECT_TRUE(godot::DSTex::get_chunk_texel_region(64, 8, 4,
+			godot::Image::FORMAT_RGBA8, top, bottom));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(top), static_cast<int64_t>(8));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(bottom), static_cast<int64_t>(12));
+
+	// Height not a multiple of 4: ceil(22/4) = 6 storage rows, so a 2-row band
+	// at row 4 spans 16..24 and must clamp to the mip edge (22).
+	GDEX_EXPECT_TRUE(godot::DSTex::get_chunk_texel_region(22, 4, 2,
+			godot::Image::FORMAT_BPTC_RGBA, top, bottom));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(top), static_cast<int64_t>(16));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(bottom), static_cast<int64_t>(22));
+
+	// Unknown formats classify as linear; every caller has rejected them before
+	// this point and the backend's DXGI-side check is the cross-check.
+	GDEX_EXPECT_TRUE(godot::DSTex::get_chunk_texel_region(256, 0, 16,
+			godot::Image::FORMAT_MAX, top, bottom));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(bottom), static_cast<int64_t>(16));
+
+	// Rejections: empty band, band starting past the mip, additive overflow,
+	// zero mip height.
+	GDEX_EXPECT_FALSE(godot::DSTex::get_chunk_texel_region(256, 0, 0,
+			godot::Image::FORMAT_BPTC_RGBA, top, bottom));
+	GDEX_EXPECT_FALSE(godot::DSTex::get_chunk_texel_region(22, 6, 1,
+			godot::Image::FORMAT_BPTC_RGBA, top, bottom));
+	GDEX_EXPECT_FALSE(godot::DSTex::get_chunk_texel_region(256, UINT32_MAX, 2,
+			godot::Image::FORMAT_BPTC_RGBA, top, bottom));
+	GDEX_EXPECT_FALSE(godot::DSTex::get_chunk_texel_region(0, 0, 1,
+			godot::Image::FORMAT_RGBA8, top, bottom));
+}

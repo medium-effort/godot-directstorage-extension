@@ -136,7 +136,7 @@ func _generate() -> void:
 
 # One entry per request this texture needs, mirroring the loader's chunk loop
 # (ds_resource_format_loader.cpp): chunked mips get one request per chunk with a
-# row band, single-chunk mips get one whole-subresource request.
+# texel-row band, single-chunk mips get one whole-subresource request.
 func _request_plan(header: Dictionary) -> Array:
 	var plan: Array = []
 	var mip_count := int(header.get("mip_count", 0))
@@ -167,6 +167,11 @@ func _request_plan(header: Dictionary) -> Array:
 	var pitch: int = mip_pitches[0] if mip_pitches.size() > 0 else 0
 	if pitch <= 0:
 		return []
+	# The chunk table counts storage rows (block rows for the 4x4 formats); the
+	# request destination box is in texel rows. Mirrors
+	# DSTex::get_chunk_texel_region so the bench plans the requests the loader
+	# actually emits.
+	var row_texels := _row_texels(FORMAT)
 	var row := 0
 	for c in chunk_count:
 		var uncompressed: int = chunk_uncompressed[c]
@@ -177,11 +182,22 @@ func _request_plan(header: Dictionary) -> Array:
 			"offset": chunk_offsets[c],
 			"size": chunk_sizes[c],
 			"uncompressed": uncompressed,
-			"top": row,
-			"bottom": row + rows,
+			"top": row * row_texels,
+			"bottom": mini(HEIGHT, (row + rows) * row_texels),
 		})
 		row += rows
 	return plan
+
+
+## Texel rows covered by one storage row of a format: 4 for the 4x4 block
+## formats, 1 otherwise. Mirrors the block-format list in dstex_format.cpp.
+static func _row_texels(format: int) -> int:
+	var block_formats := [
+		Image.FORMAT_DXT1, Image.FORMAT_DXT3, Image.FORMAT_DXT5,
+		Image.FORMAT_RGTC_R, Image.FORMAT_RGTC_RG,
+		Image.FORMAT_BPTC_RGBA, Image.FORMAT_BPTC_RGBF, Image.FORMAT_BPTC_RGBFU,
+	]
+	return 4 if format in block_formats else 1
 
 
 func _seeded_shuffle(items: Array, seed_value: int) -> void:

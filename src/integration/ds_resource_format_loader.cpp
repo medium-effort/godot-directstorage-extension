@@ -605,6 +605,11 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 							chunk_layout_ok = false;
 							break;
 						}
+						// Chunk uncompressed sizes are whole storage rows (block rows for
+						// the 4x4 formats), so `row` stays in that unit for the byte-sum
+						// check below; only the request band is converted to the texel
+						// rows a D3D12_BOX expects.
+						const uint32_t mip_height = std::max<uint32_t>(1u, p_height >> mip);
 						uint32_t row = 0;
 						for (int32_t c = 0; c < chunk_count; ++c, ++chunk_cursor) {
 							if (chunk_cursor >= p_chunk_offsets.size() ||
@@ -618,10 +623,16 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 								chunk_layout_ok = false;
 								break;
 							}
+							const uint32_t rows = uncompressed / static_cast<uint32_t>(pitch);
+							uint32_t region_top = 0;
+							uint32_t region_bottom = 0;
+							if (!DSTex::get_chunk_texel_region(mip_height, row, rows, img_fmt, region_top, region_bottom)) {
+								chunk_layout_ok = false;
+								break;
+							}
 							Ref<DSRequest> req = make_upload(static_cast<uint64_t>(p_chunk_offsets[chunk_cursor]),
 									static_cast<uint32_t>(p_chunk_compressed_sizes[chunk_cursor]), uncompressed, mip, 1);
-							const uint32_t rows = uncompressed / static_cast<uint32_t>(pitch);
-							req->set_texture_region(row, row + rows);
+							req->set_texture_region(region_top, region_bottom);
 							row += rows;
 						}
 						if (!chunk_layout_ok || static_cast<uint64_t>(row) * static_cast<uint64_t>(pitch) !=

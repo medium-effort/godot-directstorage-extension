@@ -148,6 +148,14 @@ public:
 	Dictionary get_file_info(const String &p_path);
 
 	static DSTexMipLayout get_mip_layout(uint32_t p_width, uint32_t p_height, int p_image_format);
+	/// Translate a chunk's [p_storage_row, p_storage_row + p_storage_rows) band inside one mip
+	/// into the [top, bottom) band a DSTORAGE_DESTINATION_TEXTURE_REGION / D3D12_BOX expects,
+	/// whose vertical units are texel rows (pixels). A 4x4 block-compressed mip stores
+	/// ceil(height / 4) storage rows, so one storage row covers four texel rows; a linear mip is
+	/// one for one. False when the band is empty, overflows, or starts at or past p_mip_height,
+	/// so callers can fail closed instead of emitting an out-of-bounds box.
+	static bool get_chunk_texel_region(uint32_t p_mip_height, uint32_t p_storage_row,
+			uint32_t p_storage_rows, int p_image_format, uint32_t &r_top, uint32_t &r_bottom);
 	static PackedByteArray unpad_footprint_mip(const PackedByteArray &p_footprint, uint32_t p_width, uint32_t p_height, int p_image_format);
 	/// Normalizes the RGB of every pixel as a tangent-space normal, matching
 	/// Image::normalize() (which godot-cpp does not expose). Operates on the base

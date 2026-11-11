@@ -51,9 +51,11 @@ private:
 	RID destination_resource;
 	uint32_t first_subresource = 0;
 	uint32_t subresource_count = 1;
-	// Row range inside one subresource for chunked uploads. top == bottom means
-	// "the whole subresource" (the historic range path). Internal to the loader;
-	// never bound to GDScript.
+	// Row range inside one subresource for chunked uploads, in texel rows
+	// (pixels) of the target subresource - the unit D3D12_BOX and
+	// DSTORAGE_DESTINATION_TEXTURE_REGION use. top == bottom means "the whole
+	// subresource" (the historic range path). The setter is exposed to scripts
+	// (see set_texture_region's docs).
 	uint32_t texture_region_top = 0;
 	uint32_t texture_region_bottom = 0;
 	uint32_t texture_format = 0;

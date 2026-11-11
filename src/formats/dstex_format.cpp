@@ -146,6 +146,32 @@ DSTexMipLayout DSTex::get_mip_layout(uint32_t p_width, uint32_t p_height, int p_
 	return layout;
 }
 
+bool DSTex::get_chunk_texel_region(uint32_t p_mip_height, uint32_t p_storage_row,
+		uint32_t p_storage_rows, int p_image_format, uint32_t &r_top, uint32_t &r_bottom) {
+	// The request destination is DSTORAGE_DESTINATION_TEXTURE_REGION, whose
+	// D3D12_BOX speaks texel rows ("in pixels"). get_mip_layout counts storage
+	// rows, which is block rows for the 4x4 formats, so one storage row spans
+	// four texel rows there and one texel row everywhere else.
+	const uint32_t row_texels = dstex_is_block_format(p_image_format) ? 4u : 1u;
+	if (p_mip_height == 0 || p_storage_rows == 0) {
+		return false;
+	}
+	if (p_storage_row > std::numeric_limits<uint32_t>::max() - p_storage_rows) {
+		return false;
+	}
+	const uint64_t top = static_cast<uint64_t>(p_storage_row) * row_texels;
+	const uint64_t end = static_cast<uint64_t>(p_storage_row + p_storage_rows) * row_texels;
+	if (top >= p_mip_height) {
+		return false;
+	}
+	r_top = static_cast<uint32_t>(top);
+	// The final chunk of a block-compressed mip can end past the mip's texel
+	// height (ceil(h/4) * 4); the bottom edge of a D3D12 box may sit on the mip
+	// boundary even when that boundary is not block-aligned.
+	r_bottom = static_cast<uint32_t>(std::min<uint64_t>(p_mip_height, end));
+	return r_top < r_bottom;
+}
+
 // v2 mip-table contract, shared by read_header() and read_from_file().
 //
 // Three things must hold, and the third is what the header-level heuristic in
