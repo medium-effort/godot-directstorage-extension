@@ -47,8 +47,23 @@
 #include <utility>
 #include <algorithm>
 #include <mutex>
+#include <atomic>
 
 namespace godot {
+
+// Queue-admission observability. Process-wide because a process has one
+// Win32Backend: rejected_admissions counts staging attempts refused for want of
+// operation budget, peak_staged_ops is the high-water mark of
+// (staged requests + EnqueueSignal + EnqueueSetEvent) seen in one batch slot.
+static std::atomic<uint64_t> s_rejected_admission_count{ 0 };
+static std::atomic<uint32_t> s_peak_staged_ops{ 0 };
+
+static void ds_note_staged_ops(uint32_t p_ops) {
+	uint32_t previous = s_peak_staged_ops.load(std::memory_order_relaxed);
+	while (p_ops > previous &&
+			!s_peak_staged_ops.compare_exchange_weak(previous, p_ops, std::memory_order_relaxed)) {
+	}
+}
 
 void ds_profiler_set_batch_metrics(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes, int p_request_count, int64_t p_decompression_duration_us, int p_error_state);
 
@@ -369,6 +384,13 @@ Dictionary Win32Backend::_debug_get_dstex_mip_chunks_for_testing(const String &p
 	result["source_sizes"] = source_sizes;
 	result["destination_offsets"] = destination_offsets;
 	result["destination_sizes"] = destination_sizes;
+	return result;
+}
+
+Dictionary Win32Backend::_debug_get_queue_admission_stats_for_testing() {
+	Dictionary result;
+	result["rejected_admissions"] = static_cast<int64_t>(s_rejected_admission_count.load(std::memory_order_relaxed));
+	result["peak_staged_ops"] = static_cast<int64_t>(s_peak_staged_ops.load(std::memory_order_relaxed));
 	return result;
 }
 #endif
@@ -4425,11 +4447,13 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 
 		uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
-		if (slot.requests.size() + staged_children.size() > queue_capacity) {
+		if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), static_cast<uint32_t>(staged_children.size()), queue_capacity)) {
+			s_rejected_admission_count.fetch_add(1, std::memory_order_relaxed);
 			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + ") exceeded for active batch slot.");
+			p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + " operations) exceeded for active batch slot; a batch may stage at most " + String::num_uint64(queue_capacity >= 2 ? queue_capacity - 2 : 0) + " requests plus its signal and event.");
 			return false;
 		}
+		ds_note_staged_ops(static_cast<uint32_t>(slot.requests.size() + staged_children.size()) + 2);
 
 		int transitions_before = slot.gpu_transitions.size();
 		for (size_t c = 0; c < staged_children.size(); ++c) {
@@ -4468,11 +4492,13 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 
 		uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
-		if (slot.requests.size() + 1 > queue_capacity) {
+		if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), 1, queue_capacity)) {
+			s_rejected_admission_count.fetch_add(1, std::memory_order_relaxed);
 			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + ") exceeded for active batch slot.");
+			p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + " operations) exceeded for active batch slot; a batch may stage at most " + String::num_uint64(queue_capacity >= 2 ? queue_capacity - 2 : 0) + " requests plus its signal and event.");
 			return false;
 		}
+		ds_note_staged_ops(static_cast<uint32_t>(slot.requests.size()) + 3);
 
 		// Build child request with parsed mip entries to preserve p_request immutability and submit exact offsets/sizes.
 		// Note: Uses already-parsed mip_entry from pre-lock phase; does NOT perform disk I/O under batch_mutex.
@@ -4579,11 +4605,13 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		}
 
 		uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
-		if (slot.requests.size() + staged_children.size() > queue_capacity) {
+		if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), static_cast<uint32_t>(staged_children.size()), queue_capacity)) {
+			s_rejected_admission_count.fetch_add(1, std::memory_order_relaxed);
 			p_request->set_status(DSRequest::STATUS_FAILED);
-			p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + ") exceeded for active batch slot.");
+			p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + " operations) exceeded for active batch slot; a batch may stage at most " + String::num_uint64(queue_capacity >= 2 ? queue_capacity - 2 : 0) + " requests plus its signal and event.");
 			return false;
 		}
+		ds_note_staged_ops(static_cast<uint32_t>(slot.requests.size() + staged_children.size()) + 2);
 
 		int transitions_before = slot.gpu_transitions.size();
 		for (size_t c = 0; c < staged_children.size(); ++c) {
@@ -4609,11 +4637,13 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	}
 
 	uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
-	if (slot.requests.size() + 1 > queue_capacity) {
+	if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), 1, queue_capacity)) {
+		s_rejected_admission_count.fetch_add(1, std::memory_order_relaxed);
 		p_request->set_status(DSRequest::STATUS_FAILED);
-		p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + ") exceeded for active batch slot.");
+		p_request->set_error_message("Win32Backend queue capacity (" + String::num_uint64(queue_capacity) + " operations) exceeded for active batch slot; a batch may stage at most " + String::num_uint64(queue_capacity >= 2 ? queue_capacity - 2 : 0) + " requests plus its signal and event.");
 		return false;
 	}
+	ds_note_staged_ops(static_cast<uint32_t>(slot.requests.size()) + 3);
 	if (!enqueue_one(p_request, 0)) {
 		return false;
 	}
@@ -4624,10 +4654,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 #endif
 }
 
-void Win32Backend::submit_async() {
+bool Win32Backend::submit_async() {
 #ifdef _WIN32
 	if (!accepting_requests.load() || sync_batch_in_flight.load()) {
-		return;
+		return false;
 	}
 	int submit_slot_index = active_batch_slot.load();
 	Vector<GPUTargetTransition> pre_transitions;
@@ -4636,11 +4666,23 @@ void Win32Backend::submit_async() {
 	bool enqueue_queue[QUEUE_COUNT] = { false };
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
+		// Atomic claim gate: between this claim and the second lock below (which
+		// sets `submitted`) a claimed batch is only visible as `closing`, so both
+		// states must count. Checking the target slot alone let two threads each
+		// claim a different slot and put twice the queue's operation budget in
+		// flight, which is exactly the blocking enqueue the contract forbids.
+		for (const QueueState &queue : priority_queues) {
+			for (const BatchSlot &slot : queue.batch_slots) {
+				if (slot.submitted || slot.closing) {
+					return false;
+				}
+			}
+		}
 		bool has_work = false;
 		for (const QueueState &queue : priority_queues) {
 			const BatchSlot &slot = queue.batch_slots[submit_slot_index];
 			if (slot.submitted || slot.closing || slot.completion_ready) {
-				return;
+				return false;
 			}
 			if (slot.requests.size() > 0) {
 				has_work = true;
@@ -4650,7 +4692,7 @@ void Win32Backend::submit_async() {
 			}
 		}
 		if (!has_work) {
-			return;
+			return true;
 		}
 		for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
 			QueueState &queue = priority_queues[queue_index];
@@ -4710,7 +4752,7 @@ void Win32Backend::submit_async() {
 			batch_in_flight.store(has_in_flight_batches_locked());
 			update_profiler_queue_depth_locked();
 			batch_cv.notify_all();
-			return;
+			return true;
 		}
 	}
 
@@ -4811,6 +4853,9 @@ void Win32Backend::submit_async() {
 	update_profiler_queue_depth_locked();
 	batch_cv.notify_one();
 	}
+	return true;
+#else
+	return true;
 #endif
 }
 

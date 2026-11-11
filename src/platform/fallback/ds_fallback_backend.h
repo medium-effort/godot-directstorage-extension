@@ -77,7 +77,7 @@ public:
 
 	bool enqueue_request(Ref<DSRequest> p_request) override;
 	void submit_batch() override;
-	void submit_async() override;
+	bool submit_async() override;
 	bool is_batch_complete() const override;
 	void collect_completed_results() override;
 	void cancel_requests_with_tag(uint64_t p_tag) override;

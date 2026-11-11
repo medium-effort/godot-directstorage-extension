@@ -324,12 +324,12 @@ void FallbackBackend::submit_batch() {
 	}
 }
 
-void FallbackBackend::submit_async() {
+bool FallbackBackend::submit_async() {
 	Vector<Ref<DSRequest>> batch;
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		if (pending_requests.size() == 0) {
-			return;
+			return true;
 		}
 		batch = pending_requests;
 		pending_requests.clear();
@@ -347,6 +347,7 @@ void FallbackBackend::submit_async() {
 		batch_in_flight.store(true);
 	}
 	batch_cv.notify_one();
+	return true;
 }
 
 bool FallbackBackend::is_batch_complete() const {

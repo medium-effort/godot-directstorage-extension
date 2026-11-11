@@ -388,6 +388,17 @@ public:
 	// enqueue_requests, configuration2, creator_id).
 	static Dictionary get_runtime_info();
 
+	// Whether a batch slot may stage p_add more requests on top of p_staged.
+	// A submitted batch consumes two queue operations beyond its requests
+	// (EnqueueSignal + EnqueueSetEvent), so one slot may stage at most
+	// capacity - 2 requests. Pure arithmetic: no hardware, no locks, unit-testable.
+	static bool admits_requests(uint32_t p_staged, uint32_t p_add, uint32_t p_capacity) {
+		if (p_capacity < 2) {
+			return false;
+		}
+		return static_cast<uint64_t>(p_staged) + static_cast<uint64_t>(p_add) + 2ULL <= static_cast<uint64_t>(p_capacity);
+	}
+
 #if defined(_WIN32)
 	// Loads one DirectStorage runtime DLL ("dstoragecore.dll" or "dstorage.dll")
 	// from p_dir. The only loader for the runtime: the backend and the context's
@@ -410,7 +421,7 @@ public:
 
 	bool enqueue_request(Ref<DSRequest> p_request) override;
 	void submit_batch() override;
-	void submit_async() override;
+	bool submit_async() override;
 	bool is_batch_complete() const override;
 	void collect_completed_results() override;
 	void poll_batch_status();
@@ -532,6 +543,12 @@ public:
 	// destination_sizes (PackedInt64Array), one element per split chunk.
 	// Never bound in _bind_methods().
 	static Dictionary _debug_get_dstex_mip_chunks_for_testing(const String &p_path, uint64_t p_payload_offset, uint64_t p_payload_size, uint64_t p_capacity);
+
+	// Test-only seam: admission/observability counters for the queue contract.
+	// rejected_admissions counts batches refused for want of operation budget;
+	// peak_staged_ops is the high-water mark of (requests + signal + event) in a
+	// slot. Never bound in _bind_methods().
+	static Dictionary _debug_get_queue_admission_stats_for_testing();
 #endif
 
 	// Media class of the volume that holds an asset path. Decides the

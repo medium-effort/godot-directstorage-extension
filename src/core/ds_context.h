@@ -128,6 +128,12 @@ private:
 	};
 	mutable std::mutex stream_mutex;
 	std::deque<Ref<DSRequest>> stream_queue; // pending, not yet submitted
+	// Requests this path staged into the backend but could not submit because
+	// another batch had already claimed the slot (submit_async() returned
+	// false). The next flush_stream_async() retries the submit even with an
+	// empty stream queue, so the final chunk of a prewarm cannot sit staged
+	// forever waiting for an enqueue that will never come.
+	std::atomic<int> stream_pending_submit_requests{ 0 };
 	std::unordered_map<uint64_t, StreamTagInfo> stream_tags;
 	uint64_t next_stream_tag = 1;
 

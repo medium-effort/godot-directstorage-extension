@@ -645,8 +645,8 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				if (!chunk_layout_ok) {
 					UtilityFunctions::push_warning("DSResourceFormatLoader: chunk table does not describe a contiguous mip for ", p_cache_key, "; using CPU decompression.");
 					uploads.clear();
-				} else if (uploads.size() > static_cast<int>(std::max<uint32_t>(1, queue_capacity / 2))) {
-					UtilityFunctions::push_warning("DSResourceFormatLoader: ", uploads.size(), " requests exceed the queue budget (", queue_capacity, ") for ", p_cache_key, "; using CPU decompression (raise chunk_size_kb or queue_capacity).");
+				} else if (uploads.size() > static_cast<int>(queue_capacity > 2 ? queue_capacity - 2 : 1)) {
+					UtilityFunctions::push_warning("DSResourceFormatLoader: ", uploads.size(), " requests exceed the queue budget (", queue_capacity, " operations, at most ", (queue_capacity > 2 ? queue_capacity - 2 : 1), " requests) for ", p_cache_key, "; using CPU decompression (raise chunk_size_kb or queue_capacity).");
 					uploads.clear();
 				}
 

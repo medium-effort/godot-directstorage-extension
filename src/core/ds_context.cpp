@@ -1153,6 +1153,7 @@ void DSContext::shutdown_ds_locked() {
 		// instead of queueing against a dead backend.
 		std::lock_guard<std::mutex> stream_lock(stream_mutex);
 		stream_queue.clear();
+		stream_pending_submit_requests.store(0, std::memory_order_release);
 		for (std::unordered_map<uint64_t, StreamTagInfo>::iterator it = stream_tags.begin(); it != stream_tags.end(); ++it) {
 			it->second.cancel_requested = true;
 		}
@@ -1364,7 +1365,13 @@ Error DSContext::flush_batch_async() {
 		return ERR_BUSY;
 	}
 	bool is_win32_backend = active_backend->get_name() == "Win32DirectStorage";
-	active_backend->submit_async();
+	// The backend claims the slot atomically under its own lock; false means
+	// another submitter won after the check above. The staged requests stay in
+	// the backend slot and the pending counts are untouched, so the next flush
+	// retries them.
+	if (!active_backend->submit_async()) {
+		return ERR_BUSY;
+	}
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
 	if (is_win32_backend) {
@@ -1402,9 +1409,11 @@ Error DSContext::flush_stream_async() {
 		return ERR_UNCONFIGURED;
 	}
 	std::deque<Ref<DSRequest>> to_submit;
+	bool has_staged_pending = false;
 	{
 		std::lock_guard<std::mutex> lock(stream_mutex);
-		if (stream_queue.empty()) {
+		has_staged_pending = stream_pending_submit_requests.load(std::memory_order_acquire) > 0;
+		if (stream_queue.empty() && !has_staged_pending) {
 			return OK;
 		}
 	}
@@ -1416,7 +1425,8 @@ Error DSContext::flush_stream_async() {
 	collect_completed_results();
 	{
 		std::lock_guard<std::mutex> lock(stream_mutex);
-		if (stream_queue.empty()) {
+		has_staged_pending = stream_pending_submit_requests.load(std::memory_order_acquire) > 0;
+		if (stream_queue.empty() && !has_staged_pending) {
 			return OK;
 		}
 		if (!active_backend->is_batch_complete()) {
@@ -1491,11 +1501,19 @@ Error DSContext::flush_stream_async() {
 			stream_queue.push_front(*rit);
 		}
 	}
-	if (submitted_request_count == 0) {
+	if (submitted_request_count == 0 && !has_staged_pending) {
 		return unsubmitted_requests.empty() ? OK : ERR_BUSY;
 	}
 	bool is_win32_backend = active_backend->get_name() == "Win32DirectStorage";
-	active_backend->submit_async();
+	if (!active_backend->submit_async()) {
+		// Another submitter claimed the slot between the check above and here.
+		// The requests are already staged in the backend slot; remember how many
+		// so the next flush retries the submit even with an empty stream queue.
+		stream_pending_submit_requests.fetch_add(submitted_request_count, std::memory_order_acq_rel);
+		return ERR_BUSY;
+	}
+	const int pending_before = stream_pending_submit_requests.exchange(0, std::memory_order_acq_rel);
+	const int batch_request_count = submitted_request_count + pending_before;
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
 	if (is_win32_backend) {
@@ -1504,13 +1522,13 @@ Error DSContext::flush_stream_async() {
 #endif
 	{
 		std::lock_guard<std::mutex> lock(context_mutex);
-		if (!is_win32_backend && submitted_request_count > 0) {
-			pending_batch_request_counts.push_back(submitted_request_count);
+		if (!is_win32_backend && batch_request_count > 0) {
+			pending_batch_request_counts.push_back(batch_request_count);
 		}
-		if (is_win32_backend && submitted_request_count > 0) {
+		if (is_win32_backend && batch_request_count > 0) {
 			async_batches_submitted_cache++;
 		}
-		if (submitted_request_count > 0) {
+		if (batch_request_count > 0) {
 			completion_fence = backend_fence != 0 ? backend_fence : completion_fence + 1;
 		}
 		// Stream-only: sync pending counts/ids belong to flush_batch paths.
