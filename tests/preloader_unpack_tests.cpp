@@ -45,9 +45,17 @@ struct PreloaderUnpackTest {
 		return DSPreloader::read_header_uncached(p_dstex_path, r_out);
 	}
 
-	static void payload_from_header(const String &p_engine_path, const String &p_dstex_path,
+	static bool payload_from_header(const String &p_engine_path, const String &p_dstex_path,
 			const DSPreloader::PayloadHeader &p_header, DSPreloader::Payload &r_out) {
-		DSPreloader::payload_from_header(p_engine_path, p_dstex_path, p_header, r_out);
+		return DSPreloader::payload_from_header(p_engine_path, p_dstex_path, p_header, r_out);
+	}
+
+	// Cache-state probe: try_get_cached_header() is private and
+	// read_header_uncached() deliberately bypasses the cache, so the
+	// positive-vs-failure entry contract has no other observability point.
+	// Same friend seam shape as build_texture()/expand_requests() above.
+	static bool cached_header(const String &p_dstex_path, DSPreloader::PayloadHeader &r_out) {
+		return DSPreloader::try_get_cached_header(p_dstex_path, r_out);
 	}
 
 	static bool resolve(const String &p_engine_path, DSPreloader::Payload &r_out) {
@@ -996,7 +1004,7 @@ GDEX_TEST_T(preloader_validation, payload_offset_matches_mip_table, TAG_UNIT) {
 			GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::read_header(godot::String(paths[v]), header));
 
 			godot::DSPreloader::Payload payload;
-			godot::PreloaderUnpackTest::payload_from_header(godot::String(paths[v]), godot::String(paths[v]), header, payload);
+			GDEX_ASSERT_TRUE(godot::PreloaderUnpackTest::payload_from_header(godot::String(paths[v]), godot::String(paths[v]), header, payload));
 
 			const int64_t aligned = (int64_t)payload.data_offset;
 			GDEX_EXPECT_EQ(aligned, table_offsets[0]);
@@ -1196,4 +1204,65 @@ GDEX_TEST(preloader_unpack, none_v1_payload_expands_to_none_request) {
 	GDEX_EXPECT_EQ(static_cast<int>(requests[0]->get_compression_format()),
 			static_cast<int>(godot::DSRequest::COMPRESSION_NONE));
 	GDEX_EXPECT_EQ(static_cast<int64_t>(requests[0]->get_offset()), static_cast<int64_t>(28));
+}
+
+// A v3 .dstex whose chunk table the validated parser rejects is not an
+// unchunked file: the mip table already stores the first chunk offset and the
+// summed chunk sizes, so a "downgraded" payload would pass validate_payload()
+// and stage concatenated per-chunk streams as one whole-mip request. The
+// preloader must fail closed, and must remember the failure so a repeat
+// prewarm costs one stat and no open.
+GDEX_TEST_T(preloader_validation, corrupt_chunk_table_fails_closed, TAG_UNIT) {
+	const char *const kValid = "user://gdex_chunk_valid.dstex";
+	const char *const kCorrupt = "user://gdex_chunk_corrupt.dstex";
+	track_cleanup(ctx, { kValid, kCorrupt });
+
+	// 64x64 RGBA8 with 4 KiB chunks: row_pitch 256 => 16 rows per chunk => 4
+	// chunks, so a real chunk table follows the single mip entry.
+	godot::Ref<godot::DSTex> writer;
+	writer.instantiate();
+	GDEX_ASSERT_EQ((int64_t)writer->write_to_file(godot::String(kValid), make_chain_data(1),
+						   kBaseWidth, kBaseHeight, godot::Image::FORMAT_RGBA8, 1, 9,
+						   false, false, 0, 0, 0, 4),
+			(int64_t)godot::OK);
+
+	// Fixture isolation: the unpatched file is chunked and parses.
+	const godot::Dictionary valid_header = loader_header(kValid);
+	GDEX_ASSERT_TRUE(!valid_header.is_empty());
+	GDEX_ASSERT_TRUE(static_cast<bool>(valid_header["chunked"]));
+	const godot::PackedInt32Array valid_counts = valid_header["mip_chunk_counts"];
+	GDEX_ASSERT_EQ((int64_t)valid_counts[0], (int64_t)4);
+
+	// Chunk table = v3 header + one 24-byte mip entry; each DSChunkEntry is
+	// offset(u64) / compressed_size(u32) / uncompressed_size(u32).
+	const int64_t chunk_table = (int64_t)sizeof(godot::DSTexHeaderV3) + (int64_t)sizeof(godot::DSTexMipEntryV2);
+	godot::PackedByteArray bytes = read_bytes(kValid);
+	GDEX_ASSERT_TRUE(bytes.size() > chunk_table + 16);
+	put_u32(bytes, chunk_table + 12, 0); // entry[0].uncompressed_size
+	GDEX_ASSERT_TRUE(write_bytes(kCorrupt, bytes));
+
+	// The strict parser rejects the patched bytes, so the failure is the chunk
+	// table's, not the header's.
+	GDEX_EXPECT_TRUE(loader_header(kCorrupt).is_empty());
+
+	// The two-phase split itself: the fast header path still accepts the file.
+	godot::DSPreloader::PayloadHeader fast;
+	GDEX_ASSERT_TRUE(godot::PreloaderUnpackTest::read_header(godot::String(kCorrupt), fast));
+	GDEX_EXPECT_TRUE(fast.chunked);
+
+	// Resolution must fail closed and hand back no payload at all.
+	godot::DSPreloader::Payload payload;
+	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::resolve(godot::String(kCorrupt), payload));
+	GDEX_EXPECT_EQ((int64_t)payload.mip_count, (int64_t)0);
+	GDEX_EXPECT_FALSE(payload.chunked);
+
+	// The rejection must be remembered as a failure entry, not a positive one.
+	godot::DSPreloader::PayloadHeader cached;
+	GDEX_EXPECT_TRUE(godot::PreloaderUnpackTest::cached_header(godot::String(kCorrupt), cached));
+	GDEX_EXPECT_TRUE(cached.open_failed);
+
+	// Second resolve is served by that entry: still false, still empty.
+	godot::DSPreloader::Payload again;
+	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::resolve(godot::String(kCorrupt), again));
+	GDEX_EXPECT_EQ((int64_t)again.mip_count, (int64_t)0);
 }

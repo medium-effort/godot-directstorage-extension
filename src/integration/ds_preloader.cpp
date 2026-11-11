@@ -412,6 +412,16 @@ void DSPreloader::publish_header_cache(const String &p_dstex_path, const Payload
 	s.header_cache[p_dstex_path] = copy;
 }
 
+void DSPreloader::mark_header_failed(const String &p_dstex_path) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	State &s = state();
+	PayloadHeader *entry = s.header_cache.getptr(p_dstex_path);
+	if (entry == nullptr || entry->generation != s.header_cache_generation) {
+		return;
+	}
+	entry->open_failed = true;
+}
+
 bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader &r_out) {
 	// Failure contract: r_out always carries the observed mtime/file_len
 	// observed mtime/file_len with open_failed=true until the final fill
@@ -648,7 +658,8 @@ bool DSPreloader::read_header_uncached(const String &p_dstex_path, PayloadHeader
 		}
 		// The capability must be set iff a mip is actually chunked (same contract
 		// as DSTex::read_header); the chunk tables themselves are read later by
-		// the payload builder through DSTex::read_header.
+		// the payload builder through DSTex::read_header, and a rejection there
+		// fails the payload closed instead of downgrading it to unchunked.
 		if (((header_capabilities & DSTEX_CAP_CHUNKED) != 0) != any_chunked_mip) {
 			UtilityFunctions::push_error("DSTex: v3 CAP_CHUNKED does not match the mip table.");
 			return false;
@@ -687,7 +698,7 @@ void DSPreloader::prefetch_headers(const PackedStringArray &p_dstex_paths) {
 	}
 }
 
-void DSPreloader::payload_from_header(const String &p_engine_path, const String &p_dstex_path, const PayloadHeader &p_header, Payload &r_out) {
+bool DSPreloader::payload_from_header(const String &p_engine_path, const String &p_dstex_path, const PayloadHeader &p_header, Payload &r_out) {
 	r_out = Payload();
 	r_out.engine_path = p_engine_path;
 	r_out.payload_key = p_dstex_path;
@@ -745,14 +756,30 @@ void DSPreloader::payload_from_header(const String &p_engine_path, const String 
 		dstex_reader.instantiate();
 		Dictionary header_info = dstex_reader->read_header(p_dstex_path);
 		if (header_info.is_empty()) {
-			r_out.chunked = false;
-			return;
+			// Corrupt or truncated chunk table: this is NOT an unchunked file.
+			// The v3 mip table already carries the first chunk offset and the
+			// summed chunk sizes, so a downgraded payload would pass
+			// validate_payload() and stage concatenated GDeflate streams as one
+			// whole-mip request. Reset so no caller can observe a half-built
+			// payload either.
+			r_out = Payload();
+			return false;
+		}
+		const PackedInt64Array chunk_offsets = (PackedInt64Array)header_info.get("chunk_offsets", PackedInt64Array());
+		if (chunk_offsets.size() == 0) {
+			// Invariant guard: a successful parse of a header that carries
+			// DSTEX_CAP_CHUNKED always yields at least one chunk entry (the
+			// reader rejects the capability/mip-count mismatch), so this can
+			// only fire if that contract ever regresses.
+			r_out = Payload();
+			return false;
 		}
 		r_out.mip_chunk_counts = (PackedInt32Array)header_info.get("mip_chunk_counts", PackedInt32Array());
-		r_out.chunk_offsets = (PackedInt64Array)header_info.get("chunk_offsets", PackedInt64Array());
+		r_out.chunk_offsets = chunk_offsets;
 		r_out.chunk_compressed_sizes = (PackedInt32Array)header_info.get("chunk_compressed_sizes", PackedInt32Array());
 		r_out.chunk_uncompressed_sizes = (PackedInt32Array)header_info.get("chunk_uncompressed_sizes", PackedInt32Array());
 	}
+	return true;
 }
 
 bool DSPreloader::fill_from_dstex_file(const String &p_engine_path, const String &p_dstex_path, Payload &r_out) {
@@ -765,7 +792,10 @@ bool DSPreloader::fill_from_dstex_file(const String &p_engine_path, const String
 		if (cached.open_failed) {
 			return false;
 		}
-		payload_from_header(p_engine_path, p_dstex_path, cached, r_out);
+		if (!payload_from_header(p_engine_path, p_dstex_path, cached, r_out)) {
+			mark_header_failed(p_dstex_path);
+			return false;
+		}
 		return true;
 	}
 	// Miss path: single-open single-bulk read, then publish
@@ -776,7 +806,12 @@ bool DSPreloader::fill_from_dstex_file(const String &p_engine_path, const String
 		return false;
 	}
 	publish_header_cache(p_dstex_path, fresh);
-	payload_from_header(p_engine_path, p_dstex_path, fresh, r_out);
+	if (!payload_from_header(p_engine_path, p_dstex_path, fresh, r_out)) {
+		// The fixed header parsed but the payload builder rejected the file
+		// (chunk table). Record it so repeats fail with one stat, no open.
+		mark_header_failed(p_dstex_path);
+		return false;
+	}
 	return true;
 }
 

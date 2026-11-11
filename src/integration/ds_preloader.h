@@ -367,6 +367,18 @@ private:
 	// Returns false on miss (no entry, stale generation, or mtime drift).
 	static bool try_get_cached_header(const String &p_dstex_path, PayloadHeader &r_out);
 	static void publish_header_cache(const String &p_dstex_path, const PayloadHeader &p_header);
+	// Downgrades a positive header-cache entry to a failure entry in place.
+	// Used when the fixed header parses but the payload builder rejects the
+	// file (chunk table corrupt/truncated): the observed mtime/file_len are
+	// preserved so the failure stays keyed to this exact file revision, and
+	// repeats fail with one stat and zero opens until the file's mtime moves
+	// or invalidate_header_cache()/rescan_archive() bump the generation.
+	// Re-publishing a failure entry would be ignored (publish_header_cache is
+	// first-publisher-wins for an unchanged generation+mtime+file_len), so
+	// this mutates the one field under the same mutex. A missing entry is not
+	// an error: the caller already failed closed, and the next attempt
+	// re-reads the header and fails again.
+	static void mark_header_failed(const String &p_dstex_path);
 	// Single-open single-bulk miss path: one FileAccess::open + ONE
 	// get_buffer(header + largest possible mip table, 16 V2 entries) with
 	// the entries parsed from that same buffer via memcpy — no second I/O,
@@ -385,7 +397,14 @@ private:
 	// collectors) that already hold dstex paths.
 	static void prefetch_headers(const PackedStringArray &p_dstex_paths);
 	// Shared hit/miss Payload construction so both paths stay identical.
-	static void payload_from_header(const String &p_engine_path, const String &p_dstex_path, const PayloadHeader &p_header, Payload &r_out);
+	// Returns false when a chunked header's variable-length chunk table is
+	// rejected by the validated parser (DSTex::read_header). A chunked file
+	// whose table cannot be read is NOT a valid unchunked file: the v3 mip
+	// table stores the first chunk offset and the summed chunk sizes, so a
+	// downgraded payload would pass validate_payload() and stage concatenated
+	// GDeflate streams as one whole-mip request. r_out is reset to a default
+	// Payload on failure so no caller can observe a half-built payload.
+	static bool payload_from_header(const String &p_engine_path, const String &p_dstex_path, const PayloadHeader &p_header, Payload &r_out);
 
 	// One DSRequest per independently-decompressed unit: exactly one for v1
 	// (single continuous stream), one per mip for v2 (individually

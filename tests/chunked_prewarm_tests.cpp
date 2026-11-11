@@ -16,6 +16,7 @@
 #include "integration/ds_texture_cache.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
+#include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/os.hpp>
@@ -52,6 +53,32 @@ void track_cleanup(::gdextest::TestContext &ctx, const char *p_path) {
 			godot::DirAccess::remove_absolute(ps->globalize_path(path));
 		}
 	});
+}
+
+godot::PackedByteArray read_bytes(const char *p_path) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		return godot::PackedByteArray();
+	}
+	godot::PackedByteArray bytes = file->get_buffer(static_cast<int64_t>(file->get_length()));
+	file->close();
+	return bytes;
+}
+
+bool write_bytes(const char *p_path, const godot::PackedByteArray &p_bytes) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_path), godot::FileAccess::WRITE);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	file->store_buffer(p_bytes);
+	// store_buffer() returns void in godot-cpp; the error is only observable here.
+	const bool ok = file->get_error() == godot::OK;
+	file->close();
+	return ok;
+}
+
+void put_u32(godot::PackedByteArray &r_bytes, int64_t p_offset, uint32_t p_value) {
+	memcpy(r_bytes.ptrw() + p_offset, &p_value, sizeof(p_value));
 }
 
 } // namespace
@@ -170,4 +197,100 @@ GDEX_TEST_T(chunked_prewarm, cpu_prewarm_expands_chunks_and_reassembles, TAG_INT
 	const godot::PackedByteArray decoded = image->get_data();
 	GDEX_ASSERT_EQ(decoded.size(), source.size());
 	GDEX_EXPECT_TRUE(memcmp(decoded.ptr(), source.ptr(), static_cast<size_t>(source.size())) == 0);
+}
+
+// A chunked .dstex whose chunk table is corrupt must fail closed during
+// resolution: no payload, no request, nothing tracked. Before that contract
+// existed the preloader reclassified the file as unchunked, because a v3 mip
+// table already stores the first chunk offset and the summed chunk sizes, so
+// the downgraded payload looked valid and expanded to ONE whole-mip request
+// over concatenated per-chunk streams (see the 4-vs-1 progress split below).
+// Headless-safe and backend-independent: the rejection happens before a
+// backend or a GPU path is selected, so the GPU entry point must agree.
+GDEX_TEST_T(chunked_prewarm, corrupt_chunk_table_tracks_nothing, TAG_INTEGRATION) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	if (!ds->is_initialized() && !ds->initialize_ds()) {
+		GDEX_SKIP("DSContext backend unavailable (initialize_ds failed).");
+	}
+
+	const char *valid_path = "user://gdextest_chunked_corrupt_src.dstex";
+	const char *corrupt_path = "user://gdextest_chunked_corrupt_patched.dstex";
+	// Registered before the cache: teardowns run LIFO, so the cache is torn
+	// down before its request paths disappear.
+	track_cleanup(ctx, valid_path);
+	track_cleanup(ctx, corrupt_path);
+
+	godot::Ref<godot::DSTex> writer;
+	writer.instantiate();
+	GDEX_ASSERT_EQ((int64_t)writer->write_to_file(godot::String(valid_path), make_noise(), kSize, kSize,
+						   godot::Image::FORMAT_RGBA8, kMipCount, 1, false, false, 0, 0, 0, 256),
+			(int64_t)godot::OK);
+
+	const godot::Dictionary valid_header = writer->read_header(godot::String(valid_path));
+	GDEX_ASSERT_TRUE(!valid_header.is_empty());
+	GDEX_ASSERT_TRUE(static_cast<bool>(valid_header["chunked"]));
+	const godot::PackedInt32Array counts = valid_header["mip_chunk_counts"];
+	GDEX_ASSERT_EQ((int64_t)counts[0], (int64_t)16);
+
+	// Chunk table follows the v3 header + one 24-byte mip entry; each
+	// DSChunkEntry is offset(u64) / compressed_size(u32) / uncompressed_size(u32).
+	const int64_t chunk_table = (int64_t)sizeof(godot::DSTexHeaderV3) + (int64_t)sizeof(godot::DSTexMipEntryV2);
+	godot::PackedByteArray bytes = read_bytes(valid_path);
+	GDEX_ASSERT_TRUE(bytes.size() > chunk_table + 16);
+	put_u32(bytes, chunk_table + 12, 0); // entry[0].uncompressed_size
+	GDEX_ASSERT_TRUE(write_bytes(corrupt_path, bytes));
+	GDEX_ASSERT_TRUE(writer->read_header(godot::String(corrupt_path)).is_empty());
+
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	cache->clear();
+	godot::DSPreloader::shutdown();
+
+	godot::PackedStringArray valid_paths;
+	valid_paths.push_back(godot::String(valid_path));
+	const uint64_t control_tag = godot::DSPreloader::prewarm_async(valid_paths);
+	GDEX_ASSERT_TRUE(control_tag != 0);
+	godot::PackedStringArray corrupt_paths;
+	corrupt_paths.push_back(godot::String(corrupt_path));
+	const uint64_t tag = godot::DSPreloader::prewarm_async(corrupt_paths);
+	GDEX_ASSERT_TRUE(tag != 0);
+	const uint64_t tag_gpu = godot::DSPreloader::prewarm_gpu_async(corrupt_paths, 16, true);
+	GDEX_ASSERT_TRUE(tag_gpu != 0);
+	ctx.add_teardown([ds, cache, control_tag, tag, tag_gpu]() {
+		ds->cancel_prewarm(control_tag);
+		ds->cancel_prewarm(tag);
+		ds->cancel_prewarm(tag_gpu);
+		godot::DSPreloader::shutdown();
+		cache->clear();
+		memdelete(cache);
+	});
+
+	// Positive control: the same writer output, unpatched, still expands one
+	// request per chunk. Only the denominator is asserted: the completed count
+	// may already be moving on FallbackBackend workers by the time this line
+	// runs, while the total is fixed at resolution time and is exactly what
+	// separates "chunked" from "downgraded" (16 requests vs 1). Without some
+	// control a zero total below could just mean the fixture never resolved.
+	const godot::Vector2i control = ds->get_prewarm_progress(control_tag);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(control.y), (int64_t)16);
+
+	// The corrupt file is rejected during resolution: nothing tracked, nothing
+	// pending, no stream work, no texture, and it is not marked in flight.
+	GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(tag), 0);
+	GDEX_EXPECT_EQ(godot::DSPreloader::get_pending_prewarm_count(tag), 0);
+	const godot::Vector2i progress = ds->get_prewarm_progress(tag);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(progress.x), (int64_t)0);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(progress.y), (int64_t)0);
+	GDEX_EXPECT_FALSE(cache->get_cached(godot::String(corrupt_path), godot::DSTextureCache::CACHE_MODE_REUSE).is_valid());
+	GDEX_EXPECT_FALSE(godot::DSPreloader::is_texture_pending(godot::String(corrupt_path)));
+
+	// The GPU entry point shares resolution, so it must agree.
+	GDEX_EXPECT_EQ(godot::DSPreloader::get_unbuilt_prewarm_count(tag_gpu), 0);
+	const godot::Vector2i gpu_progress = ds->get_prewarm_progress(tag_gpu);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(gpu_progress.x), (int64_t)0);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(gpu_progress.y), (int64_t)0);
 }
