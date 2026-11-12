@@ -156,12 +156,21 @@ bool build_gpu_texture_request(const godot::String &p_path, uint64_t p_tag, godo
     }
     const uint64_t start = static_cast<uint64_t>(mip_offsets[0]);
     const uint64_t end = static_cast<uint64_t>(mip_offsets[mip_count - 1]) + static_cast<uint64_t>(mip_sizes[mip_count - 1]);
+    // write_gpu_texture_fixture() uses an incompressible LCG payload that
+    // DSTex::write_to_file stores as v3 COMPRESSION_NONE; write_temp_dstex()
+    // uses a compressible pattern stored as COMPRESSION_GDEFLATE. Read the
+    // container's codec instead of hardcoding GDeflate (#0252 / #0257).
+    const int fixture_format = header.has("compression_format") ?
+            static_cast<int>(header["compression_format"]) :
+            static_cast<int>(godot::DSCompressionFormat::GDEFLATE);
     r_request.instantiate();
     r_request->set_file_path(p_path);
     r_request->set_offset(start);
     r_request->set_size(static_cast<uint32_t>(end - start));
     r_request->set_uncompressed_size(static_cast<uint32_t>(header["original_size"]));
-    r_request->set_compression_format(godot::DSRequest::COMPRESSION_GDEFLATE);
+    r_request->set_compression_format(fixture_format == static_cast<int>(godot::DSCompressionFormat::GDEFLATE) ?
+            godot::DSRequest::COMPRESSION_GDEFLATE :
+            godot::DSRequest::COMPRESSION_NONE);
     r_request->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
     r_request->set_first_subresource(0);
     r_request->set_subresource_count(static_cast<uint32_t>(mip_count));
@@ -3446,6 +3455,489 @@ GDEX_TEST_T(win32_remediation, row_range_payload_extent_is_validated, TAG_INTEGR
     GDEX_EXPECT_EQ(static_cast<int64_t>(bc7_bad->get_status()),
             static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
     GDEX_EXPECT_TRUE(bc7_bad->get_error_message().contains("row-range payload is"));
+#endif
+}
+
+
+// --- Large-dispatch probe (#0252 / #0257) -----------------------------------
+//
+// #0252 stalls on a single 16 MiB GPU request whose fence only retires when the
+// Windows TDR resets the device. Every measurement of it so far came from
+// write_gpu_texture_fixture(), whose payload is LCG-pseudorandom - and DSTex
+// stores an incompressible payload verbatim as NONE (dstex_format.cpp:1446
+// store_uncompressed). build_gpu_texture_request() then declares the request
+// COMPRESSION_GDEFLATE regardless, so the decompressor is handed raw bytes as if
+// they were a GDeflate stream. That is undefined input, and no driver version
+// promises a stable runtime for it.
+//
+// These cases measure the three candidate explanations instead of assuming one:
+//
+//   large_dispatch_fixture_codec     - the fixture really is NONE (no GPU work)
+//   large_dispatch_gdeflate_16mib    - 16 MiB of REAL GDeflate decompression
+//   large_dispatch_raw_copy_16mib    - 16 MiB of plain DMA copy, no compute
+//   large_dispatch_mismatched_codec  - the #0252 request, byte for byte
+//
+// Select them together with -Filter 'win32_remediation.large_dispatch_*'. They
+// run in registration order, and the last one can TDR the device, after which
+// every later case in the process reports DEVICE_REMOVED - which is why it is
+// last here and why the other three carry time ceilings that its absence would
+// otherwise make unverifiable.
+
+#ifdef _WIN32
+namespace {
+
+constexpr int kProbeTextureSize = 2048; // RGBA8 -> 16 MiB per mip
+
+// Compressible content (an 8-texel checker): GDeflate shrinks it, so the
+// container stays v2/GDEFLATE and the decompressor receives real tile data.
+// This is the only leg that measures GPU decompression rather than a DMA copy.
+bool write_compressible_fixture(const char *p_rel_path) {
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    if (dstex.is_null()) {
+        return false;
+    }
+    godot::PackedByteArray raw;
+    raw.resize(static_cast<int64_t>(kProbeTextureSize) * kProbeTextureSize * 4);
+    uint8_t *writer = raw.ptrw();
+    for (int y = 0; y < kProbeTextureSize; ++y) {
+        for (int x = 0; x < kProbeTextureSize; ++x) {
+            const bool light = (((x >> 3) + (y >> 3)) & 1) != 0;
+            const int64_t offset = (static_cast<int64_t>(y) * kProbeTextureSize + x) * 4;
+            writer[offset + 0] = light ? 0xF0 : 0x10;
+            writer[offset + 1] = light ? 0xE0 : 0x20;
+            writer[offset + 2] = light ? 0xD0 : 0x30;
+            writer[offset + 3] = 0xFF;
+        }
+    }
+    return dstex->write_to_file(godot::String(p_rel_path), raw, kProbeTextureSize, kProbeTextureSize,
+                   godot::Image::FORMAT_RGBA8, 1, 1) == godot::OK;
+}
+
+// One-mip whole-subresource request: payload sizes come from the container, the
+// codec comes from the caller. That split is the point of the probe - the two
+// can disagree, and the whole-subresource texture path does not check (the
+// #0181 stream-size guard covers row-range, memory and buffer destinations
+// only).
+bool build_probe_request(const char *p_rel_path, const godot::RID &p_texture,
+        godot::DSRequest::CompressionFormat p_codec, godot::Ref<godot::DSRequest> &r_request) {
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    if (dstex.is_null()) {
+        return false;
+    }
+    const godot::Dictionary header = dstex->read_header(godot::String(p_rel_path));
+    if (header.is_empty()) {
+        return false;
+    }
+    const godot::PackedInt64Array offsets = header["mip_offsets"];
+    const godot::PackedInt32Array sizes = header["mip_sizes"];
+    const godot::PackedInt32Array uncompressed = header["mip_uncompressed_sizes"];
+    if (offsets.size() < 1 || sizes.size() < 1 || uncompressed.size() < 1) {
+        return false;
+    }
+    r_request.instantiate();
+    r_request->set_file_path(godot::String(p_rel_path));
+    r_request->set_offset(static_cast<uint64_t>(offsets[0]));
+    r_request->set_size(static_cast<uint32_t>(sizes[0]));
+    r_request->set_uncompressed_size(static_cast<uint32_t>(uncompressed[0]));
+    r_request->set_compression_format(p_codec);
+    r_request->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    r_request->set_destination_resource(p_texture);
+    r_request->set_first_subresource(0);
+    r_request->set_subresource_count(1);
+    r_request->set_texture_format(0);
+    return true;
+}
+
+// Submits one request and returns the fence-retire time in milliseconds, or
+// negative (-elapsed_ms - 1) when wait_for_completion returned false (timeout
+// or D3D12 device removal where GetCompletedValue() == UINT64_MAX). The budget
+// deliberately exceeds the ~2 s TDR: a device reset is a measurement here, not
+// an abort, so the number that comes back is the finding.
+int64_t run_one_dispatch(godot::Win32Backend *p_backend, const godot::Ref<godot::DSRequest> &p_request, bool &r_retired) {
+    r_retired = false;
+    if (p_request.is_null() || !p_backend->enqueue_request(p_request)) {
+        return -1;
+    }
+    p_backend->submit_async();
+    const uint64_t fence = p_backend->get_completion_fence();
+    if (fence == 0) {
+        return -1;
+    }
+    const int64_t start = godot::Time::get_singleton()->get_ticks_usec();
+    r_retired = p_backend->wait_for_completion(fence, 5000);
+    const int64_t elapsed_ms = (godot::Time::get_singleton()->get_ticks_usec() - start) / 1000;
+    wait_until_released(p_backend, p_request->get_destination_resource());
+    return elapsed_ms;
+}
+
+// Every number travels inside the failure message, so a red case is
+// self-describing even when the JSON report is all a later session reads.
+std::string probe_report(const char *p_label, int64_t p_elapsed_ms, bool p_retired, const godot::Ref<godot::DSRequest> &p_request) {
+    std::string report = std::string(p_label) + " elapsed_ms=" + std::to_string(p_elapsed_ms) +
+            " retired=" + (p_retired ? "true" : "false");
+    if (p_request.is_valid()) {
+        report += " status=" + std::to_string(static_cast<int64_t>(p_request->get_status()));
+        const std::string error = ::gdextest::to_std_string(p_request->get_error_message());
+        if (!error.empty()) {
+            report += " error='" + error + "'";
+        }
+    }
+    return report;
+}
+
+} // namespace
+#endif
+
+GDEX_TEST_T(win32_remediation, large_dispatch_fixture_codec, TAG_INTEGRATION) {
+#ifndef _WIN32
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#else
+    // No backend, no GPU work: establish what the #0252 fixture actually holds
+    // before any timing derived from it is believed.
+    const char *raw_path = "user://i0257_probe_codec_raw.dstex";
+    const char *packed_path = "user://i0257_probe_codec_packed.dstex";
+    remove_temp_file(raw_path);
+    remove_temp_file(packed_path);
+    ctx.add_teardown([raw_path, packed_path]() {
+        remove_temp_file(raw_path);
+        remove_temp_file(packed_path);
+    });
+
+    GDEX_ASSERT_TRUE(write_gpu_texture_fixture(godot::String(raw_path)));
+    GDEX_ASSERT_TRUE(write_compressible_fixture(packed_path));
+
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    GDEX_ASSERT_TRUE(dstex.is_valid());
+    const godot::Dictionary raw_header = dstex->read_header(godot::String(raw_path));
+    const godot::Dictionary packed_header = dstex->read_header(godot::String(packed_path));
+    GDEX_ASSERT_TRUE(raw_header.size() > 0);
+    GDEX_ASSERT_TRUE(packed_header.size() > 0);
+
+    const int64_t expected_bytes = static_cast<int64_t>(kProbeTextureSize) * kProbeTextureSize * 4;
+    GDEX_EXPECT_EQ(static_cast<int64_t>(raw_header["original_size"]), expected_bytes);
+    // The regression under test: an incompressible payload is stored verbatim as
+    // NONE, so declaring GDEFLATE for it feeds noise to the decompressor.
+    GDEX_EXPECT_EQ(static_cast<int>(raw_header["compression_format"]),
+            static_cast<int>(godot::DSCompressionFormat::NONE));
+    GDEX_EXPECT_EQ(static_cast<int>(packed_header["compression_format"]),
+            static_cast<int>(godot::DSCompressionFormat::GDEFLATE));
+    GDEX_EXPECT_LT(static_cast<int64_t>(packed_header["compressed_size"]),
+            static_cast<int64_t>(packed_header["original_size"]));
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, large_dispatch_gdeflate_16mib, TAG_INTEGRATION | TAG_SLOW) {
+#ifdef _WIN32
+    // A real 16 MiB decompression: the reference the other two legs are read
+    // against. Healthy Pascal hardware finishes this far below the TDR window.
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    const char *path = "user://i0257_probe_gdeflate.dstex";
+    remove_temp_file(path);
+    ctx.add_teardown([path]() { remove_temp_file(path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    // Registered after the fixture's teardown, so LIFO deletes the backend -
+    // and with it the IDStorageFile handles - before the file is removed.
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    GDEX_ASSERT_TRUE(write_compressible_fixture(path));
+    const godot::RID texture = create_destination_texture(rd, 1);
+    GDEX_ASSERT_TRUE(texture.is_valid());
+    ctx.add_teardown([rd, texture]() {
+        if (rd->texture_is_valid(texture)) {
+            rd->free_rid(texture);
+        }
+    });
+
+    godot::Ref<godot::DSRequest> request;
+    GDEX_ASSERT_TRUE(build_probe_request(path, texture, godot::DSRequest::COMPRESSION_GDEFLATE, request));
+    bool retired = false;
+    const int64_t elapsed_ms = run_one_dispatch(backend, request, retired);
+    const std::string report = probe_report("gdeflate", elapsed_ms, retired, request);
+    godot::UtilityFunctions::print(godot::String("[PROBE] ") + godot::String(report.c_str()));
+    if (!retired || elapsed_ms < 0) {
+        GDEX_FAIL("16 MiB GDeflate did not retire inside the 5000 ms budget: " + report);
+        return;
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(request->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+    if (elapsed_ms > 500) {
+        GDEX_FAIL("16 MiB GDeflate exceeded the 500 ms ceiling: " + report);
+    }
+
+    // A TDR completes the fence, so `retired` alone cannot distinguish a
+    // finished dispatch from a reset one. A fresh texture create proves the
+    // device survived this leg (#0257).
+    const godot::RID device_alive_probe = create_destination_texture(rd, 1);
+    GDEX_EXPECT_TRUE(device_alive_probe.is_valid());
+    if (rd->texture_is_valid(device_alive_probe)) {
+        rd->free_rid(device_alive_probe);
+    }
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, large_dispatch_raw_copy_16mib, TAG_INTEGRATION | TAG_SLOW) {
+#ifdef _WIN32
+    // The non-GDeflate control: same container shape, same 2048^2 destination,
+    // same 16 MiB of payload, but declared NONE so the runtime performs a plain
+    // DMA copy with no compute dispatch at all. If this leg is fast while the
+    // mismatched one below stalls, the stall is the decompressor reading an
+    // invalid stream - not the submission path, not the transfer size, and not
+    // the driver.
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    const char *path = "user://i0257_probe_raw_copy.dstex";
+    remove_temp_file(path);
+    ctx.add_teardown([path]() { remove_temp_file(path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    GDEX_ASSERT_TRUE(write_gpu_texture_fixture(godot::String(path)));
+    const godot::RID texture = create_destination_texture(rd, 1);
+    GDEX_ASSERT_TRUE(texture.is_valid());
+    ctx.add_teardown([rd, texture]() {
+        if (rd->texture_is_valid(texture)) {
+            rd->free_rid(texture);
+        }
+    });
+
+    godot::Ref<godot::DSRequest> request;
+    GDEX_ASSERT_TRUE(build_probe_request(path, texture, godot::DSRequest::COMPRESSION_NONE, request));
+    bool retired = false;
+    const int64_t elapsed_ms = run_one_dispatch(backend, request, retired);
+    const std::string report = probe_report("raw_copy", elapsed_ms, retired, request);
+    godot::UtilityFunctions::print(godot::String("[PROBE] ") + godot::String(report.c_str()));
+    if (!retired || elapsed_ms < 0) {
+        GDEX_FAIL("16 MiB raw copy did not retire inside the 5000 ms budget: " + report);
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(request->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+    if (elapsed_ms > 500) {
+        GDEX_FAIL("16 MiB raw copy exceeded the 500 ms ceiling: " + report);
+    }
+
+    // Prove the copy landed: a fast fence over an untouched texture would look
+    // identical to a fast fence over a completed transfer.
+    const godot::PackedByteArray readback = rd->texture_get_data(texture, 0);
+    GDEX_ASSERT_EQ(readback.size(), static_cast<int64_t>(kProbeTextureSize) * kProbeTextureSize * 4);
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(readback.ptr());
+    bool any_nonzero = false;
+    for (int64_t i = 0; i < readback.size() && !any_nonzero; i += 4096) {
+        any_nonzero = bytes[i] != 0;
+    }
+    GDEX_EXPECT_TRUE(any_nonzero);
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, large_dispatch_reverse_codec_mismatch, TAG_INTEGRATION | TAG_SLOW) {
+#ifdef _WIN32
+    // The inverse of #0257: a GDEFLATE container declared as NONE would copy
+    // compressed bytes verbatim into the texture - silent corruption with no
+    // watchdog behind it. The same agreement check must refuse it.
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    const char *path = "user://i0257_probe_reverse.dstex";
+    remove_temp_file(path);
+    ctx.add_teardown([path]() { remove_temp_file(path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    GDEX_ASSERT_TRUE(write_compressible_fixture(path));
+    const godot::RID texture = create_destination_texture(rd, 1);
+    GDEX_ASSERT_TRUE(texture.is_valid());
+    ctx.add_teardown([rd, texture]() {
+        if (rd->texture_is_valid(texture)) {
+            rd->free_rid(texture);
+        }
+    });
+
+    godot::Ref<godot::DSRequest> request;
+    GDEX_ASSERT_TRUE(build_probe_request(path, texture, godot::DSRequest::COMPRESSION_NONE, request));
+    godot::PlatformBackend::EnqueueOutcome outcome = godot::PlatformBackend::EnqueueOutcome::STAGED;
+    const bool enqueued = backend->enqueue_request(request, &outcome);
+    const std::string report = probe_report("reverse_mismatch", 0, !enqueued, request);
+    godot::UtilityFunctions::print(godot::String("[PROBE] ") + godot::String(report.c_str()));
+
+    GDEX_EXPECT_FALSE(enqueued);
+    GDEX_EXPECT_TRUE(outcome == godot::PlatformBackend::EnqueueOutcome::TERMINAL);
+    GDEX_EXPECT_EQ(request->get_status(), godot::DSRequest::STATUS_FAILED);
+    GDEX_EXPECT_TRUE(request->get_error_message().contains("declared compression format"));
+    GDEX_EXPECT_EQ(backend->_debug_cached_source_file_count(), 0);
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, large_dispatch_corrupt_stream_refused, TAG_INTEGRATION | TAG_SLOW) {
+#ifdef _WIN32
+    // Right codec, bad bytes: the per-mip GDeflate stream validation added for
+    // #0257 must refuse a corrupt stream before submission. A regression here
+    // hands garbage to the compute decoder and reproduces the #0252 TDR, so this
+    // is the second-to-last case - the intentionally TDR-capable
+    // large_dispatch_mismatched_codec_16mib stays last.
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    const char *path = "user://i0257_probe_corrupt_stream.dstex";
+    remove_temp_file(path);
+    ctx.add_teardown([path]() { remove_temp_file(path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    GDEX_ASSERT_TRUE(write_compressible_fixture(path));
+    // Damage the tile-stream header of mip 0 without touching the container's
+    // mip table, so the codec still agrees and only the stream validation can
+    // catch it.
+    godot::Ref<godot::DSTex> reader;
+    reader.instantiate();
+    GDEX_ASSERT_TRUE(reader.is_valid());
+    const godot::Dictionary header = reader->read_header(godot::String(path));
+    GDEX_ASSERT_TRUE(!header.is_empty());
+    const godot::PackedInt64Array mip_offsets = header["mip_offsets"];
+    GDEX_ASSERT_TRUE(mip_offsets.size() >= 1);
+    {
+        godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(path), godot::FileAccess::READ_WRITE);
+        GDEX_ASSERT_TRUE(file.is_valid());
+        GDEX_ASSERT_TRUE(file->is_open());
+        file->seek(mip_offsets[0]);
+        GDEX_ASSERT_EQ(file->get_position(), mip_offsets[0]);
+        godot::PackedByteArray garbage;
+        garbage.resize(8);
+        memset(garbage.ptrw(), 0xFF, 8);
+        file->store_buffer(garbage);
+        GDEX_ASSERT_EQ(static_cast<int64_t>(file->get_error()), static_cast<int64_t>(godot::OK));
+        file->close();
+    }
+
+    const godot::RID texture = create_destination_texture(rd, 1);
+    GDEX_ASSERT_TRUE(texture.is_valid());
+    ctx.add_teardown([rd, texture]() {
+        if (rd->texture_is_valid(texture)) {
+            rd->free_rid(texture);
+        }
+    });
+
+    godot::Ref<godot::DSRequest> request;
+    GDEX_ASSERT_TRUE(build_probe_request(path, texture, godot::DSRequest::COMPRESSION_GDEFLATE, request));
+    godot::PlatformBackend::EnqueueOutcome outcome = godot::PlatformBackend::EnqueueOutcome::STAGED;
+    const bool enqueued = backend->enqueue_request(request, &outcome);
+    const std::string report = probe_report("corrupt_stream", 0, !enqueued, request);
+    godot::UtilityFunctions::print(godot::String("[PROBE] ") + godot::String(report.c_str()));
+
+    GDEX_EXPECT_FALSE(enqueued);
+    GDEX_EXPECT_TRUE(outcome == godot::PlatformBackend::EnqueueOutcome::TERMINAL);
+    GDEX_EXPECT_EQ(request->get_status(), godot::DSRequest::STATUS_FAILED);
+    GDEX_EXPECT_TRUE(request->get_error_message().contains("Invalid GDeflate tile-stream header"));
+    GDEX_EXPECT_EQ(backend->_debug_cached_source_file_count(), 0);
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, large_dispatch_mismatched_codec_16mib, TAG_INTEGRATION | TAG_SLOW) {
+#ifdef _WIN32
+    // The #0252 / #0257 regression test: a v3 COMPRESSION_NONE container
+    // declared as COMPRESSION_GDEFLATE on a whole-subresource GPU texture
+    // request must be rejected synchronously before submission with
+    // EnqueueOutcome::TERMINAL, never reaching the DirectStorage GDeflate
+    // compute shader (which otherwise spins on the 16 MiB of raw pseudorandom
+    // noise until the 2 s Windows TDR resets the D3D12 device).
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    const char *path = "user://i0257_probe_mismatched.dstex";
+    remove_temp_file(path);
+    ctx.add_teardown([path]() { remove_temp_file(path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    GDEX_ASSERT_TRUE(write_gpu_texture_fixture(godot::String(path)));
+    const godot::RID texture = create_destination_texture(rd, 1);
+    GDEX_ASSERT_TRUE(texture.is_valid());
+    ctx.add_teardown([rd, texture]() {
+        if (rd->texture_is_valid(texture)) {
+            rd->free_rid(texture);
+        }
+    });
+
+    godot::Ref<godot::DSRequest> request;
+    GDEX_ASSERT_TRUE(build_probe_request(path, texture, godot::DSRequest::COMPRESSION_GDEFLATE, request));
+    godot::PlatformBackend::EnqueueOutcome outcome = godot::PlatformBackend::EnqueueOutcome::STAGED;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool enqueued = backend->enqueue_request(request, &outcome);
+    const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    const std::string report = probe_report("mismatched", elapsed_ms, !enqueued, request);
+    godot::UtilityFunctions::print(godot::String("[PROBE] ") + godot::String(report.c_str()));
+
+    GDEX_EXPECT_FALSE(enqueued);
+    GDEX_EXPECT_TRUE(outcome == godot::PlatformBackend::EnqueueOutcome::TERMINAL);
+    GDEX_EXPECT_EQ(request->get_status(), godot::DSRequest::STATUS_FAILED);
+    GDEX_EXPECT_TRUE(request->get_error_message().contains("declared compression format"));
+    GDEX_EXPECT_EQ(backend->_debug_cached_source_file_count(), 0);
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
 

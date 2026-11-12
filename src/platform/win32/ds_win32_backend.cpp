@@ -437,7 +437,7 @@ Dictionary Win32Backend::_debug_get_queue_admission_stats_for_testing() {
 }
 #endif
 
-bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries) {
+bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries, DSCompressionFormat *r_container_format) {
 	r_entries.clear();
 	String resolved_path = p_path;
 	ProjectSettings *ps = ProjectSettings::get_singleton();
@@ -679,6 +679,9 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 			r_entries.clear();
 			return false;
 		}
+		if (r_container_format != nullptr) {
+			*r_container_format = is_v3 ? DSTex::get_compression_format(capabilities) : DSCompressionFormat::GDEFLATE;
+		}
 		return true;
 	}
 
@@ -740,6 +743,9 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 			r_entries.write[mip_idx].uncompressed_size = package_entry.uncompressed_size;
 			r_entries.write[mip_idx].row_pitch = package_entry.row_pitch;
 			r_entries.write[mip_idx].reserved = package_entry.reserved;
+		}
+		if (r_container_format != nullptr) {
+			*r_container_format = static_cast<DSCompressionFormat>(entry_format);
 		}
 		return true;
 	}
@@ -4037,8 +4043,9 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	// resolved its sizes from the validated chunk table, so the legacy
 	// whole-file staging/rewrite logic below must not run for it.
 	const bool is_row_region_request = gpu_texture_destination && has_row_region;
+	DSCompressionFormat container_format = DSCompressionFormat::GDEFLATE;
 	bool has_texture_mip_entries = gpu_texture_destination && !is_row_region_request &&
-			get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries);
+			get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries, &container_format);
 	uint64_t texture_footprint = 0;
 	uint32_t texture_first_subresource = p_request->get_first_subresource();
 	uint32_t texture_subresource_count = p_request->get_subresource_count();
@@ -4063,6 +4070,41 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	if (p_request->get_destination_type() == DSRequest::DESTINATION_GPU_TEXTURE && !has_texture_mip_entries &&
 			!is_row_region_request) {
 		return reject(p_request, "Win32Backend: GPU texture destinations require v2 footprint-padded formats.", EnqueueOutcome::TERMINAL);
+	}
+
+	if (has_texture_mip_entries) {
+		// Whole-subresource GPU texture requests must agree with the container's
+		// stored codec and, when GDeflate is requested, each target mip must begin
+		// with a valid GDeflate tile-stream header whose uncompressed size matches
+		// the mip table (#0252 / #0257). Feeding raw NONE bytes to the GPU GDeflate
+		// compute shader spins the dispatch past the 2 s TDR threshold.
+		const DSCompressionFormat requested_format = (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE)
+				? DSCompressionFormat::GDEFLATE
+				: DSCompressionFormat::NONE;
+		if (requested_format != container_format) {
+			String codec_error = "Win32Backend: GPU texture request declared compression format " +
+					String::num_int64(static_cast<int64_t>(requested_format)) +
+					" but container '" + p_request->get_file_path() + "' stores format " +
+					String::num_int64(static_cast<int64_t>(container_format)) + ".";
+			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+			if (err_handler) {
+				err_handler->report_error(codec_error);
+			}
+			return reject(p_request, codec_error, EnqueueOutcome::TERMINAL);
+		}
+		if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE) {
+			for (uint32_t mip_index = 0; mip_index < texture_subresource_count; mip_index++) {
+				const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource + mip_index];
+				String stream_error;
+				if (!validate_gdeflate_stream_size(p_request->get_file_path(), mip_entry.offset, mip_entry.uncompressed_size, stream_error)) {
+					DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
+					if (err_handler) {
+						err_handler->report_error(stream_error);
+					}
+					return reject(p_request, stream_error, EnqueueOutcome::TERMINAL);
+				}
+			}
+		}
 	}
 
 	String req_raw_path = p_request->get_file_path();

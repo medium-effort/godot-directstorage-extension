@@ -1467,6 +1467,42 @@ GDEX_TEST_T(win32_dstex_mip, v3_gdeflate_accepted, TAG_INTEGRATION) {
 #endif
 }
 
+GDEX_TEST_T(win32_dstex_mip, container_codec_matches_header_reader, TAG_INTEGRATION) {
+#if defined(_WIN32) && (defined(DEBUG_ENABLED) || defined(DEV_ENABLED))
+	// #0257 added a second codec derivation: the backend's container parser now
+	// reports the stored format so enqueue_request() can refuse a caller/codec
+	// disagreement. If that derivation drifts from read_header(), the guard
+	// either rejects valid assets or lets an invalid request through (the #0252
+	// TDR). Pin both directions here, headlessly.
+	godot::Ref<godot::DSTex> reader = make_dstex_reader();
+	godot::Win32Backend backend;
+
+	V3Spec packed;
+	const godot::String packed_path = scratch_path("be_codec_packed.dstex");
+	GDEX_ASSERT_TRUE(write_bytes(packed_path, build_v3(packed)));
+	godot::Vector<godot::DSTexMipEntryV2> entries;
+	godot::DSCompressionFormat backend_format = godot::DSCompressionFormat::NONE;
+	GDEX_EXPECT_TRUE(backend._debug_get_texture_mip_entries_for_testing(packed_path, 0, entries, &backend_format));
+	GDEX_EXPECT_EQ(static_cast<int>(backend_format), static_cast<int>(godot::DSCompressionFormat::GDEFLATE));
+	GDEX_EXPECT_EQ(static_cast<int>(backend_format), (int)reader->read_header(packed_path)["compression_format"]);
+
+	V3Spec raw;
+	raw.compression_format = static_cast<uint8_t>(godot::DSCompressionFormat::NONE);
+	const godot::String raw_path = scratch_path("be_codec_none.dstex");
+	GDEX_ASSERT_TRUE(write_bytes(raw_path, build_v3(raw)));
+	entries.clear();
+	backend_format = godot::DSCompressionFormat::GDEFLATE;
+	GDEX_EXPECT_TRUE(backend._debug_get_texture_mip_entries_for_testing(raw_path, 0, entries, &backend_format));
+	GDEX_EXPECT_EQ(static_cast<int>(backend_format), static_cast<int>(godot::DSCompressionFormat::NONE));
+	GDEX_EXPECT_EQ(static_cast<int>(backend_format), (int)reader->read_header(raw_path)["compression_format"]);
+
+	remove_file(packed_path);
+	remove_file(raw_path);
+#else
+	GDEX_SKIP("Windows-only backend parser");
+#endif
+}
+
 GDEX_TEST_T(win32_dstex_mip, v3_chunked_rejected, TAG_INTEGRATION) {
 #if defined(_WIN32) && (defined(DEBUG_ENABLED) || defined(DEV_ENABLED))
 	const godot::String path = scratch_path("be_v3_chunked.dstex");

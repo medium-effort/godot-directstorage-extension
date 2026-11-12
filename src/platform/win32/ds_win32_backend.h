@@ -321,7 +321,7 @@ private:
 	void update_profiler_queue_depth_locked();
 	// Container helpers own this instance's state only; they are members so one
 	// backend can never read or clear another's bookkeeping.
-	bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries);
+	bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries, DSCompressionFormat *r_container_format = nullptr);
 	void release_resource_guards(const Vector<Ref<DSRequest>> &p_requests);
 	void release_all_resource_guards();
 	bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_error, std::unordered_map<int64_t, ID3D12Resource *> *p_rid_cache = nullptr);
@@ -533,8 +533,8 @@ public:
 	// the Win32 build. This inline body is parsed on every platform, so it needs
 	// the same guard as the declaration instead of inheriting the DEBUG_ENABLED
 	// block it sits in.
-	bool _debug_get_texture_mip_entries_for_testing(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries) {
-		return get_texture_mip_entries(p_path, p_offset, r_entries);
+	bool _debug_get_texture_mip_entries_for_testing(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries, DSCompressionFormat *r_container_format = nullptr) {
+		return get_texture_mip_entries(p_path, p_offset, r_entries, r_container_format);
 	}
 #endif
 	// Test-only seam: runs the standalone-.dstex chunk splitter without a live
