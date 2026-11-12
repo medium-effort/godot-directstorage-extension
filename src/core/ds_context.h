@@ -86,6 +86,9 @@ private:
 	// scheduler race that cannot be produced on demand. Never bound in
 	// _bind_methods().
 	std::function<void()> initialization_window_hook;
+	// Test-only seam consumed by flush_batch(): see
+	// _debug_skip_next_flush_submission_for_testing().
+	std::atomic<bool> skip_next_flush_submission{ false };
 #endif
 	bool gpu_requests_pending = false;
 	uint64_t completion_fence = 0;
@@ -321,6 +324,14 @@ public:
 	// counter above what the real fence will reach makes drain_all_queues() spend
 	// its whole budget. Never bound in _bind_methods().
 	void _debug_set_backend_fence_counters_for_testing(int p_queue_index, uint64_t p_completion_value, uint64_t p_completed_value);
+	// Test-only seam: make the NEXT flush_batch() skip its submit call, leaving the
+	// staged batch in the backend slot while the pending counters are cleared
+	// exactly as in production. Reproduces the state submit_batch() leaves behind
+	// on any of its three pre-submit early returns (not accepting requests,
+	// predecessor not retired, no free slot) - the RID stays reachable from the
+	// slot, which is what a failed GPU upload must not hand to an inline free.
+	// One-shot: consumed by the first flush. Never bound in _bind_methods().
+	void _debug_skip_next_flush_submission_for_testing();
 #endif
 };
 

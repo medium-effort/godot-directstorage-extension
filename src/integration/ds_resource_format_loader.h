@@ -44,6 +44,13 @@ private:
 	mutable uint64_t cached_archive_size = 0;
 	mutable uint64_t cached_archive_write_time = 0;
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only observations of the failed-GPU-upload cleanup (see the public
+	// accessors below). Mutable because _load_texture_payload is const.
+	mutable RID debug_last_failed_gpu_rid;
+	mutable bool debug_last_failed_gpu_rid_in_flight = false;
+#endif
+
 	String _resolve_archive_path(const String &p_logical_path) const;
 	Ref<DSPkg> _get_or_open_archive(const String &p_archive_path) const;
 	// Opens p_archive_path into a caller-owned instance. Never reads or writes
@@ -111,6 +118,11 @@ public:
 	// synchronously (what the main thread does when it drains the call).
 	bool _debug_loader_init_decision_for_testing() const;
 	void _debug_run_pending_loader_init_for_testing();
+
+	// Which device RID the failed-GPU-upload cleanup handed to the release path,
+	// and whether the backend still reported it in flight at that instant.
+	RID _debug_last_failed_gpu_rid_for_testing() const;
+	bool _debug_last_failed_gpu_rid_was_in_flight_for_testing() const;
 #endif
 };
 

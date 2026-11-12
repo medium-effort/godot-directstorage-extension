@@ -1327,7 +1327,16 @@ void DSContext::flush_batch() {
 		had_gpu_requests = gpu_requests_pending;
 		submitted_request_count = pending_request_count;
 	}
-	active_backend->submit_batch();
+	bool skip_submit = false;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only: consume the one-shot seam so the staged batch stays in the slot,
+	// exactly as submit_batch()'s pre-submit early returns leave it. Everything
+	// below still runs, so the pending counters move as in production.
+	skip_submit = skip_next_flush_submission.exchange(false);
+#endif
+	if (!skip_submit) {
+		active_backend->submit_batch();
+	}
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
 	if (active_backend->get_name() == "Win32DirectStorage") {
@@ -1930,6 +1939,12 @@ void DSContext::_debug_set_initialization_window_hook_for_testing(const std::fun
 	// Taking init_mutex here would deadlock against initialize_ds(), which holds it
 	// for the whole window the hook is designed to hold open.
 	initialization_window_hook = p_hook;
+}
+
+void DSContext::_debug_skip_next_flush_submission_for_testing() {
+	// Test-only seam, see the header. Atomic because a stream flush on another
+	// thread may be the one that consumes it.
+	skip_next_flush_submission.store(true, std::memory_order_release);
 }
 
 bool DSContext::_debug_config_fields_are_atomic_for_testing() const {

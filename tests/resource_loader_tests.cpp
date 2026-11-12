@@ -1344,3 +1344,97 @@ GDEX_TEST_T(loader, threaded_load_before_init_keeps_d3d12, TAG_INTEGRATION) {
 	GDEX_SKIP("Win32 backend is excluded from the test build on non-Windows.");
 #endif
 }
+
+#ifdef _WIN32
+namespace {
+
+// 64x64 RGBA8, one mip, unchunked (chunk_size_kb 0) and not forced to the CPU
+// path: the loader attempts the whole-subresource GPU upload and, when that
+// fails, falls back to CPU decompression.
+bool write_failed_gpu_release_fixture(const char *p_path) {
+	godot::PackedByteArray payload;
+	payload.resize(64 * 64 * 4);
+	for (int64_t i = 0; i < payload.size(); ++i) {
+		payload[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+	}
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	if (dstex.is_null()) {
+		return false;
+	}
+	return dstex->write_to_file(godot::String(p_path), payload, 64, 64,
+				   godot::Image::FORMAT_RGBA8, 1, 1, false, false) == godot::OK;
+}
+
+} // namespace
+#endif
+
+// A failed GPU upload must not destroy its device texture inline: the backend can
+// still own the RID in a staged or zombie batch slot, and freeing it there is a
+// use-after-free against live DMA. The RID goes through the shared release queue
+// instead, which re-tests in-flight and defers until the governing fence retires.
+GDEX_TEST_T(loader, gpu_failed_upload_defers_rid_release, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if !defined(DEBUG_ENABLED) && !defined(DEV_ENABLED)
+	(void)ctx;
+	GDEX_SKIP("The flush-submission seam is compiled out of release builds.");
+#else
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	if (!ds->is_initialized() && !ds->initialize_ds()) {
+		GDEX_SKIP("DSContext backend unavailable (initialize_ds failed).");
+	}
+	if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+		GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver).");
+	}
+	if (!loader_worker_gate_d3d12()) {
+		GDEX_SKIP("No live D3D12 RenderingDevice (headless or non-D3D12 driver).");
+	}
+	godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+	godot::RenderingDevice *rd = rs->get_rendering_device();
+
+	const char *dstex_path = "user://gdextest_loader_failed_gpu_release.dstex";
+	// One teardown so the order is explicit: the context goes down (dropping any
+	// batch handle on the file) before the fixture is removed, then the backend is
+	// restored for the suites that run after this one.
+	ctx.add_teardown([ds, dstex_path]() {
+		ds->shutdown_ds();
+		remove_user_file(dstex_path);
+		ds->initialize_ds();
+	});
+	GDEX_ASSERT_TRUE(write_failed_gpu_release_fixture(dstex_path));
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	// The GPU upload's synchronous flush returns without submitting, which is the
+	// state submit_batch()'s pre-submit early returns leave behind in production.
+	ds->_debug_skip_next_flush_submission_for_testing();
+
+	godot::Variant result = loader->_load(godot::String(dstex_path), godot::String(""), false,
+			godot::ResourceFormatLoader::CACHE_MODE_IGNORE);
+	godot::Ref<godot::Texture2D> texture(result);
+	GDEX_ASSERT_TRUE(texture.is_valid());
+
+	const godot::RID failed_rid = loader->_debug_last_failed_gpu_rid_for_testing();
+	GDEX_ASSERT_TRUE(failed_rid.is_valid());
+	// The premise: at the release decision the backend still reported it in use.
+	GDEX_EXPECT_TRUE(loader->_debug_last_failed_gpu_rid_was_in_flight_for_testing());
+
+	// Released, not destroyed, while a backend slot still owns it.
+	GDEX_EXPECT_TRUE(rd->texture_is_valid(failed_rid));
+
+	// ... and retired rather than leaked once the fence has and the queue drains.
+	ds->wait_for_completion(5000);
+	ds->collect_completed_results();
+	godot::DSTextureCache::flush_deferred_rid_releases(true);
+	GDEX_EXPECT_FALSE(rd->texture_is_valid(failed_rid));
+#endif
+#else
+	(void)ctx;
+	GDEX_SKIP("Win32 backend is excluded from the test build on non-Windows.");
+#endif
+}

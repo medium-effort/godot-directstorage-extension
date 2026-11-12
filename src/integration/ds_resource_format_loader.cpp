@@ -394,6 +394,14 @@ void DSResourceFormatLoader::_debug_run_pending_loader_init_for_testing() {
 	}
 	ds_loader_initialize_context_on_main_thread();
 }
+
+RID DSResourceFormatLoader::_debug_last_failed_gpu_rid_for_testing() const {
+	return debug_last_failed_gpu_rid;
+}
+
+bool DSResourceFormatLoader::_debug_last_failed_gpu_rid_was_in_flight_for_testing() const {
+	return debug_last_failed_gpu_rid_in_flight;
+}
 #endif
 
 Variant DSResourceFormatLoader::_load_texture_payload(
@@ -749,7 +757,20 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 			}
 
 			if (result_texture.is_null()) {
-				rd->free_rid(tex_rid);
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+				debug_last_failed_gpu_rid = tex_rid;
+				debug_last_failed_gpu_rid_in_flight = ds_ctx != nullptr && ds_ctx->is_resource_in_flight(tex_rid);
+#endif
+				// Never free a failed upload's device texture inline. Both hazardous
+				// shapes of this branch - a synchronous flush that timed out (the slot
+				// moved to zombie_slots, hardware still draining) and one that never
+				// submitted (the slot still holds the staged requests) - leave the RID
+				// owned by the backend. release_owned_rid() re-tests in-flight, frees
+				// inline on the render thread when the answer is no, and otherwise
+				// defers to the evict queue that drains once the fence retires - the
+				// same discipline DSTextureOwner and the preloader's cancelled-prewarm
+				// path already apply.
+				DSTextureCache::release_owned_rid(tex_rid);
 			}
 		}
 	}
