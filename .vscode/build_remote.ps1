@@ -993,10 +993,30 @@ if (-not $AuditOnly) {
 # downloads and never accepts the license: the VS Code fetch task is the
 # interactive path, CI passes -Decision Accept explicitly, and a build script that
 # accepted a EULA on the user's behalf would be both surprising and unauditable.
+# In a linked worktree git cannot supply the file either, and the repair is the copy
+# bootstrap that the worktrunk pre-start hook runs - not another fetch, which would
+# download the package per worktree and ask for the license a second time.
 if (-not $AuditOnly) {
     $DirectStorageLib = Join-Path $WorkspaceRoot "thirdparty\directstorage\lib\x64\dstorage.lib"
     if (-not (Test-Path -LiteralPath $DirectStorageLib -PathType Leaf)) {
-        Show-BuildFailure -Step "DirectStorage SDK" -Message ("DirectStorage import library is missing: " + $DirectStorageLib + ". It is EULA-bound and is not committed to this repository. Fetch the pinned SDK first:`n  powershell -NoProfile -ExecutionPolicy Bypass -File tools\fetch_directstorage.ps1`n(or run the VS Code task 'Fetch DirectStorage Runtime'). This build script never downloads or accepts the license for you.") -Code 1
+        $DirectStorageHint = "It is EULA-bound and is not committed to this repository. Fetch the pinned SDK first:`n  powershell -NoProfile -ExecutionPolicy Bypass -File tools\fetch_directstorage.ps1`n(or run the VS Code task 'Fetch DirectStorage Runtime'). This build script never downloads or accepts the license for you."
+        # A linked worktree's .git is a file ("gitdir: <primary>/.git/worktrees/<name>"), and the SDK is
+        # gitignored, so the checkout can never inherit it from git: name the copy bootstrap instead.
+        $GitEntry = Join-Path $WorkspaceRoot ".git"
+        if (Test-Path -LiteralPath $GitEntry -PathType Leaf) {
+            $PrimaryWorktree = '<primary worktree>'
+            try {
+                $gitDirLine = [System.IO.File]::ReadAllLines($GitEntry, [System.Text.UTF8Encoding]::new($false))[0]
+                if ($gitDirLine -match '(?i)^\s*gitdir:\s*(.+?)[\\/]\.git[\\/]worktrees[\\/]') {
+                    $PrimaryWorktree = $Matches[1] -replace '/', '\'
+                }
+            }
+            catch {
+                Write-Status "[Warning] Could not read $GitEntry to resolve the primary worktree path." -ForegroundColor DarkYellow
+            }
+            $DirectStorageHint = ("This workspace is a linked worktree, so git cannot supply it. Seed it from the primary before building - do not fetch here, which would download the package again and ask for the license a second time:`n  powershell -NoProfile -ExecutionPolicy Bypass -File tools\wt_bootstrap_directstorage.ps1 '" + $PrimaryWorktree + "' '" + $WorkspaceRoot + "'`nThe worktrunk pre-start hooks run this when 'git wt switch --create' creates the tree; a plain 'git worktree add' (or a hook that did not run) skips it. The fetch belongs to the primary checkout only.")
+        }
+        Show-BuildFailure -Step "DirectStorage SDK" -Message ("DirectStorage import library is missing: " + $DirectStorageLib + ". " + $DirectStorageHint) -Code 1
     }
 }
 
