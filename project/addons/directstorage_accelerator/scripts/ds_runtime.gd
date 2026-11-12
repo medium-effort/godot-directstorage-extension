@@ -81,6 +81,8 @@ var _profiler_probed: bool = false
 var _has_frame_window: bool = false
 ## Set once the missing-stream-API warning has been emitted (avoids spamming).
 var _stream_api_missing_warned: bool = false
+## Set once the missing-prewarm-progress-API warning has been emitted (avoids spamming).
+var _prewarm_api_missing_warned: bool = false
 ## Background texture-ingestion task (`WorkerThreadPool` task ID, -1 = idle).
 ## `poll_completed()` builds `ImageTexture` only (Quirks Sec25 worker-safe);
 ## evict-path RID frees defer via `call_on_render_thread` (Sec27).
@@ -582,6 +584,14 @@ func _poll_prewarm_progress(ctx: Object) -> void:
 	if _tracked_tags.is_empty():
 		return
 	if not ctx.has_method("get_prewarm_progress") or not ctx.has_method("is_prewarm_complete"):
+		# A build without the prewarm API can never prove a tag finished, and a
+		# tracked tag keeps `streaming_active` true, which would hold the
+		# frame-time window open for the rest of the session. Progress is
+		# unobservable here anyway, so drop the watch after one warning.
+		if not _prewarm_api_missing_warned:
+			_prewarm_api_missing_warned = true
+			push_warning("[DirectStorage] DSRuntime: prewarm progress API missing; clearing the tag watch (progress cannot be polled).")
+		_tracked_tags.clear()
 		return
 	for tag in _tracked_tags.keys():
 		var progress: Vector2i = ctx.get_prewarm_progress(tag)

@@ -18,6 +18,13 @@ extends SceneTree
 
 const PreloaderScript := preload("uid://h8ts55gju2q4")
 
+## A context stand-in that exposes neither prewarm query method: the version-skew
+## shape DSRuntime's progress poll has to survive. A build that cannot answer the
+## queries can never prove a tag finished.
+class StubCtx extends RefCounted:
+	func is_initialized() -> bool:
+		return true
+
 const TAG := "DS-FRAME-WINDOW"
 const PROBE_DIR := "res://test_assets/frame_window/"
 const TEX_W := 64
@@ -87,6 +94,32 @@ func _run() -> void:
 		"the before mean is populated (%.1f us)" % float(stats.get("mean_frame_before_usec", 0.0)))
 	_check(float(stats.get("mean_frame_during_usec", 0.0)) > 0.0,
 		"the during mean is populated (%.1f us)" % float(stats.get("mean_frame_during_usec", 0.0)))
+
+	# Guard: a tag that was never issued still erases itself, because the
+	# predicate reports unknown tags as complete. It passes today; it fails if
+	# that unknown-tag contract ever changes and the tag starts holding the window.
+	var unknown_tag := 987654321
+	runtime.track_prewarm(unknown_tag)
+	_check(bool(runtime.is_tracking_prewarm(unknown_tag)), "an unknown tag is accepted for tracking")
+	for _i in 3:
+		await process_frame
+	_check(not bool(runtime.is_tracking_prewarm(unknown_tag)), "the runtime drops an unknown tag")
+	var after_unknown: Dictionary = _profiler.call("get_frame_window_stats")
+	_check(not bool(after_unknown.get("active", true)), "an unknown tag leaves no window open")
+
+	# Closure: a context that cannot answer the prewarm queries can never prove a
+	# tag finished, so the poll must drop the watch instead of leaving
+	# streaming_active true for the session (which holds the frame window open).
+	var orphan_tag := 636363
+	runtime.track_prewarm(orphan_tag)
+	_check(bool(runtime.is_tracking_prewarm(orphan_tag)), "a tag is tracked before the API gate runs")
+	runtime._poll_prewarm_progress(StubCtx.new())
+	_check(not bool(runtime.is_tracking_prewarm(orphan_tag)),
+		"a tag whose progress cannot be polled is dropped instead of holding the window")
+	for _i in 2:
+		await process_frame
+	var after_gate: Dictionary = _profiler.call("get_frame_window_stats")
+	_check(not bool(after_gate.get("active", true)), "the dropped tag leaves no window open")
 
 
 func _preconditions() -> bool:

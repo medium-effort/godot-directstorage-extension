@@ -12,7 +12,7 @@
 		<method name="begin_load_window">
 			<return type="void" />
 			<description>
-				Opens a frame-time window for the current streaming load. Pair it with [method end_load_window]; a second call while a window is already open is ignored so the frames already counted are kept.
+				Opens a frame-time window for the current streaming load. Pair it with [method end_load_window]; a second call while a window is already open is ignored so the frames already counted are kept. A window that reaches the tracker's frame cap (36000 frames, about ten minutes at 60 fps) closes itself, so a forgotten [method end_load_window] degrades to one truncated completed window instead of freezing the before-mean for the rest of the session.
 			</description>
 		</method>
 		<method name="end_load_window">

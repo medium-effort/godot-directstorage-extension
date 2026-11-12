@@ -12,6 +12,12 @@ namespace godot {
 // frame from DSRuntime.
 struct DSFrameWindowStats {
 	static constexpr int kBaselineCapacity = 60;
+	// Hard ceiling on one load window. A caller that opens a window and never
+	// closes it (the bound begin_load_window without end_load_window, a sampler
+	// muted mid-window, a prewarm tag that never completes) must not freeze the
+	// idle baseline for the rest of the session: at the cap the window closes
+	// itself and reports what it measured.
+	static constexpr int64_t kMaxWindowFrames = 36000;
 
 	void record_frame(double p_delta_usec) {
 		if (p_delta_usec < 0.0) {
@@ -20,6 +26,11 @@ struct DSFrameWindowStats {
 		if (window_active) {
 			during_sum_usec += p_delta_usec;
 			during_frames++;
+			if (during_frames >= kMaxWindowFrames) {
+				// end_window() reads the sums before resetting them, so the
+				// capping frame is counted once, in the window it closes.
+				end_window();
+			}
 			return;
 		}
 		// Rolling baseline over the most recent idle frames. While a window is

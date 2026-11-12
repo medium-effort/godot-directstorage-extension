@@ -92,3 +92,44 @@ GDEX_TEST(frame_window, negative_delta_is_ignored) {
 	GDEX_EXPECT_EQ(stats.frame_count(), static_cast<int64_t>(0));
 	GDEX_EXPECT_TRUE(near(stats.mean_during_usec(), 0.0));
 }
+
+// A window whose closer never arrives (a caller that forgets end_load_window, a
+// sampler muted mid-window, a prewarm tag that never completes) must not freeze
+// the idle baseline for the rest of the session. The exact ceiling is pinned by
+// behaviour: one frame fewer must still be inside the window, the next one must
+// close it.
+GDEX_TEST(frame_window, leaked_window_is_capped_and_baseline_resumes) {
+	const int64_t cap = 36000;
+	godot::DSFrameWindowStats stats;
+	for (int i = 0; i < 30; i++) {
+		stats.record_frame(10000.0);
+	}
+	stats.begin_window();
+	for (int64_t i = 0; i < cap - 1; i++) {
+		stats.record_frame(20000.0);
+	}
+	GDEX_EXPECT_TRUE(stats.is_active());
+	GDEX_EXPECT_EQ(stats.frame_count(), cap - 1);
+
+	stats.record_frame(20000.0); // the capping frame
+	GDEX_EXPECT_FALSE(stats.is_active());
+	GDEX_EXPECT_EQ(stats.completed_windows(), static_cast<int64_t>(1));
+	GDEX_EXPECT_EQ(stats.frame_count(), cap);
+	GDEX_EXPECT_TRUE(near(stats.mean_during_usec(), 20000.0));
+
+	// The baseline was frozen while the window was open; it must resume now.
+	GDEX_EXPECT_TRUE(near(stats.mean_before_usec(), 10000.0));
+	stats.record_frame(1000.0);
+	GDEX_EXPECT_TRUE(near(stats.mean_before_usec(), (30.0 * 10000.0 + 1000.0) / 31.0));
+
+	// And the tracker must be usable again, not merely closed once.
+	stats.begin_window();
+	GDEX_EXPECT_TRUE(stats.is_active());
+	for (int i = 0; i < 5; i++) {
+		stats.record_frame(5000.0);
+	}
+	stats.end_window();
+	GDEX_EXPECT_EQ(stats.completed_windows(), static_cast<int64_t>(2));
+	GDEX_EXPECT_EQ(stats.frame_count(), static_cast<int64_t>(5));
+	GDEX_EXPECT_TRUE(near(stats.mean_during_usec(), 5000.0));
+}
