@@ -46,6 +46,12 @@ public:
 	// Bounded wait for the given fence. Backends without a fence model return
 	// false; DSContext only calls it when the backend reports a fence.
 	virtual bool wait_for_completion(uint64_t /*p_fence_value*/, uint32_t /*p_timeout_msec*/) { return false; }
+	// Bounded wait for how far the batch on one priority lane has got. A lane is
+	// a backend queue with its own fence, so a slow batch on another lane must not
+	// extend this wait. The default is false: a backend without a per-lane fence
+	// cannot promise anything narrower than its all-queue signal. An initialized
+	// lane with no work is complete, so callers are not forced to pre-check.
+	virtual bool wait_for_priority_completion(int /*p_priority*/, uint32_t /*p_timeout_msec*/) { return false; }
 	virtual bool is_resource_in_flight(const RID & /*p_rid*/) const { return false; }
 };
 

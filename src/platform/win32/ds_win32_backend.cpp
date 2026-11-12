@@ -1444,6 +1444,72 @@ bool Win32Backend::wait_for_completion(uint64_t p_fence_value, uint32_t p_timeou
 #endif
 }
 
+// Wait for how far the batch on one priority lane has got. The target is that
+// lane's own counter, snapshotted once under batch_mutex: a batch that spans
+// lanes writes a value on each queue, so a numeric watermark is not comparable
+// across queues and the caller has to name the lane it cares about.
+bool Win32Backend::wait_for_priority_completion(int p_priority, uint32_t p_timeout_msec) {
+#ifdef _WIN32
+	if (!factory) {
+		return false;
+	}
+	const int queue_index = priority_to_queue_index(static_cast<DSRequest::DSPriority>(p_priority));
+	ID3D12Fence *fence = nullptr;
+	uint64_t target_value = 0;
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		const QueueState &queue = priority_queues[queue_index];
+		if (!queue.completion_fence || queue.completion_fence_value == 0) {
+			// Nothing was ever issued on this lane: there is nothing to wait for.
+			return true;
+		}
+		target_value = queue.completion_fence_value;
+		if (queue.completed_fence_value >= target_value) {
+			return true;
+		}
+		fence = queue.completion_fence;
+	}
+
+	const uint64_t start_time = Time::get_singleton() ? Time::get_singleton()->get_ticks_msec() : 0;
+	for (;;) {
+		const uint64_t completed_val = fence->GetCompletedValue();
+		if (completed_val == UINT64_MAX) {
+			// Device removed: the fence can never reach the target.
+			return false;
+		}
+		if (completed_val >= target_value) {
+			break;
+		}
+		const uint64_t now = Time::get_singleton() ? Time::get_singleton()->get_ticks_msec() : 0;
+		const uint64_t elapsed = now >= start_time ? now - start_time : 0;
+		if (elapsed >= p_timeout_msec) {
+			return false;
+		}
+		const uint32_t remaining_ms = static_cast<uint32_t>(p_timeout_msec - elapsed);
+		HANDLE wait_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+		if (!wait_event) {
+			return false;
+		}
+		const HRESULT hr = fence->SetEventOnCompletion(target_value, wait_event);
+		const DWORD wait_result = SUCCEEDED(hr) ? WaitForSingleObject(wait_event, remaining_ms) : WAIT_FAILED;
+		CloseHandle(wait_event);
+		if (FAILED(hr) || wait_result != WAIT_OBJECT_0) {
+			return false;
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(batch_mutex);
+		QueueState &queue = priority_queues[queue_index];
+		queue.completed_fence_value = std::max(queue.completed_fence_value, target_value);
+	}
+	return true;
+#else
+	(void)p_priority;
+	(void)p_timeout_msec;
+	return false;
+#endif
+}
+
 void Win32Backend::poll_batch_status() {
 #ifdef _WIN32
 	Vector<GPUTargetTransition> post_transitions;

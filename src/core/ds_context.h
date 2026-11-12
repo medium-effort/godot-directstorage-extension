@@ -171,6 +171,8 @@ private:
 
 	bool initialize_ds_locked();
 	void shutdown_ds_locked();
+	// p_priority < 0 selects the all-lane watermark form; >= 0 selects one lane.
+	bool _wait_for_completion_sliced(int p_priority, int p_timeout_msec);
 
 protected:
 	static void _bind_methods();
@@ -285,6 +287,7 @@ public:
 	void collect_completed_results();
 	uint64_t get_completion_fence() const;
 	bool wait_for_completion(int p_timeout_msec);
+	bool wait_for_priority_completion(int p_priority, int p_timeout_msec);
 	void cancel_requests_with_tag(uint64_t p_tag);
 	RID create_destination_texture(const Ref<RDTextureFormat> &p_format, const Ref<RDTextureView> &p_view = Ref<RDTextureView>());
 	// GDScript-visible batching counters. No queue merge; the sync and async

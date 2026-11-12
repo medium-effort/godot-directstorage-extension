@@ -312,7 +312,13 @@
 		<method name="wait_for_completion">
 			<return type="bool" />
 			<param index="0" name="timeout_msec" type="int" />
-			<description>Blocks execution until the pending GPU completion fence is signaled and RenderingDevice synchronization completes, or until [param timeout_msec] milliseconds elapse. Returns [code]true[/code] if the fence completed successfully.</description>
+			<description>Blocks execution until every priority lane's pending GPU completion fence is signaled and RenderingDevice synchronization completes, or until [param timeout_msec] milliseconds elapse. Every lane a batch was submitted on is waited, so a slow lane extends this call. Returns [code]true[/code] if the fences completed successfully. Use [method wait_for_priority_completion] when only one lane's work matters.</description>
+		</method>
+		<method name="wait_for_priority_completion">
+			<return type="bool" />
+			<param index="0" name="priority" type="int" />
+			<param index="1" name="timeout_msec" type="int" />
+			<description>Blocks until every batch issued on the priority lane [param priority] before the call has signaled that lane's own completion fence, or until [param timeout_msec] milliseconds elapse. Each priority has an independent fence, so a slow batch on another lane does not extend this wait; use [method wait_for_completion] when every lane must retire. An out-of-range priority is treated as normal. Returns [code]true[/code] when the lane is complete.</description>
 		</method>
 		<method name="was_gpu_decompression_used" qualifiers="const">
 			<return type="bool" />

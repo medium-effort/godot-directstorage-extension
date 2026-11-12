@@ -12,6 +12,8 @@
 // - HIGH-07: GPUTargetTransition resource ComPtr independent lifetime.
 // - HIGH-08: Synchronous timeout retains resources in zombie_slots until fence retirement.
 // - HIGH-10: Multi-queue wait_for_completion iterates all queues (0 to QUEUE_COUNT - 1).
+// - Lane-scoped completion wait: a wait that names a priority lane must not pay
+//   for another lane's batch, while the all-lane form keeps covering every lane.
 //
 // SConstruct filters Win32-specific backend files out of the test build on non-Windows;
 // all Win32Backend references are _WIN32 guarded and skip cleanly on other platforms.
@@ -342,6 +344,11 @@ GDEX_TEST_T(win32_remediation, uninitialized_backend_contracts, TAG_UNIT) {
     GDEX_EXPECT_FALSE(waited);
     // Bounded timeout: should finish within reasonable margin (not hang indefinitely)
     GDEX_EXPECT_TRUE(elapsed < 1000);
+
+    // A backend that never initialized has no lane fence, so a lane wait cannot
+    // claim completion. The idle-lane answer (true) is reserved for an
+    // initialized backend that has issued nothing on that lane.
+    GDEX_EXPECT_FALSE(backend->wait_for_priority_completion(godot::DSRequest::PRIORITY_HIGH, 0));
 #else
     (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
@@ -1336,6 +1343,77 @@ GDEX_TEST_T(win32_remediation, multi_queue_fence_wait_releases_when_low_counter_
             std::chrono::steady_clock::now() - t0).count();
     GDEX_EXPECT_TRUE(complete);
     GDEX_EXPECT_TRUE(d0 < 50);
+#else
+    (void)ctx;
+    GDEX_SKIP("The queue-counter seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, priority_wait_returns_when_its_lane_retired, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // A completion wait that names a lane must not pay for another lane's batch.
+    // The seam pins HIGH as retired and LOW as still in flight: the fast lane must
+    // answer true immediately, the pinned lane must not, and the all-lane form must
+    // keep covering both (the multi-queue contract the new form extends).
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        // Mandatory: a pinned counter above what the real fence will reach makes
+        // shutdown()'s drain_all_queues() spend its whole budget.
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 0, 0);
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_LOW, 0, 0);
+        memdelete(backend);
+    });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 5, 5);
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_LOW, 1, 0);
+
+    // A1: the public watermark is unchanged; the lane is the caller's choice.
+    GDEX_EXPECT_EQ(backend->get_completion_fence(), 5ULL);
+
+    // A2: the healthy lane answers without paying for the pinned one.
+    const auto t_high = std::chrono::steady_clock::now();
+    const bool high_done = backend->wait_for_priority_completion(godot::DSRequest::PRIORITY_HIGH, 0);
+    const auto high_msec = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_high).count();
+    GDEX_EXPECT_TRUE(high_done);
+    GDEX_EXPECT_TRUE(high_msec < 50);
+
+    // A3: the pinned lane is reported incomplete without burning budget.
+    const auto t_low0 = std::chrono::steady_clock::now();
+    const bool low_immediate = backend->wait_for_priority_completion(godot::DSRequest::PRIORITY_LOW, 0);
+    const auto low0_msec = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_low0).count();
+    GDEX_EXPECT_FALSE(low_immediate);
+    GDEX_EXPECT_TRUE(low0_msec < 50);
+
+    // A4: the bounded wait spends its budget on the lane it was asked about.
+    constexpr uint32_t kTimeoutMs = 25;
+    const auto t_low = std::chrono::steady_clock::now();
+    const bool low_done = backend->wait_for_priority_completion(godot::DSRequest::PRIORITY_LOW, kTimeoutMs);
+    const auto low_msec = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_low).count();
+    GDEX_EXPECT_FALSE(low_done);
+    GDEX_EXPECT_TRUE(low_msec >= static_cast<int64_t>(kTimeoutMs) - 5);
+    GDEX_EXPECT_TRUE(low_msec < 1000);
+
+    // A5: the all-lane form still covers the pinned lane (the contract the
+    // lane-scoped form extends rather than replaces).
+    GDEX_EXPECT_FALSE(backend->wait_for_completion(5, 0));
+
+    // A6: a lane that was never used is complete, not a false negative.
+    GDEX_EXPECT_TRUE(backend->wait_for_priority_completion(godot::DSRequest::PRIORITY_NORMAL, 0));
 #else
     (void)ctx;
     GDEX_SKIP("The queue-counter seam is compiled out of release builds.");

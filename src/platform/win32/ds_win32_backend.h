@@ -435,6 +435,7 @@ public:
 	void cancel_requests_with_tag(uint64_t p_tag) override;
 	uint64_t get_completion_fence() const override;
 	bool wait_for_completion(uint64_t p_fence_value, uint32_t p_timeout_msec) override;
+	bool wait_for_priority_completion(int p_priority, uint32_t p_timeout_msec) override;
 	bool is_resource_in_flight(const RID &p_rid) const override;
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)

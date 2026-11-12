@@ -722,23 +722,36 @@ uint64_t DSContext::get_completion_fence() const {
 }
 
 bool DSContext::wait_for_completion(int p_timeout_msec) {
+	return _wait_for_completion_sliced(-1, p_timeout_msec);
+}
+
+bool DSContext::wait_for_priority_completion(int p_priority, int p_timeout_msec) {
+	const int lane = std::clamp(p_priority, 0, static_cast<int>(DSRequest::PRIORITY_HIGH));
+	return _wait_for_completion_sliced(lane, p_timeout_msec);
+}
+
+bool DSContext::_wait_for_completion_sliced(int p_priority, int p_timeout_msec) {
+	const bool lane_scoped = p_priority >= 0;
 	if (p_timeout_msec < 0) {
 		UtilityFunctions::push_error("[DirectStorage] Completion wait rejected: timeout must not be negative.");
 		return false;
 	}
 
-	uint64_t fence_value = get_completion_fence();
-	if (fence_value == 0) {
-		bool has_gpu_pending = false;
-		{
-			std::lock_guard<std::mutex> lock(context_mutex);
-			has_gpu_pending = gpu_requests_pending;
+	uint64_t fence_value = 0;
+	if (!lane_scoped) {
+		fence_value = get_completion_fence();
+		if (fence_value == 0) {
+			bool has_gpu_pending = false;
+			{
+				std::lock_guard<std::mutex> lock(context_mutex);
+				has_gpu_pending = gpu_requests_pending;
+			}
+			if (has_gpu_pending) {
+				UtilityFunctions::push_error("[DirectStorage] Completion wait failed: GPU requests have no completion fence.");
+				return false;
+			}
+			return true;
 		}
-		if (has_gpu_pending) {
-			UtilityFunctions::push_error("[DirectStorage] Completion wait failed: GPU requests have no completion fence.");
-			return false;
-		}
-		return true;
 	}
 
 #ifdef _WIN32
@@ -784,7 +797,10 @@ bool DSContext::wait_for_completion(int p_timeout_msec) {
 				// Fallback backends complete synchronously: nothing to wait on.
 				return true;
 			}
-			if (active_backend->wait_for_completion(fence_value, slice_msec)) {
+			const bool slice_complete = lane_scoped
+					? active_backend->wait_for_priority_completion(p_priority, slice_msec)
+					: active_backend->wait_for_completion(fence_value, slice_msec);
+			if (slice_complete) {
 				return validate_d3d12_rendering_device_active("DirectStorage completion");
 			}
 			if (slice_msec == COMPLETION_WAIT_SLICE_MS) {
@@ -803,6 +819,10 @@ bool DSContext::wait_for_completion(int p_timeout_msec) {
 			return false;
 		}
 	}
+#else
+	(void)lane_scoped;
+	(void)fence_value;
+	(void)p_priority;
 #endif
 
 	return true;
@@ -2035,6 +2055,7 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("collect_completed_results"), &DSContext::collect_completed_results);
 	ClassDB::bind_method(D_METHOD("get_completion_fence"), &DSContext::get_completion_fence);
 	ClassDB::bind_method(D_METHOD("wait_for_completion", "timeout_msec"), &DSContext::wait_for_completion);
+	ClassDB::bind_method(D_METHOD("wait_for_priority_completion", "priority", "timeout_msec"), &DSContext::wait_for_priority_completion);
 	ClassDB::bind_method(D_METHOD("cancel_requests_with_tag", "tag"), &DSContext::cancel_requests_with_tag);
 	ClassDB::bind_method(D_METHOD("create_destination_texture", "format", "view"), &DSContext::create_destination_texture, DEFVAL(Ref<RDTextureView>()));
 	ClassDB::bind_method(D_METHOD("get_async_batches_submitted"), &DSContext::get_async_batches_submitted);
