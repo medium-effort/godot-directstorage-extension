@@ -133,6 +133,15 @@ public:
 	// RIDs die with the device.
 	static void flush_deferred_rid_releases(bool p_ds_drain_clean);
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test seam: when armed, every texture that reaches the eviction release is
+	// copied into p_out first - a holder created after the evictability sample
+	// but before the RID decision, which is exactly the window eviction must
+	// survive. C++ only (not bound). The caller owns the pointee and MUST clear
+	// the seam (pass nullptr) before that storage dies.
+	static void _set_evict_post_sample_probe_for_testing(std::vector<Ref<Texture2D>> *p_out);
+#endif
+
 	void set_max_entries(int p_max);
 	int get_max_entries() const;
 	int get_cached_count() const;

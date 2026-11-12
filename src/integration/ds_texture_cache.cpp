@@ -23,26 +23,33 @@ namespace godot {
 // GPU-backed entries own a RenderingDevice texture RID created by
 // texture_create(). The texture object itself is a non-owning view: dropping
 // the last Ref does NOT free the device texture, so every cache-side
-// owner-loss (evict / clear / capacity replace / disable / shutdown) must
-// explicitly free the RID or it leaks until device teardown.
+// owner-loss (evict / clear / capacity replace / disable / shutdown) must hand
+// the RID to someone before the cache's Ref goes away, or it leaks until device
+// teardown.
 //
 // Release discipline:
-// - The evicted Ref is held locally until its RID is freed inline or queued
-//   for the render thread (Ref held until terminal). The RID value itself
-//   survives Texture2DRD death because its destructor never frees it.
+// - Eviction never frees a RID. It transfers the RID to a DSTextureOwner
+//   carried by the texture, so the free runs inside the destruction of the
+//   last Ref - the only point at which no holder can still obtain one. The
+//   evictability guard's reference-count read is a sample of the holders that
+//   existed when the victim was selected, not proof about the release: a
+//   holder that appears after the sample (the engine Resident returned by
+//   ResourceLoader.load, a loader worker handing a Ref to the main thread)
+//   keeps the RID alive with it.
 // - RenderingDevice::free_rid() asserts the render thread
-//   (ERR_RENDER_THREAD_GUARD), so off-render-thread callers queue the RID and
-//   post a drain worker via RenderingServer::call_on_render_thread().
-//   Missing/dead singletons (headless Dummy, module teardown) skip the free:
-//   no live device means no live GPU resource.
-// - Idempotent: the map entry is removed under the cache lock before any
-//   free, so a repeat evict/clear finds nothing and frees nothing; only
-//   valid RIDs are ever freed, exactly once per evicted texture. A liveness
-//   check skips stale handles from re-stored evicted textures, so re-entry
-//   can never double-free ("Attempted to free invalid ID").
-// - Everything below runs OUTSIDE the cache lock (free_rid takes
-//   RenderingDevice locks; the deferred path crosses threads). No
-//   drain-logic change: context/backend queues are untouched.
+//   (ERR_RENDER_THREAD_GUARD), so the owner's release path frees inline on the
+//   render thread and otherwise queues the RID and posts a drain worker via
+//   RenderingServer::call_on_render_thread(). Missing/dead singletons (headless
+//   Dummy, module teardown) skip the free: no live device means no live GPU
+//   resource.
+// - Idempotent: the map entry is removed under the cache lock before ownership
+//   moves, so a repeat evict/clear finds nothing and transfers nothing; only
+//   valid RIDs are ever armed, and one texture is armed once per RID. A
+//   liveness check skips stale handles from re-stored evicted textures, so
+//   re-entry can never double-free ("Attempted to free invalid ID").
+// - Everything below runs OUTSIDE the cache lock (attach() takes the owner
+//   table lock, free_rid takes RenderingDevice locks, the deferred path crosses
+//   threads). No drain-logic change: context/backend queues are untouched.
 //
 // Second owner (#0126): the loader's uncached GPU path attaches a
 // DSTextureOwner to the texture instead, and that owner calls the static
@@ -56,6 +63,15 @@ static bool s_evict_drain_scheduled = false;
 // permanently in-flight slot cannot spin a retry forever.
 static int s_evict_drain_retries = 0;
 static const int kEvictDrainMaxRetries = 240; // ~4 s at 60 fps; stays queued after that
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+// Armed only by the closure test for the eviction-ownership invariant. Not
+// thread-local on purpose: the seam is a test control, not production state.
+static std::vector<Ref<Texture2D>> *s_evict_post_sample_probe = nullptr;
+void DSTextureCache::_set_evict_post_sample_probe_for_testing(std::vector<Ref<Texture2D>> *p_out) {
+	s_evict_post_sample_probe = p_out;
+}
+#endif
 
 static void ds_texture_cache_drain_evict_frees_on_render_thread();
 
@@ -279,24 +295,32 @@ static bool ds_texture_cache_is_externally_held(const Ref<Texture2D> &p_texture)
 	return p_texture->get_reference_count() > 1;
 }
 
-// Releases evicted textures: frees owned Texture2DRD RIDs on the render
-// thread, then drops the Refs. MUST be called WITHOUT cache_mutex held.
+// Releases evicted textures WITHOUT freeing anything here: the cache has just
+// dropped its only Ref, so this is the last instant at which it can still name
+// the device RID. Ownership moves to a DSTextureOwner carried by the texture,
+// which releases it inside the destruction of the last Ref - the only point at
+// which no other holder can still obtain one. The guard that selected the
+// victim is a sample of the holders that existed then, not a proof about the
+// release; a holder that appears after the sample keeps the RID alive with it.
+// MUST be called WITHOUT cache_mutex held.
 static void ds_texture_cache_release_evicted(std::vector<Ref<Texture2D>> &p_evicted) {
 	if (p_evicted.empty()) {
 		return;
 	}
-	std::vector<RID> rids;
-	rids.reserve(p_evicted.size());
 	for (size_t i = 0; i < p_evicted.size(); ++i) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		if (s_evict_post_sample_probe != nullptr) {
+			// Test seam: a holder that appears after the evictability sample.
+			s_evict_post_sample_probe->push_back(p_evicted[i]);
+		}
+#endif
 		RID rid = ds_texture_cache_extract_rd_rid(p_evicted[i]);
 		if (rid.is_valid()) {
-			rids.push_back(rid);
+			// Idempotent: twin entries reference one texture, and attach()
+			// returns early when the same RID is already armed.
+			DSTextureOwner::attach(p_evicted[i], rid);
 		}
 	}
-	// Twin entries erased together reference one RID: free it exactly once.
-	std::sort(rids.begin(), rids.end(), [](const RID &a, const RID &b) { return a.get_id() < b.get_id(); });
-	rids.erase(std::unique(rids.begin(), rids.end(), [](const RID &a, const RID &b) { return a.get_id() == b.get_id(); }), rids.end());
-	ds_texture_cache_free_texture_rids(rids);
 	p_evicted.clear();
 }
 
