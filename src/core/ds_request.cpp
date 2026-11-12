@@ -8,10 +8,12 @@ DSRequest::DSRequest() {}
 DSRequest::~DSRequest() {}
 
 void DSRequest::set_file_path(const String &p_path) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	file_path = p_path;
 }
 
@@ -20,10 +22,12 @@ String DSRequest::get_file_path() const {
 }
 
 void DSRequest::set_offset(uint64_t p_offset) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	offset = p_offset;
 }
 
@@ -32,6 +36,7 @@ uint64_t DSRequest::get_offset() const {
 }
 
 void DSRequest::set_size(int64_t p_size) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
@@ -40,6 +45,7 @@ void DSRequest::set_size(int64_t p_size) {
 		UtilityFunctions::push_error("DSRequest: Request size " + String::num_int64(p_size) + " exceeds maximum supported DirectStorage size (4 GiB).");
 		return;
 	}
+	notify_mutation_window();
 	size = static_cast<uint32_t>(p_size);
 }
 
@@ -48,6 +54,7 @@ uint32_t DSRequest::get_size() const {
 }
 
 void DSRequest::set_uncompressed_size(int64_t p_size) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
@@ -56,6 +63,7 @@ void DSRequest::set_uncompressed_size(int64_t p_size) {
 		UtilityFunctions::push_error("DSRequest: Request uncompressed_size " + String::num_int64(p_size) + " exceeds maximum supported DirectStorage size (4 GiB).");
 		return;
 	}
+	notify_mutation_window();
 	uncompressed_size = static_cast<uint32_t>(p_size);
 }
 
@@ -64,10 +72,12 @@ uint32_t DSRequest::get_uncompressed_size() const {
 }
 
 void DSRequest::set_cancellation_tag(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	cancellation_tag = p_tag;
 }
 
@@ -76,10 +86,12 @@ uint64_t DSRequest::get_cancellation_tag() const {
 }
 
 void DSRequest::set_compression_format(CompressionFormat p_format) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	compression_format = p_format;
 }
 
@@ -88,10 +100,12 @@ DSRequest::CompressionFormat DSRequest::get_compression_format() const {
 }
 
 void DSRequest::set_destination_buffer(const PackedByteArray &p_buffer) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	destination_buffer = p_buffer;
 }
 
@@ -122,10 +136,12 @@ bool DSRequest::resize_destination_buffer(uint64_t p_size) {
 }
 
 void DSRequest::set_destination_type(DSDestinationType p_type) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	destination_type = p_type;
 }
 
@@ -134,10 +150,12 @@ DSRequest::DSDestinationType DSRequest::get_destination_type() const {
 }
 
 void DSRequest::set_priority(DSPriority p_priority) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	priority = p_priority;
 }
 
@@ -146,10 +164,12 @@ DSRequest::DSPriority DSRequest::get_priority() const {
 }
 
 void DSRequest::set_destination_resource(const RID &p_resource) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	destination_resource = p_resource;
 }
 
@@ -158,10 +178,12 @@ RID DSRequest::get_destination_resource() const {
 }
 
 void DSRequest::set_first_subresource(uint32_t p_subresource) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	first_subresource = p_subresource;
 }
 
@@ -170,10 +192,12 @@ uint32_t DSRequest::get_first_subresource() const {
 }
 
 void DSRequest::set_subresource_count(uint32_t p_count) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	subresource_count = p_count;
 }
 
@@ -182,10 +206,12 @@ uint32_t DSRequest::get_subresource_count() const {
 }
 
 void DSRequest::set_texture_region(uint32_t p_top, uint32_t p_bottom) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	texture_region_top = p_top;
 	texture_region_bottom = p_bottom;
 }
@@ -199,10 +225,12 @@ uint32_t DSRequest::get_texture_region_bottom() const {
 }
 
 void DSRequest::set_texture_format(uint32_t p_format) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	texture_format = p_format;
 }
 
@@ -211,10 +239,12 @@ uint32_t DSRequest::get_texture_format() const {
 }
 
 void DSRequest::set_texture_layout(uint32_t p_layout) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {
 		UtilityFunctions::push_error("DSRequest: Cannot modify request payload while request is in-flight or completed.");
 		return;
 	}
+	notify_mutation_window();
 	texture_layout = p_layout;
 }
 
@@ -229,6 +259,30 @@ void DSRequest::set_status(Status p_status) {
 DSRequest::Status DSRequest::get_status() const {
 	return status.load(std::memory_order_acquire);
 }
+
+bool DSRequest::claim_submission() {
+	std::lock_guard<std::mutex> lock(payload_mutex);
+	if (!is_mutable()) {
+		return false;
+	}
+	status.store(STATUS_SUBMITTED, std::memory_order_release);
+	return true;
+}
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+bool DSRequest::_debug_try_claim_submission_for_testing() {
+	std::unique_lock<std::mutex> lock(payload_mutex, std::try_to_lock);
+	if (!lock.owns_lock() || !is_mutable()) {
+		return false;
+	}
+	status.store(STATUS_SUBMITTED, std::memory_order_release);
+	return true;
+}
+
+void DSRequest::_debug_set_mutation_window_hook_for_testing(const std::function<void()> &p_hook) {
+	mutation_window_hook = p_hook;
+}
+#endif
 
 void DSRequest::set_error_message(const String &p_msg) {
 	std::lock_guard<std::mutex> lock(error_mutex);

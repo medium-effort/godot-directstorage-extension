@@ -4,7 +4,7 @@
 		Encapsulates a single DirectStorage read request.
 	</brief_description>
 	<description>
-		[DSRequest] contains the source file path, byte offset, read size, cancellation tag, compression format, destination target (CPU memory buffer, GPU buffer, or GPU texture), and execution status for one DirectStorage or software-fallback read. For [constant COMPRESSION_GDEFLATE], [member size] is the compressed byte count and [member uncompressed_size] is the required destination size.
+		[DSRequest] contains the source file path, byte offset, read size, cancellation tag, compression format, destination target (CPU memory buffer, GPU buffer, or GPU texture), and execution status for one DirectStorage or software-fallback read. For [constant COMPRESSION_GDEFLATE], [member size] is the compressed byte count and [member uncompressed_size] is the required destination size. Setters are ignored with an error once the request has been submitted or has completed, so build the whole request before enqueueing it; a submitted request cannot be modified from another thread.
 	</description>
 	<tutorials>
 	</tutorials>

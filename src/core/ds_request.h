@@ -7,6 +7,7 @@
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <atomic>
+#include <functional>
 #include <mutex>
 
 namespace godot {
@@ -67,6 +68,9 @@ private:
 	std::atomic<uint64_t> cancel_timestamp_usec{ 0 };
 	mutable std::mutex error_mutex;
 	String error_message;
+	// Guards the payload fields against a submitter. A mutating setter holds it across
+	// (is_mutable(), assignment); the submitter holds it across (PENDING -> SUBMITTED).
+	mutable std::mutex payload_mutex;
 
 protected:
 	static void _bind_methods();
@@ -144,8 +148,35 @@ public:
 	bool is_gpu_in_flight() const { return gpu_in_flight.load(std::memory_order_acquire); }
 	void set_gpu_in_flight(bool p_in_flight) { gpu_in_flight.store(p_in_flight, std::memory_order_release); }
 
+	// Seals the request for submission: atomically PENDING -> SUBMITTED under the same
+	// mutex the setters take. False when the request is already submitted, in flight or
+	// terminal - in that case the status is left alone.
+	bool claim_submission();
+
 	uint64_t get_cancel_timestamp_usec() const { return cancel_timestamp_usec.load(std::memory_order_acquire); }
 	void set_cancel_timestamp_usec(uint64_t p_usec) { cancel_timestamp_usec.store(p_usec, std::memory_order_release); }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only, non-binding. Same claim, non-blocking: false means another thread is
+	// currently inside a setter's guarded window.
+	bool _debug_try_claim_submission_for_testing();
+	// Test-only, non-binding. Runs inside every guarded setter, after the guard and
+	// before the assignment, while the payload mutex is held.
+	void _debug_set_mutation_window_hook_for_testing(const std::function<void()> &p_hook);
+#endif
+
+private:
+	void notify_mutation_window() {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		if (mutation_window_hook) {
+			mutation_window_hook();
+		}
+#endif
+	}
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	std::function<void()> mutation_window_hook;
+#endif
 };
 
 } // namespace godot

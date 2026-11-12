@@ -3985,6 +3985,17 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	if (sync_batch_in_flight.load()) {
 		return reject(p_request, "Win32Backend synchronous batch submission is in progress.", EnqueueOutcome::TRANSIENT);
 	}
+	if (!p_request->claim_submission()) {
+		const String claim_error = "Win32Backend: request was already submitted or is no longer mutable.";
+		if (p_request->get_error_message().is_empty()) {
+			p_request->set_error_message(claim_error);
+		}
+		UtilityFunctions::push_error(claim_error);
+		if (r_outcome != nullptr) {
+			*r_outcome = EnqueueOutcome::TERMINAL;
+		}
+		return false;
+	}
 	int queue_index = priority_to_queue_index(p_request->get_priority());
 	QueueState &queue = priority_queues[queue_index];
 	if (!queue.queue) {
@@ -4522,8 +4533,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	} else {
 		p_child->ensure_destination_buffer_capacity(uncompressed_size);
 
-		// Transition status to STATUS_SUBMITTED before acquiring the writable pointer
-		// so is_mutable() returns false and prevents any concurrent script mutations/reallocations.
+		// Children are internal to this call and never exposed to scripts, so this
+		// store is completion bookkeeping, not the mutation guard. The caller's parent
+		// request was sealed by claim_submission() at enqueue_request() entry, before
+		// any payload field was read.
 		p_child->set_status(DSRequest::STATUS_SUBMITTED);
 		request.Destination.Memory.Buffer = p_child->get_destination_buffer_ptrw();
 		request.Destination.Memory.Size = uncompressed_size;

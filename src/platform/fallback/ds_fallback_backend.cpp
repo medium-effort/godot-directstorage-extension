@@ -177,7 +177,17 @@ bool FallbackBackend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend:
 		*r_outcome = EnqueueOutcome::STAGED;
 	}
 
-	p_request->set_status(DSRequest::STATUS_SUBMITTED);
+	if (!p_request->claim_submission()) {
+		const String claim_error = "FallbackBackend: request was already submitted or is no longer mutable.";
+		if (p_request->get_error_message().is_empty()) {
+			p_request->set_error_message(claim_error);
+		}
+		UtilityFunctions::push_error(claim_error);
+		if (r_outcome != nullptr) {
+			*r_outcome = EnqueueOutcome::TERMINAL;
+		}
+		return false;
+	}
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		pending_requests.push_back(p_request);
