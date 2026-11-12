@@ -419,7 +419,7 @@ public:
 	void shutdown() override;
 	bool was_drain_clean() const override;
 
-	bool enqueue_request(Ref<DSRequest> p_request) override;
+	bool enqueue_request(Ref<DSRequest> p_request, PlatformBackend::EnqueueOutcome *r_outcome = nullptr) override;
 	void submit_batch() override;
 	bool submit_async() override;
 	bool is_batch_complete() const override;
@@ -549,6 +549,15 @@ public:
 	// peak_staged_ops is the high-water mark of (requests + signal + event) in a
 	// slot. Never bound in _bind_methods().
 	static Dictionary _debug_get_queue_admission_stats_for_testing();
+
+#ifdef _WIN32
+	// Test-only seam: replaces the four capacity-refusal sentences so a test can
+	// produce a retryable refusal whose text no longer matches any legacy
+	// classifier. Empty restores the defaults. The classification is unaffected,
+	// which is the point: the retry decision must not depend on the text.
+	// Never bound in _bind_methods().
+	static void _set_capacity_reject_text_for_testing(const String &p_text);
+#endif
 #endif
 
 	// Media class of the volume that holds an asset path. Decides the

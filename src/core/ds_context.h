@@ -153,11 +153,11 @@ private:
 	// maintenance. flush_stream_async() hoists both once per flush
 	// (collect before submit to free batch slots, finalize after),
 	// turning up to 256 O(tracked) scans per main-thread frame into one.
-	bool enqueue_stream_request_internal(Ref<DSRequest> p_request);
+	bool enqueue_stream_request_internal(Ref<DSRequest> p_request, PlatformBackend::EnqueueOutcome *r_outcome = nullptr);
 	// Shared validation + tracking for both enqueue paths above.
 	// p_skip_maintenance=true selects the stream behavior (no per-request
 	// collect/finalize); report bookkeeping is identical either way.
-	bool enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maintenance);
+	bool enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maintenance, PlatformBackend::EnqueueOutcome *r_outcome = nullptr);
 
 	bool initialize_ds_locked();
 	void shutdown_ds_locked();

@@ -75,7 +75,7 @@ public:
 	bool initialize() override;
 	void shutdown() override;
 
-	bool enqueue_request(Ref<DSRequest> p_request) override;
+	bool enqueue_request(Ref<DSRequest> p_request, PlatformBackend::EnqueueOutcome *r_outcome = nullptr) override;
 	void submit_batch() override;
 	bool submit_async() override;
 	bool is_batch_complete() const override;

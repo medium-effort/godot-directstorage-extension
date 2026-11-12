@@ -1207,8 +1207,8 @@ bool DSContext::enqueue_request_internal(Ref<DSRequest> p_request) {
 	return enqueue_request_impl(p_request, false);
 }
 
-bool DSContext::enqueue_stream_request_internal(Ref<DSRequest> p_request) {
-	return enqueue_request_impl(p_request, true);
+bool DSContext::enqueue_stream_request_internal(Ref<DSRequest> p_request, PlatformBackend::EnqueueOutcome *r_outcome) {
+	return enqueue_request_impl(p_request, true, r_outcome);
 }
 
 // Shared validation + tracking for the sync and stream enqueue paths.
@@ -1217,7 +1217,12 @@ bool DSContext::enqueue_stream_request_internal(Ref<DSRequest> p_request) {
 // hoists both once per batch (see flush_stream_async), turning up to 256
 // O(tracked) scans per main-thread frame into one. Report bookkeeping
 // (including report_order) is identical for both paths.
-bool DSContext::enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maintenance) {
+// r_outcome is only consulted by the stream flush: a refusal is retryable when
+// the backend says so, never because its message contains a familiar phrase.
+bool DSContext::enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maintenance, PlatformBackend::EnqueueOutcome *r_outcome) {
+	if (r_outcome != nullptr) {
+		*r_outcome = PlatformBackend::EnqueueOutcome::TERMINAL;
+	}
 	if (p_request.is_null()) {
 		return false;
 	}
@@ -1274,7 +1279,7 @@ bool DSContext::enqueue_request_impl(Ref<DSRequest> p_request, bool p_skip_maint
 		collect_completed_results();
 	}
 
-	bool enqueued = active_backend->enqueue_request(p_request);
+		bool enqueued = active_backend->enqueue_request(p_request, r_outcome);
 	if (enqueued) {
 		std::lock_guard<std::mutex> lock(context_mutex);
 		if (gpu_destination) {
@@ -1474,15 +1479,13 @@ Error DSContext::flush_stream_async() {
 		// Stream fast path: per-request collect/finalize hoisted out of this
 		// main-thread loop (see enqueue_stream_request_internal); tag-reject
 		// accounting stays inline so progress cannot stall.
-		if (enqueue_stream_request_internal(request)) {
+		PlatformBackend::EnqueueOutcome outcome = PlatformBackend::EnqueueOutcome::TERMINAL;
+		if (enqueue_stream_request_internal(request, &outcome)) {
 			submitted_request_count++;
 		} else {
-			String err = request->get_error_message();
-			bool is_transient = err.contains("queue capacity") ||
-					err.contains("batch slot is not available") ||
-					err.contains("synchronous batch submission is in progress") ||
-					err.contains("owned by an in-flight DirectStorage batch");
-			if (is_transient) {
+			// Retryability comes from the backend's classification, never from
+			// matching its human-readable message: the text is for operators.
+			if (outcome == PlatformBackend::EnqueueOutcome::TRANSIENT) {
 				request->set_status(DSRequest::Status(0));
 				request->set_error_message(String());
 				unsubmitted_requests.push_back(request);

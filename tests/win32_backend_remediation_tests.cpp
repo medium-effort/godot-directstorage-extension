@@ -1031,11 +1031,16 @@ GDEX_TEST_T(win32_remediation, zombie_slot_reports_resource_in_flight, TAG_INTEG
         // (1) The moved request still owns the RID.
         GDEX_EXPECT_TRUE(backend->is_resource_in_flight(rid));
 
-        // (2) The admission gate must refuse a second write into it.
+        // (2) The admission gate must refuse a second write into it, and the
+        // refusal must be classified retryable - the stream drain requeues on
+        // that classification, never on the message text.
         godot::Ref<godot::DSRequest> conflicting;
         GDEX_ASSERT_TRUE(build_gpu_texture_request(fixture, 5202, conflicting));
         conflicting->set_destination_resource(rid);
-        GDEX_EXPECT_FALSE(backend->enqueue_request(conflicting));
+        godot::PlatformBackend::EnqueueOutcome busy_outcome =
+                godot::PlatformBackend::EnqueueOutcome::STAGED;
+        GDEX_EXPECT_FALSE(backend->enqueue_request(conflicting, &busy_outcome));
+        GDEX_EXPECT_TRUE(busy_outcome == godot::PlatformBackend::EnqueueOutcome::TRANSIENT);
         GDEX_EXPECT_TRUE(conflicting->get_error_message().contains("in-flight DirectStorage batch"));
 
         // (3) Retirement drains the zombie and releases the RID.
@@ -3223,6 +3228,48 @@ GDEX_TEST_T(win32_remediation, row_range_gdeflate_stream_size_is_validated, TAG_
     const std::string error = ::gdextest::to_std_string(wrong->get_error_message());
     GDEX_EXPECT_TRUE(error.find("declares") != std::string::npos);
     GDEX_EXPECT_TRUE(error.find("uncompressed bytes") != std::string::npos);
+#endif
+}
+
+// A refusal is retryable only when the backend says so. These two cases can
+// never succeed, so they must report TERMINAL - the caller's retry loop must
+// not be able to requeue them forever on a message it happens to recognise.
+GDEX_TEST_T(win32_remediation, terminal_refusals_report_terminal, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    // Zero-size request: refused before any file is resolved.
+    godot::Ref<godot::DSRequest> zero;
+    zero.instantiate();
+    zero->set_file_path("user://low01_classification_never_read.bin");
+    zero->set_size(0);
+    godot::PlatformBackend::EnqueueOutcome outcome = godot::PlatformBackend::EnqueueOutcome::STAGED;
+    GDEX_EXPECT_FALSE(backend->enqueue_request(zero, &outcome));
+    GDEX_EXPECT_TRUE(outcome == godot::PlatformBackend::EnqueueOutcome::TERMINAL);
+
+    // Missing source file: also terminal - a retry would find the same nothing.
+    godot::Ref<godot::DSRequest> missing;
+    missing.instantiate();
+    missing->set_file_path("user://low01_classification_missing_file.bin");
+    missing->set_size(64);
+    outcome = godot::PlatformBackend::EnqueueOutcome::STAGED;
+    GDEX_EXPECT_FALSE(backend->enqueue_request(missing, &outcome));
+    GDEX_EXPECT_TRUE(outcome == godot::PlatformBackend::EnqueueOutcome::TERMINAL);
+#else
+    (void)ctx;
+    GDEX_SKIP("The outcome seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 #endif
 }
 

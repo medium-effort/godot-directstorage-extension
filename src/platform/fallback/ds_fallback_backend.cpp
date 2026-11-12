@@ -166,9 +166,15 @@ void FallbackBackend::shutdown() {
 	batch_in_flight.store(false);
 }
 
-bool FallbackBackend::enqueue_request(Ref<DSRequest> p_request) {
+bool FallbackBackend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::EnqueueOutcome *r_outcome) {
 	if (p_request.is_null()) {
+		if (r_outcome != nullptr) {
+			*r_outcome = EnqueueOutcome::TERMINAL;
+		}
 		return false;
+	}
+	if (r_outcome != nullptr) {
+		*r_outcome = EnqueueOutcome::STAGED;
 	}
 
 	p_request->set_status(DSRequest::STATUS_SUBMITTED);

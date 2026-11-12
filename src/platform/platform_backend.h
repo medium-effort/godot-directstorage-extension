@@ -22,7 +22,15 @@ public:
 	// purpose for exactly this reason).
 	virtual bool was_drain_clean() const { return true; }
 
-	virtual bool enqueue_request(Ref<DSRequest> p_request) = 0;
+	// How a backend refusal should be treated by the caller's retry loop.
+	// STAGED is "accepted". TRANSIENT is "resource busy, retry once the slot
+	// retires". TERMINAL is "this request cannot succeed, do not retry".
+	// A caller that does not ask for the outcome is unaffected; a caller that
+	// does must treat an unset value as TERMINAL, so a refusal nobody classified
+	// can never be retried forever.
+	enum class EnqueueOutcome { STAGED, TRANSIENT, TERMINAL };
+
+	virtual bool enqueue_request(Ref<DSRequest> p_request, EnqueueOutcome *r_outcome = nullptr) = 0;
 	virtual void submit_batch() = 0;
 	// Submits the staged batch. Returns false when another batch is already in
 	// flight and the caller should retry later (transient, requests stay staged).
