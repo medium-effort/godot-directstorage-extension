@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 7 November 2026
+Last updated: 12 November 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -144,6 +144,13 @@ Any static C++ object whose constructor or destructor interacts with Godot types
 LoadLibrary failed: Error 1114 (A dynamic link library (DLL) initialization routine failed).
 ```
 
+The failure also arrives disguised. `build_remote.ps1`'s GDScript verification then reports every
+addon script as a parse error (`[PARSE CHECK FAILED] 10 of 10 script(s) failed syntax validation`),
+because the extension DLL the check loads is the one that failed to initialize. The `Error 1114 (A
+dynamic link library (DLL) initialization routine failed)` line is in the log, but above the script
+failures, so the report reads like a GDScript regression and sends you editing `.gd` files that are
+fine. One failing script is a parse error; **every** script failing is the DLL.
+
 ### The Rule
 - **NEVER declare file-static or global Godot objects**:
   ```cpp
@@ -157,6 +164,10 @@ LoadLibrary failed: Error 1114 (A dynamic link library (DLL) initialization rout
   static std::wstring s_cache_dir;
   static DSPkgCache *s_cached_pkg = nullptr;
   ```
+- **Test seams use native storage too**: a `static std::string` converted to `godot::String` at the
+  point of use is safe; a function-local `static godot::String` only moves the constructor later, and
+  its destructor still runs while the library unloads. See
+  `src/platform/win32/ds_win32_backend.cpp` -> `_set_capacity_reject_text_for_testing`.
 
 ---
 
