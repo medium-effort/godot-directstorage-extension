@@ -262,6 +262,11 @@ private:
 	std::atomic<bool> batch_in_flight{false};
 	std::atomic<bool> sync_batch_in_flight{false};
 	std::atomic<bool> completion_thread_stop{false};
+	// Set by the first shutdown(). A second call must not repeat the teardown:
+	// ~Win32Backend runs shutdown() again, and after a drain timeout the first call
+	// has already detached the completion thread and returned without tearing
+	// anything down. Re-armed by initialize().
+	std::atomic<bool> shut_down_once{false};
 	std::atomic<int> active_batch_slot{0};
 	mutable std::mutex batch_mutex;
 	std::condition_variable batch_cv;
@@ -471,6 +476,10 @@ public:
 	// has not reached on its own. Declared with void* so the declaration stays buildable on
 	// hosts that have no ID3D12Fence; the test casts under _WIN32. Never bound in _bind_methods().
 	void *_debug_get_queue_completion_fence_for_testing(int p_queue_index) const;
+	// Test-only seam: live completion threads process-wide. A detached thread that outlived
+	// its object is invisible to that object, so the count has to live outside it. Never bound
+	// in _bind_methods().
+	static int _debug_live_completion_threads_for_testing();
 	// Test-only seam: try to take the queue-error drain lock; true when nothing held it. Used to
 	// prove process_queue_errors() is serialised with the completion thread's own error drain.
 	// Never bound in _bind_methods().

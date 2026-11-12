@@ -1926,8 +1926,22 @@ void Win32Backend::register_slot_source_file(BatchSlot &r_slot, const std::wstri
 	r_slot.files.push_back(p_file);
 }
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+// Test-only: live completion threads process-wide. The object a leaked thread
+// outlived cannot report it, so the count has to live outside it.
+static std::atomic<int> s_live_completion_threads{ 0 };
+
+struct LiveCompletionThreadScope {
+	LiveCompletionThreadScope() { s_live_completion_threads.fetch_add(1, std::memory_order_acq_rel); }
+	~LiveCompletionThreadScope() { s_live_completion_threads.fetch_sub(1, std::memory_order_acq_rel); }
+};
+#endif
+
 void Win32Backend::completion_thread_func() {
 	constexpr int kSlotHandleCount = QUEUE_COUNT * BATCH_SLOT_COUNT;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	LiveCompletionThreadScope live_scope;
+#endif
 	HANDLE wait_handles[kSlotHandleCount + QUEUE_COUNT + 1] = { completion_stop_event };
 	for (int i = 0; i < QUEUE_COUNT; i++) {
 		for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; slot_index++) {
@@ -3419,6 +3433,9 @@ bool Win32Backend::initialize(const String &p_path) {
 
 	active_batch_slot.store(0);
 	sync_batch_in_flight.store(false);
+	// A fresh initialize() re-arms the one-shot teardown: the object is being
+	// brought back up, so the next shutdown() must do the work again.
+	shut_down_once.store(false, std::memory_order_release);
 	for (QueueState &queue : priority_queues) {
 		queue.completion_fence_value = 0;
 		queue.completed_fence_value = 0;
@@ -3780,6 +3797,15 @@ bool Win32Backend::was_drain_clean() const {
 
 void Win32Backend::shutdown() {
 #ifdef _WIN32
+	// Idempotent: the first call has either completed the full teardown or taken
+	// the drain-timeout branch, which leaves the object deliberately incomplete.
+	// Re-entering would repeat a full-budget drain on the main thread (~Win32Backend
+	// does exactly that) or tear down handles a detached completion thread may still
+	// be waiting on.
+	if (shut_down_once.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+
 	// 1. Immediately refuse any new incoming work.
 	accepting_requests.store(false);
 
@@ -5695,6 +5721,14 @@ void *Win32Backend::_debug_get_queue_completion_fence_for_testing(int p_queue_in
 #else
 	(void)p_queue_index;
 	return nullptr;
+#endif
+}
+
+int Win32Backend::_debug_live_completion_threads_for_testing() {
+#ifdef _WIN32
+	return s_live_completion_threads.load(std::memory_order_acquire);
+#else
+	return 0;
 #endif
 }
 

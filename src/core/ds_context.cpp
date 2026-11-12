@@ -1130,8 +1130,19 @@ void DSContext::shutdown_ds_locked() {
 		// Record whether every in-flight request actually drained. A false
 		// result means hardware DMA may still be running (drain timeout), so
 		// teardown must leave device RIDs alone.
-		last_shutdown_clean.store(backend_to_delete->was_drain_clean());
-		memdelete(backend_to_delete);
+		const bool drained = backend_to_delete->was_drain_clean();
+		last_shutdown_clean.store(drained, std::memory_order_release);
+		if (drained) {
+			memdelete(backend_to_delete);
+		} else {
+			// The drain timed out: shutdown() detached the completion thread, which
+			// still refers to this object, and the resource guards it owns must not be
+			// released while DMA may be in flight. Freeing it here would be the
+			// use-after-free Win32Backend's own contract forbids, so the object is
+			// parked instead - deliberately leaked for the life of the process.
+			abandoned_backends.push_back(backend_to_delete);
+			UtilityFunctions::push_warning("[DirectStorage] Backend left unreleased: the shutdown drain timed out, its completion thread is detached, and DMA may still be active. This is a deliberate leak; restart the application to reclaim it.");
+		}
 	}
 
 	{
@@ -1973,6 +1984,12 @@ void DSContext::_debug_set_backend_fence_counters_for_testing(int p_queue_index,
 	(void)p_completion_value;
 	(void)p_completed_value;
 #endif
+}
+
+int DSContext::_debug_abandoned_backend_count_for_testing() const {
+	// The vector is written only from shutdown_ds_locked(), under this same lock.
+	std::lock_guard<std::mutex> lock(init_mutex);
+	return static_cast<int>(abandoned_backends.size());
 }
 #endif
 

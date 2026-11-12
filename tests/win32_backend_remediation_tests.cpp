@@ -1698,6 +1698,114 @@ GDEX_TEST_T(win32_remediation, drain_timeout_records_no_watermarks, TAG_INTEGRAT
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, drain_timeout_shutdown_never_frees_the_backend, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    // Ownership closure for the drain-timeout path: a backend whose completion
+    // thread was detached must never be freed while that thread still refers to
+    // it. Every other case in this file unpins the counters before shutting down
+    // precisely to avoid this branch; this one exists to take it.
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    if (ds == nullptr) {
+        GDEX_SKIP("DSContext singleton absent: real extension not loaded in this fixture.");
+    }
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps == nullptr) {
+        GDEX_SKIP("ProjectSettings unavailable in this fixture.");
+    }
+
+    const bool had_timeout = ps->has_setting("dsgd_extension/shutdown_drain_timeout_ms");
+    const godot::Variant previous_timeout = had_timeout
+            ? ps->get_setting("dsgd_extension/shutdown_drain_timeout_ms")
+            : godot::Variant();
+    ctx.add_teardown([ps, had_timeout, previous_timeout]() {
+        if (had_timeout) {
+            ps->set_setting("dsgd_extension/shutdown_drain_timeout_ms", previous_timeout);
+        } else {
+            ps->clear("dsgd_extension/shutdown_drain_timeout_ms");
+        }
+    });
+    // 100 ms is the documented minimum, so this case stays short.
+    ps->set_setting("dsgd_extension/shutdown_drain_timeout_ms", 100);
+
+    const bool was_initialized = ds->is_initialized();
+    if (!was_initialized && !ds->initialize_ds()) {
+        GDEX_SKIP("DSContext could not initialize on this machine.");
+    }
+    if (!ds->is_d3d12_backend()) {
+        GDEX_SKIP("D3D12 DirectStorage backend unavailable (headless or non-D3D12 driver).");
+    }
+
+    ctx.add_teardown([ds, was_initialized]() {
+        // Unpin first: a pinned counter above what the real fence will reach makes
+        // any later shutdown spend its whole budget. A no-op once the context is down.
+        for (int q = 0; q < 3; ++q) {
+            ds->_debug_set_backend_fence_counters_for_testing(q, 0, 0);
+        }
+        if (was_initialized) {
+            if (!ds->is_initialized()) {
+                ds->initialize_ds();
+            }
+        } else if (ds->is_initialized()) {
+            ds->shutdown_ds();
+        }
+    });
+
+    const int abandoned_before = ds->_debug_abandoned_backend_count_for_testing();
+
+    constexpr uint64_t kStallFence = 1000000;
+    bool pinned = false;
+    for (int attempt = 0; attempt < 3 && !pinned; ++attempt) {
+        for (int q = 0; q < 3; ++q) {
+            ds->_debug_set_backend_fence_counters_for_testing(q, kStallFence, 0);
+        }
+        pinned = ds->get_completion_fence() == kStallFence;
+        if (!pinned) {
+            godot::OS::get_singleton()->delay_msec(20);
+        }
+    }
+    GDEX_EXPECT_TRUE(pinned);
+    if (!pinned) {
+        return;
+    }
+
+    const int64_t t0 = godot::Time::get_singleton()->get_ticks_msec();
+    ds->shutdown_ds();
+    const int64_t shutdown_msec = godot::Time::get_singleton()->get_ticks_msec() - t0;
+    const int abandoned_after = ds->_debug_abandoned_backend_count_for_testing();
+
+    // A1 precondition: the drain really waited out its budget. A case that never
+    // stalled cannot discriminate between the two ownership outcomes.
+    GDEX_EXPECT_TRUE(shutdown_msec >= 95);
+    GDEX_EXPECT_TRUE(shutdown_msec < 1500);
+    // A2: the failure is published, not swallowed.
+    GDEX_EXPECT_FALSE(ds->was_last_shutdown_clean());
+    // A3 the invariant: a detached completion thread means the backend is parked,
+    // never freed.
+    GDEX_FAIL_UNLESS(abandoned_after == abandoned_before + 1,
+            std::string("abandoned backends ") + std::to_string(abandoned_before) + " -> " +
+            std::to_string(abandoned_after) + " after an unclean shutdown (" +
+            std::to_string(shutdown_msec) + " ms): the backend was freed while its completion thread was detached");
+    // A4: the context is fully down even though the backend was not freed.
+    GDEX_EXPECT_FALSE(ds->is_initialized());
+    // A5: the leak did not poison the process.
+    GDEX_EXPECT_TRUE(ds->initialize_ds());
+    GDEX_EXPECT_TRUE(ds->is_d3d12_backend());
+    // A6 control: a clean drain still frees the backend and never grows the tombstone,
+    // so the decision is keyed on the drain result, not on "we once timed out".
+    ds->shutdown_ds();
+    GDEX_EXPECT_TRUE(ds->was_last_shutdown_clean());
+    GDEX_EXPECT_EQ(ds->_debug_abandoned_backend_count_for_testing(), abandoned_before + 1);
+#else
+    (void)ctx;
+    GDEX_SKIP("The fence-counter seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, readers_see_no_backend_until_initialize_returns, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)

@@ -20,6 +20,7 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "ds_profiler.h"
 #include "ds_request.h"
 #include "../platform/platform_backend.h"
@@ -75,6 +76,12 @@ private:
 	std::atomic<uint16_t> queue_capacity{ 512 };
 
 	PlatformBackend *active_backend = nullptr;
+	// Backends whose shutdown() could not drain: their completion thread was detached
+	// and still holds `this`, so the object must never be freed. Parked here for the
+	// life of the process on purpose - a deliberate leak, reported through
+	// was_last_shutdown_clean() and one warning. Never cleared, never freed; DSContext
+	// is the only owner, and it is the only place that publishes a backend.
+	std::vector<PlatformBackend *> abandoned_backends;
 	mutable std::mutex init_mutex;
 	mutable std::shared_mutex backend_lifecycle_mutex;
 	String initialization_path;
@@ -332,6 +339,9 @@ public:
 	// slot, which is what a failed GPU upload must not hand to an inline free.
 	// One-shot: consumed by the first flush. Never bound in _bind_methods().
 	void _debug_skip_next_flush_submission_for_testing();
+	// Test-only seam: number of backends deliberately left unreleased because a drain
+	// timeout detached their completion thread. Never bound in _bind_methods().
+	int _debug_abandoned_backend_count_for_testing() const;
 #endif
 };
 

@@ -306,7 +306,7 @@
 		<method name="shutdown_ds">
 			<return type="void" />
 			<description>
-				Shuts down DirectStorage queues, releases COM interfaces, and cleans up active backend resources.
+				Shuts down DirectStorage queues, releases COM interfaces, and cleans up active backend resources. If the GPU or DMA does not drain within the shutdown budget, the backend is deliberately left unreleased for the rest of the process instead of being freed while its completion thread is still attached; [method was_last_shutdown_clean] reports that case, and the process should be restarted.
 			</description>
 		</method>
 		<method name="wait_for_completion">
