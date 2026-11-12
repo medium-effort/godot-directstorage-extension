@@ -652,6 +652,20 @@ def _build_signature_fields():
         "defines": sorted(set(_build_signature_list("CPPDEFINES") + _build_signature_list("DEFINES"))),
         "linkflags": _build_signature_list("LINKFLAGS"),
         "cpppath": _build_signature_paths("CPPPATH"),
+        # GitHub-hosted runner identity, so a rejected cache entry can name the
+        # cause it actually has. Neither field reaches a compile line, so neither
+        # rotates an object access key by itself; but a new runner image ships a
+        # new toolchain and new system headers, and those content signatures are
+        # part of every object's key - the whole key space moves at once while
+        # cc/cxx (which record names such as "clang++", never versions) look
+        # unchanged. Without these two fields a cross-image miss is reported as
+        # "Build signature changed: TOOLS -javah", i.e. a machine fingerprint
+        # (Tool/javah.py exists() = env.Detect("javah")) presented as the cause.
+        # Both are unset off CI (local builds, Device B), which is recorded as ""
+        # rather than guessed, and they must stay out of OBJECT_KEY_FIELDS in
+        # .github/scripts/summarize_scons_cache.py for the same reason.
+        "image_os": os.environ.get("ImageOS", "").strip(),
+        "image_version": os.environ.get("ImageVersion", "").strip(),
     }
 
 
