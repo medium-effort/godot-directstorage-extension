@@ -995,6 +995,7 @@ Benchmarking loading screen frame times on real hardware (e.g. NVIDIA GTX 1050 T
    - Small 256x256 textures batch multiple items within the same 4 ms budget.
    - Main-thread frame time never exceeds 16.6 ms, completely eliminating frame stutters.
    - An entry that does not fit the remaining budget is no longer built inline at all: CPU builds are handed to `WorkerThreadPool` (measured 20-27 ms for a 4096x4096 RGBA8 payload, so a 2-4 ms slice cannot contain one). The first item is no longer exempt from the budget; only constant-cost GPU entries are.
+   - The exemption holds when the time budget is zero too: `p_max_usec = 0` removes only the *time* limit, and the pass still builds at most one estimated 64 MiB slice of CPU entries, offloading the rest. The single deliberate exception is the entry a caller names as the texture it is about to consume (the render-thread await path): deferring that build would turn the pump into a miss plus a duplicate synchronous load, so it is built inline whatever its size.
 
 2. **Instant Package Manifest Lookup (<0.5 ms)**:
    In exported builds where `textures.dspkg` is deployed, the archive already contains the pre-indexed list of all bundled textures. Querying `dspkg.get_entries()` directly against the requested coverage directories discovers all dependencies in **<0.5 ms**, completely bypassing the 100+ ms binary scene crawl.

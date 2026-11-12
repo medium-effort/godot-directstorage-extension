@@ -80,6 +80,10 @@ namespace {
 
 constexpr int kBigDim = 4096;
 constexpr uint64_t kBigBytes = 64ULL * 1024ULL * 1024ULL; // 4096*4096*4
+// 4096x1536 RGBA8 = 25165824 bytes (24 MiB): two of these fit the 64 MiB slice, three do not.
+constexpr uint64_t kUnboundedEntryBytes = 4096ULL * 1536ULL * 4ULL;
+// 4096x4608 RGBA8 = 75497472 bytes (72 MiB): a single entry larger than the whole slice.
+constexpr uint64_t kEssentialEntryBytes = 4096ULL * 4608ULL * 4ULL;
 
 // Payload for the pool warm-up below.
 void noop_native_task(void *) {}
@@ -236,4 +240,105 @@ GDEX_TEST_T(poll_budget, gpu_first_item_keeps_its_exemption, TAG_UNIT) {
 	// real D3D12 host the main thread can block on render-thread work, which
 	// makes a tight timing assert flaky without adding discrimination.
 	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+}
+
+// --- Unbounded branch (p_max_usec == 0): bounded in bytes, not in time -------
+//
+// The unbounded branch used to OR the fit test away, so the only bound on the slice was the loop-top
+// 64 MiB check, which runs after the entry that crossed it. Three 24 MiB entries make that
+// observable: 48 MiB fits, adding the third (72 MiB) does not, so the branch must take two and hand
+// the third to WorkerThreadPool. `stored` counts this call's inline stores only, so an offloaded
+// build cannot satisfy it, and nothing here races the worker.
+GDEX_TEST_T(poll_budget, unbounded_pump_defers_over_cap_cpu_entry, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF013EULL;
+
+	godot::PackedByteArray data;
+	data.resize(static_cast<int64_t>(kUnboundedEntryBytes));
+	uint8_t *w = data.ptrw();
+	for (int64_t i = 0; i < data.size(); i += 4093) {
+		w[i] = static_cast<uint8_t>(i & 0xFF);
+	}
+
+	const char *paths[3] = {
+		"user://gdextest_poll_unbounded_a.png",
+		"user://gdextest_poll_unbounded_b.png",
+		"user://gdextest_poll_unbounded_c.png",
+	};
+	for (int i = 0; i < 3; ++i) {
+		godot::DSPreloader::Payload meta = make_payload(paths[i], 4096);
+		meta.height = 1536;
+		meta.original_size = kUnboundedEntryBytes;
+		meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(kUnboundedEntryBytes));
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	}
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 3);
+	warm_worker_pool();
+
+	const int stored = cache->poll_completed(tag, 0, 0);
+
+	// The invariant: only what the pre-estimate admits is built on this thread.
+	GDEX_EXPECT_EQ(stored, 2);
+	GDEX_EXPECT_TRUE(wait_until_unbuilt(cache, tag, 5000));
+	for (int i = 0; i < 3; ++i) {
+		GDEX_EXPECT_TRUE(cache->get_cached(godot::String(paths[i])).is_valid());
+	}
+}
+
+// Control: one 4 KiB entry still builds inline under the unbounded pump, so a fix that defers every
+// entry would fail here instead of passing the case above.
+GDEX_TEST_T(poll_budget, unbounded_pump_small_entry_still_builds_inline, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF013FULL;
+
+	godot::DSPreloader::Payload meta = make_payload("user://gdextest_poll_unbounded_small.png", 256);
+	meta.height = 4;
+	meta.original_size = 4096;
+	meta.mip_uncompressed_sizes.push_back(4096);
+
+	godot::PackedByteArray data;
+	data.resize(4096);
+	godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+
+	GDEX_EXPECT_EQ(cache->poll_completed(tag, 0, 0), 1);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+	GDEX_EXPECT_TRUE(cache->get_cached("user://gdextest_poll_unbounded_small.png").is_valid());
+}
+
+// The caller-named entry is the one exemption: a render-thread await names the texture it is about
+// to look up, and deferring that build would turn the pump into a miss plus a duplicate synchronous
+// load. An entry the caller names is taken inline even past the cap; the same entry with nobody
+// naming it is offloaded and built on the pool.
+GDEX_TEST_T(poll_budget, unbounded_pump_essential_entry_exceeds_cap, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF0140ULL;
+	const char *essential = "user://gdextest_poll_essential.png";
+	const char *backlog = "user://gdextest_poll_essential_backlog.png";
+
+	godot::PackedByteArray data;
+	data.resize(static_cast<int64_t>(kEssentialEntryBytes));
+	uint8_t *w = data.ptrw();
+	for (int64_t i = 0; i < data.size(); i += 4093) {
+		w[i] = static_cast<uint8_t>(i & 0xFF);
+	}
+
+	godot::DSPreloader::Payload meta = make_payload(essential, 4096);
+	meta.height = 4608;
+	meta.original_size = kEssentialEntryBytes;
+	meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(kEssentialEntryBytes));
+	godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	warm_worker_pool();
+
+	// Named: built on this thread although the entry alone exceeds the slice cap.
+	GDEX_EXPECT_EQ(godot::DSPreloader::poll_completed(0, 0, 0, godot::String(essential)), 1);
+	GDEX_EXPECT_TRUE(cache->get_cached(godot::String(essential)).is_valid());
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+
+	// Same shape, nobody naming it: offloaded, then built on the pool.
+	meta.engine_path = godot::String(backlog);
+	meta.payload_key = meta.engine_path;
+	godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	GDEX_EXPECT_EQ(godot::DSPreloader::poll_completed(0, 0, 0, godot::String(essential)), 0);
+	GDEX_EXPECT_TRUE(wait_until_unbuilt(cache, tag, 5000));
+	GDEX_EXPECT_TRUE(cache->get_cached(godot::String(backlog)).is_valid());
 }

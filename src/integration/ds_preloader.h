@@ -193,10 +193,14 @@ public:
 	// When p_max_items > 0, at most p_max_items textures are processed in this call.
 	// When p_max_usec > 0, processing yields as soon as elapsed microseconds exceed the budget.
 	// Defaults to a 4000 us slice so a caller that passes nothing cannot build a
-	// 64 MiB texture inline (~20-27 ms measured); pass 0 explicitly for the legacy
-	// unbounded behaviour. CPU entries that do not fit a non-zero budget are built
-	// on WorkerThreadPool instead of the calling thread.
-	static int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, uint32_t p_max_usec = 4000);
+	// 64 MiB texture inline (~20-27 ms measured).
+	// p_max_usec == 0 removes the *time* bound only: the pass still builds at most one
+	// 64 MiB pre-estimated slice of CPU entries and hands the rest to WorkerThreadPool.
+	// p_essential_path names the single texture the caller is about to consume; only that
+	// entry may exceed the slice cap, because deferring it would return a miss and pay for
+	// a duplicate synchronous load. C++-only (this class has no bindings).
+	static int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, uint32_t p_max_usec = 4000,
+			const String &p_essential_path = String());
 
 	// Diagnostic: number of tracked textures with at least one
 	// unfinished request. p_tag == 0 counts all tags.

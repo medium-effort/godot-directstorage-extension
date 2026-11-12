@@ -2346,7 +2346,7 @@ Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vect
 	return Ref<Texture2D>();
 }
 
-int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_usec) {
+int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_usec, const String &p_essential_path) {
 	DSTextureCache *cache = DSTextureCache::get_singleton();
 	if (cache == nullptr) {
 		UtilityFunctions::push_warning("DSPreloader: DSTextureCache singleton unavailable during poll.");
@@ -2492,13 +2492,21 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 						const uint64_t remaining = (elapsed < p_max_usec) ? (p_max_usec - elapsed) : 0;
 						fits = (est_usec <= remaining) && (slice_bytes_processed + est_bytes <= kMaxBytesPerSlice);
 					} else {
-						// Explicit unbounded caller (p_max_usec == 0): legacy
-						// semantics. The first item is always taken; later items
-						// still respect the byte cap.
-						fits = (processed == 0) || (slice_bytes_processed + est_bytes <= kMaxBytesPerSlice);
+						// Explicit unbounded caller (p_max_usec == 0): unbounded in
+						// time, never in bytes. Only the entry the caller named as the
+						// texture it is about to look up (await_pending_texture) may
+						// exceed the slice cap: that build is the caller's own request,
+						// and deferring it would return a miss and pay for a duplicate
+						// synchronous load. Every other CPU entry obeys the same
+						// pre-estimate as a bounded slice and is offloaded below when it
+						// does not fit.
+						const bool essential = !p_essential_path.is_empty() &&
+								(it->second.meta.engine_path == p_essential_path ||
+										it->second.meta.payload_key == p_essential_path);
+						fits = essential || (slice_bytes_processed + est_bytes <= kMaxBytesPerSlice);
 					}
 
-					if (fits || is_gpu || p_max_usec == 0) {
+					if (fits || is_gpu) {
 						t = it->second;
 						s.pending.erase(it);
 						found = true;
@@ -2761,9 +2769,11 @@ Ref<Texture2D> DSPreloader::await_pending_texture(const String &p_path, uint32_t
 			ctx->collect_completed_results();
 		}
 		// Explicit unbounded: this is the render-thread deadlock-avoidance pump
-		// and the caller is about to look the texture up. A bounded slice would
-		// offload the very build it is waiting for and return a miss.
-		poll_completed(0, 0, 0);
+		// and the caller is about to look this path up. Time stays unbounded, but
+		// the pass is bounded in bytes: p_path is the one entry this call may build
+		// over the slice cap, and every other terminal entry is offloaded rather
+		// than built here.
+		poll_completed(0, 0, 0, p_path);
 		if (cache != nullptr) {
 			return cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
 		}
