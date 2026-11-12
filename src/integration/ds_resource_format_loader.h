@@ -12,6 +12,7 @@
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/variant.hpp>
 
+#include <functional>
 #include <mutex>
 
 namespace godot {
@@ -49,6 +50,12 @@ private:
 	// accessors below). Mutable because _load_texture_payload is const.
 	mutable RID debug_last_failed_gpu_rid;
 	mutable bool debug_last_failed_gpu_rid_in_flight = false;
+	// Test-only parking hook, called immediately before each archive I/O site so a
+	// test can park a worker there and ask another thread whether archive_mutex is
+	// free. The invariant it proves: no kernel I/O runs under the lock that lookups
+	// need. Installed and cleared with no worker running. Never bound to GDScript.
+	// The int argument is an ArchiveIoSite, declared in the public block below.
+	std::function<void(int)> debug_archive_io_hook;
 #endif
 
 	String _resolve_archive_path(const String &p_logical_path) const;
@@ -59,7 +66,16 @@ private:
 	// clears the entry tables and would break every in-archive load for the
 	// rest of the process.
 	Ref<DSPkg> _open_archive_instance(const String &p_archive_path) const;
-	bool _cached_archive_is_current(const String &p_archive_path) const;
+	// Size and whole-second write time of the file a TOC is parsed from, read with
+	// no lock held. Identity, not membership: the cached members it is compared
+	// against are only safe to touch under archive_mutex, so they are passed in.
+	struct ArchiveIdentity {
+		bool valid = false;
+		uint64_t size = 0;
+		uint64_t write_time = 0;
+	};
+	ArchiveIdentity _probe_archive_identity(const String &p_path) const;
+	bool _cached_archive_is_current(const String &p_path, uint64_t p_size, uint64_t p_write_time) const;
 	bool _is_texture_archive_entry(const String &p_path) const;
 
 	// Initializes the DirectStorage context for a load, without ever waiting for a
@@ -123,6 +139,18 @@ public:
 	// and whether the backend still reported it in flight at that instant.
 	RID _debug_last_failed_gpu_rid_for_testing() const;
 	bool _debug_last_failed_gpu_rid_was_in_flight_for_testing() const;
+
+	// Which archive I/O site the parking hook reports.
+	enum ArchiveIoSite {
+		ARCHIVE_IO_PROBE = 0, // size + mtime of the archive file (per lookup)
+		ARCHIVE_IO_OPEN = 1,  // TOC read and decrypt (DSPkg::open)
+	};
+	void _debug_set_archive_io_hook_for_testing(const std::function<void(int)> &p_hook);
+	// True when archive_mutex is free, i.e. the caller is not inside the loader's
+	// critical section. try_lock only probes: it releases at once. A spurious
+	// try_lock failure reads as "held", so this oracle can produce a false red but
+	// never a false green.
+	bool _debug_archive_mutex_is_free_for_testing() const;
 #endif
 };
 

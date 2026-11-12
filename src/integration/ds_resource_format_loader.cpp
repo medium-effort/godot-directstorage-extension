@@ -255,19 +255,31 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 	return found;
 }
 
+DSResourceFormatLoader::ArchiveIdentity DSResourceFormatLoader::_probe_archive_identity(const String &p_path) const {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	if (debug_archive_io_hook) {
+		debug_archive_io_hook(ARCHIVE_IO_PROBE);
+	}
+#endif
+	ArchiveIdentity identity;
+	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		return identity;
+	}
+	identity.size = static_cast<uint64_t>(file->get_length());
+	file->close();
+	identity.write_time = static_cast<uint64_t>(FileAccess::get_modified_time(p_path));
+	identity.valid = true;
+	return identity;
+}
+
 // True while the file the cached TOC was parsed from still looks the same.
 // Godot exposes mtime in whole seconds, so size is the discriminating field
 // for a replacement that lands inside one second; a same-size swap within the
 // same second is not detected here.
-bool DSResourceFormatLoader::_cached_archive_is_current(const String &p_path) const {
-	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ);
-	if (file.is_null() || !file->is_open()) {
-		return false;
-	}
-	const uint64_t size = static_cast<uint64_t>(file->get_length());
-	file->close();
-	const uint64_t write_time = static_cast<uint64_t>(FileAccess::get_modified_time(p_path));
-	return size == cached_archive_size && write_time == cached_archive_write_time;
+bool DSResourceFormatLoader::_cached_archive_is_current(const String &p_path, uint64_t p_size, uint64_t p_write_time) const {
+	const ArchiveIdentity identity = _probe_archive_identity(p_path);
+	return identity.valid && identity.size == p_size && identity.write_time == p_write_time;
 }
 
 Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_path) const {
@@ -275,45 +287,64 @@ Ref<DSPkg> DSResourceFormatLoader::_get_or_open_archive(const String &p_archive_
 		return Ref<DSPkg>();
 	}
 
-	std::lock_guard<std::mutex> lock(archive_mutex);
-	if (cached_archive_path == p_archive_path && cached_dspkg.is_valid()) {
-		if (_cached_archive_is_current(p_archive_path)) {
-			return cached_dspkg;
-		}
-		// The archive changed on disk: drop the parsed TOC so the next lookup
-		// reads the new file instead of serving the previous entry table
-		// (issue #0182).
-		UtilityFunctions::print_verbose("DSResourceFormatLoader: Archive changed on disk; re-reading TOC for '" + p_archive_path + "'.");
-		cached_dspkg.unref();
-		cached_archive_path = String();
-		cached_archive_size = 0;
-		cached_archive_write_time = 0;
-	}
-
-	uint64_t archive_size = 0;
-	uint64_t archive_write_time = 0;
+	// Snapshot the published triple under the lock and nothing else: a lookup on any
+	// thread waits here, so no file I/O and no TOC parse may run inside this scope.
+	// The Ref is copied under the lock so the object is owned before it is dropped.
+	String cached_path;
+	Ref<DSPkg> cached;
+	uint64_t cached_size = 0;
+	uint64_t cached_write_time = 0;
 	{
-		Ref<FileAccess> file = FileAccess::open(p_archive_path, FileAccess::READ);
-		if (file.is_valid() && file->is_open()) {
-			archive_size = static_cast<uint64_t>(file->get_length());
-			file->close();
-		}
-		archive_write_time = static_cast<uint64_t>(FileAccess::get_modified_time(p_archive_path));
+		std::lock_guard<std::mutex> lock(archive_mutex);
+		cached_path = cached_archive_path;
+		cached = cached_dspkg;
+		cached_size = cached_archive_size;
+		cached_write_time = cached_archive_write_time;
 	}
 
+	if (cached_path == p_archive_path && cached.is_valid()) {
+		// Freshness probe: kernel I/O, deliberately outside the lock. This per-call
+		// check is what makes a replaced archive observable without a restart
+		// (issue #0182); throttling it would serve the previous entry table.
+		if (_cached_archive_is_current(p_archive_path, cached_size, cached_write_time)) {
+			return cached;
+		}
+		// The archive changed on disk: the parse below replaces the cached entry
+		// instead of serving the previous table.
+		UtilityFunctions::print_verbose("DSResourceFormatLoader: Archive changed on disk; re-reading TOC for '" + p_archive_path + "'.");
+	}
+
+	// Miss or replacement: measure and parse with no lock held. DSPkg::open touches
+	// only the instance it is called on, and its key state and unauthorized log are
+	// internally guarded, so two callers may open the same archive concurrently.
+	const ArchiveIdentity identity = _probe_archive_identity(p_archive_path);
 	Ref<DSPkg> archive = _open_archive_instance(p_archive_path);
 	if (archive.is_null()) {
 		return Ref<DSPkg>();
 	}
 
-	cached_archive_path = p_archive_path;
-	cached_dspkg = archive;
-	cached_archive_size = archive_size;
-	cached_archive_write_time = archive_write_time;
-	return cached_dspkg;
+	{
+		std::lock_guard<std::mutex> lock(archive_mutex);
+		// A concurrent opener that parsed these same bytes may have published first.
+		// Keep its instance so callers of one file identity share one TOC.
+		if (cached_archive_path == p_archive_path && cached_dspkg.is_valid() &&
+				cached_archive_size == identity.size && cached_archive_write_time == identity.write_time) {
+			return cached_dspkg;
+		}
+		cached_archive_path = p_archive_path;
+		cached_dspkg = archive;
+		cached_archive_size = identity.size;
+		cached_archive_write_time = identity.write_time;
+		return cached_dspkg;
+	}
 }
 
 Ref<DSPkg> DSResourceFormatLoader::_open_archive_instance(const String &p_archive_path) const {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	if (debug_archive_io_hook) {
+		debug_archive_io_hook(ARCHIVE_IO_OPEN);
+	}
+#endif
 	uint64_t expected_fingerprint = resolve_expected_fingerprint(ProjectSettings::get_singleton());
 
 	Ref<DSPkg> archive;
@@ -321,7 +352,12 @@ Ref<DSPkg> DSResourceFormatLoader::_open_archive_instance(const String &p_archiv
 	Error open_err = archive->open(p_archive_path, expected_fingerprint);
 	if (open_err != OK) {
 		if (open_err == ERR_UNAUTHORIZED) {
+			// Function-local state, so it needs its own guard: two callers may open
+			// concurrently now that archive_mutex does not cover the parse. DSPkg's
+			// own unauthorized log is guarded the same way.
+			static std::mutex s_unauth_report_mutex;
 			static String s_last_reported_unauth_path;
+			std::lock_guard<std::mutex> report_lock(s_unauth_report_mutex);
 			if (s_last_reported_unauth_path != p_archive_path) {
 				s_last_reported_unauth_path = p_archive_path;
 				UtilityFunctions::push_error("DirectStorage: Decryption unauthorized or key mismatch for package '" + p_archive_path + "'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.");
@@ -401,6 +437,18 @@ RID DSResourceFormatLoader::_debug_last_failed_gpu_rid_for_testing() const {
 
 bool DSResourceFormatLoader::_debug_last_failed_gpu_rid_was_in_flight_for_testing() const {
 	return debug_last_failed_gpu_rid_in_flight;
+}
+
+void DSResourceFormatLoader::_debug_set_archive_io_hook_for_testing(const std::function<void(int)> &p_hook) {
+	debug_archive_io_hook = p_hook;
+}
+
+bool DSResourceFormatLoader::_debug_archive_mutex_is_free_for_testing() const {
+	if (!archive_mutex.try_lock()) {
+		return false;
+	}
+	archive_mutex.unlock();
+	return true;
 }
 #endif
 

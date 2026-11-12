@@ -291,31 +291,50 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 		State &s = state();
 		if (s.archive.is_valid() && s.archive_path == archive_path) {
 			archive = s.archive;
-		} else {
-			Ref<DSPkg> fresh;
-			fresh.instantiate();
-			// 0 means the archive is unpaired; pairing is the random archive id,
-			// compared in full 64-bit width when the expected value is non-zero.
-			uint64_t expected_fingerprint = 0;
-			if (dsgd_settings::has_setting("archive_id", "export/archive_id")) {
-				expected_fingerprint = static_cast<uint64_t>(dsgd_settings::get_setting("archive_id", "export/archive_id"));
-			}
-			Error open_err = fresh->open(archive_path, expected_fingerprint);
-			if (open_err != OK) {
-				if (open_err == ERR_UNAUTHORIZED) {
-					static String s_last_reported_preloader_unauth;
-					if (s_last_reported_preloader_unauth != archive_path) {
-						s_last_reported_preloader_unauth = archive_path;
-						UtilityFunctions::push_error("DirectStorage Preloader: Decryption unauthorized or key mismatch for package '" + archive_path + "'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.");
-					}
-				} else {
-					UtilityFunctions::push_error("DirectStorage Preloader: Failed to open DirectStorage package '" + archive_path + "': " + UtilityFunctions::error_string(open_err));
+		}
+	}
+
+	if (archive.is_null()) {
+		// Open the archive with no lock held: this mutex also guards the state the
+		// main thread reads, so a TOC read and decrypt (up to 64 MiB) must not run
+		// inside it. DSPkg::open touches only the instance it is called on.
+		Ref<DSPkg> fresh;
+		fresh.instantiate();
+		// 0 means the archive is unpaired; pairing is the random archive id,
+		// compared in full 64-bit width when the expected value is non-zero.
+		uint64_t expected_fingerprint = 0;
+		if (dsgd_settings::has_setting("archive_id", "export/archive_id")) {
+			expected_fingerprint = static_cast<uint64_t>(dsgd_settings::get_setting("archive_id", "export/archive_id"));
+		}
+		Error open_err = fresh->open(archive_path, expected_fingerprint);
+		if (open_err != OK) {
+			if (open_err == ERR_UNAUTHORIZED) {
+				// Function-local state, so it needs its own guard: two callers may
+				// open concurrently now that archive_mutex does not cover the parse.
+				static std::mutex s_unauth_report_mutex;
+				static String s_last_reported_preloader_unauth;
+				std::lock_guard<std::mutex> report_lock(s_unauth_report_mutex);
+				if (s_last_reported_preloader_unauth != archive_path) {
+					s_last_reported_preloader_unauth = archive_path;
+					UtilityFunctions::push_error("DirectStorage Preloader: Decryption unauthorized or key mismatch for package '" + archive_path + "'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.");
 				}
-				return false;
+			} else {
+				UtilityFunctions::push_error("DirectStorage Preloader: Failed to open DirectStorage package '" + archive_path + "': " + UtilityFunctions::error_string(open_err));
 			}
-			s.archive_path = archive_path;
-			s.archive = fresh;
-			archive = fresh;
+			return false;
+		}
+		{
+			std::lock_guard<std::mutex> lock(state().archive_mutex);
+			State &s = state();
+			// A concurrent opener that parsed this same path may have published
+			// first; keep its instance so one archive has one TOC in memory.
+			if (s.archive.is_valid() && s.archive_path == archive_path) {
+				archive = s.archive;
+			} else {
+				s.archive_path = archive_path;
+				s.archive = fresh;
+				archive = fresh;
+			}
 		}
 	}
 	if (!archive.is_valid() || !archive->has_texture(p_engine_path)) {

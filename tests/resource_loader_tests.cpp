@@ -27,6 +27,8 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/variant/variant.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <thread>
 
@@ -239,6 +241,14 @@ bool stage_textures_dspkg(::gdextest::TestContext &ctx, const char *p_dstex_path
 		}
 	}
 	return false;
+}
+
+bool wait_for_flag(const std::atomic<bool> &p_flag, int p_timeout_ms) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(p_timeout_ms);
+	while (!p_flag.load() && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	return p_flag.load();
 }
 
 } // namespace
@@ -1438,3 +1448,155 @@ GDEX_TEST_T(loader, gpu_failed_upload_defers_rid_release, TAG_INTEGRATION) {
 	GDEX_SKIP("Win32 backend is excluded from the test build on non-Windows.");
 #endif
 }
+
+// --- Archive lookups must not wait behind another thread's archive I/O ---------
+//
+// The loader keeps one parsed archive per process and guards the cache with
+// archive_mutex, which every archive-backed ResourceLoader query passes through.
+// The cache is corrected by kernel I/O: a size/mtime freshness probe per lookup,
+// and a full TOC read plus decrypt when the file changed. That I/O used to run
+// inside the mutex, so a main-thread query waited for a worker's file I/O. These
+// two cases park a worker at each I/O site through the DEBUG hook and ask whether
+// the mutex is free there.
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+
+GDEX_TEST_T(loader, archive_probe_does_not_run_under_lookup_mutex, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_loader_lock_probe.dstex";
+	const char *dspkg_path = "user://gdextest_loader_lock_probe.dspkg";
+	const char *virtual_path = "res://gdextest_loader_lock_probe.png";
+	if (!stage_textures_dspkg(ctx, dstex_path, dspkg_path, virtual_path)) {
+		remove_user_file(dstex_path);
+		remove_user_file(dspkg_path);
+		GDEX_ABORT_TEST("textures.dspkg staging failed");
+	}
+
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	if (ps) {
+		ps->set_setting("dsgd_extension/force_archive_resolution", true);
+	}
+	ctx.add_teardown([ps]() {
+		if (ps) {
+			ps->set_setting("dsgd_extension/force_archive_resolution", false);
+		}
+	});
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+	ctx.add_teardown([loader]() { loader->_debug_set_archive_io_hook_for_testing({}); });
+
+	// Warm the cache on this thread: the case is about a lookup that arrives while
+	// another thread is already in the probe, not about the cold open.
+	GDEX_ASSERT_TRUE(loader->_exists(godot::String(virtual_path)));
+
+	std::atomic<bool> parked{ false };
+	std::atomic<bool> release_park{ false };
+	loader->_debug_set_archive_io_hook_for_testing([&parked, &release_park](int p_site) {
+		if (p_site != godot::DSResourceFormatLoader::ARCHIVE_IO_PROBE) {
+			return;
+		}
+		parked.store(true);
+		// Self-releasing: a broken build must not hang the suite here.
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!release_park.load() && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	});
+
+	std::atomic<bool> lookup_result{ false };
+	std::thread worker([&loader, &lookup_result, virtual_path]() {
+		lookup_result.store(loader->_exists(godot::String(virtual_path)));
+	});
+
+	const bool entered = wait_for_flag(parked, 5000);
+	// The invariant: the lock every lookup takes is free while the probe's kernel
+	// I/O runs. Held while the I/O is inside the critical section, free once it is not.
+	const bool mutex_free = entered && loader->_debug_archive_mutex_is_free_for_testing();
+
+	release_park.store(true);
+	worker.join();
+	loader->_debug_set_archive_io_hook_for_testing({});
+
+	GDEX_EXPECT_TRUE(entered);
+	GDEX_EXPECT_TRUE(mutex_free);
+	GDEX_EXPECT_TRUE(lookup_result.load());
+
+	remove_user_file(dstex_path);
+	remove_user_file(dspkg_path);
+}
+
+GDEX_TEST_T(loader, archive_open_does_not_run_under_lookup_mutex, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_loader_lock_open.dstex";
+	const char *dspkg_path = "user://gdextest_loader_lock_open.dspkg";
+	const char *virtual_path = "res://gdextest_loader_lock_open.png";
+	if (!stage_textures_dspkg(ctx, dstex_path, dspkg_path, virtual_path)) {
+		remove_user_file(dstex_path);
+		remove_user_file(dspkg_path);
+		GDEX_ABORT_TEST("textures.dspkg staging failed");
+	}
+
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	if (ps) {
+		ps->set_setting("dsgd_extension/force_archive_resolution", true);
+	}
+	ctx.add_teardown([ps]() {
+		if (ps) {
+			ps->set_setting("dsgd_extension/force_archive_resolution", false);
+		}
+	});
+
+	// A fresh instance, so the lookup below is this archive's cold open.
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+	ctx.add_teardown([loader]() { loader->_debug_set_archive_io_hook_for_testing({}); });
+
+	std::atomic<bool> parked{ false };
+	std::atomic<bool> release_park{ false };
+	loader->_debug_set_archive_io_hook_for_testing([&parked, &release_park](int p_site) {
+		if (p_site != godot::DSResourceFormatLoader::ARCHIVE_IO_OPEN) {
+			return;
+		}
+		parked.store(true);
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!release_park.load() && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	});
+
+	std::atomic<bool> lookup_result{ false };
+	std::thread worker([&loader, &lookup_result, virtual_path]() {
+		lookup_result.store(loader->_exists(godot::String(virtual_path)));
+	});
+
+	const bool entered = wait_for_flag(parked, 5000);
+	// The parse is the long one: TOC read plus decrypt. A lookup must not wait for it.
+	const bool mutex_free = entered && loader->_debug_archive_mutex_is_free_for_testing();
+
+	release_park.store(true);
+	worker.join();
+	loader->_debug_set_archive_io_hook_for_testing({});
+
+	GDEX_EXPECT_TRUE(entered);
+	GDEX_EXPECT_TRUE(mutex_free);
+	// The worker still parsed and published the archive it opened.
+	GDEX_EXPECT_TRUE(lookup_result.load());
+
+	remove_user_file(dstex_path);
+	remove_user_file(dspkg_path);
+}
+
+#else
+
+GDEX_TEST_T(loader, archive_probe_does_not_run_under_lookup_mutex, TAG_INTEGRATION) {
+	(void)ctx;
+	GDEX_SKIP("The archive I/O parking seam is compiled out of release builds.");
+}
+
+GDEX_TEST_T(loader, archive_open_does_not_run_under_lookup_mutex, TAG_INTEGRATION) {
+	(void)ctx;
+	GDEX_SKIP("The archive I/O parking seam is compiled out of release builds.");
+}
+
+#endif
