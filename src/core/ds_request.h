@@ -53,8 +53,9 @@ private:
 	uint32_t subresource_count = 1;
 	// Row range inside one subresource for chunked uploads, in texel rows
 	// (pixels) of the target subresource - the unit D3D12_BOX and
-	// DSTORAGE_DESTINATION_TEXTURE_REGION use. top == bottom means "the whole
-	// subresource" (the historic range path). The setter is exposed to scripts
+	// DSTORAGE_DESTINATION_TEXTURE_REGION use. Both zero means "every
+	// subresource"; a non-zero pair must satisfy top < bottom and is rejected
+	// at submit otherwise. The setter is exposed to scripts
 	// (see set_texture_region's docs).
 	uint32_t texture_region_top = 0;
 	uint32_t texture_region_bottom = 0;
@@ -118,6 +119,14 @@ public:
 	void set_texture_region(uint32_t p_top, uint32_t p_bottom);
 	uint32_t get_texture_region_top() const;
 	uint32_t get_texture_region_bottom() const;
+
+	// True when the caller opted into the single-subresource row band: either
+	// bound non-zero. Both zero is the historic "all subresources, whole
+	// subresource" destination. A non-zero pair is a contract, not a hint: it
+	// must satisfy top < bottom inside one 2D texture subresource, and the
+	// backend fails the request before submission otherwise - it is never
+	// silently downgraded to a whole-subresource write.
+	bool has_texture_row_region() const { return texture_region_top != 0 || texture_region_bottom != 0; }
 
 	void set_texture_format(uint32_t p_format);
 	uint32_t get_texture_format() const;

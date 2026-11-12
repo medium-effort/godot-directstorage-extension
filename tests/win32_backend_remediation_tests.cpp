@@ -25,6 +25,7 @@
 #ifdef _WIN32
 #include "platform/win32/ds_win32_backend.h"
 #include "core/ds_request.h"
+#include "compression/gdeflate_compressor.h"
 #include "formats/dstex_format.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
@@ -2992,4 +2993,235 @@ GDEX_TEST_T(win32_remediation, runtime_info_probes_loaded_runtime, TAG_INTEGRATI
 #endif
 }
 
+
+
+// --- Row-band destination contract -----------------------------------------
+//
+// A request that carries a non-zero (top, bottom) pair addresses one subresource
+// of a 2D GPU texture. An empty or inverted pair is a caller bug and must fail
+// before submission; it must never be reinterpreted as a whole-subresource
+// upload. The GDeflate header of a row-range chunk is validated against the
+// request's declared size for the same reason the #0181 guard exists for memory
+// and buffer destinations.
+
+#ifdef _WIN32
+namespace {
+
+godot::RID make_band_texture(godot::RenderingDevice *p_rd, int p_size) {
+    godot::Ref<godot::RDTextureFormat> format;
+    format.instantiate();
+    format->set_width(p_size);
+    format->set_height(p_size);
+    format->set_format(godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+    format->set_mipmaps(1);
+    format->set_texture_type(godot::RenderingDevice::TEXTURE_TYPE_2D);
+    format->set_usage_bits(godot::RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+            godot::RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
+            godot::RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
+    godot::Ref<godot::RDTextureView> view;
+    view.instantiate();
+    return p_rd->texture_create(format, view, godot::TypedArray<godot::PackedByteArray>());
+}
+
+// A one-mip, un-chunked (v2) container: no chunk table, so a row band on such a
+// file can only be honoured by the row-range destination.
+bool write_v2_container(const char *p_rel_path, int p_size) {
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    const int64_t bytes = static_cast<int64_t>(p_size) * p_size * 4;
+    return dstex->write_to_file(godot::String(p_rel_path), make_pattern_payload(bytes), p_size, p_size,
+            godot::Image::FORMAT_RGBA8, 1, 1, false, false) == godot::OK;
+}
+
+// Builds the request a script would build: one subresource, one row band, the
+// payload sizes and codec taken from the container itself.
+godot::Ref<godot::DSRequest> build_band_request(const char *p_rel_path, const godot::RID &p_texture,
+        uint32_t p_top, uint32_t p_bottom) {
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    const godot::Dictionary header = dstex->read_header(godot::String(p_rel_path));
+    godot::Ref<godot::DSRequest> request;
+    if (header.is_empty()) {
+        return request;
+    }
+    const godot::PackedInt64Array offsets = header["mip_offsets"];
+    const godot::PackedInt32Array sizes = header["mip_sizes"];
+    const godot::PackedInt32Array uncompressed = header["mip_uncompressed_sizes"];
+    const int64_t codec = static_cast<int64_t>(header["compression_format"]);
+    request.instantiate();
+    request->set_file_path(godot::String(p_rel_path));
+    request->set_offset(static_cast<uint64_t>(offsets[0]));
+    request->set_size(static_cast<uint32_t>(sizes[0]));
+    request->set_uncompressed_size(static_cast<uint32_t>(uncompressed[0]));
+    request->set_compression_format(codec == static_cast<int64_t>(godot::DSCompressionFormat::GDEFLATE) ?
+                    godot::DSRequest::COMPRESSION_GDEFLATE :
+                    godot::DSRequest::COMPRESSION_NONE);
+    request->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    request->set_destination_resource(p_texture);
+    request->set_first_subresource(0);
+    request->set_subresource_count(1);
+    request->set_texture_format(0);
+    request->set_texture_region(p_top, p_bottom);
+    return request;
+}
+
+bool gpu_contract_ready(::gdextest::TestContext &ctx) {
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    if (ds == nullptr) {
+        GDEX_SKIP("DSContext singleton unavailable.");
+    }
+    if (!ds->is_initialized() && !ds->initialize_ds()) {
+        GDEX_SKIP("DSContext backend unavailable.");
+    }
+    if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+        GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver).");
+    }
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    if (rs == nullptr || rs->get_rendering_device() == nullptr) {
+        GDEX_SKIP("No RenderingDevice for the row-band contract.");
+    }
+    return true;
+}
+
+} // namespace
+#endif
+
+GDEX_TEST_T(win32_remediation, row_range_contract_rejects_empty_and_inverted, TAG_INTEGRATION | TAG_SLOW) {
+#ifndef _WIN32
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#else
+    if (!gpu_contract_ready(ctx)) {
+        return;
+    }
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    godot::RenderingDevice *rd = godot::RenderingServer::get_singleton()->get_rendering_device();
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    const char *path = "user://gdextest_row_band_contract.dstex";
+    GDEX_ASSERT_TRUE(write_v2_container(path, 64));
+    const godot::RID texture = make_band_texture(rd, 64);
+    GDEX_ASSERT_TRUE(texture.is_valid());
+    const godot::String global_path = ps->globalize_path(path);
+    ctx.add_teardown([ds, rd, texture, global_path]() {
+        ds->wait_for_completion(5000);
+        ds->collect_completed_results();
+        if (rd->texture_is_valid(texture)) {
+            rd->free_rid(texture);
+        }
+        godot::DirAccess::remove_absolute(global_path);
+    });
+
+    // Control: the whole mip as a band. Proves the row-range branch is driven.
+    godot::Ref<godot::DSRequest> control = build_band_request(path, texture, 0, 64);
+    GDEX_ASSERT_TRUE(control.is_valid());
+    if (ds->enqueue_request(control, false)) {
+        ds->flush_batch();
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(control->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+
+    // Empty band with a non-zero top: must fail before submission.
+    godot::Ref<godot::DSRequest> empty_band = build_band_request(path, texture, 64, 64);
+    GDEX_ASSERT_TRUE(empty_band.is_valid());
+    if (ds->enqueue_request(empty_band, false)) {
+        ds->flush_batch();
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(empty_band->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(::gdextest::to_std_string(empty_band->get_error_message()).find("empty or inverted") !=
+            std::string::npos);
+
+    // Inverted band: same contract.
+    godot::Ref<godot::DSRequest> inverted = build_band_request(path, texture, 64, 32);
+    GDEX_ASSERT_TRUE(inverted.is_valid());
+    if (ds->enqueue_request(inverted, false)) {
+        ds->flush_batch();
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(inverted->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(::gdextest::to_std_string(inverted->get_error_message()).find("empty or inverted") !=
+            std::string::npos);
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, row_range_gdeflate_stream_size_is_validated, TAG_INTEGRATION | TAG_SLOW) {
+#ifndef _WIN32
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#else
+    if (!gpu_contract_ready(ctx)) {
+        return;
+    }
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    godot::RenderingDevice *rd = godot::RenderingServer::get_singleton()->get_rendering_device();
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+
+    const int width = 64;
+    const int rows = 32;
+    const int64_t blob = static_cast<int64_t>(rows) * width * 4;
+    godot::PackedByteArray source;
+    source.resize(blob);
+    for (int64_t i = 0; i < blob; ++i) {
+        source[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+    }
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
+    const godot::PackedByteArray stream = compressor->compress(source, 1);
+    GDEX_ASSERT_TRUE(stream.size() > 0);
+
+    const char *path = "user://gdextest_row_band_stream.bin";
+    godot::Ref<godot::FileAccess> out = godot::FileAccess::open(godot::String(path), godot::FileAccess::WRITE);
+    GDEX_ASSERT_TRUE(out.is_valid());
+    out->store_buffer(stream);
+    out->close();
+
+    const godot::RID texture = make_band_texture(rd, 64);
+    GDEX_ASSERT_TRUE(texture.is_valid());
+    const godot::String global_path = ps->globalize_path(path);
+    ctx.add_teardown([ds, rd, texture, global_path]() {
+        ds->wait_for_completion(5000);
+        ds->collect_completed_results();
+        if (rd->texture_is_valid(texture)) {
+            rd->free_rid(texture);
+        }
+        godot::DirAccess::remove_absolute(global_path);
+    });
+
+    auto make_stream_request = [&](uint32_t p_declared) {
+        godot::Ref<godot::DSRequest> request;
+        request.instantiate();
+        request->set_file_path(godot::String(path));
+        request->set_offset(0);
+        request->set_size(static_cast<uint32_t>(stream.size()));
+        request->set_uncompressed_size(p_declared);
+        request->set_compression_format(godot::DSRequest::COMPRESSION_GDEFLATE);
+        request->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+        request->set_destination_resource(texture);
+        request->set_first_subresource(0);
+        request->set_subresource_count(1);
+        request->set_texture_format(0);
+        request->set_texture_region(0, static_cast<uint32_t>(rows));
+        return request;
+    };
+
+    // Control: the declaration agrees with the stream header.
+    godot::Ref<godot::DSRequest> correct = make_stream_request(static_cast<uint32_t>(blob));
+    if (ds->enqueue_request(correct, false)) {
+        ds->flush_batch();
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(correct->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+
+    // Wrong declaration: the stream says blob, the request says half of it.
+    godot::Ref<godot::DSRequest> wrong = make_stream_request(static_cast<uint32_t>(blob / 2));
+    if (ds->enqueue_request(wrong, false)) {
+        ds->flush_batch();
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(wrong->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    const std::string error = ::gdextest::to_std_string(wrong->get_error_message());
+    GDEX_EXPECT_TRUE(error.find("declares") != std::string::npos);
+    GDEX_EXPECT_TRUE(error.find("uncompressed bytes") != std::string::npos);
+#endif
+}
 

@@ -395,3 +395,122 @@ GDEX_TEST_T(staging_boundary, cpu_two_k_chunked_loads_at_default, TAG_INTEGRATIO
 	GDEX_ASSERT_EQ(decoded.size(), source.size());
 	GDEX_EXPECT_TRUE(memcmp(decoded.ptr(), source.ptr(), static_cast<size_t>(source.size())) == 0);
 }
+
+// --- Row-range payload vs the staging buffer --------------------------------
+
+namespace {
+
+godot::RID make_row_range_texture(godot::RenderingDevice *p_rd, int p_size) {
+	godot::Ref<godot::RDTextureFormat> format;
+	format.instantiate();
+	format->set_width(p_size);
+	format->set_height(p_size);
+	format->set_format(godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+	format->set_mipmaps(1);
+	format->set_texture_type(godot::RenderingDevice::TEXTURE_TYPE_2D);
+	format->set_usage_bits(godot::RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+			godot::RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
+			godot::RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
+	godot::Ref<godot::RDTextureView> view;
+	view.instantiate();
+	return p_rd->texture_create(format, view, godot::TypedArray<godot::PackedByteArray>());
+}
+
+godot::Ref<godot::DSRequest> make_none_row_range(const godot::String &p_path, const godot::RID &p_texture,
+		uint32_t p_top, uint32_t p_bottom, uint32_t p_bytes) {
+	godot::Ref<godot::DSRequest> request;
+	request.instantiate();
+	request->set_file_path(p_path);
+	request->set_offset(0);
+	request->set_size(p_bytes);
+	request->set_uncompressed_size(p_bytes);
+	request->set_compression_format(godot::DSRequest::COMPRESSION_NONE);
+	request->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+	request->set_destination_resource(p_texture);
+	request->set_first_subresource(0);
+	request->set_subresource_count(1);
+	request->set_texture_format(0);
+	request->set_texture_region(p_top, p_bottom);
+	return request;
+}
+
+} // namespace
+
+// A row-range chunk larger than the staging buffer cannot be split further, so
+// it must fail before submission with a message naming the staging setting
+// instead of only surfacing the runtime's E_DSTORAGE_REQUEST_TOO_LARGE text.
+GDEX_TEST_T(staging_boundary, row_range_none_chunk_larger_than_staging_fails, TAG_INTEGRATION | TAG_SLOW) {
+	if (!gpu_ready(ctx)) {
+		return;
+	}
+	StagingScope scope;
+	scope.apply(1);
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (!ds->is_d3d12_backend()) {
+		GDEX_SKIP("D3D12 backend unavailable after staging re-init.");
+	}
+	godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+	godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	if (rd == nullptr) {
+		GDEX_SKIP("No RenderingDevice for the row-range staging case.");
+	}
+	if (ds->get_staging_buffer_size_mb() != 1) {
+		GDEX_FAIL(std::string("staging setting was not applied (got ") +
+				std::to_string(ds->get_staging_buffer_size_mb()) + " MiB)");
+		return;
+	}
+
+	const int64_t row_bytes = 1024 * 4;
+	const int64_t band_bytes = 512 * row_bytes; // 2 MiB over rows [0, 512)
+	const int64_t small_bytes = 128 * row_bytes; // 512 KiB over rows [0, 128)
+	godot::PackedByteArray big;
+	big.resize(band_bytes);
+	uint32_t state = 0x9E3779B9u;
+	for (int64_t i = 0; i < big.size(); ++i) {
+		state = state * 1664525u + 1013904223u;
+		big[i] = static_cast<uint8_t>(state >> 24);
+	}
+
+	const char *big_path = "user://gdextest_staging_row_range_big.bin";
+	const char *small_path = "user://gdextest_staging_row_range_small.bin";
+	godot::Ref<godot::FileAccess> big_file = godot::FileAccess::open(godot::String(big_path), godot::FileAccess::WRITE);
+	GDEX_ASSERT_TRUE(big_file.is_valid());
+	big_file->store_buffer(big);
+	big_file->close();
+	godot::Ref<godot::FileAccess> small_file = godot::FileAccess::open(godot::String(small_path), godot::FileAccess::WRITE);
+	GDEX_ASSERT_TRUE(small_file.is_valid());
+	small_file->store_buffer(big.slice(0, small_bytes));
+	small_file->close();
+
+	track_cleanup(ctx, big_path);
+	track_cleanup(ctx, small_path);
+	const godot::RID texture = make_row_range_texture(rd, 1024);
+	GDEX_ASSERT_TRUE(texture.is_valid());
+	ctx.add_teardown([ds, rd, texture]() {
+		ds->wait_for_completion(5000);
+		ds->collect_completed_results();
+		if (rd->texture_is_valid(texture)) {
+			rd->free_rid(texture);
+		}
+	});
+
+	// Control: a band that fits must still load.
+	godot::Ref<godot::DSRequest> fitting = make_none_row_range(godot::String(small_path), texture, 0, 128,
+			static_cast<uint32_t>(small_bytes));
+	if (ds->enqueue_request(fitting, false)) {
+		ds->flush_batch();
+	}
+	GDEX_EXPECT_EQ(static_cast<int64_t>(fitting->get_status()),
+			static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+
+	// Oversized: 2 MiB into a 1 MiB staging buffer.
+	godot::Ref<godot::DSRequest> oversized = make_none_row_range(godot::String(big_path), texture, 0, 512,
+			static_cast<uint32_t>(band_bytes));
+	if (ds->enqueue_request(oversized, false)) {
+		ds->flush_batch();
+	}
+	GDEX_EXPECT_EQ(static_cast<int64_t>(oversized->get_status()),
+			static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+	GDEX_EXPECT_TRUE(oversized->get_error_message().contains("staging_buffer_size_mb"));
+}
+

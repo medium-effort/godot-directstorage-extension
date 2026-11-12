@@ -3940,15 +3940,41 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		return false;
 	}
 
+	// A non-zero (top, bottom) pair is the caller opting into the sub-box
+	// destination. An empty or inverted band is a caller bug, not "whole
+	// subresource": classify it here so the decision does not depend on
+	// resolving a D3D12 resource, and so the destination checks below never see
+	// a pair they were written to exclude. Both bounds are subresource-relative
+	// texel rows.
+	const bool has_row_region = p_request->has_texture_row_region();
+	if (has_row_region) {
+		const uint32_t region_top = p_request->get_texture_region_top();
+		const uint32_t region_bottom = p_request->get_texture_region_bottom();
+		if (region_top >= region_bottom) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("Win32Backend: texture row range is empty or inverted (top=" +
+					String::num_uint64(region_top) + ", bottom=" + String::num_uint64(region_bottom) +
+					"); a non-zero row band must satisfy top < bottom.");
+			return false;
+		}
+		if (p_request->get_destination_type() != DSRequest::DESTINATION_GPU_TEXTURE) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("Win32Backend: texture row range requires a DESTINATION_GPU_TEXTURE request (destination_type=" +
+					String::num_int64(static_cast<int64_t>(p_request->get_destination_type())) + ").");
+			return false;
+		}
+	}
+
 	// GDeflate size contract (issue #0181). The declared uncompressed size is
 	// what sizes a memory/buffer destination, but DirectStorage decompresses the
 	// tiles the stream header itself declares and reports no error when the two
 	// disagree - the write simply runs past the destination. Reject the request
-	// before anything is sized from the declaration. Texture ranges carry one
-	// stream per subresource and are covered by the dstex/dspkg footprint
-	// metadata instead.
+	// before anything is sized from the declaration. Whole-subresource texture
+	// uploads are covered by the dstex/dspkg footprint metadata instead; a
+	// row-range chunk is not (its sizes come from the caller), so it is checked
+	// here like any other declaration.
 	if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE &&
-			(p_request->get_destination_type() == DSRequest::DESTINATION_MEMORY ||
+			(has_row_region || p_request->get_destination_type() == DSRequest::DESTINATION_MEMORY ||
 					p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER)) {
 		String stream_error;
 		if (!validate_gdeflate_stream_size(p_request->get_file_path(), p_request->get_offset(), uncompressed_size, stream_error)) {
@@ -3969,8 +3995,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	// A row-range request is already one chunk of a chunked payload: the caller
 	// resolved its sizes from the validated chunk table, so the legacy
 	// whole-file staging/rewrite logic below must not run for it.
-	const bool is_row_region_request = gpu_texture_destination &&
-			p_request->get_texture_region_bottom() > p_request->get_texture_region_top();
+	const bool is_row_region_request = gpu_texture_destination && has_row_region;
 	bool has_texture_mip_entries = gpu_texture_destination && !is_row_region_request &&
 			get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries);
 	uint64_t texture_footprint = 0;
@@ -4268,7 +4293,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 					// box is derived from the mip dimensions, which only this scope has.
 					const uint32_t region_top = p_child->get_texture_region_top();
 					const uint32_t region_bottom = p_child->get_texture_region_bottom();
-					if (region_bottom > region_top) {
+					if (p_child->has_texture_row_region()) {
 						const uint32_t mip_index = subresource_mip_index(first_subresource, mip_levels);
 						const uint32_t mip_height = static_cast<uint32_t>(std::max<uint64_t>(1, texture_desc.Height >> mip_index));
 						if (texture_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
@@ -4276,7 +4301,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 						} else if (subresource_count != 1) {
 							destination_error = "Win32Backend: row-range texture uploads must target exactly one subresource (first=" +
 									String::num_uint64(first_subresource) + ", count=" + String::num_uint64(subresource_count) + ").";
-						} else if (region_top >= region_bottom || region_bottom > mip_height) {
+						} else if (region_bottom > mip_height) {
 							destination_error = "Win32Backend: texture row range is out of bounds (top=" +
 									String::num_uint64(region_top) + ", bottom=" + String::num_uint64(region_bottom) +
 									", height=" + String::num_uint64(mip_height) + ").";
@@ -4306,8 +4331,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 	DSTORAGE_REQUEST request = {};
 	// A chunked upload targets a row range of one subresource; everything else
 	// keeps the historic whole-subresource / whole-buffer destinations.
-	const bool texture_row_region = gpu_texture_destination &&
-			p_child->get_texture_region_bottom() > p_child->get_texture_region_top();
+	const bool texture_row_region = gpu_texture_destination && p_child->has_texture_row_region();
 	request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
 	request.Options.DestinationType = gpu_buffer_destination ? DSTORAGE_REQUEST_DESTINATION_BUFFER :
 			texture_row_region ? DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION :
@@ -4569,7 +4593,17 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 		return true;
 	}
 
-	if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE && staging_size > 0 && request_size > staging_size) {
+	if (staging_size > 0 && request_size > staging_size &&
+			(has_row_region || p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE)) {
+		if (has_row_region) {
+			// A row-range chunk cannot be split further without corrupting its
+			// tile stream, so an oversized one is rejected before submission.
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("DirectStorage row-range chunk (" + String::num_uint64(request_size) +
+					" bytes) exceeds the staging buffer (" + String::num_uint64(staging_size) +
+					" bytes); increase dsgd_extension/staging_buffer_size_mb");
+			return false;
+		}
 		// Non-texture (or non-GPU-texture) GDeflate payloads larger than staging may
 		// be page-chunked below; GPU-texture destinations never reach here chunked —
 		// they are governed by the single- vs multi-mip staging invariant above

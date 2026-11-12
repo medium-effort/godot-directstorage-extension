@@ -48,3 +48,22 @@ GDEX_TEST(row_range_binding, rejected_once_submitted) {
 	GDEX_EXPECT_EQ(request->get_texture_region_top(), static_cast<uint32_t>(1));
 	GDEX_EXPECT_EQ(request->get_texture_region_bottom(), static_cast<uint32_t>(2));
 }
+
+// A band that starts at row 0 is still a band; both bounds at zero is the whole
+// subresource. A non-zero pair is classified as a row band whatever its values,
+// so the backend can reject an empty or inverted one instead of silently
+// downgrading it to a whole-subresource upload.
+GDEX_TEST(row_range_binding, non_zero_pair_is_a_row_region) {
+	godot::Ref<godot::DSRequest> request;
+	request.instantiate();
+	GDEX_EXPECT_FALSE(request->has_texture_row_region());
+	request->set_texture_region(0, 32);
+	GDEX_EXPECT_TRUE(request->has_texture_row_region());
+	request->set_texture_region(64, 96);
+	GDEX_EXPECT_TRUE(request->has_texture_row_region());
+	request->set_texture_region(64, 64);
+	GDEX_EXPECT_TRUE(request->has_texture_row_region());
+	request->set_texture_region(64, 32);
+	GDEX_EXPECT_TRUE(request->has_texture_row_region());
+}
+
