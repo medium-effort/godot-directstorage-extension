@@ -168,3 +168,145 @@ GDEX_TEST_T(gpu_cache_evict, external_holder_after_evict_sample_keeps_rid, TAG_I
 	GDEX_EXPECT_FALSE(rd->texture_is_valid(st->held_rid));
 #endif
 }
+
+namespace {
+
+// 4x4 device texture wrapped exactly like the GPU loader path wraps one:
+// Texture2DRD is a non-owning view, so the RID outlives the wrapper unless an
+// owner releases it. That is the premise of every assertion below.
+struct DeviceTexture {
+	godot::RID rid;
+	godot::Ref<godot::Texture2DRD> texture;
+};
+
+DeviceTexture make_device_texture(godot::RenderingDevice *p_rd,
+		const godot::Ref<godot::RDTextureFormat> &p_format,
+		const godot::Ref<godot::RDTextureView> &p_view) {
+	DeviceTexture out;
+	out.rid = p_rd->texture_create(p_format, p_view, godot::TypedArray<godot::PackedByteArray>());
+	if (out.rid.is_valid()) {
+		out.texture.instantiate();
+		out.texture->set_texture_rd_rid(out.rid);
+	}
+	return out;
+}
+
+} // namespace
+
+// #0258: evict() / clear() / set_enabled(false) drop their entry even when an
+// outside holder still draws the texture. Such an entry must hand its device
+// RID to a DSTextureOwner: the holder keeps the texture alive, and the owner
+// releases the RID when the last holder goes. Skipping the transfer orphans
+// the RID on Texture2DRD death (the wrapper never frees it).
+//
+// The control leg is the discriminator: an unheld victim must still be freed,
+// so a build that simply stopped freeing evicted RIDs cannot pass this test.
+GDEX_TEST_T(gpu_cache_evict, explicit_drop_transfers_ownership_for_held_textures, TAG_INTEGRATION) {
+	godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+	godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+	if (rd == nullptr) {
+		GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+	}
+	if (!rs->is_on_render_thread()) {
+		// The owner's destructor frees inline on the render thread; elsewhere
+		// the release is queued for a later frame, which this synchronous body
+		// cannot observe.
+		GDEX_SKIP("test body is not on the render thread; the release cannot be observed synchronously");
+	}
+
+	struct State {
+		godot::RID rids[4];
+	};
+	auto st = std::make_shared<State>();
+
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	cache->set_enabled(true);
+	cache->set_max_entries(256);
+	ctx.add_teardown([rd, cache, st]() {
+		cache->clear();
+		memdelete(cache);
+		godot::DSTextureCache::flush_deferred_rid_releases(true);
+		// Backstop: a failed assertion above must not become a leak the
+		// renderer reports at teardown.
+		for (int i = 0; i < 4; ++i) {
+			if (st->rids[i].is_valid() && rd->texture_is_valid(st->rids[i])) {
+				rd->free_rid(st->rids[i]);
+			}
+		}
+	});
+
+	godot::Ref<godot::RDTextureFormat> fmt;
+	fmt.instantiate();
+	fmt->set_width(4);
+	fmt->set_height(4);
+	fmt->set_format(godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+	fmt->set_mipmaps(1);
+	fmt->set_texture_type(godot::RenderingDevice::TEXTURE_TYPE_2D);
+	fmt->set_usage_bits(godot::RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+			godot::RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
+			godot::RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
+	godot::Ref<godot::RDTextureView> view;
+	view.instantiate();
+
+	// Control: no outside holder. Eviction must still release the RID.
+	{
+		DeviceTexture t = make_device_texture(rd, fmt, view);
+		GDEX_ASSERT_TRUE(t.rid.is_valid());
+		st->rids[0] = t.rid;
+		const godot::String path("res://gdextest_drop_control");
+		GDEX_EXPECT_TRUE(cache->store(path, t.texture, godot::DSTextureCache::CACHE_MODE_REUSE));
+		t.texture.unref(); // the cache is the only owner
+		cache->evict(path);
+		GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+		godot::DSTextureCache::flush_deferred_rid_releases(true);
+		GDEX_EXPECT_FALSE(rd->texture_is_valid(st->rids[0]));
+	}
+
+	// evict() on a held texture: the RID lives with the holder, then dies.
+	{
+		DeviceTexture t = make_device_texture(rd, fmt, view);
+		GDEX_ASSERT_TRUE(t.rid.is_valid());
+		st->rids[1] = t.rid;
+		const godot::String path("res://gdextest_drop_evict_held");
+		GDEX_EXPECT_TRUE(cache->store(path, t.texture, godot::DSTextureCache::CACHE_MODE_REUSE));
+		cache->evict(path);
+		GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+		GDEX_EXPECT_TRUE(rd->texture_is_valid(st->rids[1]));
+		GDEX_EXPECT_TRUE(godot::DSTextureOwner::has_owner(t.texture));
+		t.texture.unref();
+		godot::DSTextureCache::flush_deferred_rid_releases(true);
+		GDEX_EXPECT_FALSE(rd->texture_is_valid(st->rids[1]));
+	}
+
+	// clear() on a held texture.
+	{
+		DeviceTexture t = make_device_texture(rd, fmt, view);
+		GDEX_ASSERT_TRUE(t.rid.is_valid());
+		st->rids[2] = t.rid;
+		const godot::String path("res://gdextest_drop_clear_held");
+		GDEX_EXPECT_TRUE(cache->store(path, t.texture, godot::DSTextureCache::CACHE_MODE_REUSE));
+		cache->clear();
+		GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+		GDEX_EXPECT_TRUE(rd->texture_is_valid(st->rids[2]));
+		GDEX_EXPECT_TRUE(godot::DSTextureOwner::has_owner(t.texture));
+		t.texture.unref();
+		godot::DSTextureCache::flush_deferred_rid_releases(true);
+		GDEX_EXPECT_FALSE(rd->texture_is_valid(st->rids[2]));
+	}
+
+	// set_enabled(false) on a held texture.
+	{
+		DeviceTexture t = make_device_texture(rd, fmt, view);
+		GDEX_ASSERT_TRUE(t.rid.is_valid());
+		st->rids[3] = t.rid;
+		const godot::String path("res://gdextest_drop_disable_held");
+		GDEX_EXPECT_TRUE(cache->store(path, t.texture, godot::DSTextureCache::CACHE_MODE_REUSE));
+		cache->set_enabled(false);
+		GDEX_EXPECT_EQ(cache->get_cached_count(), 0);
+		GDEX_EXPECT_TRUE(rd->texture_is_valid(st->rids[3]));
+		GDEX_EXPECT_TRUE(godot::DSTextureOwner::has_owner(t.texture));
+		t.texture.unref();
+		godot::DSTextureCache::flush_deferred_rid_releases(true);
+		GDEX_EXPECT_FALSE(rd->texture_is_valid(st->rids[3]));
+	}
+}

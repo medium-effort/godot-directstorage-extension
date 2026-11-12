@@ -36,6 +36,11 @@ namespace godot {
 //   holder that appears after the sample (the engine Resident returned by
 //   ResourceLoader.load, a loader worker handing a Ref to the main thread)
 //   keeps the RID alive with it.
+// - Explicit drops (evict / clear / disable) transfer ownership even when an
+//   outside holder still draws the texture: the entry leaves the map either
+//   way, so keeping the RID back would orphan it (#0258). Capacity eviction
+//   (`_evict_oldest` / `set_max_entries`) is the different case: it can pick a
+//   different victim, so it keeps a held entry cached instead.
 // - RenderingDevice::free_rid() asserts the render thread
 //   (ERR_RENDER_THREAD_GUARD), so the owner's release path frees inline on the
 //   render thread and otherwise queues the RID and posts a drain worker via
@@ -813,9 +818,13 @@ void DSTextureCache::evict(const String &p_path) {
 
 		Ref<Texture2D> victim = cache_map[canonical].texture;
 		_remove_entry(canonical);
-		if (_is_entry_evictable_locked(canonical, victim)) {
-			evicted.push_back(victim);
-		}
+		// The entry is removed whether or not an outside holder still draws it,
+		// so its RID must move to an owner either way. Skipping held textures
+		// here left them with no cache owner and no armed owner, orphaning the
+		// RID on Texture2DRD death (#0258). release_evicted() arms a
+		// DSTextureOwner: an unheld victim is freed when this Ref drops, a held
+		// one when its last outside holder goes.
+		evicted.push_back(victim);
 
 		std::vector<const Texture2D *> live_refs;
 		live_refs.reserve(cache_map.size());
@@ -834,10 +843,12 @@ void DSTextureCache::clear() {
 	{
 		std::lock_guard<std::mutex> lock(cache_mutex);
 
+		// clear() drops every entry, including textures an outside holder still
+		// draws, so every RID must transfer to a DSTextureOwner (#0258). The
+		// owner keeps the device texture alive for those holders and frees it
+		// with the last one; skipping held entries here orphaned their RIDs.
 		for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-			if (_is_entry_evictable_locked(kv.key, kv.value.texture)) {
-				evicted.push_back(kv.value.texture);
-			}
+			evicted.push_back(kv.value.texture);
 		}
 		cache_map.clear();
 		alias_map.clear();
@@ -901,10 +912,10 @@ void DSTextureCache::set_enabled(bool p_enabled) {
 
 		enabled = p_enabled;
 		if (!enabled) {
+			// Disabling drains the cache completely, so ownership of every
+			// entry (held or not) transfers to a DSTextureOwner (#0258).
 			for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-				if (!ds_texture_cache_is_externally_held(kv.value.texture)) {
-					evicted.push_back(kv.value.texture);
-				}
+				evicted.push_back(kv.value.texture);
 			}
 			cache_map.clear();
 			alias_map.clear();

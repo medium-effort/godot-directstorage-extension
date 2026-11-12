@@ -1051,7 +1051,7 @@ Furthermore, calling unconditional `DSTextureCache.clear()` during active gamepl
 ### The Rule
 Use `clear_unused()` during active gameplay to evict only unreferenced textures while preserving cache hits for live scenes; reserve `clear()` for scene transitions or teardown to avoid wiping cache entries for in-use assets.
 
-To guarantee GPU safety, both `DSTextureCache::clear()` and `DSTextureCache::clear_unused()` gate texture RID release behind `_is_entry_evictable_locked()` and `ds_texture_cache_is_externally_held()`:
+To guarantee GPU safety, RID release is ownership transfer, never an inline `free_rid()` at eviction: a reference-count sample cannot authorise a later free (a `ResourceLoader.load()` or loader worker can obtain a `Ref` after the read), so the cache hands each dropped entry to a `DSTextureOwner` that frees the RID with the texture's last `Ref`. The guard is still how "is anyone outside using this?" is sampled:
 ```cpp
 static bool ds_texture_cache_is_externally_held(const Ref<Texture2D> &p_texture) {
 	if (p_texture.is_null() || !p_texture.is_valid()) {
@@ -1062,7 +1062,7 @@ static bool ds_texture_cache_is_externally_held(const Ref<Texture2D> &p_texture)
 ```
 However, their cache retention contracts differ:
 - `DSTextureCache::clear_unused()` scans canonical entries and removes **only** unreferenced textures (`ref_count == 1`). Textures currently bound to active nodes or materials remain in `cache_map`, keeping deduplication and subsequent `get_cached()` lookups instant.
-- `DSTextureCache::clear()` preserves externally held GPU RIDs from destruction, but empties `cache_map` completely (`cache_map.clear()`).
+- `DSTextureCache::clear()`, `evict()` and `set_enabled(false)` drop their entry (or the whole map) **regardless** of holders. Every dropped texture is transferred to a `DSTextureOwner`, so its RID stays valid for the outside holders and is freed when the last one drops - never orphaned, because `Texture2DRD` does not free its own device RID (Q27). Capacity eviction (`_evict_oldest` / `set_max_entries`) is the different case: it can pick another victim, so it keeps a held entry cached instead of dropping it.
 
 In GDScript, call `clear_unused()` whenever toggling background preloads off or releasing idle level caches during active gameplay:
 ```gdscript
