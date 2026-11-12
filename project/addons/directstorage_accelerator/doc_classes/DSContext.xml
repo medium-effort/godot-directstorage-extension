@@ -242,7 +242,7 @@
 			<return type="bool" />
 			<param index="0" name="tag" type="int" />
 			<description>
-				Returns [code]true[/code] when every request for [param tag] has finished (completed, failed, or cancelled) and none remain queued. Unknown tags report [code]true[/code] (nothing pending).
+				Returns [code]true[/code] when every request for [param tag] has finished (completed, failed, or cancelled) and none remain queued. Unknown tags report [code]true[/code] (nothing pending). A tag whose context was shut down, or whose backend can no longer settle its requests, is retired and reports [code]true[/code] because no request can complete it any more.
 			</description>
 		</method>
 		<method name="is_supported" qualifiers="const">

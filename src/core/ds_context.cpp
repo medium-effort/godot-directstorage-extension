@@ -1156,6 +1156,10 @@ void DSContext::shutdown_ds_locked() {
 		stream_pending_submit_requests.store(0, std::memory_order_release);
 		for (std::unordered_map<uint64_t, StreamTagInfo>::iterator it = stream_tags.begin(); it != stream_tags.end(); ++it) {
 			it->second.cancel_requested = true;
+			// The requests themselves are going away with the backend: no
+			// completion can be counted for this tag any more, so retire it
+			// instead of leaving it permanently "loading".
+			it->second.aborted = true;
 		}
 	}
 	initialized.store(false, std::memory_order_release);
@@ -1572,6 +1576,11 @@ bool DSContext::is_prewarm_complete(uint64_t p_tag) const {
 		return true; // unknown tag: nothing pending
 	}
 	const StreamTagInfo &info = it->second;
+	if (info.aborted) {
+		// No request can complete this tag any more (the context was shut down,
+		// or the backend that held them is gone): nothing is pending.
+		return true;
+	}
 	if (info.cancel_requested) {
 		for (std::deque<Ref<DSRequest>>::const_iterator qit = stream_queue.begin(); qit != stream_queue.end(); ++qit) {
 			if (qit->is_valid() && (*qit)->get_cancellation_tag() == p_tag) {
@@ -1650,8 +1659,20 @@ void DSContext::cancel_prewarm(uint64_t p_tag) {
 		stream_queue.swap(remaining);
 	}
 	{
-		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
-		if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
+		bool backend_gone = false;
+		{
+			std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+			backend_gone = !initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend;
+		}
+		if (backend_gone) {
+			// The requests already handed to the backend can no longer be
+			// accounted: the backend that would report them is gone. Retire the
+			// tag so the cancellation does not leave it "loading" forever.
+			std::lock_guard<std::mutex> stream_lock(stream_mutex);
+			StreamTagInfo &stale = stream_tags[p_tag];
+			stale.tag = p_tag;
+			stale.cancel_requested = true;
+			stale.aborted = true;
 			return;
 		}
 		active_backend->cancel_requests_with_tag(p_tag);

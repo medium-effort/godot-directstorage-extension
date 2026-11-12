@@ -124,6 +124,11 @@ private:
 		int completed = 0; // terminal (COMPLETED/FAILED, incl. cancelled)
 		int cancelled = 0;
 		bool cancel_requested = false;
+		// True once the context can no longer settle this tag: the backend that
+		// held its remaining requests is gone, so no completion can ever arrive.
+		// is_prewarm_complete() retires an aborted tag while the progress counts
+		// stay as measured.
+		bool aborted = false;
 		bool fixed_total = false;
 	};
 	mutable std::mutex stream_mutex;

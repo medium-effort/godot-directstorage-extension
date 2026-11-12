@@ -342,6 +342,31 @@ GDEX_TEST_T(preloader_cancellation_retirement, context_cancelled_stream_progress
     GDEX_EXPECT_TRUE(ds->is_prewarm_complete(tag));
 }
 
+// A tag whose remaining work was destroyed with the backend can never reach
+// completed == total, so the predicate must retire it: once nothing can complete
+// a tag, "still loading" is a lie that makes await_prewarm_finished() wait
+// forever and holds any consumer's load bracket open.
+GDEX_TEST_T(preloader_cancellation_retirement, prewarm_tag_retires_after_shutdown, TAG_INTEGRATION) {
+    godot::DSContext *ds = require_initialized_context(ctx);
+    const uint64_t tag = 700001;
+    ds->set_prewarm_total(tag, 5);
+    GDEX_EXPECT_FALSE(ds->is_prewarm_complete(tag));
+
+    ctx.add_teardown([ds]() {
+        if (ds != nullptr && ds->is_initialized()) {
+            ds->shutdown_ds();
+        }
+    });
+
+    ds->shutdown_ds();
+    ds->initialize_ds();
+
+    GDEX_EXPECT_TRUE(ds->is_prewarm_complete(tag));
+    const godot::Vector2i progress = ds->get_prewarm_progress(tag);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(progress.x), static_cast<int64_t>(0));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(progress.y), static_cast<int64_t>(5));
+}
+
 GDEX_TEST_T(request_payload_immutability, setters_rejected_when_submitted_or_gpu_in_flight, TAG_UNIT) {
     godot::Ref<godot::DSRequest> req;
     req.instantiate();
