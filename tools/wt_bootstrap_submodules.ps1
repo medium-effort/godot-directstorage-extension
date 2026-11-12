@@ -111,7 +111,9 @@ foreach ($rawEntry in $rawEntries) {
     $localModule = Join-Path $primaryModules $submodulePath
     $hasLocalModule = Test-Path -LiteralPath (Join-Path $localModule "HEAD")
 
-    $updateArgs = @("submodule", "update", "--init")
+    # Name the directory explicitly: the manual fallback runs this from the primary (or anywhere),
+    # and without -C git would seed the caller's repository instead of this worktree.
+    $updateArgs = @("-C", $dest, "submodule", "update", "--init")
     # A previous, aborted bootstrap can leave an empty directory behind; --force
     # lets git adopt it instead of refusing with "already exists".
     $submoduleDir = Join-Path $dest $submodulePath
@@ -203,7 +205,7 @@ foreach ($parentPath in @($localModuleByPath.Keys)) {
 # Anything still missing falls back to the network: the parent is initialized now, so one
 # recursive pass completes it.
 if ($failed.Count -eq 0) {
-    if (-not (Invoke-GitStep -Arguments @("submodule", "update", "--init", "--recursive") -Label "recursive submodule update (nested)")) {
+    if (-not (Invoke-GitStep -Arguments @("-C", $dest, "submodule", "update", "--init", "--recursive") -Label "recursive submodule update (nested)")) {
         $failed += "(nested)"
     }
 }
