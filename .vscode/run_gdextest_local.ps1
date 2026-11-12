@@ -279,6 +279,22 @@ $FixtureRoot = "build/gdextest/project"
 # fixture process in another worktree.
 $FixtureAbs = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $PSScriptRoot) $FixtureRoot))
 
+# One run per workspace: see tools/run_guard.ps1. Acquired before the [2/5]
+# fixture stage, because that stage regenerates $FixtureRoot and its
+# Stop-OrphanFixtureProcess taskkills leftover Godot processes started against
+# it - so starting now would kill a windowed run mid-suite instead of waiting
+# for it.
+. (Join-Path $RepoRoot "tools/run_guard.ps1")
+$RunGuard = Enter-RunGuard -Name (Get-RunGuardName -Root $RepoRoot)
+if ($RunGuard.Owned -eq $false) {
+    Show-StepFailure -Step "Run Concurrency Guard" -Message ("Another gdextest run is already active for this workspace (guard: {0}). This runner regenerates {1} and taskkills leftover Godot processes started against it, so starting now would kill that run mid-suite. Wait for it to finish - the OS releases the guard when that process exits, so it can never go stale." -f $RunGuard.FullName, $FixtureRoot) -Code 2
+}
+elseif ($null -eq $RunGuard.Owned) {
+    Write-ReportText "[Guard] Warning: could not create the run guard; continuing without concurrency protection." -ForegroundColor Yellow
+}
+# $RunGuard (and the Mutex it references) must stay referenced for the rest of
+# the run: dropping the last reference would let the GC release the mutex early.
+
 # Artifact names mirror .gdextest.toml: [gdextest.output] name and
 # [gdextest.fixture] project_name. Keep both in sync with that file.
 $TestLibraryName = "libdsgd_tests"

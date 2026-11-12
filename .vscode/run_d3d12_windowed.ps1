@@ -43,6 +43,11 @@
     so a killed run may lose its tail; the JSON is written and flushed by the
     harness and is the authoritative result.
 
+    Concurrency: only one gdextest run may target this workspace at a time
+    (tools/run_guard.ps1, workspace-keyed kernel mutex). A second run exits
+    with code 2 before touching the fixture instead of dying later on a raw
+    sharing violation.
+
 .PARAMETER Filter
     gdextest name-glob filter (e.g. "gpu_*"). Matched against suite.name.
 
@@ -118,6 +123,22 @@ function Write-VerboseHost {
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $RepoRoot
+
+# One run per workspace: see tools/run_guard.ps1 for the full list of
+# collisions. Acquired before anything touches the fixture, because the -Force
+# copy of the test library into the fixture bin throws a bare sharing violation
+# when a live engine has it mapped, and that reads like a broken build.
+. (Join-Path $RepoRoot "tools/run_guard.ps1")
+$RunGuard = Enter-RunGuard -Name (Get-RunGuardName -Root $RepoRoot)
+if ($RunGuard.Owned -eq $false) {
+    Write-Host ("ERROR: another gdextest run is already active for this workspace (guard: {0}). A second run cannot produce a result: it would overwrite build/gdextest/project/addons/gdextest/bin while that engine has the library mapped, and it would clear this run's result JSON and redirect logs. Wait for it to finish - the OS releases the guard when that process exits, so it can never go stale." -f $RunGuard.FullName) -ForegroundColor Red
+    exit 2
+}
+elseif ($null -eq $RunGuard.Owned) {
+    Write-Host "[Guard] Warning: could not create the run guard; continuing without concurrency protection." -ForegroundColor Yellow
+}
+# $RunGuard (and the Mutex it references) must stay referenced for the rest of
+# the run: dropping the last reference would let the GC release the mutex early.
 
 if (-not $GodotExe) {
     $GodotExe = Get-GodotConsolePath -RepoRoot $RepoRoot
