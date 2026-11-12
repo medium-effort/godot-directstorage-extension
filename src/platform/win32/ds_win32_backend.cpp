@@ -4310,6 +4310,54 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request) {
 							destination_error = "Win32Backend: block-compressed row range must start on a 4-row boundary and end on one unless it reaches the mip edge (top=" +
 									String::num_uint64(region_top) + ", bottom=" + String::num_uint64(region_bottom) + ").";
 						}
+						if (destination_error.is_empty()) {
+							// DirectStorage defines a texture destination's UncompressedSize
+							// as the box's copyable footprint (GetCopyableFootprints
+							// TotalBytes) and does not check it: "for other destination
+							// types, the uncompressed size may be greater than the
+							// destination size" (dstorage.h:486-492). A wrong extent is
+							// therefore written silently - surplus clipped, shortfall
+							// zero-filling the band tail - and still reports success.
+							// Refuse the mismatch here, where the resource descriptor and
+							// the box are both in scope.
+							Microsoft::WRL::ComPtr<ID3D12Device> extent_device;
+							if (SUCCEEDED(destination_texture->GetDevice(IID_PPV_ARGS(&extent_device))) && extent_device) {
+								D3D12_RESOURCE_DESC footprint_desc = texture_desc;
+								D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+								UINT footprint_rows = 0;
+								UINT64 row_size_in_bytes = 0;
+								UINT64 total_bytes = 0;
+								extent_device->GetCopyableFootprints(&footprint_desc, static_cast<UINT>(first_subresource), 1, 0,
+										&footprint, &footprint_rows, &row_size_in_bytes, &total_bytes);
+								// RowPitch is the 256-aligned copyable pitch; pRowSizeInBytes
+								// is the natural row (400 for a 100-texel RGBA8 row) and must
+								// not be used here.
+								const uint64_t copyable_row_bytes = static_cast<uint64_t>(footprint.Footprint.RowPitch);
+								const uint32_t block = dxgi_format_is_block_compressed(texture_desc.Format) ? 4u : 1u;
+								const uint64_t first_block = region_top / block;
+								const uint64_t last_block = (static_cast<uint64_t>(region_bottom) - 1) / block;
+								const uint64_t box_block_rows = last_block - first_block + 1;
+								// What DirectStorage writes per codec: the source bytes for
+								// an uncompressed copy, the declared output for GDeflate.
+								const uint64_t declared_bytes = p_child->get_compression_format() == DSRequest::COMPRESSION_NONE
+										? static_cast<uint64_t>(src_size)
+										: static_cast<uint64_t>(uncompressed_size);
+								const uint64_t expected_bytes = copyable_row_bytes * box_block_rows;
+								if (declared_bytes != expected_bytes) {
+									destination_error = "Win32Backend: row-range payload is " + String::num_uint64(declared_bytes) +
+											" bytes but the band [" + String::num_uint64(region_top) + ", " +
+											String::num_uint64(region_bottom) + ") holds " + String::num_uint64(expected_bytes) +
+											" bytes at the destination's copyable row pitch (" + String::num_uint64(copyable_row_bytes) +
+											" x " + String::num_uint64(box_block_rows) + " block rows).";
+								}
+							} else {
+								// Teardown or device-removal race: never invent a rejection.
+								static std::atomic<bool> extent_check_skipped{ false };
+								if (!extent_check_skipped.exchange(true)) {
+									UtilityFunctions::push_warning("Win32Backend: skipped the row-range payload-extent check; the destination device was unavailable.");
+								}
+							}
+						}
 					}
 				}
 			}

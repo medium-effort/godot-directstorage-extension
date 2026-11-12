@@ -46,6 +46,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
@@ -3222,6 +3223,182 @@ GDEX_TEST_T(win32_remediation, row_range_gdeflate_stream_size_is_validated, TAG_
     const std::string error = ::gdextest::to_std_string(wrong->get_error_message());
     GDEX_EXPECT_TRUE(error.find("declares") != std::string::npos);
     GDEX_EXPECT_TRUE(error.find("uncompressed bytes") != std::string::npos);
+#endif
+}
+
+
+// --- Row-band payload extent -------------------------------------------------
+//
+// The destination's row pitch is the 256-byte-aligned copyable pitch, not the
+// natural row size: a 100-texel RGBA8 row is 400 bytes and its copyable pitch is
+// 512. The exact-size rows below only complete if the backend derives that
+// pitch correctly, which is the guard against the new extent check rejecting
+// uploads that work today.
+
+#ifdef _WIN32
+namespace {
+
+godot::RID make_band_texture_sized(godot::RenderingDevice *p_rd, int p_width, int p_height, int p_format) {
+    godot::Ref<godot::RDTextureFormat> format;
+    format.instantiate();
+    format->set_width(p_width);
+    format->set_height(p_height);
+    format->set_format(static_cast<godot::RenderingDevice::DataFormat>(p_format));
+    format->set_mipmaps(1);
+    format->set_texture_type(godot::RenderingDevice::TEXTURE_TYPE_2D);
+    format->set_usage_bits(godot::RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
+            godot::RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
+            godot::RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
+    godot::Ref<godot::RDTextureView> view;
+    view.instantiate();
+    return p_rd->texture_create(format, view, godot::TypedArray<godot::PackedByteArray>());
+}
+
+godot::PackedByteArray make_band_payload(int64_t p_bytes, uint8_t p_seed) {
+    godot::PackedByteArray data;
+    data.resize(p_bytes);
+    uint8_t *writer = data.ptrw();
+    for (int64_t i = 0; i < p_bytes; ++i) {
+        writer[i] = static_cast<uint8_t>(p_seed + (i * 29) & 0xFF);
+    }
+    return data;
+}
+
+bool write_band_file(const char *p_rel_path, const godot::PackedByteArray &p_data) {
+    godot::Ref<godot::FileAccess> file = godot::FileAccess::open(godot::String(p_rel_path), godot::FileAccess::WRITE);
+    if (file.is_null() || !file->is_open()) {
+        return false;
+    }
+    file->store_buffer(p_data);
+    const bool ok = file->get_error() == godot::OK;
+    file->close();
+    return ok;
+}
+
+godot::Ref<godot::DSRequest> make_extent_request(const char *p_rel_path, const godot::RID &p_texture,
+        uint32_t p_bytes, uint32_t p_top, uint32_t p_bottom) {
+    godot::Ref<godot::DSRequest> request;
+    request.instantiate();
+    request->set_file_path(godot::String(p_rel_path));
+    request->set_offset(0);
+    request->set_size(p_bytes);
+    request->set_uncompressed_size(p_bytes);
+    request->set_compression_format(godot::DSRequest::COMPRESSION_NONE);
+    request->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    request->set_destination_resource(p_texture);
+    request->set_first_subresource(0);
+    request->set_subresource_count(1);
+    request->set_texture_format(0);
+    request->set_texture_region(p_top, p_bottom);
+    return request;
+}
+
+} // namespace
+#endif
+
+GDEX_TEST_T(win32_remediation, row_range_payload_extent_is_validated, TAG_INTEGRATION | TAG_SLOW) {
+#ifndef _WIN32
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#else
+    if (!gpu_contract_ready(ctx)) {
+        return;
+    }
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    godot::RenderingDevice *rd = godot::RenderingServer::get_singleton()->get_rendering_device();
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+
+    const int width = 100;
+    const int height = 64;
+    const uint32_t pitch = 512; // align_up(100 * 4, 256)
+    const char *path = "user://gdextest_row_band_extent.bin";
+
+    // Control: the exact band extent completes and lands the right rows.
+    const godot::PackedByteArray exact = make_band_payload(32 * pitch, 0x40);
+    GDEX_ASSERT_TRUE(write_band_file(path, exact));
+    const godot::RID rgba = make_band_texture_sized(rd, width, height, godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+    GDEX_ASSERT_TRUE(rgba.is_valid());
+    const godot::String rgba_path = ps->globalize_path(path);
+    ctx.add_teardown([ds, rd, rgba, rgba_path]() {
+        ds->wait_for_completion(5000);
+        ds->collect_completed_results();
+        if (rd->texture_is_valid(rgba)) {
+            rd->free_rid(rgba);
+        }
+        godot::DirAccess::remove_absolute(rgba_path);
+    });
+
+    godot::Ref<godot::DSRequest> control = make_extent_request(path, rgba, static_cast<uint32_t>(exact.size()), 0, 32);
+    if (ds->enqueue_request(control, false)) {
+        ds->flush_batch();
+    }
+    if (control->get_status() != godot::DSRequest::STATUS_COMPLETED) {
+        GDEX_FAIL("extent control failed: " + ::gdextest::to_std_string(control->get_error_message()));
+    }
+    const godot::PackedByteArray readback = rd->texture_get_data(rgba, 0);
+    GDEX_ASSERT_EQ(readback.size(), static_cast<int64_t>(width) * height * 4);
+    bool rows_match = true;
+    const uint8_t *read_bytes = reinterpret_cast<const uint8_t *>(readback.ptr());
+    const uint8_t *source_bytes = reinterpret_cast<const uint8_t *>(exact.ptr());
+    for (int row = 0; row < 32 && rows_match; ++row) {
+        // Copyable rows are 512 bytes, the destination row is 400.
+        if (std::memcmp(read_bytes + static_cast<int64_t>(row) * width * 4,
+                    source_bytes + static_cast<int64_t>(row) * pitch, static_cast<size_t>(width) * 4) != 0) {
+            rows_match = false;
+        }
+    }
+    GDEX_EXPECT_TRUE(rows_match);
+
+    // Short payload: the tail the runtime would zero-fill must be refused.
+    const godot::PackedByteArray short_payload = make_band_payload(16 * pitch, 0x11);
+    GDEX_ASSERT_TRUE(write_band_file(path, short_payload));
+    godot::Ref<godot::DSRequest> short_request = make_extent_request(path, rgba, static_cast<uint32_t>(short_payload.size()), 0, 32);
+    if (ds->enqueue_request(short_request, false)) {
+        ds->flush_batch();
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(short_request->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(short_request->get_error_message().contains("row-range payload is"));
+
+    // Long payload: the surplus the runtime would clip must be refused.
+    const godot::PackedByteArray long_payload = make_band_payload(64 * pitch, 0x22);
+    GDEX_ASSERT_TRUE(write_band_file(path, long_payload));
+    godot::Ref<godot::DSRequest> long_request = make_extent_request(path, rgba, static_cast<uint32_t>(long_payload.size()), 0, 32);
+    if (ds->enqueue_request(long_request, false)) {
+        ds->flush_batch();
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(long_request->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(long_request->get_error_message().contains("row-range payload is"));
+
+    // Block-compressed: 8 block rows of 512 bytes fill a 32-row band.
+    const godot::RID bc7 = make_band_texture_sized(rd, width, height, godot::RenderingDevice::DATA_FORMAT_BC7_UNORM_BLOCK);
+    GDEX_ASSERT_TRUE(bc7.is_valid());
+    ctx.add_teardown([ds, rd, bc7]() {
+        ds->wait_for_completion(5000);
+        ds->collect_completed_results();
+        if (rd->texture_is_valid(bc7)) {
+            rd->free_rid(bc7);
+        }
+    });
+    const godot::PackedByteArray bc7_exact = make_band_payload(8 * pitch, 0x33);
+    GDEX_ASSERT_TRUE(write_band_file(path, bc7_exact));
+    godot::Ref<godot::DSRequest> bc7_control = make_extent_request(path, bc7, static_cast<uint32_t>(bc7_exact.size()), 0, 32);
+    if (ds->enqueue_request(bc7_control, false)) {
+        ds->flush_batch();
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(bc7_control->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+
+    const godot::PackedByteArray bc7_over = make_band_payload(9 * pitch, 0x44);
+    GDEX_ASSERT_TRUE(write_band_file(path, bc7_over));
+    godot::Ref<godot::DSRequest> bc7_bad = make_extent_request(path, bc7, static_cast<uint32_t>(bc7_over.size()), 0, 32);
+    if (ds->enqueue_request(bc7_bad, false)) {
+        ds->flush_batch();
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(bc7_bad->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(bc7_bad->get_error_message().contains("row-range payload is"));
 #endif
 }
 
