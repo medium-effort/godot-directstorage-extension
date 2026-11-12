@@ -1859,17 +1859,17 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		return fail(ERR_FILE_CORRUPT, "v5 encrypted header envelope overlaps data_offset.");
 	}
 
-	// The encryption requirement comes from the build, never from the file. A
-	// protected export publishes dsgd_extension/protected into its own
-	// settings, and the header flag that would otherwise decide whether the TOC
-	// is authenticated is attacker-controlled: reading it alone lets a plaintext
-	// archive with a copied archive id open in a build that advertises an
-	// authenticated TOC. Source and editor builds never publish the setting, so
-	// they keep accepting plaintext archives.
-	bool require_encrypted_toc = false;
-	if (dsgd_settings::has_setting("protected", "export/protected")) {
-		require_encrypted_toc = static_cast<bool>(dsgd_settings::get_setting("protected", "export/protected"));
-	}
+	// The authenticated-TOC requirement is carried by the build, never by the
+	// file and never by a setting alone. A protected export injects the archive
+	// key into the encrypted PCK as res://.dspkg/toc.key, and no file beside the
+	// executable can add or remove a PCK entry. dsgd_extension/protected stays
+	// as an additive signal: it is what a source/editor build never publishes
+	// and what the failed outcome publishes without a key entry, so an
+	// override.cfg can raise the requirement but never clear the PCK one.
+	const bool key_entry_delivered = FileAccess::file_exists(DSPKG_TOC_KEY_PATH);
+	const bool setting_requires_toc = dsgd_settings::has_setting("protected", "export/protected") &&
+			static_cast<bool>(dsgd_settings::get_setting("protected", "export/protected"));
+	const bool require_encrypted_toc = key_entry_delivered || setting_requires_toc;
 	if (require_encrypted_toc && !is_encrypted) {
 		// A v4/v5 header that simply cleared the flag is a downgrade; anything
 		// older cannot carry the flag at all, so it is a mismatch rather than a

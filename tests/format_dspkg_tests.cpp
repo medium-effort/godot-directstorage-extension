@@ -1293,6 +1293,83 @@ GDEX_TEST_T(dspkg, protected_build_rejects_plaintext_archive, TAG_INTEGRATION) {
 	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), godot::DSPkg::compute_key_id(key_hex));
 }
 
+// The requirement must survive a project-settings override. `dsgd_extension/protected`
+// is published in project.binary, and a file beside the executable (`override.cfg`)
+// can displace it at startup. The carrier that no file beside the executable can add
+// or remove is the archive key the export injects into the encrypted PCK: a delivered
+// res://.dspkg/toc.key must require an authenticated TOC on its own, with the setting
+// absent or false, while the encrypted path keeps working.
+GDEX_TEST_T(dspkg, key_entry_enforces_encrypted_toc, TAG_INTEGRATION) {
+	const char *dstex_plain = "user://gdextest_dspkg_keygate_plain.dstex";
+	const char *dspkg_plain = "user://gdextest_dspkg_keygate_plain.dspkg";
+	const char *dstex_enc = "user://gdextest_dspkg_keygate_enc.dstex";
+	const char *dspkg_enc = "user://gdextest_dspkg_keygate_enc.dspkg";
+	const char *virtual_path = "res://textures/test_keygate.dstex";
+	const uint64_t archive_id = 0x0BADF00DCAFEBABEULL;
+	const godot::String key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+	const godot::String setting = "dsgd_extension/protected";
+
+	// No delivered file and no global key override at either end of the case.
+	TocKeySandbox sandbox;
+
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	GDEX_ASSERT_TRUE(ps != nullptr);
+	const bool had_setting = ps->has_setting(setting);
+	const godot::Variant previous = had_setting ? ps->get_setting(setting) : godot::Variant();
+	ctx.add_teardown([ps, setting, dstex_plain, dspkg_plain, dstex_enc, dspkg_enc, had_setting, previous]() {
+		if (had_setting) {
+			ps->set_setting(setting, previous);
+		} else {
+			ps->clear(setting);
+		}
+		remove_temp_file(dstex_plain);
+		remove_temp_file(dspkg_plain);
+		remove_temp_file(dstex_enc);
+		remove_temp_file(dspkg_enc);
+	});
+
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_plain, dspkg_plain, archive_id, godot::String(), virtual_path));
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_enc, dspkg_enc, archive_id, key_hex, virtual_path));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+
+	// 1. Baseline: no carrier, no setting, and the fixture really is plaintext.
+	ps->clear(setting);
+	GDEX_ASSERT_FALSE(godot::FileAccess::file_exists(godot::String(TOC_KEY_PATH)));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_plain), archive_id), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+
+	// 2. A delivered key entry is the requirement, with no setting at all.
+	const godot::String key_id_before = godot::DSPkg::get_global_encryption_key_id();
+	GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_plain), archive_id), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+	GDEX_EXPECT_FALSE(reader->has_texture(godot::String(virtual_path)));
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), key_id_before);
+
+	// 3. An explicit false cannot negate the carrier either.
+	ps->set_setting(setting, false);
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_plain), archive_id), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+
+	// 4. Control: the encrypted archive opens with the same delivered key.
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_enc), archive_id), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), godot::DSPkg::compute_key_id(key_hex));
+
+	// 5. The setting half still works alone (a failed export ships no carrier).
+	remove_toc_key_file();
+	ps->set_setting(setting, true);
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_plain), archive_id), godot::ERR_UNAUTHORIZED);
+
+	// 6. The carrier is sampled per open, not latched at the first refusal.
+	ps->clear(setting);
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_plain), archive_id), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+}
+
 GDEX_TEST_T(dspkg, archive_id_zero_archive_rejected_when_expected, TAG_INTEGRATION) {
 	const char *dstex_path = "user://gdextest_dspkg_id_zero_unpaired.dstex";
 	const char *dspkg_unpaired = "user://gdextest_dspkg_id_zero_unpaired.dspkg";

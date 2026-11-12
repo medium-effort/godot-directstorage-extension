@@ -86,7 +86,7 @@ DSPKG_BOOT status=fail reason=<code> mode=<protected|unprotected>
 |---|---|
 | `missing_extension` | the extension DLL is absent, so `DSContext` was never registered |
 | `missing_archive` | the build expects `textures.dspkg` beside the executable and did not find it |
-| `archive_unauthorized` | no usable key: the PCK is not mounted, the include filter missed `res://.dspkg/toc.key`, or the PCK key is wrong |
+| `archive_unauthorized` | no usable key: the PCK is not mounted, the include filter missed `res://.dspkg/toc.key`, the PCK key is wrong, or the archive is plaintext in a build whose PCK delivered that key entry |
 | `archive_pairing_mismatch` | the archive belongs to a different export than the build |
 | `archive_unreadable` | the archive is truncated or corrupt |
 

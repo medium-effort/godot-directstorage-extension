@@ -47,7 +47,7 @@ from the editor (`set_as_internal`) and must stay in sync with the runtime.
 |---|---|---|
 | `dsgd_extension/bundle_dspkg` | "an archive is expected to exist beside the executable" | `_publish_contract()` |
 | `dsgd_extension/archive_id` | the random 64-bit archive id of this export, or `0` when pairing is off | same |
-| `dsgd_extension/protected` | true for the `protected` and `failed` outcomes | same |
+| `dsgd_extension/protected` | true for the `protected` and `failed` outcomes; additive only - the non-overridable carrier is the `res://.dspkg/toc.key` entry inside the encrypted PCK, which `DSPkg::open()` also checks | same |
 | `dsgd_extension/archive_name` | archive filename (default `textures.dspkg`) | same |
 
 `bundle_dspkg` is true only when **all** of these hold:

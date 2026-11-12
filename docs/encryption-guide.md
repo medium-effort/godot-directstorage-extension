@@ -48,6 +48,12 @@ rather than trusting the archive: an archive that is not encrypted is refused at
 `archive_unauthorized`, and the exporter's round-trip check applies the same rule to the archive it
 just wrote.
 
+The requirement is carried by the build's own files. A protected export injects the archive key into
+the encrypted PCK as `res://.dspkg/toc.key`, and the reader refuses a plaintext table of contents
+whenever that entry is present, so a file placed beside the executable cannot switch the requirement
+off. The published `dsgd_extension/protected` setting is only an additional signal; it can add the
+requirement, never remove it.
+
 ---
 
 ## How the pieces fit

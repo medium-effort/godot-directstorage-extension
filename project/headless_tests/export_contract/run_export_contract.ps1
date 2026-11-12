@@ -29,7 +29,8 @@ param(
 #   * encrypt_directory on and off
 #   * a corrupted TOC
 #   * a plaintext archive substituted into a protected build (the archive id is
-#     copied out of the cleartext header) must be refused at boot
+#     copied out of the cleartext header) must be refused at boot, including when
+#     an override.cfg beside the executable flips dsgd_extension/protected to false
 #   * "a skipped payload implies a declared archive" with failures injected at
 #     create(), the first add_texture(), mid-walk and finalize()
 #   * the pack scan: validity, key-leak absence, and a positive control that a
@@ -785,6 +786,66 @@ Invoke-Case 'protected_plaintext_archive' {
         Add-Check 'protected_plaintext_archive.id_copied' ($protectedId -ne 0) ('id=0x' + $protectedId.ToString('x'))
 
         Assert-BootFail -Case 'protected_plaintext_archive' -StageDir $stage -Reason 'archive_unauthorized' -RequireNonZeroExit
+    }
+}
+
+# ---------------------------------------------------------------- plaintext archive + override.cfg
+#
+# The requirement must not rest on a project setting that a file beside the executable
+# can replace. Godot reads override.cfg from the exported binary's directory over
+# project.binary, so this case plants exactly that file with
+# dsgd_extension/protected=false and repeats the protected_plaintext_archive attack.
+# The requirement has to survive on the key entry the encrypted PCK delivers. The control
+# leg proves the override was applied (mode flips to unprotected) and that the honest
+# encrypted archive still boots.
+
+Invoke-Case 'protected_plaintext_archive_override' {
+    if (-not $ProtectedAvailable) {
+        Add-NotCovered 'protected_plaintext_archive_override' $TemplateReason
+    } elseif ($null -eq $script:ProtectedStage) {
+        Add-NotCovered 'protected_plaintext_archive_override' 'no protected release to attack'
+    } elseif ($null -eq $script:PlainArchiveStage) {
+        Add-NotCovered 'protected_plaintext_archive_override' 'no unprotected release to source a plaintext archive from'
+    } else {
+        $stage = Join-Path $WorkRoot 'stage-protected_plaintext_archive_override'
+        if (Test-Path -LiteralPath $stage) { throw ('stage directory already exists: ' + $stage) }
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        # Copy-Item, not Copy-ReleaseStage: that helper hardlinks files over 1 MiB and the
+        # attack truncates textures.dspkg in place, which would corrupt the shared source.
+        foreach ($item in @(Get-ChildItem -LiteralPath $script:ProtectedStage -File)) {
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $stage $item.Name) -Force
+        }
+        Write-Utf8NoBom -Path (Join-Path $stage 'override.cfg') -Text "dsgd_extension/protected=false`r`n"
+
+        # Control leg: the override is honoured and the honest encrypted archive still boots.
+        $control = Invoke-Boot -StageDir $stage
+        if ($control.MissingExecutable) {
+            Add-Check 'protected_plaintext_archive_override.control_executable' $false 'no game.exe in the staged release directory'
+            return
+        }
+        Add-Check 'protected_plaintext_archive_override.control_no_timeout' (-not $control.Boot.TimedOut) ('timed_out=' + $control.Boot.TimedOut + ' exit=' + $control.ExitCode)
+        Add-Check 'protected_plaintext_archive_override.control_single_ok' (($control.Boot.OkCount -eq 1) -and ($control.Boot.SinkOkCount -eq 1)) ('line=' + $control.Boot.OkLine)
+        Add-Check 'protected_plaintext_archive_override.control_override_applied' ($control.Boot.OkMode -eq 'unprotected') ('mode=' + $control.Boot.OkMode)
+        Add-Check 'protected_plaintext_archive_override.control_entries' ($control.Boot.OkEntries -ge 3) ('entries=' + $control.Boot.OkEntries)
+
+        # Attack leg: the same substitution protected_plaintext_archive performs.
+        $protectedBytes = [System.IO.File]::ReadAllBytes((Join-Path $script:ProtectedStage 'textures.dspkg'))
+        $plainBytes = [System.IO.File]::ReadAllBytes((Join-Path $script:PlainArchiveStage 'textures.dspkg'))
+        $plainVersion = [BitConverter]::ToUInt16($plainBytes, 4)
+        $plainFlags = [BitConverter]::ToUInt16($plainBytes, 6)
+        $plainKeyId = [BitConverter]::ToUInt64($plainBytes, 52)
+        Add-Check 'protected_plaintext_archive_override.source_is_plaintext' (($plainVersion -eq 4) -and (($plainFlags -band 2) -eq 0) -and ($plainKeyId -eq 0)) ('version=' + $plainVersion + ' flags=' + $plainFlags + ' key_id=' + $plainKeyId)
+        $protectedId = [BitConverter]::ToUInt64($protectedBytes, 20)
+        [Array]::Copy([BitConverter]::GetBytes($protectedId), 0, $plainBytes, 20, 8)
+        [System.IO.File]::WriteAllBytes((Join-Path $stage 'textures.dspkg'), $plainBytes)
+        Add-Check 'protected_plaintext_archive_override.id_copied' ($protectedId -ne 0) ('id=0x' + $protectedId.ToString('x'))
+
+        $attack = Invoke-Boot -StageDir $stage
+        Add-Check 'protected_plaintext_archive_override.attack_no_timeout' (-not $attack.Boot.TimedOut) ('timed_out=' + $attack.Boot.TimedOut + ' exit=' + $attack.ExitCode)
+        Add-Check 'protected_plaintext_archive_override.attack_no_ok_line' (($attack.Boot.OkCount -eq 0) -and ($attack.Boot.SinkOkCount -eq 0)) ('stdout_ok=' + $attack.Boot.OkCount + ' sink_ok=' + $attack.Boot.SinkOkCount)
+        Add-Check 'protected_plaintext_archive_override.attack_failure_reason' (($attack.Boot.FailCount -eq 1) -and ($attack.Boot.FailReason -eq 'archive_unauthorized')) ('reason=' + $attack.Boot.FailReason + ' line=' + $attack.Boot.FailLine)
+        Add-Check 'protected_plaintext_archive_override.attack_override_applied' ($attack.Boot.FailLine -match 'mode=unprotected') ('line=' + $attack.Boot.FailLine)
+        Add-Check 'protected_plaintext_archive_override.attack_nonzero_exit' ($attack.ExitCode -ne 0) ('exit=' + $attack.ExitCode)
     }
 }
 
