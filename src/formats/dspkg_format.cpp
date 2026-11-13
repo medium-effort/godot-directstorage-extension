@@ -1939,13 +1939,8 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 			return fail(ERR_FILE_CORRUPT, "TOC envelope exceeds maximum size limit (16 MiB).");
 		}
 	} else {
-		constexpr uint64_t MAX_SERIALIZED_ENTRY_SIZE = DSPKG_ENTRY_PREFIX_SIZE + UINT16_MAX + DSPKG_ENTRY_FIELDS_SIZE_V3 + 24ULL * DSTEX_MAX_MIP_COUNT;
-		uint64_t max_legacy_toc_table = 0;
-		if (!checked_multiply(loaded_header.entry_count, MAX_SERIALIZED_ENTRY_SIZE, max_legacy_toc_table)) {
-			return fail(ERR_FILE_CORRUPT, "Entry table size overflow.");
-		}
-		if (toc_len > DSPKG_MAX_TOC_SIZE + max_legacy_toc_table) {
-			return fail(ERR_FILE_CORRUPT, "Legacy TOC length exceeds plausible bounds.");
+		if (toc_len > DSPKG_MAX_TOC_SIZE) {
+			return fail(ERR_FILE_CORRUPT, "Legacy TOC envelope exceeds maximum size limit (16 MiB).");
 		}
 	}
 
@@ -2018,6 +2013,9 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		if (plaintext_toc.size() < toc_len) {
 			return fail(ERR_FILE_CORRUPT, "Failed to read complete unencrypted TOC bytes.");
 		}
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		dspkg_note_preauth_toc_bytes(toc_len);
+#endif
 	}
 
 	// Header semantics are validated only after the encrypted TOC MAC has

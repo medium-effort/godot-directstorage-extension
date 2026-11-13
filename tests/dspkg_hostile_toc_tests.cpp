@@ -27,8 +27,12 @@ namespace {
 
 constexpr const char *kKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 constexpr const char *kHostilePath = "user://gdextest_dspkg_preauth_hostile.dspkg";
+constexpr const char *kLegacyHostilePath = "user://gdextest_dspkg_legacy_v3_hostile.dspkg";
+constexpr const char *kLegacyValidPath = "user://gdextest_dspkg_legacy_v3_valid.dspkg";
 // The v5 envelope cap; entry_count = 32 makes the plausible bound admit it.
 constexpr uint64_t kTocLen = 64ULL * 1024ULL * 1024ULL;
+constexpr uint64_t kLegacyHostileFileSize = 128ULL * 1024ULL * 1024ULL;
+constexpr uint32_t kLegacyHostileEntryCount = 2048;
 constexpr uint64_t kChunk = 1024ULL * 1024ULL;
 constexpr uint32_t kEntryCount = 32;
 constexpr uint64_t kHeaderSize = 96;
@@ -89,6 +93,71 @@ bool write_hostile_archive() {
 		file->store_buffer(take == kChunk ? zeros : zeros.slice(0, static_cast<int64_t>(take)));
 		remaining -= take;
 	}
+
+	const Error write_error = file->get_error();
+	file->close();
+	return write_error == OK;
+}
+
+bool write_legacy_v3_hostile_archive() {
+	using namespace godot;
+
+	Ref<FileAccess> file = FileAccess::open(String(kLegacyHostilePath), FileAccess::WRITE);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+
+	// 28-byte legacy v3 header with an inflated entry_count and 128 MiB data_offset.
+	file->store_32(0x474B5044);
+	file->store_16(DSPKG_VERSION_ENTRY_FLAGS);
+	file->store_16(0);
+	file->store_32(kLegacyHostileEntryCount);
+	file->store_64(kLegacyHostileFileSize);
+	file->store_64(0);
+	file->seek(kLegacyHostileFileSize - 1);
+	file->store_8(0);
+
+	const Error write_error = file->get_error();
+	file->close();
+	return write_error == OK;
+}
+
+bool write_legacy_v3_valid_archive(const char *p_entry_path) {
+	using namespace godot;
+
+	const String entry_path(p_entry_path);
+	const PackedByteArray path_utf8 = entry_path.to_utf8_buffer();
+	const uint64_t entry_size = DSPKG_ENTRY_PREFIX_SIZE + static_cast<uint64_t>(path_utf8.size()) + DSPKG_ENTRY_FIELDS_SIZE_V3;
+	const uint64_t data_offset = DSPKG_HEADER_SIZE_LEGACY + entry_size;
+
+	Ref<FileAccess> file = FileAccess::open(String(kLegacyValidPath), FileAccess::WRITE);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+
+	file->store_32(0x474B5044);
+	file->store_16(DSPKG_VERSION_ENTRY_FLAGS);
+	file->store_16(0);
+	file->store_32(1);
+	file->store_64(data_offset);
+	file->store_64(0);
+
+	file->store_64(static_cast<uint64_t>(entry_path.hash()));
+	file->store_16(static_cast<uint16_t>(path_utf8.size()));
+	file->store_buffer(path_utf8);
+	file->store_64(0); // data_offset relative to header.data_offset
+	file->store_64(16); // compressed_size
+	file->store_64(16); // original_size
+	file->store_32(2); // width
+	file->store_32(2); // height
+	file->store_32(5); // pixel_format (FORMAT_RGBA8)
+	file->store_32(1); // mip_count
+	file->store_32(0); // flags
+
+	PackedByteArray payload;
+	payload.resize(16);
+	payload.fill(0x5A);
+	file->store_buffer(payload);
 
 	const Error write_error = file->get_error();
 	file->close();
@@ -176,3 +245,51 @@ GDEX_TEST_T(dspkg_hostile_toc, preauth_toc_single_buffer, TAG_INTEGRATION) {
 	GDEX_SKIP("the pre-auth allocation probe is compiled out in release builds");
 }
 #endif
+
+GDEX_TEST_T(dspkg_hostile_toc, legacy_v3_oversized_toc_rejected_before_alloc, TAG_INTEGRATION) {
+	remove_user_file(kLegacyHostilePath);
+	ctx.add_teardown([]() {
+		remove_user_file(kLegacyHostilePath);
+	});
+
+	GDEX_ASSERT_TRUE(write_legacy_v3_hostile_archive());
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	godot::DSPkg::_reset_preauth_toc_probe_for_testing();
+#endif
+	const godot::Error open_error = reader->open(godot::String(kLegacyHostilePath), 0);
+
+	// 1. Legacy v1-v3 archives exceeding the flat 16 MiB TOC cap must fail corrupt.
+	GDEX_EXPECT_EQ(static_cast<int64_t>(open_error), static_cast<int64_t>(godot::ERR_FILE_CORRUPT));
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// 2. Rejection must occur before file->get_buffer(toc_len) allocates the TOC buffer.
+	const uint64_t peak = godot::DSPkg::_get_preauth_toc_peak_bytes_for_testing();
+	GDEX_EXPECT_EQ(peak, static_cast<uint64_t>(0));
+#endif
+	// 3. A refused open leaves no reader state behind.
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+}
+
+GDEX_TEST_T(dspkg_hostile_toc, legacy_v3_valid_toc_opens, TAG_INTEGRATION) {
+	constexpr const char *kEntryPath = "res://textures/legacy_ok.dstex";
+	remove_user_file(kLegacyValidPath);
+	ctx.add_teardown([]() {
+		remove_user_file(kLegacyValidPath);
+	});
+
+	GDEX_ASSERT_TRUE(write_legacy_v3_valid_archive(kEntryPath));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+
+	const godot::Error open_error = reader->open(godot::String(kLegacyValidPath), 0);
+
+	GDEX_EXPECT_EQ(static_cast<int64_t>(open_error), static_cast<int64_t>(godot::OK));
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+	GDEX_EXPECT_TRUE(reader->has_texture(godot::String(kEntryPath)));
+}
