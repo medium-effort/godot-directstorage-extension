@@ -822,8 +822,8 @@ Win32Backend::QueueErrorInfo Win32Backend::read_queue_error(IDStorageQueue *p_qu
 
 	if (failure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST) {
 		String req_name_str = String(failure.Request.RequestName);
-		info.message += " [File: " + String(failure.Request.Filename) + ", RequestName: " + req_name_str + "]";
 		info.failed_request_name = req_name_str;
+		info.failed_filename = String(failure.Request.Filename);
 	}
 
 	const HRESULT hr_aborted = HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
@@ -833,6 +833,20 @@ Win32Backend::QueueErrorInfo Win32Backend::read_queue_error(IDStorageQueue *p_qu
 		info.fatal = false;
 	}
 	return info;
+}
+
+// Renders the record exactly once: base line, then the request bracket (the only
+// place that text is built), then the attribution details. Re-rendering the same
+// record therefore cannot duplicate anything, which is what the enrichment
+// callers rely on.
+String Win32Backend::QueueErrorInfo::format_message() const {
+	String text = message;
+	if (!failed_request_name.is_empty()) {
+		const String filename = failed_filename.is_empty() ? resolved_file_path : failed_filename;
+		text += " [File: " + filename + ", RequestName: " + failed_request_name + "]";
+	}
+	text += request_details;
+	return text;
 }
 
 void Win32Backend::enrich_queue_error_from_slot(const BatchSlot &p_slot, QueueErrorInfo &r_error) {
@@ -845,8 +859,11 @@ void Win32Backend::enrich_queue_error_from_slot(const BatchSlot &p_slot, QueueEr
 		return;
 	}
 	const Ref<DSRequest> &req = it->second;
-	if (r_error.message.find("[File: , RequestName:") != -1 && !req->get_file_path().is_empty()) {
-		r_error.message = r_error.message.replace("[File: , RequestName:", "[File: " + req->get_file_path() + ", RequestName:");
+	// Attribution is assignment, never text rewriting: calling this twice for the
+	// same record (the queue-error event thread and the batch claim both can) must
+	// produce the same message.
+	if (r_error.failed_filename.is_empty()) {
+		r_error.resolved_file_path = req->get_file_path();
 	}
 	String details = " (dest=" + String::num_int64(static_cast<int64_t>(req->get_destination_type())) +
 			", offset=" + String::num_uint64(req->get_offset()) +
@@ -863,7 +880,7 @@ void Win32Backend::enrich_queue_error_from_slot(const BatchSlot &p_slot, QueueEr
 		details += ", asset=" + label;
 	}
 	details += ")";
-	r_error.message += details;
+	r_error.request_details = details;
 }
 
 void Win32Backend::enrich_queue_error_from_queue_locked(const QueueState &p_queue, QueueErrorInfo &r_error) {
@@ -894,15 +911,16 @@ void Win32Backend::report_queue_error(const QueueErrorInfo &p_error) {
 		hook();
 	}
 #endif
+	const String text = p_error.format_message();
 	if (!p_error.fatal) {
-		UtilityFunctions::print_verbose("[DirectStorage] Request aborted on queue: " + p_error.message);
+		UtilityFunctions::print_verbose("[DirectStorage] Request aborted on queue: " + text);
 		return;
 	}
 	// Engine calls happen after every extension mutex is released (GODOT_QUIRKS.md Q46).
-	UtilityFunctions::push_error(p_error.message);
+	UtilityFunctions::push_error(text);
 	DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
 	if (err_handler) {
-		err_handler->report_error(p_error.message);
+		err_handler->report_error(text);
 	}
 }
 
@@ -1370,8 +1388,17 @@ void Win32Backend::handle_queue_error_event(int p_queue_index) {
 			if (!record.present) {
 				break;
 			}
-			enrich_queue_error_from_queue_locked(queue, record);
-			stash_queue_error_locked(queue, record, &immediate);
+			// Stash the record un-attributed. The batch that claims it attributes
+			// it against its own slot exactly once; a record no batch can carry is
+			// attributed here, because this report is its only consumer.
+			QueueErrorInfo immediate_record;
+			stash_queue_error_locked(queue, record, &immediate_record);
+			if (immediate_record.present) {
+				enrich_queue_error_from_queue_locked(queue, immediate_record);
+				if (!immediate.present) {
+					immediate = immediate_record;
+				}
+			}
 			if (!queue.error_event) {
 				break;
 			}
@@ -1887,11 +1914,13 @@ void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, int
 		}
 	}
 	if (queue_error.present) {
+		// This is the single attribution point for a record a batch claimed; the
+		// queue-error event thread only attributes records no batch can carry.
 		enrich_queue_error_from_slot(p_slot, queue_error);
 		r_report.error = queue_error;
 	}
 	if (queue_failed) {
-		attribute_batch_error_records(p_slot.requests, p_slot.request_name_map, queue_error.failed_request_name, queue_error.message);
+		attribute_batch_error_records(p_slot.requests, p_slot.request_name_map, queue_error.failed_request_name, queue_error.format_message());
 	}
 	for (int i = 0; i < p_slot.requests.size(); i++) {
 		if (p_slot.requests[i].is_valid()) {
@@ -6017,6 +6046,35 @@ void Win32Backend::_debug_inject_queue_error_for_testing(int p_queue_index, cons
 	(void)p_message;
 	(void)p_failed_request_name;
 	(void)p_fatal;
+#endif
+}
+
+String Win32Backend::_debug_render_queue_error_attributed_twice_for_testing(const String &p_failed_request_name,
+		const String &p_base_message, const Ref<DSRequest> &p_request, const String &p_failed_filename) {
+#ifdef _WIN32
+	// Test-only seam, never bound in _bind_methods(). Runs the production
+	// attribution and rendering twice over one record, which is what the error
+	// event thread and the batch claim used to do; the returned text proves the
+	// result does not depend on how often it ran.
+	QueueErrorInfo record;
+	record.present = true;
+	record.message = p_base_message;
+	record.failed_request_name = p_failed_request_name;
+	record.failed_filename = p_failed_filename;
+	BatchSlot slot;
+	if (p_request.is_valid()) {
+		slot.request_name_map[std::string(p_failed_request_name.utf8().get_data())] = p_request;
+	}
+	for (int pass = 0; pass < 2; pass++) {
+		enrich_queue_error_from_slot(slot, record);
+	}
+	return record.format_message();
+#else
+	(void)p_failed_request_name;
+	(void)p_base_message;
+	(void)p_request;
+	(void)p_failed_filename;
+	return String();
 #endif
 }
 

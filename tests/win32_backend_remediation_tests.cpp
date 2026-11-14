@@ -2829,6 +2829,55 @@ GDEX_TEST_T(win32_remediation, queue_error_two_fatal_records_fail_whole_batch, T
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, queue_error_attribution_is_idempotent, TAG_UNIT) {
+#ifdef _WIN32
+    // #0263: one record can be attributed twice - the queue-error event thread
+    // attributes it before stashing, and the batch claim attributes the stashed
+    // record again. Attribution now assigns fields and format_message() assembles
+    // the text once, so a second pass must change nothing. The previous code
+    // appended the payload summary to the message itself, so the claim rendered it
+    // twice and every request attributed to that failure inherited the duplicate.
+    godot::Ref<godot::DSRequest> request;
+    request.instantiate();
+    request->set_file_path("res://idempotent.dstex");
+    request->set_destination_type(godot::DSRequest::DESTINATION_MEMORY);
+    request->set_offset(4096);
+    request->set_size(1024);
+    request->set_uncompressed_size(1024);
+    request->set_debug_label("res://idempotent.dstex");
+
+    const godot::String base("DirectStorage queue error (HRESULT 0x80070057, command type Request): invalid parameter");
+    const godot::String rendered = godot::Win32Backend::_debug_render_queue_error_attributed_twice_for_testing(
+            "REQ_1_2", base, request);
+
+    GDEX_EXPECT_TRUE(rendered.begins_with(base));
+    // One bracket, filled from the request because the record carried no filename.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(rendered.count("[File: ")), static_cast<int64_t>(1));
+    GDEX_EXPECT_TRUE(rendered.contains("[File: res://idempotent.dstex, RequestName: REQ_1_2]"));
+    // One payload summary, whatever the number of attribution passes.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(rendered.count(" (dest=")), static_cast<int64_t>(1));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(rendered.count(", offset=")), static_cast<int64_t>(1));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(rendered.count(", asset=")), static_cast<int64_t>(1));
+    GDEX_EXPECT_TRUE(rendered.contains(", offset=4096"));
+    GDEX_EXPECT_TRUE(rendered.contains(", size=1024"));
+
+    // A filename the runtime filled in wins over the request's own path, and still
+    // renders once.
+    const godot::String with_filename = godot::Win32Backend::_debug_render_queue_error_attributed_twice_for_testing(
+            "REQ_1_3", base, request, "C:\\games\\textures\\idempotent.dstex");
+    GDEX_EXPECT_EQ(static_cast<int64_t>(with_filename.count("[File: ")), static_cast<int64_t>(1));
+    GDEX_EXPECT_TRUE(with_filename.contains("[File: C:\\games\\textures\\idempotent.dstex, RequestName: REQ_1_3]"));
+
+    // A record naming no request renders as the bare base line: no empty bracket.
+    const godot::String unnamed = godot::Win32Backend::_debug_render_queue_error_attributed_twice_for_testing(
+            "", base, request);
+    GDEX_EXPECT_TRUE(unnamed == base);
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, second_instance_shutdown_preserves_first_instance_state, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)

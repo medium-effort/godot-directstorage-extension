@@ -103,16 +103,31 @@ private:
 		bool completion_ready = false;
 		bool is_sync_submission = false;
 	};
-	// One failure read from IDStorageQueue::RetrieveErrorRecord(). The message is
-	// built where the record is read so the caller can push/report it only after
-	// every extension mutex has been released.
+	// One failure read from IDStorageQueue::RetrieveErrorRecord(). The record is
+	// kept as fields and only rendered by format_message(), so attribution can be
+	// filled in when the record is matched to a staged request without rewriting
+	// text that was already assembled. Re-attributing the same record is
+	// idempotent by construction: every accessor assigns, never appends.
 	struct QueueErrorInfo {
 		bool present = false;
 		// False for a cancellation (ERROR_OPERATION_ABORTED). The record is still
 		// consumed and logged verbosely, but the batch is not a failure.
 		bool fatal = true;
+		// Base line from the record itself: HRESULT, command type, system message.
+		// For an injected (test) record this is the injected text verbatim.
 		String message;
 		String failed_request_name;
+		// Filename DirectStorage reported on the record. Empty in practice unless
+		// the runtime learned it from the source file, so attribution falls back to
+		// the staged request's own path.
+		String failed_filename;
+		// Filled by enrichment: the staged request's file path (only when the
+		// record carried no filename) and a one-line payload summary.
+		String resolved_file_path;
+		String request_details;
+		// Renders base line + "[File: ..., RequestName: ...]" + details. The only
+		// place the bracket text is assembled, so it appears exactly once.
+		String format_message() const;
 	};
 	// Everything a retiring batch has to say to the engine once batch_mutex is
 	// released: the queue failure (if any) plus the resource-guard warnings
@@ -512,6 +527,15 @@ public:
 	// order. Lets a test inject a record that names a real staged request without
 	// reaching into the slot's containers. Never bound in _bind_methods().
 	PackedStringArray _debug_staged_request_names_for_testing(int p_queue_index, int p_slot_index) const;
+	// Test-only seam: attributes a synthetic queue-error record against the given
+	// request twice and returns the rendered text. The queue-error event thread
+	// and the batch claim can both attribute one record, so attribution must be
+	// idempotent; the test asserts each part appears exactly once instead of
+	// trusting that the two call sites never overlap. A non-empty filename
+	// reproduces a record the runtime filled in itself, which must win over the
+	// request's path. Never bound in _bind_methods().
+	static String _debug_render_queue_error_attributed_twice_for_testing(const String &p_failed_request_name,
+			const String &p_base_message, const Ref<DSRequest> &p_request, const String &p_failed_filename = String());
 	// Test-only seam: how many times DStorageSetConfiguration has actually been
 	// applied. The counter is per loaded runtime instance, not per process, so a
 	// second load cycle must raise it again; a process-wide latch did not. Never
