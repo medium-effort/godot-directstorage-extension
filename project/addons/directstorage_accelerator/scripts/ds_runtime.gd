@@ -117,7 +117,16 @@ var _mild_slices: int = 0
 var _heavy_slices: int = 0
 var _drain_reported: bool = true
 var _slice_debug: bool = false
-var _gpu_pump_cooldown: int = 0
+## Frames between GPU prewarm chunk pumps, per slice label. `_process` is the
+## only caller of `pump_gpu_prewarm()` (DSPreloader has no other pump), so
+## "heavy" has to stay paced rather than stopped: a hard stop wedges the GPU
+## chunk queue for as long as the frame cost stays above the heavy threshold,
+## and every caller waiting on the tag (e.g.
+## `DSPreloaderScript.await_prewarm_finished()`, which only pumps when the
+## autoload is absent) then waits forever. 8 frames is a floor, not a target.
+const GPU_PUMP_FRAME_STRIDE_HEAVY: int = 8
+const GPU_PUMP_FRAME_STRIDE_MILD: int = 2
+var _gpu_pump_frames_since: int = 0
 
 
 ## Starts tracking progress for a prewarm tag returned by `prewarm_async()`.
@@ -157,7 +166,23 @@ func reset_slice_stats() -> void:
 	_heavy_slices = 0
 	_drain_reported = true
 	_smooth_streak = 2
-	_gpu_pump_cooldown = 0
+	_gpu_pump_frames_since = 0
+
+
+## Decides whether this frame pumps one GPU prewarm chunk and advances the
+## pacing counter. Pure state arithmetic (no engine calls) so the cadence can be
+## asserted without frame timing: "heavy" is paced, never stopped.
+func _should_pump_gpu_now(slice_label: String) -> bool:
+	var stride: int = 1
+	if slice_label == "heavy":
+		stride = GPU_PUMP_FRAME_STRIDE_HEAVY
+	elif slice_label == "mild":
+		stride = GPU_PUMP_FRAME_STRIDE_MILD
+	_gpu_pump_frames_since += 1
+	if _gpu_pump_frames_since < stride:
+		return false
+	_gpu_pump_frames_since = 0
+	return true
 
 
 ## Returns per-batch slice counts for the benchmark profiler.
@@ -526,21 +551,13 @@ func _process(delta: float) -> void:
 				_slice_label = slice_label
 			# Phase-2 GPU prewarm: at most one render-thread chunk per
 			# frame; no-op while idle, in flight, or without D3D12.
-			# Paced by adaptive backpressure: skipped on "heavy" and
-			# spaced to every 2nd frame on "mild" so slow GPUs can drain
-			# back to baseline between chunks.
-			if _has_pump_gpu:
-				if slice_label == "heavy":
-					_gpu_pump_cooldown = 1
-				elif slice_label == "mild":
-					if _gpu_pump_cooldown > 0:
-						_gpu_pump_cooldown -= 1
-					else:
-						cache.pump_gpu_prewarm()
-						_gpu_pump_cooldown = 1
-				else:
-					_gpu_pump_cooldown = 0
-					cache.pump_gpu_prewarm()
+			# Paced by adaptive backpressure ("warm" every frame, "mild"
+			# every 2nd, "heavy" every 8th) so slow GPUs drain back to
+			# baseline between chunks. Heavy stays paced rather than
+			# stopped: this loop is the only pump, so a hard stop would
+			# wedge the chunk queue and every waiter on the tag.
+			if _has_pump_gpu and _should_pump_gpu_now(slice_label):
+				cache.pump_gpu_prewarm()
 			# Main-thread texture drain: Texture2DRD wrappers must be
 			# instantiated on the main or render thread (GODOT_QUIRKS Sec02 & Sec25).
 			# Fast (<2us per texture): drain completed GPU textures within budget.
