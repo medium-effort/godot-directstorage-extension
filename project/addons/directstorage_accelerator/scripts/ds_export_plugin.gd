@@ -600,7 +600,6 @@ func _resolve_dstex_path(path: String) -> String:
 ## log but the remaining core steps still run outside this plugin's control.
 ## Native DLLs (dsgd_64, dstorage) are exported flat by Godot itself.
 func _export_end() -> void:
-	_notice_runtime_license()
 	_sync_notice_files()
 	var dspkg_ok := true
 	if _archive_failed:
@@ -669,11 +668,12 @@ func _has_runtime_dlls() -> bool:
 	return FileAccess.file_exists(ADDON_RUNTIME_BIN.path_join("dstorage.dll"))
 
 
-## The runtime is redistributed under Microsoft's license. When the DirectStorage
-## license file option is disabled, print a reminder rather than a warning: this
-## is an informational obligation on the game developer, not a defect in the export.
-func _notice_runtime_license() -> void:
-	if _include_directstorage_license_file or not _has_runtime_dlls():
+## The runtime is redistributed under Microsoft's license. Whenever runtime DLLs
+## are present without a DirectStorage license file written to the export
+## (whether the option is disabled or the runtime texts could not be resolved),
+## print a reminder: this is an informational obligation on the game developer.
+func _notice_runtime_license(runtime_license_written: bool = false) -> void:
+	if runtime_license_written or not _has_runtime_dlls():
 		return
 	print("[DirectStorage Exporter] NOTICE: dstorage.dll and dstoragecore.dll are Microsoft DirectStorage redistributables governed by Microsoft's license. Microsoft's own NuGet build targets copy only the DLLs; the license texts travel in the runtime package. You remain responsible for your distribution terms.")
 
@@ -688,12 +688,14 @@ func _sync_notice_files() -> void:
 	if _target_export_dir.is_empty():
 		if _include_dsgd_license_file or _include_directstorage_license_file:
 			push_warning("[DirectStorage Exporter] License files are enabled but the export directory is unknown; no license file was deployed.")
+		_notice_runtime_license(false)
 		return
 
 	_remove_managed_notice_files()
 
 	var written: PackedStringArray = []
 	var merged_runtime := false
+	var runtime_license_written := false
 
 	var dsgd_sections: Array[Dictionary] = []
 	if _include_dsgd_license_file:
@@ -711,6 +713,7 @@ func _sync_notice_files() -> void:
 		if _write_notice_file(_target_export_dir.path_join(DSGD_LICENSE_EXPORT_NAME), _compose_notice_file(header, dsgd_sections)):
 			written.append(DSGD_LICENSE_EXPORT_NAME)
 			merged_runtime = merge_runtime
+			runtime_license_written = merged_runtime
 	elif _include_dsgd_license_file:
 		push_warning("[DirectStorage Exporter] The DSGD license file is enabled but neither '" + ADDON_LICENSE_SOURCE + "' nor '" + THIRD_PARTY_NOTICES_SOURCE + "' could be read. No file was written.")
 
@@ -723,6 +726,7 @@ func _sync_notice_files() -> void:
 			var header := _notice_header("DirectStorage - license and notices", runtime_sections)
 			if _write_notice_file(_target_export_dir.path_join(DIRECTSTORAGE_LICENSE_EXPORT_NAME), _compose_notice_file(header, runtime_sections)):
 				written.append(DIRECTSTORAGE_LICENSE_EXPORT_NAME)
+				runtime_license_written = true
 
 	if written.is_empty():
 		print("[DirectStorage Exporter] Notices: none (managed license files removed).")
@@ -730,6 +734,8 @@ func _sync_notice_files() -> void:
 		print("[DirectStorage Exporter] Notices: ", DSGD_LICENSE_EXPORT_NAME, " (DirectStorage runtime texts merged).")
 	else:
 		print("[DirectStorage Exporter] Notices: ", ", ".join(written), ".")
+
+	_notice_runtime_license(runtime_license_written)
 
 
 ## Project license and the components inside dsgd_64.dll. Both describe the same
