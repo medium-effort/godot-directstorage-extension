@@ -250,6 +250,15 @@ public:
 	// A chunked payload must report one unit per staged request, because the
 	// context counts a request when it finalizes.
 	static int64_t _count_gpu_requests_for_testing(const Payload &p_payload);
+	// Test-only: runs the render-thread chunk planner over synthetic per-item
+	// request counts and payload byte estimates, returning one entry per planned
+	// callback chunk with "items", "requests" and "bytes". Pins the slicing
+	// contract without a device or a queue: whole textures are never split, a
+	// chunk closes before it would exceed either cap, and one oversized texture
+	// rides alone instead of wedging the queue behind it.
+	// Never bound in _bind_methods(): the GDScript surface is unchanged.
+	static Array _debug_plan_gpu_chunk_slices_for_testing(const PackedInt32Array &p_item_requests,
+			const PackedInt64Array &p_item_bytes, int p_item_cap, int p_request_cap, int64_t p_byte_cap);
 #endif
 
 	friend struct PreloaderUnpackTest;

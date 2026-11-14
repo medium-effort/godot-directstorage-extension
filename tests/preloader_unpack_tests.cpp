@@ -1266,3 +1266,142 @@ GDEX_TEST_T(preloader_validation, corrupt_chunk_table_fails_closed, TAG_UNIT) {
 	GDEX_EXPECT_FALSE(godot::PreloaderUnpackTest::resolve(godot::String(kCorrupt), again));
 	GDEX_EXPECT_EQ((int64_t)again.mip_count, (int64_t)0);
 }
+
+GDEX_TEST_T(preloader, gpu_chunk_planner_enforces_caps_without_splitting_textures, TAG_UNIT) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// #0265: the per-callback GPU prewarm budget (item count, request count and
+	// 16 MiB of estimated payload) is decided by a pure planner, so the contract
+	// is assertable without a device, a queue or a fixture: whole textures are
+	// never split, a chunk closes before it would exceed a cap, and one oversized
+	// texture rides alone instead of wedging the queue behind it.
+	constexpr int64_t kMiB = 1024 * 1024;
+	constexpr int64_t kByteCap = 16 * kMiB;
+
+	struct PlannedChunk {
+		int64_t items = 0;
+		int64_t requests = 0;
+		int64_t bytes = 0;
+	};
+
+	auto ones = [](int p_count) {
+		godot::PackedInt32Array values;
+		for (int i = 0; i < p_count; i++) {
+			values.push_back(1);
+		}
+		return values;
+	};
+	auto plan = [](const godot::PackedInt32Array &p_requests, const godot::PackedInt64Array &p_bytes,
+					   int p_item_cap, int p_request_cap, int64_t p_byte_cap) {
+		std::vector<PlannedChunk> chunks;
+		const godot::Array planned = godot::DSPreloader::_debug_plan_gpu_chunk_slices_for_testing(
+				p_requests, p_bytes, p_item_cap, p_request_cap, p_byte_cap);
+		for (int i = 0; i < planned.size(); i++) {
+			const godot::Dictionary chunk = planned[i];
+			PlannedChunk entry;
+			entry.items = static_cast<int64_t>(chunk.get("items", 0));
+			entry.requests = static_cast<int64_t>(chunk.get("requests", 0));
+			entry.bytes = static_cast<int64_t>(chunk.get("bytes", 0));
+			chunks.push_back(entry);
+		}
+		return chunks;
+	};
+	auto bytes_of = [](std::initializer_list<int64_t> p_values) {
+		godot::PackedInt64Array values;
+		for (int64_t value : p_values) {
+			values.push_back(value);
+		}
+		return values;
+	};
+	// Every chunk must stay inside the budget unless it is a single oversized
+	// texture, and the plan must account for every input item exactly once.
+	// (Predicates return bool: GDEX macros need the test's ctx, so they cannot
+	// live inside a lambda.)
+	auto chunks_inside_budget = [](const std::vector<PlannedChunk> &p_chunks) {
+		for (const PlannedChunk &chunk : p_chunks) {
+			if (chunk.items <= 0) {
+				return false;
+			}
+			if (!(chunk.bytes <= kByteCap || chunk.items == 1)) {
+				return false;
+			}
+		}
+		return true;
+	};
+	auto planned_item_count = [](const std::vector<PlannedChunk> &p_chunks) {
+		int64_t seen = 0;
+		for (const PlannedChunk &chunk : p_chunks) {
+			seen += chunk.items;
+		}
+		return seen;
+	};
+
+	// Packing: five 4 MiB textures fill one 16 MiB chunk, the fifth starts the next.
+	{
+		const std::vector<PlannedChunk> chunks = plan(ones(5),
+				bytes_of({ 4 * kMiB, 4 * kMiB, 4 * kMiB, 4 * kMiB, 4 * kMiB }), 16, 64, kByteCap);
+		GDEX_ASSERT_EQ((int64_t)chunks.size(), (int64_t)2);
+		GDEX_EXPECT_EQ(chunks[0].items, (int64_t)4);
+		GDEX_EXPECT_EQ(chunks[0].requests, (int64_t)4);
+		GDEX_EXPECT_EQ(chunks[0].bytes, 16 * kMiB);
+		GDEX_EXPECT_EQ(chunks[1].items, (int64_t)1);
+		GDEX_EXPECT_EQ(chunks[1].bytes, 4 * kMiB);
+		GDEX_EXPECT_TRUE(chunks_inside_budget(chunks));
+		GDEX_EXPECT_EQ(planned_item_count(chunks), (int64_t)5);
+	}
+
+	// An oversized texture rides alone and does not swallow its neighbours: it
+	// gets its own chunk and the following item starts a fresh one.
+	{
+		const std::vector<PlannedChunk> chunks = plan(ones(3),
+				bytes_of({ 4 * kMiB, 24 * kMiB, 4 * kMiB }), 16, 64, kByteCap);
+		GDEX_ASSERT_EQ((int64_t)chunks.size(), (int64_t)3);
+		GDEX_EXPECT_EQ(chunks[1].items, (int64_t)1);
+		GDEX_EXPECT_EQ(chunks[1].bytes, 24 * kMiB);
+		GDEX_EXPECT_EQ(chunks[2].items, (int64_t)1);
+		GDEX_EXPECT_EQ(chunks[2].bytes, 4 * kMiB);
+		GDEX_EXPECT_TRUE(chunks_inside_budget(chunks));
+		GDEX_EXPECT_EQ(planned_item_count(chunks), (int64_t)3);
+	}
+
+	// The request cap splits independently of the byte cap: three chunked
+	// textures at 40 requests each cannot share a 64-request callback.
+	{
+		godot::PackedInt32Array requests;
+		requests.push_back(40);
+		requests.push_back(40);
+		requests.push_back(40);
+		const std::vector<PlannedChunk> chunks = plan(requests, bytes_of({ kMiB, kMiB, kMiB }), 16, 64, kByteCap);
+		GDEX_ASSERT_EQ((int64_t)chunks.size(), (int64_t)3);
+		GDEX_EXPECT_EQ(chunks[0].requests, (int64_t)40);
+		GDEX_EXPECT_TRUE(chunks_inside_budget(chunks));
+		GDEX_EXPECT_EQ(planned_item_count(chunks), (int64_t)3);
+	}
+
+	// The item cap still bounds a chunk built from tiny textures that fit on bytes.
+	{
+		const std::vector<PlannedChunk> chunks = plan(ones(5),
+				bytes_of({ kMiB, kMiB, kMiB, kMiB, kMiB }), 2, 64, kByteCap);
+		GDEX_ASSERT_EQ((int64_t)chunks.size(), (int64_t)3);
+		GDEX_EXPECT_EQ(chunks[0].items, (int64_t)2);
+		GDEX_EXPECT_EQ(chunks[1].items, (int64_t)2);
+		GDEX_EXPECT_EQ(chunks[2].items, (int64_t)1);
+		GDEX_EXPECT_TRUE(chunks_inside_budget(chunks));
+		GDEX_EXPECT_EQ(planned_item_count(chunks), (int64_t)5);
+	}
+
+	// Nothing to slice and nothing that fits into two chunks both stay sane.
+	GDEX_EXPECT_EQ((int64_t)plan(ones(0), bytes_of({}), 16, 64, kByteCap).size(), (int64_t)0);
+	{
+		const std::vector<PlannedChunk> chunks = plan(ones(3), bytes_of({ kMiB, kMiB, kMiB }), 16, 64, kByteCap);
+		GDEX_ASSERT_EQ((int64_t)chunks.size(), (int64_t)1);
+		GDEX_EXPECT_EQ(chunks[0].items, (int64_t)3);
+		GDEX_EXPECT_EQ(chunks[0].requests, (int64_t)3);
+		GDEX_EXPECT_EQ(chunks[0].bytes, 3 * kMiB);
+		GDEX_EXPECT_TRUE(chunks_inside_budget(chunks));
+		GDEX_EXPECT_EQ(planned_item_count(chunks), (int64_t)3);
+	}
+#else
+	(void)ctx;
+	GDEX_SKIP("The GPU chunk-planner seam is compiled out of release builds.");
+#endif
+}

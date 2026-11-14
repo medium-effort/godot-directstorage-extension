@@ -1809,7 +1809,21 @@ GDEX_TEST_T(gpu_prewarm, chunked_bcn_full_mip_chain_tail_mips_succeed, TAG_INTEG
 
     godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
     if (ps) {
+        // Record the prior value: this setting is process-wide and another suite may
+        // already have forced it, so a hard reset to false would silently change
+        // that suite's environment (gdextest ProjectSettings rule).
+        const bool had_force = ps->has_setting("dsgd_extension/force_archive_resolution");
+        const godot::Variant prev_force = had_force
+                ? ps->get_setting("dsgd_extension/force_archive_resolution")
+                : godot::Variant();
         ps->set_setting("dsgd_extension/force_archive_resolution", true);
+        ctx.add_teardown([ps, had_force, prev_force]() {
+            if (had_force) {
+                ps->set_setting("dsgd_extension/force_archive_resolution", prev_force);
+            } else {
+                ps->clear("dsgd_extension/force_archive_resolution");
+            }
+        });
     }
 
     const char *dstex_path = "user://gdextest_chunked_bc5_tail.dstex";
@@ -1817,9 +1831,6 @@ GDEX_TEST_T(gpu_prewarm, chunked_bcn_full_mip_chain_tail_mips_succeed, TAG_INTEG
     const char *virtual_path = "res://gdextest_chunked_bc5_tail.png";
 
     ctx.add_teardown([ps, ds, cache, dstex_path, dspkg_path]() {
-        if (ps) {
-            ps->set_setting("dsgd_extension/force_archive_resolution", false);
-        }
         cache->clear();
         memdelete(cache);
         godot::DSPreloader::shutdown();
@@ -1845,7 +1856,12 @@ GDEX_TEST_T(gpu_prewarm, chunked_bcn_full_mip_chain_tail_mips_succeed, TAG_INTEG
     raw.resize(total_raw_bytes);
     uint8_t *wptr = raw.ptrw();
     for (int64_t i = 0; i < total_raw_bytes; ++i) {
-        wptr[i] = static_cast<uint8_t>((i * 131 + 17) & 0xFF);
+        // 16-byte runs. Measured for this shape: 8540 compressed bytes against a
+        // 90368-byte footprint, so the container is unambiguously GDeflate. The
+        // pseudo-random bytes this used to write land at 89608, close enough to the
+        // NONE fallback threshold that a writer tweak could quietly turn the case
+        // into a raw-copy test (#0264).
+        wptr[i] = static_cast<uint8_t>(((i / 16) & 1) ? 0xFF : 0x00);
     }
 
     godot::Ref<godot::DSTex> dstex;
@@ -1860,6 +1876,13 @@ GDEX_TEST_T(gpu_prewarm, chunked_bcn_full_mip_chain_tail_mips_succeed, TAG_INTEG
 
     godot::Dictionary hdr = dstex->read_header(godot::String(dstex_path));
     GDEX_ASSERT_TRUE((bool)hdr.get("chunked", false));
+    // The container must really hold GDeflate: an incompressible fixture is stored
+    // verbatim as NONE, which exercises only the raw-copy branch of the routing
+    // this case exists to protect (#0264).
+    const int64_t container_codec = static_cast<int64_t>(static_cast<int>(hdr.get("compression_format", -1)));
+    GDEX_EXPECT_EQ(container_codec, static_cast<int64_t>(static_cast<int>(godot::DSCompressionFormat::GDEFLATE)));
+    GDEX_EXPECT_TRUE(static_cast<int64_t>(hdr.get("compressed_size", 0)) <
+            static_cast<int64_t>(hdr.get("original_size", 0)));
 
     godot::Ref<godot::DSPkg> builder;
     builder.instantiate();

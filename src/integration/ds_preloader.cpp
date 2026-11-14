@@ -159,6 +159,47 @@ static size_t count_gpu_requests_for_payload(const DSPreloader::Payload &p_meta)
 	return (shaped && total > 0) ? total : 1;
 }
 
+// One render-thread callback's worth of GPU prewarm items.
+struct GpuChunkSlice {
+	size_t first = 0;
+	size_t count = 0;
+};
+
+// THE definition of the per-callback split, shared by prewarm_gpu_async() and the
+// test seam so the budget cannot drift from what it asserts. Consecutive items
+// are packed while the chunk stays inside ALL THREE caps; a whole texture is
+// never split (an item that does not fit starts the next chunk), so a single
+// oversized texture rides alone rather than wedge the queue behind it.
+static std::vector<GpuChunkSlice> plan_gpu_chunk_slices(const std::vector<uint64_t> &p_requests_per_item,
+		const std::vector<uint64_t> &p_bytes_per_item, size_t p_item_cap, size_t p_request_cap, uint64_t p_byte_cap) {
+	std::vector<GpuChunkSlice> slices;
+	const size_t item_count = std::min(p_requests_per_item.size(), p_bytes_per_item.size());
+	size_t index = 0;
+	while (index < item_count) {
+		GpuChunkSlice slice;
+		slice.first = index;
+		uint64_t slice_requests = 0;
+		uint64_t slice_bytes = 0;
+		while (index < item_count) {
+			const uint64_t item_requests = p_requests_per_item[index];
+			const uint64_t item_bytes = p_bytes_per_item[index];
+			const bool overflows = slice.count > 0 &&
+					(slice.count >= p_item_cap ||
+							slice_requests + item_requests > p_request_cap ||
+							slice_bytes + item_bytes > p_byte_cap);
+			if (overflows) {
+				break;
+			}
+			slice_requests += item_requests;
+			slice_bytes += item_bytes;
+			++slice.count;
+			++index;
+		}
+		slices.push_back(slice);
+	}
+	return slices;
+}
+
 // Terminal accounting for GPU prewarm units the DSContext will never count
 // itself: an alloc that failed before enqueueing, or requests abandoned mid
 // fan-out. The tag total counts one unit per interned request (#0247), so a
@@ -1583,30 +1624,27 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 				kGpuPrewarmRequestsPerCallback,
 				static_cast<size_t>(std::max<uint32_t>(1, ctx->get_queue_capacity() / 2)));
 		{
-			GpuChunk part;
-			part.tag = tag;
-			size_t part_requests = 0;
-			uint64_t part_bytes = 0;
+			// Per-item budget inputs first, then the shared planner decides the
+			// boundaries (the same function the test seam asserts).
+			std::vector<uint64_t> item_requests;
+			std::vector<uint64_t> item_bytes;
+			item_requests.reserve(chunk.items.size());
+			item_bytes.reserve(chunk.items.size());
 			for (size_t i = 0; i < chunk.items.size(); ++i) {
-				const size_t item_requests = count_gpu_requests_for_payload(chunk.items[i].meta);
-				const uint64_t item_bytes = estimate_payload_bytes(chunk.items[i].meta);
-				const bool item_overflow = !part.items.empty() &&
-						(part.items.size() >= (size_t)chunk_size ||
-								part_requests + item_requests > callback_request_cap ||
-								part_bytes + item_bytes > kGpuPrewarmBytesPerCallback);
-				if (item_overflow) {
-					s.gpu_chunks.push_back(part);
-					part = GpuChunk();
-					part.tag = tag;
-					part_requests = 0;
-					part_bytes = 0;
-				}
-				part.items.push_back(chunk.items[i]);
-				part_requests += item_requests;
-				part_bytes += item_bytes;
+				item_requests.push_back(static_cast<uint64_t>(count_gpu_requests_for_payload(chunk.items[i].meta)));
+				item_bytes.push_back(estimate_payload_bytes(chunk.items[i].meta));
 			}
-			if (!part.items.empty()) {
-				s.gpu_chunks.push_back(part);
+			const std::vector<GpuChunkSlice> slices = plan_gpu_chunk_slices(item_requests, item_bytes,
+					static_cast<size_t>(std::max(1, chunk_size)), callback_request_cap, kGpuPrewarmBytesPerCallback);
+			for (size_t slice_index = 0; slice_index < slices.size(); ++slice_index) {
+				GpuChunk part;
+				part.tag = tag;
+				for (size_t i = slices[slice_index].first; i < slices[slice_index].first + slices[slice_index].count; ++i) {
+					part.items.push_back(chunk.items[i]);
+				}
+				if (!part.items.empty()) {
+					s.gpu_chunks.push_back(part);
+				}
 			}
 		}
 	}
@@ -2261,6 +2299,38 @@ Ref<DSRequest> DSPreloader::_get_gpu_prewarm_request_for_testing(uint64_t p_tag)
 
 int64_t DSPreloader::_count_gpu_requests_for_testing(const Payload &p_payload) {
 	return static_cast<int64_t>(count_gpu_requests_for_payload(p_payload));
+}
+
+Array DSPreloader::_debug_plan_gpu_chunk_slices_for_testing(const PackedInt32Array &p_item_requests,
+		const PackedInt64Array &p_item_bytes, int p_item_cap, int p_request_cap, int64_t p_byte_cap) {
+	std::vector<uint64_t> requests;
+	requests.reserve(static_cast<size_t>(p_item_requests.size()));
+	for (int i = 0; i < p_item_requests.size(); i++) {
+		requests.push_back(static_cast<uint64_t>(std::max<int64_t>(0, p_item_requests[i])));
+	}
+	std::vector<uint64_t> bytes;
+	bytes.reserve(static_cast<size_t>(p_item_bytes.size()));
+	for (int i = 0; i < p_item_bytes.size(); i++) {
+		bytes.push_back(static_cast<uint64_t>(std::max<int64_t>(0, p_item_bytes[i])));
+	}
+	const std::vector<GpuChunkSlice> slices = plan_gpu_chunk_slices(requests, bytes,
+			static_cast<size_t>(std::max(1, p_item_cap)), static_cast<size_t>(std::max(1, p_request_cap)),
+			static_cast<uint64_t>(std::max<int64_t>(0, p_byte_cap)));
+	Array result;
+	for (size_t s = 0; s < slices.size(); s++) {
+		uint64_t slice_requests = 0;
+		uint64_t slice_bytes = 0;
+		for (size_t i = slices[s].first; i < slices[s].first + slices[s].count; i++) {
+			slice_requests += requests[i];
+			slice_bytes += bytes[i];
+		}
+		Dictionary entry;
+		entry["items"] = static_cast<int64_t>(slices[s].count);
+		entry["requests"] = static_cast<int64_t>(slice_requests);
+		entry["bytes"] = static_cast<int64_t>(slice_bytes);
+		result.push_back(entry);
+	}
+	return result;
 }
 #endif
 
