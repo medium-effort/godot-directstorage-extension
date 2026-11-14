@@ -1784,4 +1784,117 @@ GDEX_TEST_T(gpu_prewarm, npot_loader_render_thread_reports_storage_dims, TAG_INT
     GDEX_EXPECT_EQ((int64_t)npot_tex->get_height(), (int64_t)52);
 }
 
+GDEX_TEST_T(gpu_prewarm, chunked_bcn_full_mip_chain_tail_mips_succeed, TAG_INTEGRATION | TAG_SLOW) {
+    if (!godot::ClassDB::class_exists("DSContext") || !godot::ClassDB::class_exists("DSTextureCache")) {
+        GDEX_SKIP("DSContext or DSTextureCache class unavailable");
+    }
+    if (godot::DSContext *pre = godot::DSContext::get_singleton()) {
+        pre->shutdown_ds();
+    }
+    godot::DSPreloader::shutdown();
+    godot::DSContext *ds = require_singleton_context(ctx);
+    if (!ds->initialize_ds() || !ds->is_initialized()) {
+        GDEX_SKIP("DSContext backend unavailable (initialize_ds failed)");
+    }
+    if (!ds->is_d3d12_backend() || !ds->is_gpu_decompression_enabled()) {
+        GDEX_SKIP("D3D12 GPU decompression unavailable (headless or non-D3D12 driver)");
+    }
+    if (!godot::DSPreloader::is_gpu_prewarm_available()) {
+        GDEX_SKIP("GPU prewarm unavailable (no live D3D12 RenderingDevice)");
+    }
+
+    godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+    GDEX_ASSERT_TRUE(cache != nullptr);
+    cache->set_enabled(true);
+
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps) {
+        ps->set_setting("dsgd_extension/force_archive_resolution", true);
+    }
+
+    const char *dstex_path = "user://gdextest_chunked_bc5_tail.dstex";
+    const char *dspkg_path = "user://gdextest_chunked_bc5_tail.dspkg";
+    const char *virtual_path = "res://gdextest_chunked_bc5_tail.png";
+
+    ctx.add_teardown([ps, ds, cache, dstex_path, dspkg_path]() {
+        if (ps) {
+            ps->set_setting("dsgd_extension/force_archive_resolution", false);
+        }
+        cache->clear();
+        memdelete(cache);
+        godot::DSPreloader::shutdown();
+        ds->shutdown_ds();
+        remove_abs(dstex_path);
+        remove_abs(dspkg_path);
+        remove_abs("res://textures.dspkg");
+    });
+
+    // 256x256 BC5 (FORMAT_RGTC_RG) with 9 mips down to 1x1 (mip 7 = 2x2, mip 8 = 1x1).
+    constexpr int kWidth = 256;
+    constexpr int kHeight = 256;
+    constexpr int kMips = 9;
+    godot::PackedByteArray raw;
+    int64_t total_raw_bytes = 0;
+    for (int m = 0; m < kMips; ++m) {
+        const int mw = std::max(1, kWidth >> m);
+        const int mh = std::max(1, kHeight >> m);
+        const int blocks_w = std::max(1, (mw + 3) / 4);
+        const int blocks_h = std::max(1, (mh + 3) / 4);
+        total_raw_bytes += static_cast<int64_t>(blocks_w) * blocks_h * 16;
+    }
+    raw.resize(total_raw_bytes);
+    uint8_t *wptr = raw.ptrw();
+    for (int64_t i = 0; i < total_raw_bytes; ++i) {
+        wptr[i] = static_cast<uint8_t>((i * 131 + 17) & 0xFF);
+    }
+
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    GDEX_ASSERT_TRUE(dstex.is_valid());
+    // chunk_size_kb = 16 splits mip 0 (65536 bytes) into multiple chunks while
+    // leaving tail mips (including 2x2 and 1x1) as single-chunk mips.
+    GDEX_ASSERT_EQ(static_cast<int64_t>(dstex->write_to_file(
+            godot::String(dstex_path), raw, kWidth, kHeight,
+            godot::Image::FORMAT_RGTC_RG, kMips, 1, false, false, 0, 0, 0, 16)),
+            static_cast<int64_t>(godot::OK));
+
+    godot::Dictionary hdr = dstex->read_header(godot::String(dstex_path));
+    GDEX_ASSERT_TRUE((bool)hdr.get("chunked", false));
+
+    godot::Ref<godot::DSPkg> builder;
+    builder.instantiate();
+    GDEX_ASSERT_TRUE(builder.is_valid());
+    GDEX_ASSERT_EQ(static_cast<int64_t>(builder->create(godot::String(dspkg_path))), static_cast<int64_t>(godot::OK));
+    GDEX_ASSERT_EQ(static_cast<int64_t>(builder->add_texture(godot::String(virtual_path), godot::String(dstex_path))), static_cast<int64_t>(godot::OK));
+    GDEX_ASSERT_EQ(static_cast<int64_t>(builder->finalize()), static_cast<int64_t>(godot::OK));
+
+    godot::DirAccess::remove_absolute(godot::String("res://textures.dspkg"));
+    GDEX_ASSERT_EQ(static_cast<int64_t>(godot::DirAccess::copy_absolute(
+            godot::String(dspkg_path), godot::String("res://textures.dspkg"))),
+            static_cast<int64_t>(godot::OK));
+
+    // 1) Exported archive prewarm path (DSPreloader::prewarm_gpu_async).
+    godot::PackedStringArray paths;
+    paths.push_back(godot::String(virtual_path));
+    const uint64_t tag = cache->prewarm_gpu_async(paths, 16, true);
+    GDEX_ASSERT_TRUE(tag != 0);
+
+    const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() + 20000;
+    GDEX_ASSERT_TRUE(drive_prewarm_to_settled(ds, cache, tag, deadline));
+
+    godot::Ref<godot::Texture2D> prewarm_tex = cache->get_cached(godot::String(virtual_path), godot::DSTextureCache::CACHE_MODE_REUSE);
+    GDEX_ASSERT_TRUE(prewarm_tex.is_valid());
+    godot::Ref<godot::Texture2DRD> prewarm_rd = prewarm_tex;
+    GDEX_EXPECT_TRUE(prewarm_rd.is_valid());
+    GDEX_EXPECT_EQ(static_cast<int64_t>(prewarm_tex->get_width()), static_cast<int64_t>(kWidth));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(prewarm_tex->get_height()), static_cast<int64_t>(kHeight));
+
+    // 2) Loose .dstex loader path (DSResourceFormatLoader::_load_texture_payload).
+    cache->clear();
+    godot::Ref<godot::Texture2D> loader_tex;
+    GDEX_ASSERT_TRUE(run_render_load(dstex_path, loader_tex, 10000));
+    godot::Ref<godot::Texture2DRD> loader_rd = loader_tex;
+    GDEX_EXPECT_TRUE(loader_rd.is_valid());
+}
+
 

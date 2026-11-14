@@ -326,7 +326,9 @@ private:
 	void update_profiler_queue_depth_locked();
 	// Container helpers own this instance's state only; they are members so one
 	// backend can never read or clear another's bookkeeping.
-	bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries, DSCompressionFormat *r_container_format = nullptr);
+	bool get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries, DSCompressionFormat *r_container_format = nullptr, int64_t p_single_mip_index = -1);
+	static void enrich_queue_error_from_slot(const BatchSlot &p_slot, QueueErrorInfo &r_error);
+	static void enrich_queue_error_from_queue_locked(const QueueState &p_queue, QueueErrorInfo &r_error);
 	void release_resource_guards(const Vector<Ref<DSRequest>> &p_requests);
 	void release_all_resource_guards();
 	bool validate_resource_guard(const Ref<DSRequest> &p_request, String &r_error, std::unordered_map<int64_t, ID3D12Resource *> *p_rid_cache = nullptr);

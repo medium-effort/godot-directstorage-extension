@@ -437,7 +437,7 @@ Dictionary Win32Backend::_debug_get_queue_admission_stats_for_testing() {
 }
 #endif
 
-bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries, DSCompressionFormat *r_container_format) {
+bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries, DSCompressionFormat *r_container_format, int64_t p_single_mip_index) {
 	r_entries.clear();
 	String resolved_path = p_path;
 	ProjectSettings *ps = ProjectSettings::get_singleton();
@@ -549,13 +549,19 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 		}
 
 		if (is_v3) {
-			for (uint32_t mip_index = 0; mip_index < header.mip_count; mip_index++) {
-				if (r_entries[mip_index].chunk_count > 1) {
-					// Chunk tables need chunk-destination requests; Step 3 has no
-					// path for them, so never hand them to the un-chunked GPU
-					// staging logic.
+			if (p_single_mip_index >= 0) {
+				if (static_cast<uint64_t>(p_single_mip_index) >= header.mip_count ||
+						r_entries[static_cast<int64_t>(p_single_mip_index)].chunk_count > 1) {
 					r_entries.clear();
 					return false;
+				}
+			} else {
+				for (uint32_t mip_index = 0; mip_index < header.mip_count; mip_index++) {
+					if (r_entries[mip_index].chunk_count > 1) {
+						// Multi-mip whole-texture requests cannot target chunked mips.
+						r_entries.clear();
+						return false;
+					}
 				}
 			}
 		}
@@ -719,20 +725,31 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 		// legacy entry without GPU mip metadata or an unknown offset — fall
 		// back to the safe error path in enqueue_request, no crash.
 		Vector<DSPkgMipEntry> package_entries;
-		if (!dspkg_cache.package->get_mip_entries_for_offset(p_offset, package_entries) || package_entries.is_empty()) {
-			return false;
-		}
 		uint8_t entry_format = 0;
 		uint8_t entry_gacl = 0;
 		bool entry_chunked = false;
-		if (!dspkg_cache.package->get_entry_features_for_offset(p_offset, entry_format, entry_gacl, entry_chunked) ||
-				(entry_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE) &&
-						entry_format != static_cast<uint8_t>(DSCompressionFormat::NONE)) ||
-				entry_gacl != static_cast<uint8_t>(DSGaclTransform::NONE) ||
-				entry_chunked) {
+		if (p_single_mip_index >= 0) {
+			if (!dspkg_cache.package->get_gpu_entry_for_mip_offset(p_offset, static_cast<uint32_t>(p_single_mip_index),
+						package_entries, entry_format, entry_gacl, entry_chunked) ||
+					package_entries.is_empty() ||
+					p_single_mip_index >= package_entries.size() ||
+					package_entries[p_single_mip_index].chunk_count > 1) {
+				return false;
+			}
+		} else {
+			if (!dspkg_cache.package->get_mip_entries_for_offset(p_offset, package_entries) || package_entries.is_empty()) {
+				return false;
+			}
+			if (!dspkg_cache.package->get_entry_features_for_offset(p_offset, entry_format, entry_gacl, entry_chunked) ||
+					entry_chunked) {
+				return false;
+			}
+		}
+		if ((entry_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE) &&
+					entry_format != static_cast<uint8_t>(DSCompressionFormat::NONE)) ||
+				entry_gacl != static_cast<uint8_t>(DSGaclTransform::NONE)) {
 			// The un-chunked GPU staging path can only submit one GDeflate stream
-			// or a raw NONE block per mip. Zstd/GACL/chunked entries fail closed
-			// until Step 4.
+			// or a raw NONE block per mip. Zstd/GACL entries fail closed.
 			return false;
 		}
 		r_entries.resize(package_entries.size());
@@ -816,6 +833,51 @@ Win32Backend::QueueErrorInfo Win32Backend::read_queue_error(IDStorageQueue *p_qu
 		info.fatal = false;
 	}
 	return info;
+}
+
+void Win32Backend::enrich_queue_error_from_slot(const BatchSlot &p_slot, QueueErrorInfo &r_error) {
+	if (!r_error.present || r_error.failed_request_name.is_empty()) {
+		return;
+	}
+	const CharString utf8_name = r_error.failed_request_name.utf8();
+	const auto it = p_slot.request_name_map.find(utf8_name.get_data());
+	if (it == p_slot.request_name_map.end() || it->second.is_null()) {
+		return;
+	}
+	const Ref<DSRequest> &req = it->second;
+	if (r_error.message.find("[File: , RequestName:") != -1 && !req->get_file_path().is_empty()) {
+		r_error.message = r_error.message.replace("[File: , RequestName:", "[File: " + req->get_file_path() + ", RequestName:");
+	}
+	String details = " (dest=" + String::num_int64(static_cast<int64_t>(req->get_destination_type())) +
+			", offset=" + String::num_uint64(req->get_offset()) +
+			", size=" + String::num_uint64(req->get_size()) +
+			", uncomp=" + String::num_uint64(req->get_uncompressed_size()) +
+			", mip=" + String::num_uint64(req->get_first_subresource()) +
+			", count=" + String::num_uint64(req->get_subresource_count());
+	if (req->has_texture_row_region()) {
+		details += ", region=[" + String::num_uint64(req->get_texture_region_top()) +
+				", " + String::num_uint64(req->get_texture_region_bottom()) + ")";
+	}
+	const String label = req->get_debug_label();
+	if (!label.is_empty()) {
+		details += ", asset=" + label;
+	}
+	details += ")";
+	r_error.message += details;
+}
+
+void Win32Backend::enrich_queue_error_from_queue_locked(const QueueState &p_queue, QueueErrorInfo &r_error) {
+	if (!r_error.present || r_error.failed_request_name.is_empty()) {
+		return;
+	}
+	for (int slot_index = 0; slot_index < p_queue.batch_slots.size(); slot_index++) {
+		const BatchSlot &slot = p_queue.batch_slots[slot_index];
+		const CharString utf8_name = r_error.failed_request_name.utf8();
+		if (slot.request_name_map.find(utf8_name.get_data()) != slot.request_name_map.end()) {
+			enrich_queue_error_from_slot(slot, r_error);
+			return;
+		}
+	}
 }
 
 void Win32Backend::report_queue_error(const QueueErrorInfo &p_error) {
@@ -1308,6 +1370,7 @@ void Win32Backend::handle_queue_error_event(int p_queue_index) {
 			if (!record.present) {
 				break;
 			}
+			enrich_queue_error_from_queue_locked(queue, record);
 			stash_queue_error_locked(queue, record, &immediate);
 			if (!queue.error_event) {
 				break;
@@ -1709,6 +1772,9 @@ bool Win32Backend::build_single_mip_child_request(Ref<DSRequest> p_parent, const
 	r_child->set_subresource_count(1);
 	r_child->set_texture_format(p_parent->get_texture_format());
 	r_child->set_texture_layout(p_parent->get_texture_layout());
+	if (!p_parent->get_debug_label().is_empty()) {
+		r_child->set_debug_label(p_parent->get_debug_label());
+	}
 	return true;
 #else
 	return false;
@@ -1821,6 +1887,7 @@ void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, int
 		}
 	}
 	if (queue_error.present) {
+		enrich_queue_error_from_slot(p_slot, queue_error);
 		r_report.error = queue_error;
 	}
 	if (queue_failed) {
@@ -4147,11 +4214,14 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	// whole-file staging/rewrite logic below must not run for it.
 	const bool is_row_region_request = gpu_texture_destination && has_row_region;
 	DSCompressionFormat container_format = DSCompressionFormat::GDEFLATE;
-	bool has_texture_mip_entries = gpu_texture_destination && !is_row_region_request &&
-			get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries, &container_format);
-	uint64_t texture_footprint = 0;
 	uint32_t texture_first_subresource = p_request->get_first_subresource();
 	uint32_t texture_subresource_count = p_request->get_subresource_count();
+	const int64_t single_mip_index = (texture_subresource_count == 1)
+			? static_cast<int64_t>(texture_first_subresource)
+			: -1;
+	bool has_texture_mip_entries = gpu_texture_destination && !is_row_region_request &&
+			get_texture_mip_entries(p_request->get_file_path(), p_request->get_offset(), texture_mip_entries, &container_format, single_mip_index);
+	uint64_t texture_footprint = 0;
 	if (has_texture_mip_entries) {
 		if (texture_first_subresource >= static_cast<uint32_t>(texture_mip_entries.size()) ||
 				texture_subresource_count == 0 ||
@@ -4485,10 +4555,16 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 							destination_error = "Win32Backend: texture row range is out of bounds (top=" +
 									String::num_uint64(region_top) + ", bottom=" + String::num_uint64(region_bottom) +
 									", height=" + String::num_uint64(mip_height) + ").";
-						} else if (dxgi_format_is_block_compressed(texture_desc.Format) &&
-								(region_top % 4 != 0 || (region_bottom % 4 != 0 && region_bottom != mip_height))) {
-							destination_error = "Win32Backend: block-compressed row range must start on a 4-row boundary and end on one unless it reaches the mip edge (top=" +
-									String::num_uint64(region_top) + ", bottom=" + String::num_uint64(region_bottom) + ").";
+						} else if (dxgi_format_is_block_compressed(texture_desc.Format)) {
+							const uint32_t mip_width = static_cast<uint32_t>(std::max<uint64_t>(1, texture_desc.Width >> mip_index));
+							if (mip_width < 4 || mip_height < 4) {
+								destination_error = "Win32Backend: block-compressed row-range upload cannot target a < 4x4 tail mip (" +
+										String::num_uint64(mip_width) + "x" + String::num_uint64(mip_height) +
+										"); use MULTIPLE_SUBRESOURCES_RANGE without a texture row region.";
+							} else if (region_top % 4 != 0 || (region_bottom % 4 != 0 && region_bottom != mip_height)) {
+								destination_error = "Win32Backend: block-compressed row range must start on a 4-row boundary and end on one unless it reaches the mip edge (top=" +
+										String::num_uint64(region_top) + ", bottom=" + String::num_uint64(region_bottom) + ").";
+							}
 						}
 						if (destination_error.is_empty()) {
 							// DirectStorage defines a texture destination's UncompressedSize

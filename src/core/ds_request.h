@@ -68,6 +68,8 @@ private:
 	std::atomic<uint64_t> cancel_timestamp_usec{ 0 };
 	mutable std::mutex error_mutex;
 	String error_message;
+	// Optional diagnostic label (e.g. engine resource path) for archive-backed errors.
+	String debug_label;
 	// Guards the payload fields against a submitter. A mutating setter holds it across
 	// (is_mutable(), assignment); the submitter holds it across (PENDING -> SUBMITTED).
 	mutable std::mutex payload_mutex;
@@ -137,6 +139,9 @@ public:
 
 	void set_texture_layout(uint32_t p_layout);
 	uint32_t get_texture_layout() const;
+
+	void set_debug_label(const String &p_label);
+	String get_debug_label() const;
 
 	void set_status(Status p_status);
 	Status get_status() const;

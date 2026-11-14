@@ -224,6 +224,19 @@ uint32_t DSRequest::get_texture_region_bottom() const {
 	return texture_region_bottom;
 }
 
+void DSRequest::set_debug_label(const String &p_label) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
+	if (!is_mutable()) {
+		return;
+	}
+	debug_label = p_label;
+}
+
+String DSRequest::get_debug_label() const {
+	std::lock_guard<std::mutex> lock(payload_mutex);
+	return debug_label;
+}
+
 void DSRequest::set_texture_format(uint32_t p_format) {
 	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {

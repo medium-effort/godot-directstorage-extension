@@ -639,6 +639,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					req->set_subresource_count(p_subresource_count);
 					req->set_texture_format(static_cast<uint32_t>(native_format));
 					req->set_compression_format(is_gdeflate ? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
+					req->set_debug_label(p_cache_key);
 					uploads.push_back(req);
 					return req;
 				};
@@ -652,16 +653,13 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 						const int32_t chunk_count = p_mip_chunk_counts.size() > static_cast<int64_t>(mip) ? p_mip_chunk_counts[mip] : 1;
 						const int32_t pitch = p_mip_row_pitches.size() > static_cast<int64_t>(mip) ? p_mip_row_pitches[mip] : 0;
 						if (chunk_count <= 1) {
-							Ref<DSRequest> req = make_upload(static_cast<uint64_t>(p_mip_offsets[mip]),
+							// A single-chunk mip has no chunk-table entry and targets
+							// ONE subresource: keep it on MULTIPLE_SUBRESOURCES_RANGE
+							// (no texture row region) so <4x4 BCn tail mips do not
+							// submit non-4-aligned D3D12_BOX extents.
+							make_upload(static_cast<uint64_t>(p_mip_offsets[mip]),
 									static_cast<uint32_t>(p_mip_sizes[mip]),
 									static_cast<uint32_t>(p_mip_uncompressed_sizes[mip]), mip, 1);
-							// A single-chunk mip has no chunk-table entry but still
-							// targets ONE subresource: give it the whole-mip row band so
-							// it keeps the row-range destination. A chunked container
-							// cannot use the whole-subresource destination at all - the
-							// backend rebuilds that request from a mip table it refuses
-							// for chunked files.
-							req->set_texture_region(0, std::max<uint32_t>(1u, p_height >> mip));
 							continue;
 						}
 						if (pitch <= 0) {

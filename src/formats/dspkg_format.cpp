@@ -2843,6 +2843,34 @@ bool DSPkg::get_entry_features_for_offset(uint64_t p_offset, uint8_t &r_compress
 	return true;
 }
 
+bool DSPkg::get_gpu_entry_for_mip_offset(uint64_t p_offset, uint32_t p_mip_index, Vector<DSPkgMipEntry> &r_entries,
+		uint8_t &r_compression_format, uint8_t &r_gacl_transform, bool &r_chunked) const {
+	r_entries.clear();
+	if (!is_opened) {
+		return false;
+	}
+	const DSPkgOffsetEntry *found = entries_by_offset.getptr(p_offset);
+	if (found == nullptr) {
+		// Single-chunk tail mips of a chunked entry are submitted with their own
+		// mip offset rather than the entry's base payload offset.
+		for (const KeyValue<uint64_t, DSPkgOffsetEntry> &kv : entries_by_offset) {
+			if (p_mip_index < static_cast<uint32_t>(kv.value.mips.size()) &&
+					kv.value.mips[p_mip_index].offset == p_offset) {
+				found = &kv.value;
+				break;
+			}
+		}
+	}
+	if (found == nullptr) {
+		return false;
+	}
+	r_entries = found->mips;
+	r_compression_format = found->compression_format;
+	r_gacl_transform = found->gacl_transform;
+	r_chunked = found->chunked;
+	return true;
+}
+
 Array DSPkg::get_mip_entries_for_offset(uint64_t p_offset) const {
 	Array result;
 	Vector<DSPkgMipEntry> entries;

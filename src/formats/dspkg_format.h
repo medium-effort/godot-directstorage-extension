@@ -308,6 +308,8 @@ public:
 	bool get_mip_entries_for_path(const String &p_path, Vector<DSPkgMipEntry> &r_entries) const;
 	bool get_mip_entries_for_offset(uint64_t p_offset, Vector<DSPkgMipEntry> &r_entries) const;
 	bool get_entry_features_for_offset(uint64_t p_offset, uint8_t &r_compression_format, uint8_t &r_gacl_transform, bool &r_chunked) const;
+	bool get_gpu_entry_for_mip_offset(uint64_t p_offset, uint32_t p_mip_index, Vector<DSPkgMipEntry> &r_entries,
+			uint8_t &r_compression_format, uint8_t &r_gacl_transform, bool &r_chunked) const;
 	Array get_mip_entries_for_offset(uint64_t p_offset) const;
 	int get_entry_count() const;
 	Array get_entries() const;
