@@ -47,6 +47,13 @@ static constexpr uint64_t MAX_PREWARM_REQUEST_BYTES = 512ULL * 1024ULL * 1024ULL
 // is additionally lowered to half the queue capacity by prewarm_gpu_async().
 static constexpr size_t kGpuPrewarmRequestsPerCallback = 64;
 
+// Per-callback VRAM byte cap: bound how much texture_create() + GPU GDeflate
+// decompression work a single render-thread callback stages. Whole textures
+// are never split: a single oversized texture rides alone in its own chunk.
+static constexpr uint64_t kGpuPrewarmBytesPerCallback = 16ULL * 1024ULL * 1024ULL;
+
+static uint64_t estimate_payload_bytes(const DSPreloader::Payload &p_meta);
+
 // Single walk over a chunked payload's chunk table, in mip order. This is the
 // ONE definition of the GPU upload shape: eligibility, request counting and
 // request construction all consume it, so they cannot drift apart.
@@ -1579,19 +1586,24 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 			GpuChunk part;
 			part.tag = tag;
 			size_t part_requests = 0;
+			uint64_t part_bytes = 0;
 			for (size_t i = 0; i < chunk.items.size(); ++i) {
 				const size_t item_requests = count_gpu_requests_for_payload(chunk.items[i].meta);
+				const uint64_t item_bytes = estimate_payload_bytes(chunk.items[i].meta);
 				const bool item_overflow = !part.items.empty() &&
 						(part.items.size() >= (size_t)chunk_size ||
-								part_requests + item_requests > callback_request_cap);
+								part_requests + item_requests > callback_request_cap ||
+								part_bytes + item_bytes > kGpuPrewarmBytesPerCallback);
 				if (item_overflow) {
 					s.gpu_chunks.push_back(part);
 					part = GpuChunk();
 					part.tag = tag;
 					part_requests = 0;
+					part_bytes = 0;
 				}
 				part.items.push_back(chunk.items[i]);
 				part_requests += item_requests;
+				part_bytes += item_bytes;
 			}
 			if (!part.items.empty()) {
 				s.gpu_chunks.push_back(part);

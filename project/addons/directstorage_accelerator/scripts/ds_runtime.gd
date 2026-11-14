@@ -117,6 +117,7 @@ var _mild_slices: int = 0
 var _heavy_slices: int = 0
 var _drain_reported: bool = true
 var _slice_debug: bool = false
+var _gpu_pump_cooldown: int = 0
 
 
 ## Starts tracking progress for a prewarm tag returned by `prewarm_async()`.
@@ -156,6 +157,7 @@ func reset_slice_stats() -> void:
 	_heavy_slices = 0
 	_drain_reported = true
 	_smooth_streak = 2
+	_gpu_pump_cooldown = 0
 
 
 ## Returns per-batch slice counts for the benchmark profiler.
@@ -469,17 +471,6 @@ func _process(delta: float) -> void:
 				_has_poll = cache.has_method("poll_completed")
 				_has_pump_gpu = cache.has_method("pump_gpu_prewarm")
 				_cache_caps_probed = true
-			# Phase-2 GPU prewarm: at most one render-thread chunk per
-			# frame; no-op while idle, in flight, or without D3D12.
-			# Compatible with older builds lacking the method.
-			if _has_pump_gpu:
-				cache.pump_gpu_prewarm()
-			# Main-thread texture drain: Texture2DRD wrappers must be
-			# instantiated on the main or render thread (GODOT_QUIRKS Sec02 & Sec25).
-			# Fast (<2us per texture): drain completed GPU textures within budget.
-			# Never gated on _poll_task_id so the main thread is never starved.
-			if _has_poll:
-				cache.poll_completed(0, 32, 2000)
 			# Adaptive backpressure: EMA over clamped delta + 2-frame streak
 			# gate (Rev1: immediate delta is noisy under the 120-148ms clamp).
 			var frame_ms: float = delta * 1000.0
@@ -533,6 +524,29 @@ func _process(delta: float) -> void:
 				if _slice_debug:
 					print("[DirectStorage] DSRuntime slice: %s -> %s (ema %.1f ms)" % [_slice_label, slice_label, _slice_ema_ms])
 				_slice_label = slice_label
+			# Phase-2 GPU prewarm: at most one render-thread chunk per
+			# frame; no-op while idle, in flight, or without D3D12.
+			# Paced by adaptive backpressure: skipped on "heavy" and
+			# spaced to every 2nd frame on "mild" so slow GPUs can drain
+			# back to baseline between chunks.
+			if _has_pump_gpu:
+				if slice_label == "heavy":
+					_gpu_pump_cooldown = 1
+				elif slice_label == "mild":
+					if _gpu_pump_cooldown > 0:
+						_gpu_pump_cooldown -= 1
+					else:
+						cache.pump_gpu_prewarm()
+						_gpu_pump_cooldown = 1
+				else:
+					_gpu_pump_cooldown = 0
+					cache.pump_gpu_prewarm()
+			# Main-thread texture drain: Texture2DRD wrappers must be
+			# instantiated on the main or render thread (GODOT_QUIRKS Sec02 & Sec25).
+			# Fast (<2us per texture): drain completed GPU textures within budget.
+			# Never gated on _poll_task_id so the main thread is never starved.
+			if _has_poll:
+				cache.poll_completed(0, 32, 2000)
 			if _poll_task_id != -1 and WorkerThreadPool.is_task_completed(_poll_task_id):
 				WorkerThreadPool.wait_for_task_completion(_poll_task_id)
 				_poll_task_id = -1
