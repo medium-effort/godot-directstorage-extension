@@ -362,6 +362,10 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 	var rel := dir_res.trim_prefix("res://").trim_prefix("/").trim_prefix("\\")
 	if rel != "" and _should_skip_dir(rel, excludes):
 		return
+	# Godot's EditorFileSystem ignores any directory containing .gdignore (and its subtree),
+	# so reimport_files() would silently skip assets inside it.
+	if FileAccess.file_exists(dir_res.path_join(".gdignore")):
+		return
 	var da := DirAccess.open(dir_res)
 	if da == null:
 		return
@@ -459,7 +463,7 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 				"mode": "upgrade",
 				"base_mode": "upgrade",
 				"eligible": true,
-				"reason": "importer_version %d < %d" % [iver, TARGET_VERSION],
+				"reason": "Upgrade importer v%d -> v%d" % [iver, TARGET_VERSION],
 				"importer": importer,
 				"importer_version": iver,
 				"uid": uid,

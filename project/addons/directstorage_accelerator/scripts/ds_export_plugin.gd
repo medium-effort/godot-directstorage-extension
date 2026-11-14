@@ -214,6 +214,8 @@ func _get_export_option_warning(_platform: EditorExportPlatform, option: String)
 			return "Merge has no effect unless both license files are included."
 	elif option == String(OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE):
 		if include_runtime and _resolve_directstorage_texts(false).is_empty():
+			if _has_runtime_dlls():
+				return "No DirectStorage runtime license texts were found, even though DirectStorage DLLs are present. Reinstall the runtime through Tools > DSGD Tools... > Manage DirectStorage Runtime."
 			return "No DirectStorage runtime license texts were found. Install a runtime through Tools > DSGD Tools... > Manage DirectStorage Runtime."
 	return ""
 
@@ -663,12 +665,15 @@ func _export_end() -> void:
 		return
 
 
-## The runtime is redistributed under Microsoft's license. Print a notice rather
-## than a warning: this is an informational obligation on the game developer,
-## not a defect in the export. Microsoft's own NuGet targets copy only the DLLs;
-## the exporter can deploy the texts when the option is enabled.
+func _has_runtime_dlls() -> bool:
+	return FileAccess.file_exists(ADDON_RUNTIME_BIN.path_join("dstorage.dll"))
+
+
+## The runtime is redistributed under Microsoft's license. When the DirectStorage
+## license file option is disabled, print a reminder rather than a warning: this
+## is an informational obligation on the game developer, not a defect in the export.
 func _notice_runtime_license() -> void:
-	if not FileAccess.file_exists(ADDON_RUNTIME_BIN.path_join("dstorage.dll")):
+	if _include_directstorage_license_file or not _has_runtime_dlls():
 		return
 	print("[DirectStorage Exporter] NOTICE: dstorage.dll and dstoragecore.dll are Microsoft DirectStorage redistributables governed by Microsoft's license. Microsoft's own NuGet build targets copy only the DLLs; the license texts travel in the runtime package. You remain responsible for your distribution terms.")
 
@@ -711,7 +716,8 @@ func _sync_notice_files() -> void:
 
 	if _include_directstorage_license_file and not merged_runtime:
 		if runtime_texts.is_empty():
-			push_warning("[DirectStorage Exporter] The DirectStorage license file is enabled but the runtime texts could not be resolved. Install a runtime through Tools > DSGD Tools... > Manage DirectStorage Runtime, or disable dsgd_extension/include_directstorage_license_file.")
+			var action := "Reinstall the runtime" if _has_runtime_dlls() else "Install a runtime"
+			push_warning("[DirectStorage Exporter] The DirectStorage license file is enabled but the runtime texts could not be resolved. " + action + " through Tools > DSGD Tools... > Manage DirectStorage Runtime, or disable dsgd_extension/include_directstorage_license_file.")
 		else:
 			var runtime_sections := _collect_directstorage_sections(runtime_texts)
 			var header := _notice_header("DirectStorage - license and notices", runtime_sections)

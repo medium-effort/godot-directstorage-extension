@@ -790,6 +790,10 @@ func _update_summary_and_actions() -> void:
 func _log(msg: String) -> void:
 	_log_label.visible = true
 	_log_label.append_text(msg + "\n")
+	if msg.begins_with("[ERROR]"):
+		push_error("[DirectStorage Migration] " + msg)
+	elif msg.begins_with("[WARN]"):
+		push_warning("[DirectStorage Migration] " + msg)
 
 
 func _set_busy(busy: bool) -> void:
@@ -891,8 +895,14 @@ func _on_migrate_pressed() -> void:
 			total_deleted += d.get("deleted", []).size()
 		_log("Cleaned up %d obsolete .ctex cache files." % total_deleted)
 
+	var failed_count := selected.size() - verified_entries.size()
 	_progress_bar.value = 100.0
-	_log("--- Migration Completed Successfully! ---")
+	if failed_count == 0:
+		_log("--- Migration Completed Successfully! ---")
+	else:
+		_log("[WARN] Migration finished with %d verification failure(s) (%d/%d verified)." % [
+			failed_count, verified_entries.size(), selected.size()
+		])
 	_set_busy(false)
 
 	# Rescan to reflect updated state in the tree
