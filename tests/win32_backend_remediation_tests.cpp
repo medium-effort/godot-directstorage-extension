@@ -4176,3 +4176,111 @@ GDEX_TEST_T(win32_remediation, large_dispatch_mismatched_codec_16mib, TAG_INTEGR
 #endif
 }
 
+// R1 / issue #0266: the GPU destination-resolution handoff used to be a single
+// slot. Two threads that resolved different destination RIDs before the render
+// thread ran overwrote each other; the callback serviced only the newer context,
+// the older caller burned its full 250 ms wait, and its perfectly valid request
+// was rejected as "GPU texture RID could not be mapped to an ID3D12Resource".
+//
+// Async body on purpose: a parked context is only serviced while the engine
+// renders, and a blocking test body would starve the very pump the callers wait
+// on. The workers are released behind a barrier so both park before the first
+// frame, then the body yields frames until both callers return.
+//
+// Discriminator honesty: whether the loser is actually hit depends on the render
+// thread not running between the two enqueues, so this case is the end-to-end
+// guard, not the deterministic falsifier. render_handoff_queue.* pins the
+// container contract (N pushes serviced by N pops, prune leaves no ghost) on
+// every platform and fails 100% when the queue regresses to a single slot.
+GDEX_TEST_ASYNC_T(win32_remediation, concurrent_gpu_destination_enqueues_all_accepted,
+        TAG_ASYNC | TAG_INTEGRATION | TAG_SLOW) {
+#if !defined(_WIN32)
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#else
+    godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+    godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
+    if (rd == nullptr) {
+        GDEX_SKIP("RenderingDevice unavailable (run windowed with --rendering-driver d3d12)");
+    }
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() {
+        memdelete(backend); // shutdown() drains anything still in flight
+        remove_temp_file("user://r1_concurrent_dest_enqueue.dstex");
+    });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    const godot::String fixture("user://r1_concurrent_dest_enqueue.dstex");
+    remove_temp_file("user://r1_concurrent_dest_enqueue.dstex");
+    GDEX_ASSERT_TRUE(write_gpu_texture_fixture(fixture));
+
+    godot::Ref<godot::DSRequest> requests[2];
+    godot::RID rids[2];
+    for (int i = 0; i < 2; ++i) {
+        GDEX_ASSERT_TRUE(build_gpu_texture_request(fixture, static_cast<uint64_t>(5401 + i), requests[i]));
+        rids[i] = create_destination_texture(rd, static_cast<int>(requests[i]->get_subresource_count()));
+        GDEX_ASSERT_TRUE(rids[i].is_valid());
+        requests[i]->set_destination_resource(rids[i]);
+    }
+
+    std::atomic<int> ready{ 0 };
+    std::atomic<bool> go{ false };
+    std::atomic<int> finished{ 0 };
+    std::atomic<bool> accepted[2];
+    accepted[0].store(false);
+    accepted[1].store(false);
+
+    std::thread workers[2];
+    for (int i = 0; i < 2; ++i) {
+        workers[i] = std::thread([&backend, &requests, &ready, &go, &finished, &accepted, i]() {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            accepted[i].store(backend->enqueue_request(requests[i]), std::memory_order_release);
+            finished.fetch_add(1, std::memory_order_release);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < 2) {
+        std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);
+
+    for (int frame = 0; frame < 120 && finished.load(std::memory_order_acquire) < 2; ++frame) {
+        co_await ctx.await_frames(1);
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (workers[i].joinable()) {
+            // Bounded: a caller that never got serviced returns after its 250 ms wait.
+            workers[i].join();
+        }
+    }
+
+    GDEX_EXPECT_EQ(finished.load(std::memory_order_acquire), 2);
+    GDEX_EXPECT_TRUE(accepted[0].load());
+    GDEX_EXPECT_TRUE(accepted[1].load());
+
+    backend->submit_async();
+    const uint64_t fence = backend->get_completion_fence();
+    GDEX_EXPECT_TRUE(backend->wait_for_completion(fence, 5000));
+    // The fence retiring is the hardware side. The batch is retired - and the
+    // request statuses finalized - only by poll_batch_status(), which the
+    // completion thread drives; poll explicitly before reading the status, or a
+    // completed request still reads as SUBMITTED.
+    for (int i = 0; i < 2; ++i) {
+        GDEX_EXPECT_TRUE(wait_until_released(backend, rids[i]));
+    }
+    for (int i = 0; i < 2; ++i) {
+        GDEX_EXPECT_EQ(requests[i]->get_status(), godot::DSRequest::STATUS_COMPLETED);
+        if (rids[i].is_valid() && rd->texture_is_valid(rids[i])) {
+            rd->free_rid(rids[i]);
+        }
+    }
+#endif
+}
+

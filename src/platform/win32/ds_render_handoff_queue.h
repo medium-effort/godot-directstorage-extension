@@ -2,9 +2,9 @@
 #define DS_RENDER_HANDOFF_QUEUE_H
 
 #include <cstddef>
+#include <deque>
 #include <memory>
 #include <mutex>
-#include <vector>
 
 namespace godot {
 
@@ -43,7 +43,7 @@ public:
 			return std::shared_ptr<T>();
 		}
 		std::shared_ptr<T> ctx = contexts.front();
-		contexts.erase(contexts.begin());
+		contexts.pop_front();
 		return ctx;
 	}
 
@@ -77,7 +77,10 @@ public:
 
 private:
 	mutable std::mutex mutex;
-	std::vector<std::shared_ptr<T>> contexts;
+	// std::deque, not std::vector: the render thread pops from the front on every
+	// handoff, and erase(begin()) would shift the whole queue each time. prune()
+	// stays a linear scan, which is what identity matching needs anyway.
+	std::deque<std::shared_ptr<T>> contexts;
 };
 
 } // namespace godot
