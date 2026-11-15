@@ -278,16 +278,19 @@ GDEX_TEST_T(loader, handles_type_accepts_2d_family_rejects_layered, TAG_INTEGRAT
 	const godot::StringName resource(godot::String("Resource"));
 	const godot::StringName texture(godot::String("Texture"));
 	const godot::StringName texture3d(godot::String("Texture3D"));
+	const godot::StringName texture2d_array(godot::String("Texture2DArray"));
+	const godot::StringName cubemap(godot::String("Cubemap"));
 
 	GDEX_EXPECT_TRUE(loader->_handles_type(empty_type));
 	GDEX_EXPECT_TRUE(loader->_handles_type(tex2d));
 	GDEX_EXPECT_TRUE(loader->_handles_type(compressed));
 	GDEX_EXPECT_TRUE(loader->_handles_type(resource));
 	GDEX_EXPECT_TRUE(loader->_handles_type(texture));
-	// NOTE: the rejection path pushes one engine error line by design
-	// (unsupported non-2D texture type); the log entry is expected, not a
-	// test failure.
+	// Rejection is silent by contract: this is a query predicate the engine
+	// calls for every registered loader, so no engine error may be logged here.
 	GDEX_EXPECT_FALSE(loader->_handles_type(texture3d));
+	GDEX_EXPECT_FALSE(loader->_handles_type(texture2d_array));
+	GDEX_EXPECT_FALSE(loader->_handles_type(cubemap));
 }
 
 // --- Interception: .dstex paths, claim-vs-existence split ---------------------

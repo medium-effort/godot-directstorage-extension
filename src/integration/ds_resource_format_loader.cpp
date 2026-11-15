@@ -131,12 +131,16 @@ bool DSResourceFormatLoader::_recognize_path(const String &p_path, const StringN
 	return !FileAccess::file_exists(p_path) && _exists(p_path);
 }
 
+// Pure query predicate. Godot calls this while scanning every registered loader
+// for type compatibility, and _recognize_path() above calls it too, so an
+// unsupported type is a normal "false" and must stay silent: logging here means
+// one red engine error per probe, including probes the user never initiated.
+// Types outside the set below (Texture3D, Texture2DArray, TextureLayered,
+// Cubemap, TextureCube) fall through to the silent rejection; there is no
+// _load() diagnostic to keep in their place because _load() receives no type
+// hint and is never dispatched for a type this predicate rejected.
 bool DSResourceFormatLoader::_handles_type(const StringName &p_type) const {
-	String type_str = p_type;
-	if (type_str == "Texture3D" || type_str == "Texture2DArray" || type_str == "TextureLayered" || type_str == "Cubemap" || type_str == "TextureCube") {
-		UtilityFunctions::push_error("DSResourceFormatLoader: Unsupported non-2D texture type '" + type_str + "'; only Texture2D resources are supported.");
-		return false;
-	}
+	const String type_str = p_type;
 	if (type_str.is_empty() || type_str == "Texture2D" || type_str == "CompressedTexture2D" || type_str == "Resource" || type_str == "Texture" || type_str == "RefCounted" || type_str == "Object") {
 		return true;
 	}
