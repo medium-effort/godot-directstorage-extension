@@ -12,6 +12,7 @@
 #include <godot_cpp/classes/rd_texture_view.hpp>
 #include <cstdint>
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <functional>
 #include <list>
@@ -38,6 +39,27 @@ public:
 		INIT_STATUS_FAILED = 3,
 	};
 
+	// Reasons DSResourceFormatLoader::_load_texture_payload() takes the CPU path
+	// instead of DirectStorage GPU decompression (review item R3). Declared here,
+	// before the counters that index by it, because a data member's array bound is
+	// parsed in declaration order.
+	enum LoaderFallback {
+		LOADER_FALLBACK_IMAGE_TEXTURE_OPT_IN,
+		LOADER_FALLBACK_EMBEDDED_IN_PCK,
+		LOADER_FALLBACK_GPU_DISABLED,
+		LOADER_FALLBACK_LEGACY_V1,
+		LOADER_FALLBACK_SUB_THREADS,
+		LOADER_FALLBACK_WORKER_THREAD,
+		LOADER_FALLBACK_SEPARATE_THREAD,
+		LOADER_FALLBACK_NO_D3D12,
+		LOADER_FALLBACK_NO_RENDERING_DEVICE,
+		LOADER_FALLBACK_NO_MIPS,
+		LOADER_FALLBACK_CHUNK_LAYOUT,
+		LOADER_FALLBACK_QUEUE_BUDGET,
+		LOADER_FALLBACK_GPU_FAILED,
+		LOADER_FALLBACK_COUNT
+	};
+
 private:
 	static DSContext *singleton;
 	static std::once_flag support_probe_once;
@@ -49,6 +71,13 @@ private:
 	// active, so teardown must not free device resources. Atomic like its
 	// neighbours: the teardown getter takes no lock.
 	std::atomic<bool> last_shutdown_clean{ true };
+
+	// Load-outcome counters, written by DSResourceFormatLoader::_load_texture_payload
+	// on whichever thread performs the load (main, worker, render).
+	std::atomic<uint64_t> loader_gpu_loads{ 0 };
+	std::atomic<uint64_t> loader_cache_hits{ 0 };
+	std::array<std::atomic<uint64_t>, LOADER_FALLBACK_COUNT> loader_fallbacks{};
+	std::atomic<bool> loader_thread_fallback_warned{ false };
 
 	// Atomic: initialize_ds_locked() runs on whichever thread first needs the
 	// context (main, resource-loader worker, or the enqueue path), while the
@@ -247,6 +276,22 @@ public:
 	// reports UMA == TRUE (shared system memory architecture).
 	bool is_uma() const;
 	Dictionary get_capability_report() const;
+	// Resource-loader load-outcome counters (review item R3). The loader records
+	// every texture load so the capability report can distinguish "the GPU path is
+	// configured" from "the GPU path is configured but this load took the CPU
+	// fallback". Process-lifetime atomics with no reset API: read deltas around a
+	// scene load rather than absolute values, since other loads move them too.
+	void note_loader_gpu_load();
+	void note_loader_cache_hit();
+	// One `push_warning` per process when the reason is a thread-affinity fallback
+	// (worker thread or Separate render thread): that is the only fallback a user
+	// can act on, and every other reason stays at print_verbose.
+	void note_loader_cpu_fallback(LoaderFallback p_reason);
+	// Snapshot of the same counters without the GPU/adapter queries
+	// get_capability_report() performs. Keys: loader_gpu_loads, loader_cache_hits,
+	// loader_cpu_fallbacks (reason -> count). Not bound to script: the capability
+	// report carries the same values for GDScript consumers.
+	Dictionary get_loader_stats() const;
 	// Installed-runtime identity and feature probes without the GPU queries in
 	// get_capability_report(). Returns {} off Windows.
 	Dictionary get_runtime_info() const;

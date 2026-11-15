@@ -75,6 +75,9 @@ DSContext::DSContext() {
 	if (singleton == nullptr) {
 		singleton = this;
 	}
+	for (std::atomic<uint64_t> &slot : loader_fallbacks) {
+		slot.store(0, std::memory_order_relaxed);
+	}
 }
 
 DSContext::~DSContext() {
@@ -568,6 +571,79 @@ bool DSContext::is_uma() const {
 #endif
 }
 
+// Stable keys for get_capability_report()["loader_cpu_fallbacks"]. Keep in the
+// same order as DSContext::LoaderFallback; a reason added to the enum without a
+// name here reports as "unknown".
+static const char *ds_loader_fallback_name(int p_reason) {
+	static const char *const names[] = {
+		"image_texture_opt_in",
+		"embedded_in_pck",
+		"gpu_disabled",
+		"legacy_v1",
+		"sub_threads",
+		"worker_thread",
+		"separate_thread",
+		"no_d3d12",
+		"no_rendering_device",
+		"no_mips",
+		"chunk_layout",
+		"queue_budget",
+		"gpu_failed",
+	};
+	static_assert(sizeof(names) / sizeof(names[0]) == DSContext::LOADER_FALLBACK_COUNT, "loader fallback name table must cover every reason");
+	if (p_reason < 0 || p_reason >= DSContext::LOADER_FALLBACK_COUNT) {
+		return "unknown";
+	}
+	return names[p_reason];
+}
+
+void DSContext::note_loader_gpu_load() {
+	loader_gpu_loads.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DSContext::note_loader_cache_hit() {
+	loader_cache_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DSContext::note_loader_cpu_fallback(LoaderFallback p_reason) {
+	if (p_reason < 0 || p_reason >= LOADER_FALLBACK_COUNT) {
+		return;
+	}
+	loader_fallbacks[p_reason].fetch_add(1, std::memory_order_relaxed);
+	// Thread affinity is the only fallback the user can act on, and the per-load
+	// detail stays on print_verbose. Say it once per process: a background scene
+	// load would otherwise print one line per texture.
+	if (p_reason != LOADER_FALLBACK_WORKER_THREAD && p_reason != LOADER_FALLBACK_SEPARATE_THREAD) {
+		return;
+	}
+	if (loader_thread_fallback_warned.exchange(true, std::memory_order_relaxed)) {
+		return;
+	}
+	const char *reason = p_reason == LOADER_FALLBACK_WORKER_THREAD
+			? "this load ran on a worker thread (background/threaded loading)"
+			: "the rendering thread is separate from the main thread (rendering/driver/threads/thread_model = Separate)";
+	UtilityFunctions::push_warning(
+			"DirectStorage: GPU decompression is inactive for this texture load because ",
+			reason, ". Threaded texture loads decompress on the CPU; load on the main thread "
+			"under the default thread model, or prewarm with DSPreloader.prewarm_gpu_async(), "
+			"to reach the GPU path. Counted in get_capability_report()[\"loader_cpu_fallbacks\"].");
+}
+
+Dictionary DSContext::get_loader_stats() const {
+	Dictionary stats;
+	Dictionary fallback_counts;
+	for (int i = 0; i < LOADER_FALLBACK_COUNT; i++) {
+		const uint64_t count = loader_fallbacks[i].load(std::memory_order_relaxed);
+		if (count > 0) {
+			fallback_counts[ds_loader_fallback_name(i)] = static_cast<int64_t>(count);
+		}
+	}
+	stats["loader_gpu_loads"] = static_cast<int64_t>(loader_gpu_loads.load(std::memory_order_relaxed));
+	stats["loader_cache_hits"] = static_cast<int64_t>(loader_cache_hits.load(std::memory_order_relaxed));
+	stats["loader_cpu_fallbacks"] = fallback_counts;
+	return stats;
+}
+
 Dictionary DSContext::get_capability_report() const {
 	Dictionary report;
 	int gpu_tier = get_gpu_decompression_support_tier();
@@ -625,6 +701,12 @@ Dictionary DSContext::get_capability_report() const {
 	report["integrated_gpu_guess"] = adapter.get("integrated_gpu_guess", false);
 	report["active_backend"] = get_active_backend_name();
 	report["supported_destination_types"] = supported_destinations;
+	// R3: "gpu_decompression_enabled" says the GPU path is available, not that any
+	// load used it. These counters answer the second question.
+	Dictionary loader_stats = get_loader_stats();
+	report["loader_gpu_loads"] = loader_stats["loader_gpu_loads"];
+	report["loader_cache_hits"] = loader_stats["loader_cache_hits"];
+	report["loader_cpu_fallbacks"] = loader_stats["loader_cpu_fallbacks"];
 	return report;
 }
 

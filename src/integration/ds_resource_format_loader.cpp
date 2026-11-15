@@ -579,23 +579,43 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	// set_enabled(false).
 
 	bool can_attempt_gpu = false;
+	// Every outcome is recorded (review item R3). The availability flags in
+	// get_capability_report() cannot tell "GPU path configured" from "GPU path
+	// taken", and a threaded load falls back with print_verbose only.
+	auto note_fallback = [ds_ctx](DSContext::LoaderFallback p_reason) {
+		if (ds_ctx != nullptr) {
+			ds_ctx->note_loader_cpu_fallback(p_reason);
+		}
+	};
 	if (p_as_image_texture) {
 		UtilityFunctions::print_verbose("DSResourceFormatLoader: Texture requested as ImageTexture for '" + p_cache_key + "'; bypassing GPU direct upload.");
+		note_fallback(DSContext::LOADER_FALLBACK_IMAGE_TEXTURE_OPT_IN);
 	} else if (!is_physical_source) {
 		UtilityFunctions::print_verbose("DSResourceFormatLoader: Source file is embedded in PCK archive for '" + p_cache_key + "'; bypassing DirectStorage GPU upload.");
-	} else if (gpu_active && p_is_v2 && !p_use_sub_threads) {
-		if (!rs || !rs->is_on_render_thread()) {
-			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression unavailable off render thread for '" + p_cache_key + "' (thread affinity fallback); using CPU memory decompression.");
-		} else if (rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
-			String driver_name = rs->get_current_rendering_driver_name();
-			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression requires D3D12 driver for '" + p_cache_key + "' (current: '" + driver_name + "'); using CPU memory decompression.");
-		} else if (!rd) {
-			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression unavailable (no RenderingDevice) for '" + p_cache_key + "'; using CPU memory decompression.");
-		} else if (p_mip_count == 0) {
-			UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression requires at least one mip for '" + p_cache_key + "'; using CPU memory decompression.");
-		} else {
-			can_attempt_gpu = true;
-		}
+		note_fallback(DSContext::LOADER_FALLBACK_EMBEDDED_IN_PCK);
+	} else if (!gpu_active) {
+		note_fallback(DSContext::LOADER_FALLBACK_GPU_DISABLED);
+	} else if (!p_is_v2) {
+		note_fallback(DSContext::LOADER_FALLBACK_LEGACY_V1);
+	} else if (p_use_sub_threads) {
+		note_fallback(DSContext::LOADER_FALLBACK_SUB_THREADS);
+	} else if (!rs || !rs->is_on_render_thread()) {
+		UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression unavailable off render thread for '" + p_cache_key + "' (thread affinity fallback); using CPU memory decompression.");
+		// With the default thread model the main thread *is* the render thread, so
+		// an off-render call from the main thread means the Separate model.
+		note_fallback(Thread::is_main_thread() ? DSContext::LOADER_FALLBACK_SEPARATE_THREAD : DSContext::LOADER_FALLBACK_WORKER_THREAD);
+	} else if (rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+		String driver_name = rs->get_current_rendering_driver_name();
+		UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression requires D3D12 driver for '" + p_cache_key + "' (current: '" + driver_name + "'); using CPU memory decompression.");
+		note_fallback(DSContext::LOADER_FALLBACK_NO_D3D12);
+	} else if (!rd) {
+		UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression unavailable (no RenderingDevice) for '" + p_cache_key + "'; using CPU memory decompression.");
+		note_fallback(DSContext::LOADER_FALLBACK_NO_RENDERING_DEVICE);
+	} else if (p_mip_count == 0) {
+		UtilityFunctions::print_verbose("DSResourceFormatLoader: GPU decompression requires at least one mip for '" + p_cache_key + "'; using CPU memory decompression.");
+		note_fallback(DSContext::LOADER_FALLBACK_NO_MIPS);
+	} else {
+		can_attempt_gpu = true;
 	}
 
 	if (can_attempt_gpu) {
@@ -720,9 +740,11 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				const uint32_t queue_capacity = ds_ctx->get_queue_capacity();
 				if (!chunk_layout_ok) {
 					UtilityFunctions::push_warning("DSResourceFormatLoader: chunk table does not describe a contiguous mip for ", p_cache_key, "; using CPU decompression.");
+					note_fallback(DSContext::LOADER_FALLBACK_CHUNK_LAYOUT);
 					uploads.clear();
 				} else if (uploads.size() > static_cast<int>(queue_capacity > 2 ? queue_capacity - 2 : 1)) {
 					UtilityFunctions::push_warning("DSResourceFormatLoader: ", uploads.size(), " requests exceed the queue budget (", queue_capacity, " operations, at most ", (queue_capacity > 2 ? queue_capacity - 2 : 1), " requests) for ", p_cache_key, "; using CPU decompression (raise chunk_size_kb or queue_capacity).");
+					note_fallback(DSContext::LOADER_FALLBACK_QUEUE_BUDGET);
 					uploads.clear();
 				}
 
@@ -783,6 +805,9 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					}
 					result_texture = tex_rd;
 					ownership_transferred = true;
+					if (ds_ctx != nullptr) {
+						ds_ctx->note_loader_gpu_load();
+					}
 				} else {
 					String failure_reason = uploads.size() == 0 ? String("no request was staged") : String();
 					for (int i = 0; i < uploads.size() && failure_reason.is_empty(); ++i) {
@@ -801,9 +826,11 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					}
 					UtilityFunctions::push_warning("DSResourceFormatLoader: GPU texture load failed for ", p_cache_key,
 							" (", failure_reason, "); falling back to CPU decompression.");
+					note_fallback(DSContext::LOADER_FALLBACK_GPU_FAILED);
 				}
 			} else {
 				UtilityFunctions::push_warning("DSResourceFormatLoader: Could not retrieve the native texture format for ", p_cache_key, "; falling back to CPU decompression.");
+				note_fallback(DSContext::LOADER_FALLBACK_GPU_FAILED);
 			}
 
 			if (result_texture.is_null()) {
@@ -1155,15 +1182,24 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_original_path, bool p_use_sub_threads, int32_t p_cache_mode) const {
 	if (p_cache_mode == ResourceFormatLoader::CACHE_MODE_REUSE) {
 		DSTextureCache *cache = DSTextureCache::get_singleton();
+		// A REUSE hit skips decompression entirely, so it is neither a GPU load nor
+		// a CPU fallback; count it separately.
+		auto cache_hit = [](const Ref<Texture2D> &p_texture) {
+			DSContext *ctx = DSContext::get_singleton();
+			if (ctx != nullptr) {
+				ctx->note_loader_cache_hit();
+			}
+			return p_texture;
+		};
 		if (cache) {
 			Ref<Texture2D> cached = cache->get_cached(p_path, p_cache_mode);
 			if (cached.is_valid()) {
-				return cached;
+				return cache_hit(cached);
 			}
 			if (!p_original_path.is_empty() && p_original_path != p_path) {
 				cached = cache->get_cached(p_original_path, p_cache_mode);
 				if (cached.is_valid()) {
-					return cached;
+					return cache_hit(cached);
 				}
 			}
 
@@ -1182,13 +1218,13 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 				if (on_render) {
 					cached = DSPreloader::await_pending_texture(wait_path, 0);
 					if (cached.is_valid()) {
-						return cached;
+						return cache_hit(cached);
 					}
 				}
 				if (!p_original_path.is_empty() && p_original_path != wait_path) {
 					cached = cache->get_cached(p_original_path, p_cache_mode);
 					if (cached.is_valid()) {
-						return cached;
+						return cache_hit(cached);
 					}
 				}
 			}

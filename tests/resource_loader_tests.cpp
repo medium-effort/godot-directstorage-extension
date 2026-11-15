@@ -648,7 +648,100 @@ GDEX_TEST_T(loader, cache_mode_reuse_returns_same_ref, TAG_INTEGRATION) {
 	remove_user_file(dstex_path);
 }
 
-// --- Cache modes: REPLACE refreshes the entry -------------------------------------
+// --- Load-outcome counters: GPU vs cache vs CPU fallback (R3) ---------------------
+
+GDEX_TEST_T(loader, load_outcome_counters_track_each_load, TAG_INTEGRATION) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	const bool gpu_active = ds->is_gpu_decompression_enabled();
+	godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
+	const bool on_render = rs != nullptr && rs->is_on_render_thread();
+
+	// v3 (NPOT) so the D3D12 leg actually qualifies for the GPU path; the v1
+	// fixture this file otherwise uses is rejected as legacy before the thread
+	// gate, which would make the GPU counter untestable.
+	const char *dstex_path = "user://gdextest_loader_012_counters.dstex";
+	if (!write_npot_v3_dstex(dstex_path)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	ctx.add_teardown([cache]() {
+		cache->clear();
+		memdelete(cache);
+	});
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	auto gpu_loads = [ds]() -> int64_t {
+		return static_cast<int64_t>(ds->get_loader_stats()["loader_gpu_loads"]);
+	};
+	auto cache_hits = [ds]() -> int64_t {
+		return static_cast<int64_t>(ds->get_loader_stats()["loader_cache_hits"]);
+	};
+	auto fallback_counts = [ds]() -> godot::Dictionary {
+		return ds->get_loader_stats()["loader_cpu_fallbacks"];
+	};
+	auto fallback_total = [fallback_counts]() -> int64_t {
+		godot::Dictionary counts = fallback_counts();
+		int64_t total = 0;
+		godot::Array keys = counts.keys();
+		for (int i = 0; i < keys.size(); i++) {
+			total += static_cast<int64_t>(counts[keys[i]]);
+		}
+		return total;
+	};
+	auto reason_count = [fallback_counts](const char *p_reason) -> int64_t {
+		godot::Dictionary counts = fallback_counts();
+		const godot::String key(p_reason);
+		return counts.has(key) ? static_cast<int64_t>(counts[key]) : static_cast<int64_t>(0);
+	};
+
+	const int64_t fallbacks_before = fallback_total();
+	const int64_t gpu_before = gpu_loads();
+	const int64_t hits_before = cache_hits();
+	const int64_t gpu_disabled_before = reason_count("gpu_disabled");
+
+	const godot::String res_path(dstex_path);
+	godot::Ref<godot::Texture2D> first(loader->_load(res_path, godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_REUSE));
+	GDEX_ASSERT_TRUE(first.is_valid());
+
+	// Exactly one outcome per load: the GPU path, or one counted CPU reason.
+	const int64_t outcomes = (fallback_total() - fallbacks_before) + (gpu_loads() - gpu_before);
+	GDEX_EXPECT_EQ(outcomes, static_cast<int64_t>(1));
+
+	// The reason must match the configuration the load actually ran in, so the
+	// counter cannot silently attribute a gate rejection to thread affinity.
+	if (!gpu_active) {
+		GDEX_EXPECT_EQ(reason_count("gpu_disabled") - gpu_disabled_before, static_cast<int64_t>(1));
+	} else {
+		// GPU decompression is enabled. Under the default thread model the main
+		// thread IS the render thread, so this ordinary load must reach the GPU
+		// path; a false `on_render` here means the project is running the
+		// experimental Separate model, where every loader load falls back.
+		GDEX_EXPECT_TRUE(on_render);
+		GDEX_EXPECT_EQ(gpu_loads() - gpu_before, static_cast<int64_t>(1));
+	}
+
+	// A REUSE reload is served from the cache: pointer-identical, counted as a hit,
+	// and neither a GPU load nor a CPU fallback.
+	const int64_t gpu_after_first = gpu_loads();
+	const int64_t fallbacks_after_first = fallback_total();
+	godot::Ref<godot::Texture2D> second(loader->_load(res_path, godot::String(""), false, godot::ResourceFormatLoader::CACHE_MODE_REUSE));
+	GDEX_ASSERT_TRUE(second.is_valid());
+	GDEX_EXPECT_TRUE(first.ptr() == second.ptr());
+	GDEX_EXPECT_EQ(cache_hits() - hits_before, static_cast<int64_t>(1));
+	GDEX_EXPECT_EQ(gpu_loads(), gpu_after_first);
+	GDEX_EXPECT_EQ(fallback_total(), fallbacks_after_first);
+
+	remove_user_file(dstex_path);
+}
 
 GDEX_TEST_T(loader, cache_mode_replace_refreshes_entry, TAG_INTEGRATION) {
 	const char *dstex_path = "user://gdextest_loader_012_replace.dstex";
