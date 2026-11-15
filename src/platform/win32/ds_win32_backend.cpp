@@ -1,4 +1,5 @@
 #include "ds_win32_backend.h"
+#include "ds_render_handoff_queue.h"
 #include "../../core/ds_backend_config.h"
 #include "../../core/ds_context.h"
 #include "../../core/ds_error_handler.h"
@@ -999,15 +1000,18 @@ struct DSGPUDestinationContext {
 	uint64_t native_format = 0;
 	bool rd_available = false;
 };
-static std::shared_ptr<DSGPUDestinationContext> s_gpu_dest_query_ctx;
-static std::mutex s_dest_query_mutex;
+// One parked context per in-flight query, never a single slot (R1). With one
+// slot, two threads resolving different destination RIDs before the render thread
+// runs overwrite each other: the callback services the newer context, and the
+// older caller spends its whole 250 ms budget waiting for a completion that can
+// never arrive, so its perfectly valid request is rejected. A queue parks every
+// context, and each posted callback pops exactly one.
+// Never destroyed, matching s_transition_queue: freeing handoff state from a
+// static destructor would run during DLL_PROCESS_DETACH.
+static DSRenderHandoffQueue<DSGPUDestinationContext> &s_gpu_dest_query_queue = *new DSRenderHandoffQueue<DSGPUDestinationContext>();
 
 static void ds_win32_fetch_destination_resource_on_render_thread() {
-	std::shared_ptr<DSGPUDestinationContext> ctx;
-	{
-		std::lock_guard<std::mutex> query_lock(s_dest_query_mutex);
-		ctx = std::move(s_gpu_dest_query_ctx);
-	}
+	std::shared_ptr<DSGPUDestinationContext> ctx = s_gpu_dest_query_queue.take_front();
 	if (!ctx) {
 		return;
 	}
@@ -1082,10 +1086,7 @@ static bool ds_win32_query_destination_resource_on_render_thread(
 	ctx->is_buffer_request = p_is_buffer_request;
 	ctx->destination_rid = p_destination_rid;
 
-	{
-		std::lock_guard<std::mutex> query_lock(s_dest_query_mutex);
-		s_gpu_dest_query_ctx = ctx;
-	}
+	s_gpu_dest_query_queue.push(ctx);
 	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_destination_resource_on_render_thread));
 
 	{
@@ -1093,11 +1094,10 @@ static bool ds_win32_query_destination_resource_on_render_thread(
 		constexpr std::chrono::milliseconds kDestQueryTimeout(250);
 		bool signaled = ctx->cv.wait_for(lock, kDestQueryTimeout, [&ctx] { return ctx->completed; });
 		if (!signaled) {
-			// HIGH-02: Bounded timeout with no secondary unbounded wait. Clear handoff slot if still pending.
-			std::lock_guard<std::mutex> query_lock(s_dest_query_mutex);
-			if (s_gpu_dest_query_ctx == ctx) {
-				s_gpu_dest_query_ctx.reset();
-			}
+			// HIGH-02: Bounded timeout with no secondary unbounded wait. Drop this
+			// query from the handoff so a late callback cannot service a caller that
+			// already returned.
+			s_gpu_dest_query_queue.prune(ctx);
 			return false;
 		}
 		r_rd_available = ctx->rd_available;
@@ -3447,6 +3447,7 @@ void ds_win32_release_static_d3d12_state() {
 		std::lock_guard<std::mutex> lock(s_transition_dispatch_mutex);
 		s_transition_queue.clear();
 	}
+	s_gpu_dest_query_queue.clear();
 }
 
 bool Win32Backend::execute_transitions(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common) {
