@@ -126,7 +126,7 @@
 		<method name="get_drive_info" qualifiers="const">
 			<return type="Dictionary" />
 			<param index="0" name="path" type="String" default="res://" />
-			<description>Returns drive capability information for [param path], including [code]drive[/code], [code]bus_type[/code], [code]file_system[/code], [code]bypassio_state[/code], [code]media_type[/code] ([code]HDD[/code], [code]SSD[/code], or [code]Unknown[/code]), [code]rotational[/code], [code]rotational_known[/code], [code]seek_penalty[/code], [code]trim[/code], [code]directstorage_supported[/code], and, when applicable, [code]reason[/code]. [code]rotational[/code] is the media signal that selects the DirectStorage I/O mode.</description>
+			<description>Returns drive capability information for [param path], including [code]drive[/code], [code]bus_type[/code], [code]file_system[/code], [code]bypassio_state[/code], [code]bypassio_failing_driver[/code], [code]bypassio_failure_reason[/code], [code]media_type[/code] ([code]HDD[/code], [code]SSD[/code], or [code]Unknown[/code]), [code]rotational[/code], [code]rotational_known[/code], [code]seek_penalty[/code], [code]trim[/code], [code]directstorage_supported[/code], and, when applicable, [code]reason[/code]. [code]rotational[/code] is the media signal that selects the DirectStorage I/O mode.</description>
 		</method>
 		<method name="get_gpu_decompression_support_tier" qualifiers="const">
 			<return type="int" />

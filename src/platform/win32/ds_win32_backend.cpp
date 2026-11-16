@@ -2805,6 +2805,8 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	res["bus_type"] = "Unknown";
 	res["file_system"] = "Unknown";
 	res["bypassio_state"] = "Unsupported";
+	res["bypassio_failing_driver"] = "";
+	res["bypassio_failure_reason"] = "";
 	res["media_type"] = "Unknown";
 	res["rotational"] = false;
 	res["rotational_known"] = false;
@@ -2970,7 +2972,7 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 			nullptr,
 			OPEN_EXISTING,
-			FILE_FLAG_BACKUP_SEMANTICS,
+			FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_NO_BUFFERING,
 			nullptr);
 	if (hFs != INVALID_HANDLE_VALUE) {
 		DSBpioInput bpio_in = {};
@@ -2990,6 +2992,18 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 			const bool stack_paused = (static_cast<uint32_t>(bpio_out.OutFlags) & DS_BPIO_OUTFLAG_VOLUME_STACK_BYPASS_PAUSED) != 0;
 			const bool query_ok = bpio_out.Query.OpStatus == 0;
 			res["bypassio_state"] = (query_ok && !stack_paused) ? "Enabled" : "Disabled";
+
+			const size_t max_driver_chars = sizeof(bpio_out.Query.FailingDriverName) / sizeof(wchar_t);
+			const size_t driver_chars = wcsnlen(bpio_out.Query.FailingDriverName, max_driver_chars);
+			if (driver_chars > 0) {
+				res["bypassio_failing_driver"] = String::utf16(reinterpret_cast<const char16_t *>(bpio_out.Query.FailingDriverName), static_cast<int>(driver_chars));
+			}
+
+			const size_t max_reason_chars = sizeof(bpio_out.Query.FailureReason) / sizeof(wchar_t);
+			const size_t reason_chars = wcsnlen(bpio_out.Query.FailureReason, max_reason_chars);
+			if (reason_chars > 0) {
+				res["bypassio_failure_reason"] = String::utf16(reinterpret_cast<const char16_t *>(bpio_out.Query.FailureReason), static_cast<int>(reason_chars));
+			}
 		}
 		CloseHandle(hFs);
 	}
@@ -3673,6 +3687,20 @@ bool Win32Backend::initialize(const String &p_path) {
 	if (!drive_info.get("directstorage_supported", false)) {
 		UtilityFunctions::print("[DirectStorage] Win32Backend initialization failed: Drive " + String(drive_info["drive"]) + " is unsupported (" + String(drive_info["reason"]) + ").");
 		return false;
+	}
+	if (!static_cast<bool>(drive_info.get("rotational", false)) &&
+			String(drive_info.get("bypassio_state", "")) == "Disabled") {
+		const String failing_driver = String(drive_info.get("bypassio_failing_driver", ""));
+		const String failure_reason = String(drive_info.get("bypassio_failure_reason", ""));
+		String detail;
+		if (!failing_driver.is_empty() && !failure_reason.is_empty()) {
+			detail = " (" + failing_driver + ": " + failure_reason + ")";
+		} else if (!failing_driver.is_empty()) {
+			detail = " (" + failing_driver + ")";
+		} else if (!failure_reason.is_empty()) {
+			detail = " (" + failure_reason + ")";
+		}
+		UtilityFunctions::print("[DirectStorage] BypassIO disabled on " + String(drive_info.get("drive", "")) + detail + "; using standard unbuffered I/O.");
 	}
 	// Computed before the runtime is configured (DStorageSetConfiguration is
 	// one-shot and must precede DStorageGetFactory). The probe path does the

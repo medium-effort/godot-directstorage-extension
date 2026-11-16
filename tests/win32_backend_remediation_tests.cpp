@@ -406,6 +406,8 @@ GDEX_TEST_T(win32_remediation, drive_info_reports_bypassio_state, TAG_UNIT) {
 #ifdef _WIN32
     const godot::Dictionary info = godot::Win32Backend::get_drive_info_for_path("res://");
     GDEX_EXPECT_TRUE(info.has("bypassio_state"));
+    GDEX_EXPECT_TRUE(info.has("bypassio_failing_driver"));
+    GDEX_EXPECT_TRUE(info.has("bypassio_failure_reason"));
     const godot::String state = info["bypassio_state"];
     GDEX_EXPECT_TRUE(state == "Enabled" || state == "Disabled" || state == "Unsupported");
 
