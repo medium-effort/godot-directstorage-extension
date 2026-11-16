@@ -1061,7 +1061,6 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 		req->set_compression_format(p_payload.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
 				? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
 		req->set_cancellation_tag(p_tag);
-		req->get_destination_buffer_ref().resize((int64_t)p_payload.original_size);
 		r_out.push_back(req);
 		return true;
 	}
@@ -1086,7 +1085,6 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 								? DSRequest::COMPRESSION_GDEFLATE
 								: DSRequest::COMPRESSION_NONE);
 				req->set_cancellation_tag(p_tag);
-				req->get_destination_buffer_ref().resize(static_cast<int64_t>(p_payload.mip_uncompressed_sizes[i]));
 				r_out.push_back(req);
 				continue;
 			}
@@ -1107,8 +1105,6 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 								? DSRequest::COMPRESSION_GDEFLATE
 								: DSRequest::COMPRESSION_NONE);
 				req->set_cancellation_tag(p_tag);
-				req->get_destination_buffer_ref().resize(
-						static_cast<int64_t>(p_payload.chunk_uncompressed_sizes[chunk_cursor]));
 				r_out.push_back(req);
 			}
 		}
@@ -1140,7 +1136,6 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 		req->set_compression_format(p_payload.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
 				? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
 		req->set_cancellation_tag(p_tag);
-		req->get_destination_buffer_ref().resize((int64_t)uncomp);
 		r_out.push_back(req);
 	}
 	return r_out.size() > 0;
@@ -2445,7 +2440,7 @@ Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vect
 	return Ref<Texture2D>();
 }
 
-int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_usec, const String &p_essential_path) {
+int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_usec, const String &p_essential_path, bool p_gpu_only) {
 	DSTextureCache *cache = DSTextureCache::get_singleton();
 	if (cache == nullptr) {
 		UtilityFunctions::push_warning("DSPreloader: DSTextureCache singleton unavailable during poll.");
@@ -2516,6 +2511,8 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				if (!cand.gpu_failed && (cand.requests.is_empty() || !can_build_gpu)) {
 					continue;
 				}
+			} else if (p_gpu_only) {
+				continue;
 			}
 			bool all_terminal = true;
 			for (int i = 0; i < cand.requests.size(); ++i) {
@@ -2564,6 +2561,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 		}
 
 		Tracked t;
+		int64_t entry_id = 0;
 		bool found = false;
 		bool budget_exhausted = false;
 		bool offloaded = false;
@@ -2581,7 +2579,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 					// CPU builds are 20-27 ms for a 64 MiB texture (measured), so
 					// the estimate is deliberately conservative; GPU completion is a
 					// constant 2 us (RID wrap + store, no data movement).
-					uint64_t est_usec = is_gpu ? 2 : (est_bytes / (1024ULL * 1024ULL)) * kCpuBuildUsecPerMiB;
+					uint64_t est_usec = is_gpu ? 2 : std::max<uint64_t>(1ULL, (est_bytes * kCpuBuildUsecPerMiB + (1024ULL * 1024ULL - 1ULL)) / (1024ULL * 1024ULL));
 					uint64_t elapsed = (p_max_usec > 0 && Time::get_singleton()) ? (Time::get_singleton()->get_ticks_usec() - start_usec) : 0;
 
 					bool fits;
@@ -2607,7 +2605,8 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 
 					if (fits || is_gpu) {
 						t = it->second;
-						s.pending.erase(it);
+						entry_id = it->first;
+						it->second.build_in_flight = true;
 						found = true;
 					} else if (offloads >= kMaxOffloadsPerSlice) {
 						// Budget for this slice is spent; the next call offloads more.
@@ -2618,7 +2617,8 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 						// No usable worker pool: build inline so the stream still
 						// drains. Progress beats a strict bound.
 						t = it->second;
-						s.pending.erase(it);
+						entry_id = it->first;
+						it->second.build_in_flight = true;
 						found = true;
 					}
 				}
@@ -2647,9 +2647,13 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 		}
 		processed++;
 
-		// Safely unblock any worker threads awaiting this specific texture
+		// Erase from s.pending only AFTER complete_*_entry() stores into
+		// DSTextureCache: otherwise a concurrent main-thread poll sees
+		// get_unbuilt_prewarm_count() == 0 and fires prewarm_finished() while
+		// the last texture is still being built.
 		{
 			std::lock_guard<std::mutex> lock(state().mutex);
+			state().pending.erase(entry_id);
 			unblock_pending_paths_locked(t);
 		}
 	}

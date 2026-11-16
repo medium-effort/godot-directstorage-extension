@@ -522,7 +522,7 @@ func _process(delta: float) -> void:
 				heavy_at = maxf(45.0, _baseline_ema_ms * 2.5)
 				mild_at = maxf(20.0, _baseline_ema_ms * 1.5)
 				warm_at = maxf(10.0, _baseline_ema_ms * 1.1)
-			var slice_items: int = 3
+			var slice_items: int = 2
 			var slice_usec: int = 4000
 			var slice_label: String = "mild"
 			if _slice_ema_ms > heavy_at:
@@ -531,7 +531,7 @@ func _process(delta: float) -> void:
 				slice_label = "heavy"
 				_smooth_streak = 0
 			elif _slice_ema_ms > mild_at:
-				slice_items = 3
+				slice_items = 2
 				slice_usec = 4000
 				slice_label = "mild"
 				_smooth_streak = 0
@@ -539,11 +539,11 @@ func _process(delta: float) -> void:
 				_smooth_streak += 1
 				if _smooth_streak >= 2:
 					if _slice_ema_ms < warm_at:
-						slice_items = 12
-						slice_usec = 8000
+						slice_items = 3
+						slice_usec = 4000
 					else:
-						slice_items = 8
-						slice_usec = 8000
+						slice_items = 2
+						slice_usec = 4000
 					slice_label = "warm"
 			if slice_label != _slice_label:
 				if _slice_debug:
@@ -563,7 +563,7 @@ func _process(delta: float) -> void:
 			# Fast (<2us per texture): drain completed GPU textures within budget.
 			# Never gated on _poll_task_id so the main thread is never starved.
 			if _has_poll:
-				cache.poll_completed(0, 32, 2000)
+				cache.poll_completed(0, 32, 2000, true)
 			if _poll_task_id != -1 and WorkerThreadPool.is_task_completed(_poll_task_id):
 				WorkerThreadPool.wait_for_task_completion(_poll_task_id)
 				_poll_task_id = -1

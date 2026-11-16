@@ -365,7 +365,7 @@ void DSTextureCache::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("prewarm_gpu_async", "paths", "chunk_size", "prefer_gpu"), &DSTextureCache::prewarm_gpu_async, DEFVAL(16), DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("pump_gpu_prewarm"), &DSTextureCache::pump_gpu_prewarm);
 	ClassDB::bind_method(D_METHOD("is_gpu_prewarm_available"), &DSTextureCache::is_gpu_prewarm_available);
-	ClassDB::bind_method(D_METHOD("poll_completed", "tag", "max_items", "max_usec"), &DSTextureCache::poll_completed, DEFVAL((uint64_t)0), DEFVAL(0), DEFVAL(4000));
+	ClassDB::bind_method(D_METHOD("poll_completed", "tag", "max_items", "max_usec", "gpu_only"), &DSTextureCache::poll_completed, DEFVAL((uint64_t)0), DEFVAL(0), DEFVAL(4000), DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("get_pending_prewarm_count", "tag"), &DSTextureCache::get_pending_prewarm_count, DEFVAL((uint64_t)0));
 	ClassDB::bind_method(D_METHOD("get_unbuilt_prewarm_count", "tag"), &DSTextureCache::get_unbuilt_prewarm_count, DEFVAL((uint64_t)0));
 	ClassDB::bind_method(D_METHOD("get_unbuilt_cpu_prewarm_count", "tag"), &DSTextureCache::get_unbuilt_cpu_prewarm_count, DEFVAL((uint64_t)0));
@@ -785,8 +785,8 @@ bool DSTextureCache::is_gpu_prewarm_available() {
 	return DSPreloader::is_gpu_prewarm_available();
 }
 
-int DSTextureCache::poll_completed(uint64_t p_tag, int p_max_items, int p_max_usec) {
-	return DSPreloader::poll_completed(p_tag, p_max_items, (uint32_t)std::max(0, p_max_usec));
+int DSTextureCache::poll_completed(uint64_t p_tag, int p_max_items, int p_max_usec, bool p_gpu_only) {
+	return DSPreloader::poll_completed(p_tag, p_max_items, (uint32_t)std::max(0, p_max_usec), String(), p_gpu_only);
 }
 
 int DSTextureCache::get_pending_prewarm_count(uint64_t p_tag) const {

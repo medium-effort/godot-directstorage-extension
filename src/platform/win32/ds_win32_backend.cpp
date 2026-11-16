@@ -1261,6 +1261,10 @@ void Win32Backend::complete_chunked_requests() {
 					state.parent->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER) {
 				state.parent->set_status(DSRequest::STATUS_COMPLETED);
 			} else {
+				const uint64_t required_size = state.parent->get_uncompressed_size() > 0
+						? state.parent->get_uncompressed_size()
+						: state.parent->get_size();
+				state.parent->ensure_destination_buffer_capacity(required_size);
 				PackedByteArray &destination = state.parent->get_destination_buffer_ref();
 				bool valid_destination = true;
 				for (int i = 0; i < state.children.size(); i++) {

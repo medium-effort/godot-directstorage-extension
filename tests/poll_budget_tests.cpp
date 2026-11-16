@@ -27,7 +27,10 @@
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace godot {
@@ -341,4 +344,100 @@ GDEX_TEST_T(poll_budget, unbounded_pump_essential_entry_exceeds_cap, TAG_UNIT) {
 	GDEX_EXPECT_EQ(godot::DSPreloader::poll_completed(0, 0, 0, godot::String(essential)), 0);
 	GDEX_EXPECT_TRUE(wait_until_unbuilt(cache, tag, 5000));
 	GDEX_EXPECT_TRUE(cache->get_cached(godot::String(backlog)).is_valid());
+}
+
+// DSRuntime's main-thread drain passes gpu_only=true so it only wraps
+// Texture2DRD entries and never builds CPU ImageTextures inline.
+GDEX_TEST_T(poll_budget, gpu_only_poll_leaves_cpu_entries_for_worker, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF0141ULL;
+
+	godot::PackedByteArray small_data;
+	small_data.resize(4096);
+	for (int i = 0; i < 2; ++i) {
+		godot::String p = godot::String("user://gdextest_poll_gpu_only_cpu_") + godot::String::num_int64(i) + ".png";
+		godot::DSPreloader::Payload meta = make_payload(p.utf8().get_data(), 256);
+		meta.height = 4;
+		meta.original_size = 4096;
+		meta.mip_uncompressed_sizes.push_back(4096);
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, small_data);
+	}
+	godot::DSPreloader::Payload gpu_meta = make_payload("user://gdextest_poll_gpu_only_gpu.png", 256);
+	gpu_meta.mip_uncompressed_sizes.push_back(4096);
+	godot::PrewarmBudgetTest::inject_gpu_failed_entry(tag, gpu_meta);
+
+	const int gpu_stored = cache->poll_completed(tag, 32, 2000, true);
+	GDEX_EXPECT_EQ(gpu_stored, 0);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_gpu_prewarm_count(tag), 0);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_cpu_prewarm_count(tag), 2);
+
+	const int cpu_stored = cache->poll_completed(tag, 32, 2000, false);
+	GDEX_EXPECT_EQ(cpu_stored, 2);
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+}
+
+// Regression test for the completion race: a worker thread calling poll_completed()
+// must keep each entry in s.pending (build_in_flight=true) until complete_cpu_entry()
+// has stored the ImageTexture into DSTextureCache, so a concurrent main-thread
+// get_unbuilt_prewarm_count(tag) == 0 check never fires prewarm_finished() early.
+GDEX_TEST_T(poll_budget, concurrent_worker_poll_keeps_unbuilt_until_cached, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF0142ULL;
+	constexpr int kCount = 8;
+
+	godot::PackedByteArray data;
+	data.resize(static_cast<int64_t>(kUnboundedEntryBytes));
+	uint8_t *w = data.ptrw();
+	for (int64_t i = 0; i < data.size(); i += 4093) {
+		w[i] = static_cast<uint8_t>(i & 0xFF);
+	}
+
+	std::vector<godot::String> paths;
+	paths.reserve(kCount);
+	for (int i = 0; i < kCount; ++i) {
+		godot::String p = godot::String("user://gdextest_poll_race_") + godot::String::num_int64(i) + ".png";
+		paths.push_back(p);
+		godot::DSPreloader::Payload meta = make_payload(p.utf8().get_data(), 4096);
+		meta.height = 1536;
+		meta.original_size = kUnboundedEntryBytes;
+		meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(kUnboundedEntryBytes));
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	}
+	warm_worker_pool();
+
+	std::atomic<bool> stop_worker{ false };
+	std::thread worker([&]() {
+		while (!stop_worker.load()) {
+			cache->poll_completed(tag, 2, 4000, false);
+			std::this_thread::yield();
+		}
+	});
+
+	bool saw_zero = false;
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	while (std::chrono::steady_clock::now() < deadline) {
+		if (cache->get_unbuilt_prewarm_count(tag) == 0) {
+			saw_zero = true;
+			break;
+		}
+		std::this_thread::yield();
+	}
+
+	// Capture the invariant immediately at the moment unbuilt hits 0, before
+	// joining the worker thread.
+	const int cached_at_zero = cache->get_cached_count();
+	std::vector<bool> all_cached_at_zero;
+	all_cached_at_zero.reserve(kCount);
+	for (int i = 0; i < kCount; ++i) {
+		all_cached_at_zero.push_back(cache->get_cached(paths[i]).is_valid());
+	}
+
+	stop_worker.store(true);
+	worker.join();
+
+	GDEX_EXPECT_TRUE(saw_zero);
+	GDEX_EXPECT_EQ(cached_at_zero, kCount);
+	for (int i = 0; i < kCount; ++i) {
+		GDEX_EXPECT_TRUE(all_cached_at_zero[i]);
+	}
 }

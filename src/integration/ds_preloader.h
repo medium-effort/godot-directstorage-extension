@@ -200,7 +200,7 @@ public:
 	// entry may exceed the slice cap, because deferring it would return a miss and pay for
 	// a duplicate synchronous load. C++-only (this class has no bindings).
 	static int poll_completed(uint64_t p_tag = 0, int p_max_items = 0, uint32_t p_max_usec = 4000,
-			const String &p_essential_path = String());
+			const String &p_essential_path = String(), bool p_gpu_only = false);
 
 	// Diagnostic: number of tracked textures with at least one
 	// unfinished request. p_tag == 0 counts all tags.
