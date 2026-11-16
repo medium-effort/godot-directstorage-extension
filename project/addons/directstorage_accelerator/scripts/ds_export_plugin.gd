@@ -115,6 +115,7 @@ var _target_export_path: String = ""
 var _platform_messages_at_begin: int = 0
 var _export_features: PackedStringArray = []
 var _is_debug_export: bool = false
+var _is_windows_export: bool = true
 var _bundle_dspkg_enabled: bool = false
 var _enforce_pairing_enabled: bool = true
 var _steampipe_1mb_alignment_enabled: bool = false
@@ -138,13 +139,17 @@ static func _is_windows_platform(platform: EditorExportPlatform) -> bool:
 
 ## Declares whether this export plugin supports the target platform.
 func _supports_platform(platform: EditorExportPlatform) -> bool:
-	return _is_windows_platform(platform)
+	if _is_windows_platform(platform):
+		return true
+	if platform != null and platform.get_os_name() in ["Linux", "macOS"]:
+		return true
+	return false
 
-## Exposes custom export options for Windows Desktop in the Export dialog.
+## Exposes custom export options for supported desktop platforms in the Export dialog.
 func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 	if not _supports_platform(platform):
 		return []
-	return [
+	var options: Array[Dictionary] = [
 		{
 			"option": {
 				"name": OPTION_BUNDLE_DSPKG,
@@ -195,32 +200,38 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 			},
 			"default_value": true,
 		},
-		{
-			"option": {
-				"name": OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE,
-				"type": TYPE_BOOL,
-				"hint": PROPERTY_HINT_NONE,
-				"hint_string": "",
-				"usage": PROPERTY_USAGE_DEFAULT
-			},
-			"default_value": true,
-		},
-		{
-			"option": {
-				"name": OPTION_MERGE_LICENSE_FILES,
-				"type": TYPE_BOOL,
-				"hint": PROPERTY_HINT_NONE,
-				"hint_string": "",
-				"usage": PROPERTY_USAGE_DEFAULT
-			},
-			"default_value": true,
-		}
 	]
+	if _is_windows_platform(platform):
+		options.append_array([
+			{
+				"option": {
+					"name": OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE,
+					"type": TYPE_BOOL,
+					"hint": PROPERTY_HINT_NONE,
+					"hint_string": "",
+					"usage": PROPERTY_USAGE_DEFAULT
+				},
+				"default_value": true,
+			},
+			{
+				"option": {
+					"name": OPTION_MERGE_LICENSE_FILES,
+					"type": TYPE_BOOL,
+					"hint": PROPERTY_HINT_NONE,
+					"hint_string": "",
+					"usage": PROPERTY_USAGE_DEFAULT
+				},
+				"default_value": true,
+			}
+		])
+	return options
 
 ## Export options have no tooltip field, so the warning text is the only place
 ## the dialog can explain an interaction. Keep it to combinations that actually
 ## change the result.
-func _get_export_option_warning(_platform: EditorExportPlatform, option: String) -> String:
+func _get_export_option_warning(platform: EditorExportPlatform, option: String) -> String:
+	if not _is_windows_platform(platform):
+		return ""
 	var include_dsgd := _option_bool(OPTION_INCLUDE_DSGD_LICENSE_FILE, true)
 	var include_runtime := _option_bool(OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE, true)
 	if option == String(OPTION_MERGE_LICENSE_FILES):
@@ -267,18 +278,19 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 
 	_export_features = features
 	_is_debug_export = is_debug
+	_is_windows_export = _is_windows_platform(platform)
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
 	_store_uncompressed_textures = _option_bool(
 		OPTION_STORE_UNCOMPRESSED_TEXTURES,
-		not _is_windows_platform(platform)
+		not _is_windows_export
 	)
 	# A preset created before an option existed has no key and returns nil;
 	# treat that as the default instead of silently disabling an output.
 	_include_dsgd_license_file = _option_bool(OPTION_INCLUDE_DSGD_LICENSE_FILE, true)
-	_include_directstorage_license_file = _option_bool(OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE, true)
-	_merge_license_files = _option_bool(OPTION_MERGE_LICENSE_FILES, true)
+	_include_directstorage_license_file = _option_bool(OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE, true) if _is_windows_export else false
+	_merge_license_files = _option_bool(OPTION_MERGE_LICENSE_FILES, true) if _is_windows_export else false
 
 	_archive_entries.clear()
 	_skipped_payloads = 0
@@ -713,7 +725,7 @@ func _has_runtime_dlls() -> bool:
 ## (whether the option is disabled or the runtime texts could not be resolved),
 ## print a reminder: this is an informational obligation on the game developer.
 func _notice_runtime_license(runtime_license_written: bool = false) -> void:
-	if runtime_license_written or not _has_runtime_dlls():
+	if not _is_windows_export or runtime_license_written or not _has_runtime_dlls():
 		return
 	print("[DirectStorage Exporter] NOTICE: dstorage.dll and dstoragecore.dll are Microsoft DirectStorage redistributables governed by Microsoft's license. Microsoft's own NuGet build targets copy only the DLLs; the license texts travel in the runtime package. You remain responsible for your distribution terms.")
 
