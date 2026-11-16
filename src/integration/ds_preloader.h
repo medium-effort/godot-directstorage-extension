@@ -159,8 +159,11 @@ public:
 	// making the call safe anywhere prewarm_async is (including headless CI).
 	// Completion wraps Texture2DRD on the main/render thread only; worker
 	// poll_completed() calls skip GPU entries and leave them pending.
-	// Returns the DSContext stream tag, or 0 when DSContext is unavailable.
-	static uint64_t prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size = 16, bool p_prefer_gpu = true);
+	// Textures are sliced into render-thread callbacks bounded by
+	// p_chunk_size items, the request cap, and p_max_chunk_bytes (when > 0,
+	// otherwise kGpuPrewarmBytesPerCallback = 16 MiB). Whole textures are
+	// never split. Returns the DSContext stream tag, or 0 when DSContext is unavailable.
+	static uint64_t prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size = 16, bool p_prefer_gpu = true, int64_t p_max_chunk_bytes = 0);
 
 	// True for payloads the GPU path accepts: v2 footprint metadata,
 	// worker-safe exclusion (as_image_texture == false), and a format the GPU

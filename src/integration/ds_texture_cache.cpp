@@ -362,7 +362,7 @@ void DSTextureCache::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_cached_count"), &DSTextureCache::get_cached_count);
 
 	ClassDB::bind_method(D_METHOD("prewarm_async", "paths"), &DSTextureCache::prewarm_async);
-	ClassDB::bind_method(D_METHOD("prewarm_gpu_async", "paths", "chunk_size", "prefer_gpu"), &DSTextureCache::prewarm_gpu_async, DEFVAL(16), DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("prewarm_gpu_async", "paths", "chunk_size", "prefer_gpu", "max_chunk_bytes"), &DSTextureCache::prewarm_gpu_async, DEFVAL(16), DEFVAL(true), DEFVAL((int64_t)0));
 	ClassDB::bind_method(D_METHOD("pump_gpu_prewarm"), &DSTextureCache::pump_gpu_prewarm);
 	ClassDB::bind_method(D_METHOD("is_gpu_prewarm_available"), &DSTextureCache::is_gpu_prewarm_available);
 	ClassDB::bind_method(D_METHOD("poll_completed", "tag", "max_items", "max_usec", "gpu_only"), &DSTextureCache::poll_completed, DEFVAL((uint64_t)0), DEFVAL(0), DEFVAL(4000), DEFVAL(false));
@@ -773,8 +773,8 @@ uint64_t DSTextureCache::prewarm_async(const PackedStringArray &p_paths) {
 	return DSPreloader::prewarm_async(p_paths);
 }
 
-uint64_t DSTextureCache::prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size, bool p_prefer_gpu) {
-	return DSPreloader::prewarm_gpu_async(p_paths, p_chunk_size, p_prefer_gpu);
+uint64_t DSTextureCache::prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size, bool p_prefer_gpu, int64_t p_max_chunk_bytes) {
+	return DSPreloader::prewarm_gpu_async(p_paths, p_chunk_size, p_prefer_gpu, p_max_chunk_bytes);
 }
 
 void DSTextureCache::pump_gpu_prewarm() {

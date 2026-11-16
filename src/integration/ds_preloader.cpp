@@ -1475,7 +1475,7 @@ void DSPreloader::free_gpu_orphans_on_render_thread() {
 	}
 }
 
-uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size, bool p_prefer_gpu) {
+uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size, bool p_prefer_gpu, int64_t p_max_chunk_bytes) {
 	DSContext *ctx = DSContext::get_singleton();
 	if (ctx == nullptr) {
 		UtilityFunctions::push_error("DSPreloader: DSContext singleton unavailable; prewarm_gpu_async aborted.");
@@ -1629,8 +1629,9 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 				item_requests.push_back(static_cast<uint64_t>(count_gpu_requests_for_payload(chunk.items[i].meta)));
 				item_bytes.push_back(estimate_payload_bytes(chunk.items[i].meta));
 			}
+			const uint64_t chunk_byte_cap = p_max_chunk_bytes > 0 ? static_cast<uint64_t>(p_max_chunk_bytes) : kGpuPrewarmBytesPerCallback;
 			const std::vector<GpuChunkSlice> slices = plan_gpu_chunk_slices(item_requests, item_bytes,
-					static_cast<size_t>(std::max(1, chunk_size)), callback_request_cap, kGpuPrewarmBytesPerCallback);
+					static_cast<size_t>(std::max(1, chunk_size)), callback_request_cap, chunk_byte_cap);
 			for (size_t slice_index = 0; slice_index < slices.size(); ++slice_index) {
 				GpuChunk part;
 				part.tag = tag;

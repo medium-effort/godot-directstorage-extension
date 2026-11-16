@@ -74,7 +74,8 @@
 			<param index="0" name="paths" type="PackedStringArray" />
 			<param index="1" name="chunk_size" type="int" default="16" />
 			<param index="2" name="prefer_gpu" type="bool" default="true" />
-			<description>Enqueues texture [param paths] for direct-to-GPU VRAM DMA streaming prewarm in chunks of [param chunk_size] and returns the batch tag. Returns [code]0[/code] when the native singletons or the stream driver autoload ([code]DSRuntime[/code]) are unavailable.
+			<param index="3" name="max_chunk_bytes" type="int" default="0" />
+			<description>Enqueues texture [param paths] for direct-to-GPU VRAM DMA streaming prewarm in chunks of [param chunk_size] and up to [param max_chunk_bytes] (when greater than [code]0[/code], otherwise the default 16 MiB cap) and returns the batch tag. Returns [code]0[/code] when the native singletons or the stream driver autoload ([code]DSRuntime[/code]) are unavailable.
 			[b]Note:[/b] A texture is eligible for the GPU path when its payload carries v2 per-mip footprint metadata, it was not imported with [code]compatibility/as_image_texture[/code], and its format is either a color format with an sRGB counterpart (BC1, BC2, BC3, BC7, the RGBA8/BGRA8 family) or one of the linear block formats used by 3D material data (BC4, BC5 - normal, roughness, AO and height maps). Uncompressed and float data formats (R8, RG8, RGB8, the R16 family, float formats, BC6H) always stay on the memory path and arrive as [ImageTexture] even when GPU prewarm is active. Non-multiple-of-4 textures are GPU-eligible, but the resulting [Texture2DRD] reports the padded storage dimensions (the engine exposes no size setter); enable [code]compatibility/as_image_texture[/code] when [method Texture2D.get_width] must report the authoring size.</description>
 		</method>
 	</methods>
@@ -90,6 +91,9 @@
 		</constant>
 		<constant name="FALLBACK_FRAME_BUDGET_USEC" value="8000">
 			Default per-frame processing budget in microseconds used during main-thread fallback loading.
+		</constant>
+		<constant name="BACKGROUND_GPU_CHUNK_BYTES" value="4194304">
+			Recommended GPU prewarm chunk byte cap (4 MiB) for background streaming during active gameplay.
 		</constant>
 		<constant name="STREAM_PUMP_AUTOLOAD" value="&quot;DSRuntime&quot;">
 			Name of the autoload node whose stream pump submits and harvests queued prewarm requests.

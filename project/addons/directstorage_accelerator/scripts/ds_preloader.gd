@@ -48,6 +48,10 @@ const TRAVERSABLE_EXTENSIONS: PackedStringArray = ["tscn", "scn", "tres", "res",
 ## headroom for 60 FPS loading-screen rendering.
 const FALLBACK_FRAME_BUDGET_USEC: int = 8000
 
+## Recommended GPU prewarm chunk byte cap (4 MiB) for background streaming
+## during active gameplay; keeps per-frame D3D12 allocation bursts bounded.
+const BACKGROUND_GPU_CHUNK_BYTES: int = 4 * 1024 * 1024
+
 ## Name of the autoload that drives the async stream queue, and the legacy
 ## autoload older addon versions installed. One of them must exist in the tree
 ## or nothing ever calls [code]flush_stream_async()[/code] /
@@ -328,9 +332,11 @@ static func is_gpu_prewarm_available() -> bool:
 ## [code]compatibility/as_image_texture[/code] when [method Texture2D.get_width] must report the
 ## authoring size.
 ##
-## Textures are allocated in render-thread chunks of [param chunk_size] to bound frame time.
+## Textures are allocated in render-thread chunks of [param chunk_size] and up to
+## [param max_chunk_bytes] (when > 0; default 0 uses the native 16 MiB cap, pass
+## [constant BACKGROUND_GPU_CHUNK_BYTES] for background gameplay streaming).
 ## Returns 0 when native singletons or the stream driver are unavailable.
-static func prewarm_gpu_async(paths: PackedStringArray, chunk_size: int = 16, prefer_gpu: bool = true) -> int:
+static func prewarm_gpu_async(paths: PackedStringArray, chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0) -> int:
 	if not ClassDB.class_exists("DSTextureCache"):
 		push_warning("[DirectStorage] DSPreloader: DSTextureCache class unavailable; prewarm_gpu_async aborted.")
 		return 0
@@ -343,7 +349,10 @@ static func prewarm_gpu_async(paths: PackedStringArray, chunk_size: int = 16, pr
 		return 0
 	var tag: int = 0
 	if cache.has_method("prewarm_gpu_async"):
-		tag = int(cache.call("prewarm_gpu_async", paths, chunk_size, prefer_gpu))
+		if max_chunk_bytes > 0:
+			tag = int(cache.call("prewarm_gpu_async", paths, chunk_size, prefer_gpu, max_chunk_bytes))
+		else:
+			tag = int(cache.call("prewarm_gpu_async", paths, chunk_size, prefer_gpu))
 	elif cache.has_method("prewarm_async"):
 		tag = int(cache.call("prewarm_async", paths))
 	_track_batch_manager_tag(tag)

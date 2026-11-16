@@ -93,6 +93,7 @@ var _poll_task_id: int = -1
 var _cache_caps_probed: bool = false
 var _has_get_unbuilt: bool = false
 var _has_get_unbuilt_cpu: bool = false
+var _has_get_unbuilt_gpu: bool = false
 var _has_poll: bool = false
 var _has_pump_gpu: bool = false
 ## Adaptive slice backpressure
@@ -125,7 +126,9 @@ var _slice_debug: bool = false
 ## `DSPreloaderScript.await_prewarm_finished()`, which only pumps when the
 ## autoload is absent) then waits forever. 8 frames is a floor, not a target.
 const GPU_PUMP_FRAME_STRIDE_HEAVY: int = 8
-const GPU_PUMP_FRAME_STRIDE_MILD: int = 2
+const GPU_PUMP_FRAME_STRIDE_MILD: int = 3
+const GPU_FRAME_BUDGET_MILD_MS: float = 16.6
+const GPU_FRAME_BUDGET_HEAVY_MS: float = 33.3
 var _gpu_pump_frames_since: int = 0
 
 
@@ -169,20 +172,42 @@ func reset_slice_stats() -> void:
 	_gpu_pump_frames_since = 0
 
 
+## Resolves the effective GPU prewarm backpressure label, escalating
+## immediately when a single frame exceeds 60 FPS / 30 FPS budgets so
+## GPU chunk pumping backs off before the EMA catches up.
+func _effective_gpu_slice_label(slice_label: String, frame_ms: float = 0.0) -> String:
+	if slice_label == "heavy" or frame_ms > GPU_FRAME_BUDGET_HEAVY_MS:
+		return "heavy"
+	if slice_label == "mild" or frame_ms > GPU_FRAME_BUDGET_MILD_MS:
+		return "mild"
+	return "warm"
+
+
 ## Decides whether this frame pumps one GPU prewarm chunk and advances the
 ## pacing counter. Pure state arithmetic (no engine calls) so the cadence can be
 ## asserted without frame timing: "heavy" is paced, never stopped.
-func _should_pump_gpu_now(slice_label: String) -> bool:
+func _should_pump_gpu_now(slice_label: String, frame_ms: float = 0.0) -> bool:
+	var effective := _effective_gpu_slice_label(slice_label, frame_ms)
 	var stride: int = 1
-	if slice_label == "heavy":
+	if effective == "heavy":
 		stride = GPU_PUMP_FRAME_STRIDE_HEAVY
-	elif slice_label == "mild":
+	elif effective == "mild":
 		stride = GPU_PUMP_FRAME_STRIDE_MILD
 	_gpu_pump_frames_since += 1
 	if _gpu_pump_frames_since < stride:
 		return false
 	_gpu_pump_frames_since = 0
 	return true
+
+
+func _record_slice_stat(label: String) -> void:
+	if label == "heavy":
+		_heavy_slices += 1
+	elif label == "mild":
+		_mild_slices += 1
+	else:
+		_warm_slices += 1
+	_drain_reported = false
 
 
 ## Returns per-batch slice counts for the benchmark profiler.
@@ -493,6 +518,7 @@ func _process(delta: float) -> void:
 			if not _cache_caps_probed:
 				_has_get_unbuilt = cache.has_method("get_unbuilt_prewarm_count")
 				_has_get_unbuilt_cpu = cache.has_method("get_unbuilt_cpu_prewarm_count")
+				_has_get_unbuilt_gpu = cache.has_method("get_unbuilt_gpu_prewarm_count")
 				_has_poll = cache.has_method("poll_completed")
 				_has_pump_gpu = cache.has_method("pump_gpu_prewarm")
 				_cache_caps_probed = true
@@ -556,7 +582,11 @@ func _process(delta: float) -> void:
 			# baseline between chunks. Heavy stays paced rather than
 			# stopped: this loop is the only pump, so a hard stop would
 			# wedge the chunk queue and every waiter on the tag.
-			if _has_pump_gpu and _should_pump_gpu_now(slice_label):
+			var has_gpu_unbuilt := false
+			if _has_get_unbuilt_gpu:
+				has_gpu_unbuilt = int(cache.get_unbuilt_gpu_prewarm_count(0)) > 0
+			var gpu_slice_label := _effective_gpu_slice_label(slice_label, frame_ms)
+			if _has_pump_gpu and _should_pump_gpu_now(slice_label, frame_ms):
 				cache.pump_gpu_prewarm()
 			# Main-thread texture drain: Texture2DRD wrappers must be
 			# instantiated on the main or render thread (GODOT_QUIRKS Sec02 & Sec25).
@@ -572,15 +602,13 @@ func _process(delta: float) -> void:
 				has_cpu_unbuilt = int(cache.get_unbuilt_cpu_prewarm_count(0)) > 0
 			elif _has_get_unbuilt:
 				has_cpu_unbuilt = int(cache.get_unbuilt_prewarm_count(0)) > 0
+			var recorded_slice := false
 			if _poll_task_id == -1 and has_cpu_unbuilt:
 				_poll_task_id = WorkerThreadPool.add_task(_background_poll_slice.bind(slice_items, slice_usec), false, "DS_PollCompleted")
-				if slice_label == "heavy":
-					_heavy_slices += 1
-				elif slice_label == "mild":
-					_mild_slices += 1
-				else:
-					_warm_slices += 1
-				_drain_reported = false
+				_record_slice_stat(slice_label)
+				recorded_slice = true
+			if not recorded_slice and has_gpu_unbuilt:
+				_record_slice_stat(gpu_slice_label)
 			if not _drain_reported and _poll_task_id == -1 and _has_get_unbuilt and int(cache.get_unbuilt_prewarm_count(0)) == 0:
 				if _slice_debug:
 					print("[DirectStorage] DSRuntime prewarm drained: warm=%d mild=%d heavy=%d" % [_warm_slices, _mild_slices, _heavy_slices])
