@@ -2415,6 +2415,35 @@ GDEX_TEST_T(dspkg, shared_payload_dedup_roundtrip, TAG_INTEGRATION) {
 	godot::Array mips = reader->get_mip_entries_for_offset(static_cast<uint64_t>(static_cast<int64_t>(info_a["data_offset"])));
 	GDEX_EXPECT_EQ(mips.size(), 3);
 
+	// Mismatched metadata (e.g. flags) on a shared-payload alias must fail closed.
+	{
+		const uint64_t entry0_size = godot::DSPKG_FIXED_ENTRY_SIZE_V5 +
+				static_cast<uint64_t>(godot::String(entry_b).utf8().length()) +
+				3ULL * sizeof(godot::DSPkgMipEntry);
+		const uint64_t entry1_flags_off = godot::DSPKG_HEADER_SIZE_V5 + entry0_size +
+				godot::DSPKG_ENTRY_PREFIX_SIZE +
+				static_cast<uint64_t>(godot::String(entry_a).utf8().length()) +
+				40ULL; // data_offset(8)+comp(8)+orig(8)+w(4)+h(4)+fmt(4)+mips(4)
+		godot::Ref<godot::FileAccess> f_rw = godot::FileAccess::open(godot::String(pkg_alias), godot::FileAccess::READ_WRITE);
+		GDEX_ASSERT_TRUE(f_rw.is_valid() && f_rw->is_open());
+		f_rw->seek(entry1_flags_off);
+		const uint32_t orig_flags = f_rw->get_32();
+		f_rw->seek(entry1_flags_off);
+		f_rw->store_32(orig_flags ^ 1U);
+		f_rw->close();
+
+		godot::Ref<godot::DSPkg> bad_meta_reader;
+		bad_meta_reader.instantiate();
+		GDEX_EXPECT_EQ(static_cast<int64_t>(bad_meta_reader->open(godot::String(pkg_alias), 0xCAFEBABEULL)),
+				static_cast<int64_t>(godot::ERR_FILE_CORRUPT));
+
+		godot::Ref<godot::FileAccess> f_fix = godot::FileAccess::open(godot::String(pkg_alias), godot::FileAccess::READ_WRITE);
+		GDEX_ASSERT_TRUE(f_fix.is_valid() && f_fix->is_open());
+		f_fix->seek(entry1_flags_off);
+		f_fix->store_32(orig_flags);
+		f_fix->close();
+	}
+
 	// Clearing DSPKG_CAP_SHARED_PAYLOAD on an aliased archive must fail closed.
 	{
 		godot::Ref<godot::FileAccess> f_rw = godot::FileAccess::open(godot::String(pkg_alias), godot::FileAccess::READ_WRITE);

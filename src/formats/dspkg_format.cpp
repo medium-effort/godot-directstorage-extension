@@ -2206,6 +2206,7 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 	bool used_shared_payload = false;
 	const bool allow_shared_payload = is_v5 && (loaded_capabilities & DSPKG_CAP_SHARED_PAYLOAD) != 0;
 	HashMap<uint64_t, uint64_t> seen_payload_ends;
+	HashMap<uint64_t, String> canonical_path_by_offset;
 	DSPkgTlvSummary entry_tlv_summary;
 	DSPkgTlvSummary header_tlv_summary;
 
@@ -2353,14 +2354,19 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 		// share the exact same (abs_payload_offset, abs_payload_end) span.
 		bool is_shared_alias = false;
 		if (abs_payload_offset < previous_payload_end) {
-			const uint64_t *existing_end = allow_shared_payload ? seen_payload_ends.getptr(abs_payload_offset) : nullptr;
+			const bool is_texture_entry = entry.entry_kind == static_cast<uint8_t>(DSPkgEntryKind::TEXTURE);
+			const uint64_t *existing_end = (allow_shared_payload && is_texture_entry)
+					? seen_payload_ends.getptr(abs_payload_offset)
+					: nullptr;
 			if (existing_end == nullptr || *existing_end != abs_payload_end) {
 				return fail(ERR_FILE_CORRUPT, "Entry payload spans overlap a previous entry.");
 			}
 			is_shared_alias = true;
 			used_shared_payload = true;
 		} else {
-			seen_payload_ends[abs_payload_offset] = abs_payload_end;
+			if (entry.entry_kind == static_cast<uint8_t>(DSPkgEntryKind::TEXTURE)) {
+				seen_payload_ends[abs_payload_offset] = abs_payload_end;
+			}
 			previous_payload_end = abs_payload_end;
 		}
 
@@ -2591,6 +2597,9 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 						}
 					}
 				} else {
+					if (is_shared_alias) {
+						return fail(ERR_FILE_CORRUPT, "Shared payload alias must match an existing texture entry.");
+					}
 					DSPkgOffsetEntry offset_entry;
 					offset_entry.mips = mip_vector;
 					offset_entry.compression_format = entry.compression_format;
@@ -2599,6 +2608,31 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 					entries_by_offset[abs_payload_offset] = offset_entry;
 				}
 			}
+		}
+
+		if (is_shared_alias) {
+			const String *canon_path = canonical_path_by_offset.getptr(abs_payload_offset);
+			const DSPkgEntry *canon = canon_path ? entries_by_path.getptr(*canon_path) : nullptr;
+			if (canon == nullptr ||
+					canon->entry_kind != entry.entry_kind ||
+					canon->width != entry.width ||
+					canon->height != entry.height ||
+					canon->logical_width != entry.logical_width ||
+					canon->logical_height != entry.logical_height ||
+					canon->pixel_format != entry.pixel_format ||
+					canon->mip_count != entry.mip_count ||
+					canon->original_size != entry.original_size ||
+					canon->flags != entry.flags ||
+					canon->compression_format != entry.compression_format ||
+					canon->gacl_transform != entry.gacl_transform ||
+					canon->chunked != entry.chunked ||
+					!(canon->chunk_offsets == entry.chunk_offsets) ||
+					!(canon->chunk_compressed_sizes == entry.chunk_compressed_sizes) ||
+					!(canon->chunk_uncompressed_sizes == entry.chunk_uncompressed_sizes)) {
+				return fail(ERR_FILE_CORRUPT, "Shared payload alias metadata does not match canonical entry.");
+			}
+		} else if (entry.entry_kind == static_cast<uint8_t>(DSPkgEntryKind::TEXTURE)) {
+			canonical_path_by_offset[abs_payload_offset] = entry.path;
 		}
 
 		if (entries_by_path.has(entry.path)) {
