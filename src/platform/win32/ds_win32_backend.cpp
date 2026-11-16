@@ -3069,6 +3069,7 @@ void Win32Backend::apply_dstorage_configuration() {
 	DSBackendConfigOptions options;
 	options.disable_gpu_decompression = ctx ? ctx->get_disable_gpu_decompression() : false;
 	options.disable_gpu_decompression_metacommand = ctx ? ctx->get_disable_gpu_decompression_metacommand() : false;
+	options.force_disable_bypass_io = ctx ? ctx->get_force_disable_bypass_io() : false;
 	options.force_file_buffering = s_desired_file_buffering.load();
 	options.cpu_decompression_threads = 0;
 	if (ProjectSettings *ps = ProjectSettings::get_singleton()) {
@@ -3088,6 +3089,9 @@ void Win32Backend::apply_dstorage_configuration() {
 		} else if (bench_os->get_environment("DSGD_BENCH_DISABLE_FILE_BUFFERING") == "1") {
 			options.force_file_buffering = false;
 		}
+		if (bench_os->get_environment("DSGD_BENCH_DISABLE_BYPASSIO") == "1") {
+			options.force_disable_bypass_io = true;
+		}
 	}
 #endif
 	const DSResolvedBackendConfig resolved = resolve_backend_config(options);
@@ -3103,19 +3107,23 @@ void Win32Backend::apply_dstorage_configuration() {
 	}
 
 	HRESULT hr = E_FAIL;
-	if (resolved.force_file_buffering) {
-		DSTORAGE_CONFIGURATION1 buffered_config = {};
-		buffered_config.DisableTelemetry = resolved.disable_telemetry ? TRUE : FALSE;
-		buffered_config.DisableGpuDecompression = resolved.disable_gpu_decompression ? TRUE : FALSE;
-		buffered_config.DisableGpuDecompressionMetacommand = resolved.disable_gpu_decompression_metacommand ? TRUE : FALSE;
-		buffered_config.DisableBypassIO = resolved.disable_bypass_io ? TRUE : FALSE;
-		buffered_config.ForceFileBuffering = TRUE;
-		buffered_config.NumBuiltInCpuDecompressionThreads = resolved.cpu_decompression_threads;
-		hr = DStorageSetConfiguration1(&buffered_config);
+	if (resolved.force_file_buffering || resolved.disable_bypass_io) {
+		DSTORAGE_CONFIGURATION1 config1 = {};
+		config1.DisableTelemetry = resolved.disable_telemetry ? TRUE : FALSE;
+		config1.DisableGpuDecompression = resolved.disable_gpu_decompression ? TRUE : FALSE;
+		config1.DisableGpuDecompressionMetacommand = resolved.disable_gpu_decompression_metacommand ? TRUE : FALSE;
+		config1.DisableBypassIO = resolved.disable_bypass_io ? TRUE : FALSE;
+		config1.ForceFileBuffering = resolved.force_file_buffering ? TRUE : FALSE;
+		config1.NumBuiltInCpuDecompressionThreads = resolved.cpu_decompression_threads;
+		hr = DStorageSetConfiguration1(&config1);
 		if (SUCCEEDED(hr)) {
-			UtilityFunctions::print("[DirectStorage] File buffering enabled: rotational media uses ForceFileBuffering (BypassIO disabled).");
+			if (resolved.force_file_buffering) {
+				UtilityFunctions::print("[DirectStorage] File buffering enabled: rotational media uses ForceFileBuffering (BypassIO disabled).");
+			} else {
+				UtilityFunctions::print("[DirectStorage] BypassIO force-disabled via configuration; using standard unbuffered I/O.");
+			}
 		} else {
-			UtilityFunctions::print("[DirectStorage] ForceFileBuffering configuration failed: 0x" +
+			UtilityFunctions::print("[DirectStorage] DStorageSetConfiguration1 failed: 0x" +
 					String::num_uint64(static_cast<uint32_t>(hr), 16) + "; continuing with the default I/O path.");
 		}
 	} else {

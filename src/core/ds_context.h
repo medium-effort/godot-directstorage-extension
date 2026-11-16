@@ -89,6 +89,7 @@ private:
 	// forcing the reference implementation instead of the driver's optimized
 	// metacommand, so the two can be compared on the same machine.
 	std::atomic<bool> disable_gpu_decompression_metacommand{ false };
+	std::atomic<bool> force_disable_bypass_io{ false };
 	// Reduction-only UMA auto-tune (see initialize_ds_locked): when true and
 	// the active adapter is an integrated/UMA GPU, effective staging/queue
 	// are clamped down to the UMA caps. Explicit low values pass through
@@ -349,6 +350,9 @@ public:
 
 	void set_disable_gpu_decompression_metacommand(bool p_disable);
 	bool get_disable_gpu_decompression_metacommand() const;
+
+	void set_force_disable_bypass_io(bool p_disable);
+	bool get_force_disable_bypass_io() const;
 
 	void set_auto_tune_for_integrated_gpu(bool p_enable);
 	bool get_auto_tune_for_integrated_gpu() const;

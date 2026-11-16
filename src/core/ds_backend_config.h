@@ -13,6 +13,7 @@ namespace godot {
 struct DSBackendConfigOptions {
 	bool disable_gpu_decompression = false;
 	bool disable_gpu_decompression_metacommand = false;
+	bool force_disable_bypass_io = false;
 	bool force_file_buffering = false;
 	bool disable_telemetry = true;
 	// Maximum threads the runtime may use to decompress built-in formats on the
@@ -41,7 +42,7 @@ inline DSResolvedBackendConfig resolve_backend_config(const DSBackendConfigOptio
 	resolved.disable_gpu_decompression_metacommand = p_options.disable_gpu_decompression_metacommand;
 	resolved.force_file_buffering = p_options.force_file_buffering;
 	// ForceFileBuffering is only honoured with BypassIO off.
-	resolved.disable_bypass_io = p_options.force_file_buffering;
+	resolved.disable_bypass_io = p_options.force_disable_bypass_io || p_options.force_file_buffering;
 	// 0 means "runtime default"; a negative or absurd project setting must not
 	// reach DSTORAGE_CONFIGURATION. 256 is far above any consumer core count and
 	// still below the runtime's INT32 range.
