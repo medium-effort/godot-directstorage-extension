@@ -77,6 +77,10 @@
 			<return type="bool" />
 			<description>Returns whether identical-source payload deduplication is enabled for the archive builder.</description>
 		</method>
+		<method name="is_repack_uncompressed" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether [method finalize] repacks GDeflate-compressed [code].dstex[/code] payloads into uncompressed [code]NONE[/code] entries.</description>
+		</method>
 		<method name="open">
 			<return type="Error" />
 			<param index="0" name="path" type="String" />
@@ -117,6 +121,11 @@
 			<return type="void" />
 			<param index="0" name="enabled" type="bool" />
 			<description>Enables or disables deduplicating identical [code].dstex[/code] payloads across alias entries (such as a source [code].png[/code] path and its imported [code].dstex[/code] path) during [method finalize]. Must be called while building an archive.</description>
+		</method>
+		<method name="set_repack_uncompressed">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>Enables or disables export-time decompression of GDeflate-compressed [code].dstex[/code] payloads into uncompressed v5 [code]NONE[/code] entries during [method finalize]. Must be called while building an archive.</description>
 		</method>
 	</methods>
 </class>

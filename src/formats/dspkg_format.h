@@ -226,6 +226,7 @@ private:
 	uint64_t payload_alignment = 512;
 	bool bin_packing_enabled = false;
 	bool payload_dedup_enabled = false;
+	bool repack_uncompressed = false;
 	std::vector<DSPkgStagedEntry> staging_entries;
 	bool is_building = false;
 	bool m_encryption_enabled = false;
@@ -282,6 +283,8 @@ public:
 	bool is_bin_packing_enabled() const;
 	void set_payload_dedup_enabled(bool p_enabled);
 	bool is_payload_dedup_enabled() const;
+	void set_repack_uncompressed(bool p_enabled);
+	bool is_repack_uncompressed() const;
 	Error add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata = Dictionary());
 	Error set_encryption_key(const String &p_key_hex);
 	Error finalize();

@@ -1,5 +1,6 @@
 #include "dspkg_format.h"
 #include "dstex_format.h"
+#include "compression/gdeflate_decompressor.h"
 #include "core/ds_settings.h"
 #include "gen/dspkg_encryption_key.h"
 #include "monocypher.h"
@@ -527,6 +528,8 @@ void DSPkg::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_bin_packing_enabled"), &DSPkg::is_bin_packing_enabled);
 	ClassDB::bind_method(D_METHOD("set_payload_dedup_enabled", "enabled"), &DSPkg::set_payload_dedup_enabled);
 	ClassDB::bind_method(D_METHOD("is_payload_dedup_enabled"), &DSPkg::is_payload_dedup_enabled);
+	ClassDB::bind_method(D_METHOD("set_repack_uncompressed", "enabled"), &DSPkg::set_repack_uncompressed);
+	ClassDB::bind_method(D_METHOD("is_repack_uncompressed"), &DSPkg::is_repack_uncompressed);
 	ClassDB::bind_method(D_METHOD("add_texture", "resource_path", "dstex_path", "mip_metadata"), &DSPkg::add_texture, DEFVAL(Dictionary()));
 	ClassDB::bind_method(D_METHOD("set_encryption_key", "key_hex"), &DSPkg::set_encryption_key);
 	ClassDB::bind_method(D_METHOD("finalize"), &DSPkg::finalize);
@@ -558,6 +561,7 @@ Error DSPkg::create(const String &p_output_path, uint64_t p_archive_fingerprint)
 	payload_alignment = DEFAULT_PAYLOAD_ALIGNMENT;
 	bin_packing_enabled = false;
 	payload_dedup_enabled = false;
+	repack_uncompressed = false;
 	staging_entries.clear();
 	is_building = true;
 	m_encryption_enabled = false;
@@ -740,6 +744,18 @@ void DSPkg::set_payload_dedup_enabled(bool p_enabled) {
 
 bool DSPkg::is_payload_dedup_enabled() const {
 	return payload_dedup_enabled;
+}
+
+void DSPkg::set_repack_uncompressed(bool p_enabled) {
+	if (!is_building) {
+		UtilityFunctions::push_error("DSPkg: Not in building state. Call create() first.");
+		return;
+	}
+	repack_uncompressed = p_enabled;
+}
+
+bool DSPkg::is_repack_uncompressed() const {
+	return repack_uncompressed;
 }
 
 Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata) {
@@ -1017,6 +1033,23 @@ Error DSPkg::finalize() {
 		seen_staging_paths.insert(res_path);
 	}
 
+	auto should_repack_entry = [&](const DSPkgStagedEntry &p_entry) -> bool {
+		return repack_uncompressed &&
+				p_entry.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE);
+	};
+
+	// A repacked entry is written as a v5 NONE texture, and DSPkg::open()
+	// requires a GPU mip table on every v5 texture entry. Only a v1 .dstex
+	// source lacks one (its payload has no pitch-padded footprint), so the
+	// archive it produced could never be opened again. Refuse it here instead.
+	for (uint32_t i = 0; i < count; ++i) {
+		const DSPkgStagedEntry &entry = *sorted_entries[i];
+		if (should_repack_entry(entry) && !entry.gpu_metadata) {
+			UtilityFunctions::push_error("DSPkg: Cannot repack texture without GPU mip metadata (rebuild the .dstex with a current importer): " + entry.resource_path);
+			return ERR_INVALID_DATA;
+		}
+	}
+
 	// Deduplicate entries that stage the exact same .dstex source (e.g.
 	// res://...png and its res://.godot/imported/...dstex alias). Canonical
 	// entries write the payload once; aliases reuse the canonical TOC offsets.
@@ -1068,8 +1101,12 @@ Error DSPkg::finalize() {
 	bool write_v5 = has_shared_payload;
 	for (uint32_t i = 0; i < count && !write_v5; ++i) {
 		const DSPkgStagedEntry &entry = *sorted_entries[i];
-		if (entry.chunked || entry_logical_tlv_size(entry) > 0 ||
-				entry.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
+		const bool out_chunked = entry.chunked && !should_repack_entry(entry);
+		const uint8_t out_compression = should_repack_entry(entry)
+				? static_cast<uint8_t>(DSCompressionFormat::NONE)
+				: entry.compression_format;
+		if (out_chunked || entry_logical_tlv_size(entry) > 0 ||
+				out_compression != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
 			write_v5 = true;
 			break;
 		}
@@ -1105,7 +1142,7 @@ Error DSPkg::finalize() {
 				UtilityFunctions::push_error("DSPkg: Entry extension size overflow.");
 				return ERR_INVALID_PARAMETER;
 			}
-			if (item.chunked) {
+			if (item.chunked && !should_repack_entry(item)) {
 				// v5 chunk tables follow the mip table inside the same entry.
 				uint64_t chunk_entries = 0;
 				for (int64_t mip = 0; mip < item.mip_chunk_counts.size(); ++mip) {
@@ -1187,6 +1224,13 @@ Error DSPkg::finalize() {
 			return ERR_INVALID_DATA;
 		}
 
+		const bool repack_entry = should_repack_entry(item);
+		const bool out_chunked = item.chunked && !repack_entry;
+		const uint8_t out_compression = repack_entry
+				? static_cast<uint8_t>(DSCompressionFormat::NONE)
+				: item.compression_format;
+		const PackedInt32Array &out_mip_sizes = repack_entry ? item.mip_uncompressed_sizes : mip_sizes_entry;
+
 		const bool per_mip_payload = write_gpu_metadata && item.gpu_metadata && mips_count > 1;
 		uint64_t comp_size = 0;
 		uint64_t entry_rel_offset = 0;
@@ -1194,7 +1238,7 @@ Error DSPkg::finalize() {
 			comp_size = entry_comp_sizes[canon_idx];
 			entry_rel_offset = entry_payload_offsets[canon_idx];
 		} else {
-			if (item.chunked) {
+			if (out_chunked) {
 				// add_texture() already computed the chunk-laid-out span.
 				comp_size = item.payload_size;
 			} else if (per_mip_payload) {
@@ -1206,12 +1250,16 @@ Error DSPkg::finalize() {
 							return ERR_INVALID_PARAMETER;
 						}
 					}
-					if (!checked_add(running_mip_span, static_cast<uint64_t>(mip_sizes_entry[mip]), running_mip_span)) {
+					if (!checked_add(running_mip_span, static_cast<uint64_t>(out_mip_sizes[mip]), running_mip_span)) {
 						UtilityFunctions::push_error("DSPkg: Mip span overflow.");
 						return ERR_INVALID_PARAMETER;
 					}
 				}
 				comp_size = running_mip_span;
+			} else if (repack_entry) {
+				// Repacking is only allowed for entries with GPU mip metadata
+				// (enforced above), so the footprint size is always available.
+				comp_size = static_cast<uint64_t>(static_cast<uint32_t>(item.mip_uncompressed_sizes[0]));
 			} else {
 				comp_size = item.payload_size;
 			}
@@ -1254,7 +1302,7 @@ Error DSPkg::finalize() {
 			// staged size differs), then the mip table below. Descriptor bytes
 			// pack little-endian to match the reader's get_8 sequence.
 			const uint32_t descriptor = static_cast<uint32_t>(DSPkgEntryKind::TEXTURE) |
-					(static_cast<uint32_t>(item.compression_format) << 8) |
+					(static_cast<uint32_t>(out_compression) << 8) |
 					(static_cast<uint32_t>(DSGaclTransform::NONE) << 16);
 			writer.put_32(descriptor);
 			writer.put_32(0); // metadata_size: texture entries carry none
@@ -1311,7 +1359,7 @@ Error DSPkg::finalize() {
 						mip_entry.row_pitch = mip_row_pitches[mip];
 					}
 					const uint32_t chunk_count = write_v5
-							? (item.chunked ? static_cast<uint32_t>(item.mip_chunk_counts[mip]) : 1u)
+							? (out_chunked ? static_cast<uint32_t>(item.mip_chunk_counts[mip]) : 1u)
 							: 0u;
 					mip_entry.chunk_count = chunk_count;
 					if (chunk_count > 1) {
@@ -1345,7 +1393,7 @@ Error DSPkg::finalize() {
 						}
 						mip_entry.compressed_size = static_cast<uint32_t>(chunk_sum);
 					} else {
-						mip_entry.compressed_size = mip_sizes_entry[mip];
+						mip_entry.compressed_size = static_cast<uint32_t>(out_mip_sizes[mip]);
 						if (!checked_add(mip_cursor, mip_entry.compressed_size, mip_cursor)) {
 							UtilityFunctions::push_error("DSPkg: Invalid compressed mip metadata.");
 							return ERR_INVALID_DATA;
@@ -1471,7 +1519,7 @@ Error DSPkg::finalize() {
 		header_v5.toc_entry_size = DSPKG_FIXED_ENTRY_SIZE_V5;
 		header_v5.capabilities = has_shared_payload ? DSPKG_CAP_SHARED_PAYLOAD : 0;
 		for (uint32_t i = 0; i < count; ++i) {
-			if (sorted_entries[i]->chunked) {
+			if (sorted_entries[i]->chunked && !should_repack_entry(*sorted_entries[i])) {
 				header_v5.capabilities |= DSPKG_CAP_CHUNKED;
 				break;
 			}
@@ -1596,6 +1644,40 @@ Error DSPkg::finalize() {
 		}
 		return true;
 	};
+	Ref<GDeflateDecompressor> repack_decompressor;
+	if (repack_uncompressed) {
+		repack_decompressor.instantiate();
+	}
+	auto stream_decompressed_range = [&](FileAccess *p_source, uint64_t p_source_offset, uint64_t p_compressed_size, uint64_t p_uncompressed_size) -> bool {
+		if (p_uncompressed_size == 0) {
+			return true;
+		}
+		if (p_source_offset > static_cast<uint64_t>(INT64_MAX)) {
+			UtilityFunctions::push_error("DSPkg: Source payload offset exceeds the storable range.");
+			return false;
+		}
+		if (p_compressed_size == 0 || p_compressed_size > DSPKG_MAX_ENTRY_BYTES || p_compressed_size > static_cast<uint64_t>(INT32_MAX) ||
+				p_uncompressed_size > DSPKG_MAX_ENTRY_BYTES || p_uncompressed_size > static_cast<uint64_t>(INT32_MAX)) {
+			UtilityFunctions::push_error("DSPkg: Repack slice size exceeds storable bounds.");
+			return false;
+		}
+		p_source->seek(static_cast<int64_t>(p_source_offset));
+		PackedByteArray compressed = p_source->get_buffer(static_cast<int64_t>(p_compressed_size));
+		if (static_cast<uint64_t>(compressed.size()) != p_compressed_size) {
+			UtilityFunctions::push_error("DSPkg: Source texture ended while reading GDeflate payload for repack.");
+			return false;
+		}
+		PackedByteArray decompressed = repack_decompressor->decompress(compressed, static_cast<int>(p_uncompressed_size));
+		if (static_cast<uint64_t>(decompressed.size()) != p_uncompressed_size) {
+			UtilityFunctions::push_error("DSPkg: Failed to decompress GDeflate payload while repacking uncompressed.");
+			return false;
+		}
+		if (!write_bytes(decompressed.ptr(), p_uncompressed_size)) {
+			write_failed = true;
+			return false;
+		}
+		return true;
+	};
 
 	for (uint32_t i = 0; i < count; ++i) {
 		if (canonical_index[i] != i) {
@@ -1643,10 +1725,12 @@ Error DSPkg::finalize() {
 			return ERR_FILE_CORRUPT;
 		}
 
+		const bool repack_entry = should_repack_entry(item);
 		const uint32_t mips = item.mip_count;
 		if (item.chunked) {
 			// Mirror add_texture's chunk span: 512-aligned mip starts, 8-aligned
-			// chunks after the first, each streamed from its source offset.
+			// chunks after the first (omitted when repacking to NONE), each
+			// streamed from its source offset.
 			int64_t chunk_cursor = 0;
 			for (uint32_t mip = 0; mip < mips; ++mip) {
 				if (mip > 0) {
@@ -1663,7 +1747,13 @@ Error DSPkg::finalize() {
 				const uint32_t chunk_count = static_cast<uint32_t>(item.mip_chunk_counts[mip]);
 				if (chunk_count <= 1) {
 					const uint64_t mip_size = static_cast<uint64_t>(static_cast<uint32_t>(item.mip_sizes[mip]));
-					if (!stream_source_range(source.ptr(), static_cast<uint64_t>(item.source_mip_offsets[mip]), mip_size)) {
+					const uint64_t out_size = repack_entry
+							? static_cast<uint64_t>(static_cast<uint32_t>(item.mip_uncompressed_sizes[mip]))
+							: mip_size;
+					const bool ok = repack_entry
+							? stream_decompressed_range(source.ptr(), static_cast<uint64_t>(item.source_mip_offsets[mip]), mip_size, out_size)
+							: stream_source_range(source.ptr(), static_cast<uint64_t>(item.source_mip_offsets[mip]), mip_size);
+					if (!ok) {
 						source->close();
 						if (write_failed) {
 							return fail_write("payload");
@@ -1671,7 +1761,7 @@ Error DSPkg::finalize() {
 						file->close();
 						return ERR_FILE_CORRUPT;
 					}
-					if (!checked_add(payload_offset, mip_size, payload_offset)) {
+					if (!checked_add(payload_offset, out_size, payload_offset)) {
 						UtilityFunctions::push_error("DSPkg: Chunked payload offset overflow.");
 						source->close();
 						file->close();
@@ -1680,7 +1770,7 @@ Error DSPkg::finalize() {
 					continue;
 				}
 				for (uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
-					if (chunk > 0) {
+					if (chunk > 0 && !repack_entry) {
 						uint64_t aligned_chunk_offset = 0;
 						if (!align_up(payload_offset, 8, aligned_chunk_offset)) {
 							UtilityFunctions::push_error("DSPkg: Chunked payload chunk alignment overflow.");
@@ -1692,7 +1782,8 @@ Error DSPkg::finalize() {
 						payload_offset = aligned_chunk_offset;
 					}
 					if (chunk_cursor >= item.source_chunk_offsets.size() ||
-							chunk_cursor >= item.source_chunk_compressed_sizes.size()) {
+							chunk_cursor >= item.source_chunk_compressed_sizes.size() ||
+							(repack_entry && chunk_cursor >= item.source_chunk_uncompressed_sizes.size())) {
 						UtilityFunctions::push_error("DSPkg: Chunk table does not match the staged source.");
 						source->close();
 						file->close();
@@ -1700,8 +1791,13 @@ Error DSPkg::finalize() {
 					}
 					const uint64_t chunk_size = static_cast<uint64_t>(
 							static_cast<uint32_t>(item.source_chunk_compressed_sizes[chunk_cursor]));
-					if (!stream_source_range(source.ptr(),
-								static_cast<uint64_t>(item.source_chunk_offsets[chunk_cursor]), chunk_size)) {
+					const uint64_t out_chunk_size = repack_entry
+							? static_cast<uint64_t>(static_cast<uint32_t>(item.source_chunk_uncompressed_sizes[chunk_cursor]))
+							: chunk_size;
+					const bool ok = repack_entry
+							? stream_decompressed_range(source.ptr(), static_cast<uint64_t>(item.source_chunk_offsets[chunk_cursor]), chunk_size, out_chunk_size)
+							: stream_source_range(source.ptr(), static_cast<uint64_t>(item.source_chunk_offsets[chunk_cursor]), chunk_size);
+					if (!ok) {
 						source->close();
 						if (write_failed) {
 							return fail_write("payload");
@@ -1709,7 +1805,7 @@ Error DSPkg::finalize() {
 						file->close();
 						return ERR_FILE_CORRUPT;
 					}
-					if (!checked_add(payload_offset, chunk_size, payload_offset)) {
+					if (!checked_add(payload_offset, out_chunk_size, payload_offset)) {
 						UtilityFunctions::push_error("DSPkg: Chunked payload offset overflow.");
 						source->close();
 						file->close();
@@ -1748,7 +1844,13 @@ Error DSPkg::finalize() {
 					}
 					contiguous_cursor += mip_size;
 				}
-				if (!stream_source_range(source.ptr(), slice_offset, mip_size)) {
+				const uint64_t out_size = repack_entry
+						? static_cast<uint64_t>(static_cast<uint32_t>(item.mip_uncompressed_sizes[mip]))
+						: mip_size;
+				const bool ok = repack_entry
+						? stream_decompressed_range(source.ptr(), slice_offset, mip_size, out_size)
+						: stream_source_range(source.ptr(), slice_offset, mip_size);
+				if (!ok) {
 					source->close();
 					if (write_failed) {
 						return fail_write("payload");
@@ -1756,7 +1858,7 @@ Error DSPkg::finalize() {
 					file->close();
 					return ERR_FILE_CORRUPT;
 				}
-				if (!checked_add(payload_offset, mip_size, payload_offset)) {
+				if (!checked_add(payload_offset, out_size, payload_offset)) {
 					UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
 					source->close();
 					file->close();
@@ -1772,7 +1874,13 @@ Error DSPkg::finalize() {
 					slice_offset = static_cast<uint64_t>(item.source_mip_offsets[slice]);
 					slice_size = static_cast<uint64_t>(static_cast<uint32_t>(item.source_mip_sizes[slice]));
 				}
-				if (!stream_source_range(source.ptr(), slice_offset, slice_size)) {
+				const uint64_t out_size = repack_entry
+						? static_cast<uint64_t>(static_cast<uint32_t>(item.mip_uncompressed_sizes[slice]))
+						: slice_size;
+				const bool ok = repack_entry
+						? stream_decompressed_range(source.ptr(), slice_offset, slice_size, out_size)
+						: stream_source_range(source.ptr(), slice_offset, slice_size);
+				if (!ok) {
 					source->close();
 					if (write_failed) {
 						return fail_write("payload");
@@ -1780,7 +1888,7 @@ Error DSPkg::finalize() {
 					file->close();
 					return ERR_FILE_CORRUPT;
 				}
-				if (!checked_add(payload_offset, slice_size, payload_offset)) {
+				if (!checked_add(payload_offset, out_size, payload_offset)) {
 					UtilityFunctions::push_error("DSPkg: Payload file offset overflow.");
 					source->close();
 					file->close();
@@ -2317,9 +2425,13 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 					return fail(ERR_FILE_CORRUPT, "Audio entry must use compression_format NONE.");
 				}
 			}
-			if (entry.compression_format == static_cast<uint8_t>(DSCompressionFormat::NONE) &&
-					entry.compressed_size != entry.original_size) {
-				return fail(ERR_FILE_CORRUPT, "NONE-compressed entry sizes must match.");
+			if (entry.compression_format == static_cast<uint8_t>(DSCompressionFormat::NONE)) {
+				const bool gpu_texture = has_gpu_metadata &&
+						entry.entry_kind == static_cast<uint8_t>(DSPkgEntryKind::TEXTURE);
+				if (gpu_texture ? (entry.compressed_size < entry.original_size)
+								: (entry.compressed_size != entry.original_size)) {
+					return fail(ERR_FILE_CORRUPT, "NONE-compressed entry sizes must match.");
+				}
 			}
 			if (entry.gacl_transform != static_cast<uint8_t>(DSGaclTransform::NONE)) {
 				if (entry.entry_kind != static_cast<uint8_t>(DSPkgEntryKind::TEXTURE) ||

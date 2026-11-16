@@ -1,13 +1,16 @@
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
 
+#include "compression/gdeflate_decompressor.h"
 #include "formats/dspkg_format.h"
 #include "formats/dstex_format.h"
 #include "monocypher.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
+#include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
@@ -2462,6 +2465,311 @@ GDEX_TEST_T(dspkg, shared_payload_dedup_roundtrip, TAG_INTEGRATION) {
 	remove_temp_file(dstex_path);
 	remove_temp_file(pkg_single);
 	remove_temp_file(pkg_alias);
+}
+
+GDEX_TEST_T(dspkg, repack_uncompressed_inline_gdeflate_to_none, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_repack_inline.dstex";
+	const char *pkg_path = "user://gdextest_repack_inline.dspkg";
+	const char *entry_path = "res://gdextest_repack_inline.png";
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_path);
+
+	// Build a compressible multi-mip RGBA8 .dstex (256x256 -> 3 mips).
+	godot::PackedByteArray raw;
+	int w = 256;
+	int h = 256;
+	for (int m = 0; m < 3; ++m) {
+		godot::Ref<godot::Image> img = godot::Image::create(w, h, false, godot::Image::FORMAT_RGBA8);
+		img->fill(godot::Color(0.25f * static_cast<float>(m + 1), 0.5f, 0.75f, 1.0f));
+		raw.append_array(img->get_data());
+		w = std::max(1, w / 2);
+		h = std::max(1, h / 2);
+	}
+	godot::Ref<godot::DSTex> tex_writer;
+	tex_writer.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(tex_writer->write_to_file(
+						   godot::String(dstex_path), raw, 256, 256, godot::Image::FORMAT_RGBA8, 3)),
+			static_cast<int64_t>(godot::OK));
+
+	godot::Dictionary src_hdr = tex_writer->read_header(godot::String(dstex_path));
+	GDEX_ASSERT_EQ((int)src_hdr["compression_format"], static_cast<int>(godot::DSCompressionFormat::GDEFLATE));
+	GDEX_ASSERT_TRUE(!static_cast<bool>(src_hdr["chunked"]));
+	const godot::PackedInt32Array src_uncomp_sizes = src_hdr["mip_uncompressed_sizes"];
+	GDEX_ASSERT_EQ(src_uncomp_sizes.size(), 3);
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->create(godot::String(pkg_path), 0x11223344ULL)),
+			static_cast<int64_t>(godot::OK));
+	builder->set_repack_uncompressed(true);
+	GDEX_EXPECT_TRUE(builder->is_repack_uncompressed());
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->add_texture(godot::String(entry_path), godot::String(dstex_path))),
+			static_cast<int64_t>(godot::OK));
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->finalize()), static_cast<int64_t>(godot::OK));
+
+	int version = 0;
+	int64_t min_reader = 0;
+	GDEX_ASSERT_TRUE(read_archive_header_versions(pkg_path, version, min_reader));
+	GDEX_EXPECT_EQ(version, 5);
+	GDEX_EXPECT_EQ(min_reader, static_cast<int64_t>(5));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(reader->open(godot::String(pkg_path), 0x11223344ULL)),
+			static_cast<int64_t>(godot::OK));
+	godot::Dictionary info = reader->get_entry_info(godot::String(entry_path));
+	GDEX_EXPECT_EQ((int)info["compression_format"], static_cast<int>(godot::DSCompressionFormat::NONE));
+	GDEX_EXPECT_TRUE(!static_cast<bool>(info["chunked"]));
+
+	godot::Array mips = reader->get_mip_entries_for_offset(static_cast<uint64_t>(static_cast<int64_t>(info["data_offset"])));
+	GDEX_ASSERT_EQ(mips.size(), 3);
+	for (int m = 0; m < 3; ++m) {
+		godot::Dictionary mip_dict = mips[m];
+		GDEX_EXPECT_EQ(static_cast<int64_t>(mip_dict["compressed_size"]), static_cast<int64_t>(src_uncomp_sizes[m]));
+		GDEX_EXPECT_EQ(static_cast<int64_t>(mip_dict["uncompressed_size"]), static_cast<int64_t>(src_uncomp_sizes[m]));
+		GDEX_EXPECT_EQ(static_cast<int64_t>(mip_dict["chunk_count"]), static_cast<int64_t>(1));
+	}
+
+	// Verify repacked payload matches GDeflate-decoded source mips (512-byte aligned between mips).
+	godot::Ref<godot::FileAccess> src_file = godot::FileAccess::open(godot::String(dstex_path), godot::FileAccess::READ);
+	GDEX_ASSERT_TRUE(src_file.is_valid() && src_file->is_open());
+	godot::PackedInt64Array src_offsets = src_hdr["mip_offsets"];
+	godot::PackedInt32Array src_sizes = src_hdr["mip_sizes"];
+	godot::Ref<godot::GDeflateDecompressor> dec;
+	dec.instantiate();
+	godot::PackedByteArray archived_bytes =
+			godot::PackedByteArray(reader->read_texture(godot::String(entry_path))["compressed_data"]);
+	int64_t cursor = 0;
+	for (int m = 0; m < 3; ++m) {
+		if (m > 0) {
+			cursor = (cursor + 511) & ~int64_t(511);
+		}
+		src_file->seek(src_offsets[m]);
+		godot::PackedByteArray mip_comp = src_file->get_buffer(src_sizes[m]);
+		godot::PackedByteArray mip_dec = dec->decompress(mip_comp, src_uncomp_sizes[m]);
+		GDEX_ASSERT_EQ(mip_dec.size(), src_uncomp_sizes[m]);
+		GDEX_ASSERT_TRUE(cursor + mip_dec.size() <= archived_bytes.size());
+		GDEX_EXPECT_EQ(memcmp(archived_bytes.ptr() + cursor, mip_dec.ptr(), static_cast<size_t>(mip_dec.size())), 0);
+		cursor += mip_dec.size();
+	}
+	GDEX_EXPECT_EQ(cursor, static_cast<int64_t>(archived_bytes.size()));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_path);
+}
+
+GDEX_TEST_T(dspkg, repack_uncompressed_chunked_gdeflate_to_none, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_repack_chunked.dstex";
+	const char *pkg_path = "user://gdextest_repack_chunked.dspkg";
+	const char *entry_path = "res://gdextest_repack_chunked.png";
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_path);
+
+	// 64x64 RGBA8 (16 KiB) + 32x32 RGBA8 (4 KiB) with 1 KiB chunking -> chunked GDeflate v3.
+	godot::PackedByteArray raw;
+	int w = 64;
+	int h = 64;
+	for (int m = 0; m < 2; ++m) {
+		godot::Ref<godot::Image> img = godot::Image::create(w, h, false, godot::Image::FORMAT_RGBA8);
+		img->fill(godot::Color(0.2f * static_cast<float>(m + 1), 0.4f, 0.7f, 1.0f));
+		raw.append_array(img->get_data());
+		w = std::max(1, w / 2);
+		h = std::max(1, h / 2);
+	}
+	godot::Ref<godot::DSTex> tex_writer;
+	tex_writer.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(tex_writer->write_to_file(
+						   godot::String(dstex_path), raw, 64, 64, godot::Image::FORMAT_RGBA8, 2, 1, false, false, 0, 0, 0, 1)),
+			static_cast<int64_t>(godot::OK));
+
+	godot::Dictionary src_hdr = tex_writer->read_header(godot::String(dstex_path));
+	GDEX_ASSERT_EQ((int)src_hdr["compression_format"], static_cast<int>(godot::DSCompressionFormat::GDEFLATE));
+	GDEX_ASSERT_TRUE(static_cast<bool>(src_hdr["chunked"]));
+	const godot::PackedInt32Array src_uncomp_sizes = src_hdr["mip_uncompressed_sizes"];
+	GDEX_ASSERT_EQ(src_uncomp_sizes.size(), 2);
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->create(godot::String(pkg_path), 0x55667788ULL)),
+			static_cast<int64_t>(godot::OK));
+	builder->set_repack_uncompressed(true);
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->add_texture(godot::String(entry_path), godot::String(dstex_path))),
+			static_cast<int64_t>(godot::OK));
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->finalize()), static_cast<int64_t>(godot::OK));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(reader->open(godot::String(pkg_path), 0x55667788ULL)),
+			static_cast<int64_t>(godot::OK));
+	godot::Dictionary info = reader->get_entry_info(godot::String(entry_path));
+	GDEX_EXPECT_EQ((int)info["compression_format"], static_cast<int>(godot::DSCompressionFormat::NONE));
+	GDEX_EXPECT_TRUE(!static_cast<bool>(info["chunked"]));
+
+	godot::Array mips = reader->get_mip_entries_for_offset(static_cast<uint64_t>(static_cast<int64_t>(info["data_offset"])));
+	GDEX_ASSERT_EQ(mips.size(), 2);
+	for (int m = 0; m < 2; ++m) {
+		godot::Dictionary mip_dict = mips[m];
+		GDEX_EXPECT_EQ(static_cast<int64_t>(mip_dict["compressed_size"]), static_cast<int64_t>(src_uncomp_sizes[m]));
+		GDEX_EXPECT_EQ(static_cast<int64_t>(mip_dict["uncompressed_size"]), static_cast<int64_t>(src_uncomp_sizes[m]));
+		GDEX_EXPECT_EQ(static_cast<int64_t>(mip_dict["chunk_count"]), static_cast<int64_t>(1));
+	}
+
+	// Verify repacked payload matches chunk-decoded footprints (512-byte aligned between mips, no 8-byte chunk gaps).
+	godot::Ref<godot::FileAccess> src_file = godot::FileAccess::open(godot::String(dstex_path), godot::FileAccess::READ);
+	GDEX_ASSERT_TRUE(src_file.is_valid() && src_file->is_open());
+	const godot::PackedInt32Array src_counts = src_hdr["mip_chunk_counts"];
+	const godot::PackedInt64Array src_chunk_offsets = src_hdr["chunk_offsets"];
+	const godot::PackedInt32Array src_chunk_comp = src_hdr["chunk_compressed_sizes"];
+	const godot::PackedInt32Array src_chunk_uncomp = src_hdr["chunk_uncompressed_sizes"];
+	const godot::PackedInt64Array src_mip_offsets = src_hdr["mip_offsets"];
+	const godot::PackedInt32Array src_mip_sizes = src_hdr["mip_sizes"];
+	godot::Ref<godot::GDeflateDecompressor> dec;
+	dec.instantiate();
+	godot::PackedByteArray archived_bytes =
+			godot::PackedByteArray(reader->read_texture(godot::String(entry_path))["compressed_data"]);
+	int64_t cursor = 0;
+	int64_t chunk_cursor = 0;
+	for (int m = 0; m < 2; ++m) {
+		if (m > 0) {
+			cursor = (cursor + 511) & ~int64_t(511);
+		}
+		if (src_counts[m] <= 1) {
+			src_file->seek(src_mip_offsets[m]);
+			godot::PackedByteArray mip_comp = src_file->get_buffer(src_mip_sizes[m]);
+			godot::PackedByteArray mip_dec = dec->decompress(mip_comp, src_uncomp_sizes[m]);
+			GDEX_ASSERT_EQ(mip_dec.size(), src_uncomp_sizes[m]);
+			GDEX_ASSERT_TRUE(cursor + mip_dec.size() <= archived_bytes.size());
+			GDEX_EXPECT_EQ(memcmp(archived_bytes.ptr() + cursor, mip_dec.ptr(), static_cast<size_t>(mip_dec.size())), 0);
+			cursor += mip_dec.size();
+		} else {
+			for (int32_t c = 0; c < src_counts[m]; ++c) {
+				src_file->seek(src_chunk_offsets[chunk_cursor]);
+				godot::PackedByteArray c_comp = src_file->get_buffer(src_chunk_comp[chunk_cursor]);
+				godot::PackedByteArray c_dec = dec->decompress(c_comp, src_chunk_uncomp[chunk_cursor]);
+				GDEX_ASSERT_EQ(c_dec.size(), src_chunk_uncomp[chunk_cursor]);
+				GDEX_ASSERT_TRUE(cursor + c_dec.size() <= archived_bytes.size());
+				GDEX_EXPECT_EQ(memcmp(archived_bytes.ptr() + cursor, c_dec.ptr(), static_cast<size_t>(c_dec.size())), 0);
+				cursor += c_dec.size();
+				++chunk_cursor;
+			}
+		}
+	}
+	GDEX_EXPECT_EQ(cursor, static_cast<int64_t>(archived_bytes.size()));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_path);
+}
+
+// Regression test: multi-mip or row-padded NONE GPU textures have
+// entry.compressed_size >= entry.original_size due to 256-byte row-pitch and
+// 512-byte D3D12 mip placement padding; DSPkg::open() must accept them.
+GDEX_TEST_T(dspkg, repack_uncompressed_padded_multimip_opens_cleanly, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_repack_padded.dstex";
+	const char *pkg_path = "user://gdextest_repack_padded.dspkg";
+	const char *entry_path = "res://gdextest_repack_padded.png";
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_path);
+
+	// 5x5 RGBA8 with 2 mips (5x5 -> 2x2): mip 0 is 5 * 256 = 1280 B (not 512-aligned),
+	// so 256 B of inter-mip placement padding is inserted before mip 1, making
+	// entry.compressed_size (1792) > entry.original_size (1536).
+	godot::PackedByteArray raw;
+	int w = 5;
+	int h = 5;
+	for (int m = 0; m < 2; ++m) {
+		godot::Ref<godot::Image> img = godot::Image::create(w, h, false, godot::Image::FORMAT_RGBA8);
+		img->fill(godot::Color(0.25f, 0.5f, 0.75f, 1.0f));
+		raw.append_array(img->get_data());
+		w = std::max(1, w / 2);
+		h = std::max(1, h / 2);
+	}
+	godot::Ref<godot::DSTex> tex_writer;
+	tex_writer.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(tex_writer->write_to_file(
+						   godot::String(dstex_path), raw, 5, 5, godot::Image::FORMAT_RGBA8, 2)),
+			static_cast<int64_t>(godot::OK));
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->create(godot::String(pkg_path), 0x99AABBCCULL)),
+			static_cast<int64_t>(godot::OK));
+	builder->set_repack_uncompressed(true);
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->add_texture(godot::String(entry_path), godot::String(dstex_path))),
+			static_cast<int64_t>(godot::OK));
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->finalize()), static_cast<int64_t>(godot::OK));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(reader->open(godot::String(pkg_path), 0x99AABBCCULL)),
+			static_cast<int64_t>(godot::OK));
+	godot::Dictionary info = reader->get_entry_info(godot::String(entry_path));
+	GDEX_EXPECT_EQ((int)info["compression_format"], static_cast<int>(godot::DSCompressionFormat::NONE));
+	GDEX_EXPECT_GT(static_cast<int64_t>(info["compressed_size"]), static_cast<int64_t>(info["original_size"]));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_path);
+}
+
+GDEX_TEST_T(dspkg, repack_uncompressed_rejects_texture_without_gpu_mip_metadata, TAG_INTEGRATION) {
+	// A repacked entry is emitted as a v5 NONE texture, and DSPkg::open()
+	// requires a GPU mip table on every v5 texture entry. A legacy v1 .dstex
+	// has none (its payload stores natural rows, not a pitch-padded footprint),
+	// so finalize() must refuse it instead of writing an archive that no reader
+	// can open. The v1 payload is deliberately not a valid GDeflate stream: the
+	// refusal has to happen before any payload work.
+	const char *dstex_path = "user://gdextest_repack_v1.dstex";
+	const char *pkg_path = "user://gdextest_repack_v1.dspkg";
+	const char *entry_path = "res://gdextest_repack_v1.png";
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_path);
+
+	const uint32_t v1_payload_bytes = 64;
+	godot::DSTexHeader v1{};
+	v1.magic = 0x58455444; // "DTEX"
+	v1.version = 1;
+	v1.flags = 0;
+	v1.width = 64;
+	v1.height = 64;
+	v1.pixel_format = static_cast<uint32_t>(godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+	v1.mip_count = 1;
+	v1.original_size = 64u * 64u * 4u;
+	v1.compressed_size = v1_payload_bytes;
+	v1.reserved = 0;
+	godot::DSTexMipEntry v1_mip{};
+	v1_mip.offset = sizeof(godot::DSTexHeader) + sizeof(godot::DSTexMipEntry);
+	v1_mip.size = v1_payload_bytes;
+
+	godot::Ref<godot::FileAccess> src = godot::FileAccess::open(godot::String(dstex_path), godot::FileAccess::WRITE);
+	GDEX_ASSERT_TRUE(src.is_valid() && src->is_open());
+	src->store_buffer(reinterpret_cast<const uint8_t *>(&v1), sizeof(v1));
+	src->store_buffer(reinterpret_cast<const uint8_t *>(&v1_mip), sizeof(v1_mip));
+	godot::PackedByteArray fake_payload;
+	fake_payload.resize(v1_payload_bytes);
+	for (uint32_t i = 0; i < v1_payload_bytes; ++i) {
+		fake_payload.ptrw()[i] = static_cast<uint8_t>(i);
+	}
+	src->store_buffer(fake_payload);
+	src->close();
+
+	godot::Ref<godot::DSTex> tex_reader;
+	tex_reader.instantiate();
+	godot::Dictionary src_hdr = tex_reader->read_header(godot::String(dstex_path));
+	GDEX_ASSERT_TRUE(!src_hdr.is_empty());
+	GDEX_ASSERT_EQ((int)src_hdr["version"], 1);
+	GDEX_ASSERT_EQ((int)src_hdr["compression_format"], static_cast<int>(godot::DSCompressionFormat::GDEFLATE));
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->create(godot::String(pkg_path), 0x55667788ULL)),
+			static_cast<int64_t>(godot::OK));
+	builder->set_repack_uncompressed(true);
+	GDEX_ASSERT_EQ(static_cast<int64_t>(builder->add_texture(godot::String(entry_path), godot::String(dstex_path))),
+			static_cast<int64_t>(godot::OK));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(builder->finalize()), static_cast<int64_t>(godot::ERR_INVALID_DATA));
+	GDEX_EXPECT_FALSE(godot::FileAccess::file_exists(godot::String(pkg_path)));
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_path);
 }
 
 
