@@ -99,16 +99,50 @@ void Win32Backend::_set_capacity_reject_text_for_testing(const String &p_text) {
 
 void ds_profiler_set_batch_metrics(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes, int p_request_count, int64_t p_decompression_duration_us, int p_error_state);
 
-#ifndef FSCTL_GET_BYPASSIO_STATE
-#define FSCTL_GET_BYPASSIO_STATE CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 238, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#ifdef _WIN32
+#ifndef FSCTL_MANAGE_BYPASS_IO
+#define FSCTL_MANAGE_BYPASS_IO CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 274, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #endif
 
-struct DS_BYPASSIO_OUTPUT {
-	uint32_t State;
-	uint32_t Reason;
-	uint32_t VolumeDriverState;
-	uint32_t StorageDriverState;
+#ifdef FS_BPIO_INFLAG_NONE
+using DSBpioInput = FS_BPIO_INPUT;
+using DSBpioOutput = FS_BPIO_OUTPUT;
+constexpr uint32_t DS_BPIO_OP_QUERY = FS_BPIO_OP_QUERY;
+constexpr uint32_t DS_BPIO_OUTFLAG_VOLUME_STACK_BYPASS_PAUSED = 0x1U;
+#else
+struct DSBpioInput {
+	uint32_t Operation;
+	uint32_t InFlags;
+	uint64_t Reserved1;
+	uint64_t Reserved2;
 };
+
+struct DSBpioResults {
+	int32_t OpStatus;
+	uint16_t FailingDriverNameLen;
+	wchar_t FailingDriverName[32];
+	uint16_t FailureReasonLen;
+	wchar_t FailureReason[128];
+};
+
+struct DSBpioOutput {
+	uint32_t Operation;
+	uint32_t OutFlags;
+	uint64_t Reserved1;
+	uint64_t Reserved2;
+	union {
+		DSBpioResults Enable;
+		DSBpioResults Query;
+		DSBpioResults VolumeStackResume;
+		DSBpioResults StreamResume;
+		uint8_t RawPayload[512];
+	};
+};
+
+constexpr uint32_t DS_BPIO_OP_QUERY = 3U;
+constexpr uint32_t DS_BPIO_OUTFLAG_VOLUME_STACK_BYPASS_PAUSED = 0x1U;
+#endif
+#endif
 
 #ifdef _WIN32
 struct DSRuntimeProbe {
@@ -2859,7 +2893,7 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 		query.PropertyId = StorageDeviceProperty;
 		query.QueryType = PropertyStandardQuery;
 
-		STORAGE_DEVICE_DESCRIPTOR dev_desc = {};
+		uint8_t dev_buf[512] = {};
 		DWORD bytes_returned = 0;
 
 		if (DeviceIoControl(
@@ -2867,12 +2901,13 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 					IOCTL_STORAGE_QUERY_PROPERTY,
 					&query,
 					sizeof(query),
-					&dev_desc,
-					sizeof(dev_desc),
+					dev_buf,
+					sizeof(dev_buf),
 					&bytes_returned,
-					nullptr)) {
-
-			switch (dev_desc.BusType) {
+					nullptr) &&
+				bytes_returned >= sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+			const auto *dev_desc = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR *>(dev_buf);
+			switch (dev_desc->BusType) {
 				case BusTypeNvme:
 					res["bus_type"] = "NVMe";
 					break;
@@ -2895,7 +2930,7 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 					res["bus_type"] = "Virtual";
 					break;
 				default:
-					res["bus_type"] = "BusType_" + String::num_int64(dev_desc.BusType);
+					res["bus_type"] = "BusType_" + String::num_int64(dev_desc->BusType);
 					break;
 			}
 		}
@@ -2924,28 +2959,39 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 			trim_enabled = trim_desc.TrimEnabled != FALSE;
 		}
 
-		// Query Windows Kernel BypassIO state
-		DS_BYPASSIO_OUTPUT bypassio_out = {};
-		DWORD bypassio_bytes = 0;
-		if (DeviceIoControl(
-					hDevice,
-					FSCTL_GET_BYPASSIO_STATE,
-					nullptr,
-					0,
-					&bypassio_out,
-					sizeof(bypassio_out),
-					&bypassio_bytes,
-					nullptr)) {
-			if (bypassio_out.State == 0) {
-				res["bypassio_state"] = "Enabled";
-			} else if (bypassio_out.State == 1) {
-				res["bypassio_state"] = "Disabled";
-			} else {
-				res["bypassio_state"] = "Unsupported";
-			}
-		}
-
 		CloseHandle(hDevice);
+	}
+
+	// Query Windows Kernel BypassIO state on the mounted filesystem root handle.
+	// FSCTL_MANAGE_BYPASS_IO is handled by the NTFS/minifilter stack, not the raw volume device.
+	HANDLE hFs = CreateFileW(
+			w_drive_root.c_str(),
+			FILE_READ_ATTRIBUTES,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			nullptr,
+			OPEN_EXISTING,
+			FILE_FLAG_BACKUP_SEMANTICS,
+			nullptr);
+	if (hFs != INVALID_HANDLE_VALUE) {
+		DSBpioInput bpio_in = {};
+		bpio_in.Operation = static_cast<decltype(bpio_in.Operation)>(DS_BPIO_OP_QUERY);
+		DSBpioOutput bpio_out = {};
+		DWORD bpio_bytes = 0;
+		if (DeviceIoControl(
+					hFs,
+					FSCTL_MANAGE_BYPASS_IO,
+					&bpio_in,
+					sizeof(bpio_in),
+					&bpio_out,
+					sizeof(bpio_out),
+					&bpio_bytes,
+					nullptr) &&
+				bpio_bytes >= 24) {
+			const bool stack_paused = (static_cast<uint32_t>(bpio_out.OutFlags) & DS_BPIO_OUTFLAG_VOLUME_STACK_BYPASS_PAUSED) != 0;
+			const bool query_ok = bpio_out.Query.OpStatus == 0;
+			res["bypassio_state"] = (query_ok && !stack_paused) ? "Enabled" : "Disabled";
+		}
+		CloseHandle(hFs);
 	}
 
 	bool is_nvme = (res["bus_type"] == "NVMe");

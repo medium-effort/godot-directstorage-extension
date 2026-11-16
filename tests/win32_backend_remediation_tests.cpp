@@ -402,6 +402,31 @@ GDEX_TEST_T(win32_remediation, drive_info_reports_media_class, TAG_UNIT) {
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, drive_info_reports_bypassio_state, TAG_UNIT) {
+#ifdef _WIN32
+    const godot::Dictionary info = godot::Win32Backend::get_drive_info_for_path("res://");
+    GDEX_EXPECT_TRUE(info.has("bypassio_state"));
+    const godot::String state = info["bypassio_state"];
+    GDEX_EXPECT_TRUE(state == "Enabled" || state == "Disabled" || state == "Unsupported");
+
+    const godot::String bus = info["bus_type"];
+    const godot::String fs = info["file_system"];
+    GDEX_EXPECT_FALSE(bus.is_empty());
+    // Windows 11+ NVMe/NTFS volumes should resolve BypassIO state via FSCTL_MANAGE_BYPASS_IO
+    // (Enabled or Disabled if a filter vetoes it), rather than unconditionally failing with Unsupported.
+    if (bus == "NVMe" && fs == "NTFS" && godot::OS::get_singleton() && godot::OS::get_singleton()->get_version().contains("226")) {
+        GDEX_EXPECT_TRUE(state != "Unsupported");
+    }
+
+    const godot::Dictionary unc_info = godot::Win32Backend::get_drive_info_for_path("\\\\localhost\\share\\file");
+    GDEX_EXPECT_TRUE(godot::String(unc_info["bus_type"]) == "Network");
+    GDEX_EXPECT_TRUE(godot::String(unc_info["bypassio_state"]) == "Unsupported");
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, multi_queue_wait_for_completion_bounded_timeout, TAG_INTEGRATION) {
 #ifdef _WIN32
     // HIGH-10: wait_for_completion() must inspect all priority queues up to
