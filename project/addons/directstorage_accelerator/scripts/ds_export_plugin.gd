@@ -340,6 +340,8 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		return
 
 	_apply_steampipe_alignment()
+	if _dspkg.has_method("set_payload_dedup_enabled"):
+		_dspkg.set_payload_dedup_enabled(true)
 
 	if _outcome == _policy.OUTCOME_PROTECTED:
 		if not _apply_archive_key():

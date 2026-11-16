@@ -46,9 +46,11 @@ constexpr uint64_t DSPKG_CAP_CONTENT_HASH = 1ULL << 3;
 constexpr uint64_t DSPKG_CAP_MESH = 1ULL << 4;
 constexpr uint64_t DSPKG_CAP_CRYPTO_V2 = 1ULL << 5;
 constexpr uint64_t DSPKG_CAP_MULTI_ARCHIVE = 1ULL << 6;
+constexpr uint64_t DSPKG_CAP_SHARED_PAYLOAD = 1ULL << 7;
 constexpr uint64_t DSPKG_CAP_KNOWN_MASK =
 		DSPKG_CAP_ZSTD | DSPKG_CAP_GACL | DSPKG_CAP_CHUNKED | DSPKG_CAP_CONTENT_HASH |
-		DSPKG_CAP_MESH | DSPKG_CAP_CRYPTO_V2 | DSPKG_CAP_MULTI_ARCHIVE;
+		DSPKG_CAP_MESH | DSPKG_CAP_CRYPTO_V2 | DSPKG_CAP_MULTI_ARCHIVE |
+		DSPKG_CAP_SHARED_PAYLOAD;
 
 // DSTex v3 capability word layout. Bits 0-7 and 8-15 carry the codec and GACL
 // transform directly; bit 16 is the chunked summary; bits 17-63 are reserved.

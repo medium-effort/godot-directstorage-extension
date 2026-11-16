@@ -73,6 +73,10 @@
 			<return type="bool" />
 			<description>Returns whether 1 MiB chunk bin-packing is enabled for payload alignment.</description>
 		</method>
+		<method name="is_payload_dedup_enabled" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether identical-source payload deduplication is enabled for the archive builder.</description>
+		</method>
 		<method name="open">
 			<return type="Error" />
 			<param index="0" name="path" type="String" />
@@ -108,6 +112,11 @@
 			<return type="void" />
 			<param index="0" name="alignment" type="int" />
 			<description>Sets the payload byte alignment for archive entries. Must be a power of two and &gt;= [code]512[/code]. For SteamPipe delta patching, pass [code]1048576[/code] (1 MiB).</description>
+		</method>
+		<method name="set_payload_dedup_enabled">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>Enables or disables deduplicating identical [code].dstex[/code] payloads across alias entries (such as a source [code].png[/code] path and its imported [code].dstex[/code] path) during [method finalize]. Must be called while building an archive.</description>
 		</method>
 	</methods>
 </class>

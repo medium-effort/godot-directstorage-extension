@@ -2341,4 +2341,98 @@ GDEX_TEST_T(dspkg, none_texture_forces_v5_archive, TAG_INTEGRATION) {
 	remove_temp_file(pkg_gz);
 }
 
+GDEX_TEST_T(dspkg, shared_payload_dedup_roundtrip, TAG_INTEGRATION) {
+	const char *dstex_path = "user://gdextest_dedup_src.dstex";
+	const char *pkg_single = "user://gdextest_dedup_single.dspkg";
+	const char *pkg_alias = "user://gdextest_dedup_alias.dspkg";
+	const char *entry_a = "res://gdextest_dedup.png";
+	const char *entry_b = "res://.godot/imported/gdextest_dedup.dstex";
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_single);
+	remove_temp_file(pkg_alias);
+
+	// 256x256 RGBA8 with 3 mips: 262144 + 65536 + 16384 = 344064 bytes.
+	GDEX_ASSERT_TRUE(write_temp_dstex(dstex_path, 256, 256, 3, 256 * 256 * 4 + 128 * 128 * 4 + 64 * 64 * 4));
+
+	GDEX_ASSERT_TRUE(build_single_texture_archive(dstex_path, pkg_single, entry_a));
+
+	{
+		godot::Ref<godot::DSPkg> builder;
+		builder.instantiate();
+		GDEX_ASSERT_EQ(static_cast<int64_t>(builder->create(godot::String(pkg_alias), 0xCAFEBABEULL)),
+				static_cast<int64_t>(godot::OK));
+		builder->set_payload_dedup_enabled(true);
+		GDEX_EXPECT_TRUE(builder->is_payload_dedup_enabled());
+		GDEX_ASSERT_EQ(static_cast<int64_t>(builder->add_texture(godot::String(entry_a), godot::String(dstex_path))),
+				static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_EQ(static_cast<int64_t>(builder->add_texture(godot::String(entry_b), godot::String(dstex_path))),
+				static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_EQ(static_cast<int64_t>(builder->finalize()), static_cast<int64_t>(godot::OK));
+	}
+
+	int single_ver = 0;
+	int alias_ver = 0;
+	int64_t single_min = 0;
+	int64_t alias_min = 0;
+	GDEX_ASSERT_TRUE(read_archive_header_versions(pkg_single, single_ver, single_min));
+	GDEX_ASSERT_TRUE(read_archive_header_versions(pkg_alias, alias_ver, alias_min));
+	GDEX_EXPECT_EQ(single_ver, 4);
+	GDEX_EXPECT_EQ(alias_ver, 5);
+
+	godot::Ref<godot::FileAccess> f_single = godot::FileAccess::open(godot::String(pkg_single), godot::FileAccess::READ);
+	godot::Ref<godot::FileAccess> f_alias = godot::FileAccess::open(godot::String(pkg_alias), godot::FileAccess::READ);
+	GDEX_ASSERT_TRUE(f_single.is_valid() && f_alias.is_valid());
+	const uint64_t single_len = f_single->get_length();
+	const uint64_t alias_len = f_alias->get_length();
+	// Only TOC growth (< 512 B), never a second payload copy.
+	GDEX_EXPECT_LT(alias_len, single_len + 512ULL);
+
+	godot::PackedByteArray hdr_bytes = f_alias->get_buffer(sizeof(godot::DSPkgHeaderV5));
+	GDEX_ASSERT_EQ(hdr_bytes.size(), static_cast<int64_t>(sizeof(godot::DSPkgHeaderV5)));
+	godot::DSPkgHeaderV5 hdr5{};
+	memcpy(&hdr5, hdr_bytes.ptr(), sizeof(hdr5));
+	GDEX_EXPECT_TRUE((hdr5.capabilities & godot::DSPKG_CAP_SHARED_PAYLOAD) != 0);
+	f_single->close();
+	f_alias->close();
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(reader->open(godot::String(pkg_alias), 0xCAFEBABEULL)),
+			static_cast<int64_t>(godot::OK));
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 2);
+
+	godot::Dictionary info_a = reader->get_entry_info(godot::String(entry_a));
+	godot::Dictionary info_b = reader->get_entry_info(godot::String(entry_b));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(info_a["data_offset"]), static_cast<int64_t>(info_b["data_offset"]));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(info_a["compressed_size"]), static_cast<int64_t>(info_b["compressed_size"]));
+
+	godot::PackedByteArray bytes_a = godot::PackedByteArray(reader->read_texture(godot::String(entry_a))["compressed_data"]);
+	godot::PackedByteArray bytes_b = godot::PackedByteArray(reader->read_texture(godot::String(entry_b))["compressed_data"]);
+	GDEX_ASSERT_EQ(bytes_a.size(), bytes_b.size());
+	GDEX_EXPECT_GT(bytes_a.size(), 0);
+	GDEX_EXPECT_EQ(memcmp(bytes_a.ptr(), bytes_b.ptr(), static_cast<size_t>(bytes_a.size())), 0);
+
+	godot::Array mips = reader->get_mip_entries_for_offset(static_cast<uint64_t>(static_cast<int64_t>(info_a["data_offset"])));
+	GDEX_EXPECT_EQ(mips.size(), 3);
+
+	// Clearing DSPKG_CAP_SHARED_PAYLOAD on an aliased archive must fail closed.
+	{
+		godot::Ref<godot::FileAccess> f_rw = godot::FileAccess::open(godot::String(pkg_alias), godot::FileAccess::READ_WRITE);
+		GDEX_ASSERT_TRUE(f_rw.is_valid() && f_rw->is_open());
+		hdr5.capabilities &= ~godot::DSPKG_CAP_SHARED_PAYLOAD;
+		f_rw->seek(0);
+		f_rw->store_buffer(reinterpret_cast<const uint8_t *>(&hdr5), sizeof(hdr5));
+		f_rw->close();
+
+		godot::Ref<godot::DSPkg> bad_reader;
+		bad_reader.instantiate();
+		GDEX_EXPECT_EQ(static_cast<int64_t>(bad_reader->open(godot::String(pkg_alias), 0xCAFEBABEULL)),
+				static_cast<int64_t>(godot::ERR_FILE_CORRUPT));
+	}
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(pkg_single);
+	remove_temp_file(pkg_alias);
+}
+
 
