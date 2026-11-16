@@ -509,7 +509,9 @@ func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
 	if version != 2 and version != 3:
 		return {}
 	if version == 3:
-		if int(metadata.get("compression_format", 1)) != 1 or int(metadata.get("gacl_transform", 0)) != 0:
+		# NONE (0) is a payload the v5 archive can stage, so only Zstd/GACL
+		# (and any future codec) lacks an archive representation here.
+		if int(metadata.get("compression_format", 1)) not in [0, 1] or int(metadata.get("gacl_transform", 0)) != 0:
 			push_warning("[DirectStorage Exporter] v3 payload in '" + dstex_path + "' needs Zstd/GACL support archives do not have; bundling without GPU mip metadata.")
 			return {}
 	var mip_count := int(metadata.get("mip_count", 0))
