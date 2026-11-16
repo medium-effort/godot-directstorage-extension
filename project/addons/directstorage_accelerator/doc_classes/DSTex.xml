@@ -45,6 +45,11 @@
 			<param index="0" name="path" type="String" />
 			<description>Reads and validates the [code].dstex[/code] header and mip table (validating mip table bounds and enforcing a maximum of 16 mip levels before allocating memory). The result contains [code]magic[/code] ([int]), [code]version[/code] ([int]), [code]flags[/code] ([int]), [code]width[/code] ([int]), [code]height[/code] ([int]), [code]pixel_format[/code] ([int]), [code]mip_count[/code] ([int]), [code]original_size[/code] ([int]), [code]compressed_size[/code] ([int]), [code]reserved[/code] ([int]), [code]logical_width[/code] ([int]), [code]logical_height[/code] ([int]), [code]depth_or_layers[/code] ([int]), [code]mip_offsets[/code] ([PackedInt64Array]), [code]mip_sizes[/code] ([PackedInt32Array]), [code]mip_uncompressed_sizes[/code] ([PackedInt32Array]), and [code]mip_row_pitches[/code] ([PackedInt32Array]). For version 3 files, [code]logical_width[/code]/[code]logical_height[/code] are the authoring dimensions (falling back to the storage dimensions when the file records none); for older versions they equal [code]width[/code]/[code]height[/code]. Returns an empty dictionary on validation failure.</description>
 		</method>
+		<method name="repack_uncompressed_to_buffer">
+			<return type="PackedByteArray" />
+			<param index="0" name="src_path" type="String" />
+			<description>Decodes a GDeflate-compressed [code].dstex[/code] file at [param src_path] into an uncompressed v3 ([code]NONE[/code]) [code].dstex[/code] byte buffer suitable for embedding in an exported PCK. Returns the raw file bytes unchanged if [param src_path] is already uncompressed and non-chunked; a chunked uncompressed file is coalesced into one contiguous footprint per mip. Legacy v1 containers carry no GPU mip footprint, so they are rejected with an empty [PackedByteArray], as are unsupported codecs and transforms.</description>
+		</method>
 		<method name="normalize_image" qualifiers="static">
 			<return type="void" />
 			<param index="0" name="image" type="Image" />

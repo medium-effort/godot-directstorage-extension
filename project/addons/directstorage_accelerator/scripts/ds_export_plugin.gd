@@ -35,6 +35,7 @@ var _policy: GDScript = _load_policy()
 const OPTION_BUNDLE_DSPKG: StringName = &"dsgd_extension/bundle_textures_dspkg"
 const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"dsgd_extension/enforce_archive_pairing"
 const OPTION_STEAMPIPE_1MB_ALIGNMENT: StringName = &"dsgd_extension/steampipe_1mb_alignment"
+const OPTION_STORE_UNCOMPRESSED_TEXTURES: StringName = &"dsgd_extension/store_uncompressed_textures"
 const OPTION_INCLUDE_DSGD_LICENSE_FILE: StringName = &"dsgd_extension/include_dsgd_license_file"
 const OPTION_INCLUDE_DIRECTSTORAGE_LICENSE_FILE: StringName = &"dsgd_extension/include_directstorage_license_file"
 const OPTION_MERGE_LICENSE_FILES: StringName = &"dsgd_extension/merge_license_files"
@@ -117,6 +118,7 @@ var _is_debug_export: bool = false
 var _bundle_dspkg_enabled: bool = false
 var _enforce_pairing_enabled: bool = true
 var _steampipe_1mb_alignment_enabled: bool = false
+var _store_uncompressed_textures: bool = false
 var _include_dsgd_license_file: bool = true
 var _include_directstorage_license_file: bool = true
 var _merge_license_files: bool = true
@@ -128,13 +130,15 @@ var _archive_name: String = "textures.dspkg"
 func _get_name() -> String:
 	return "dsgd Extension"
 
-## Declares whether this export plugin supports the target platform.
-func _supports_platform(platform: EditorExportPlatform) -> bool:
+## Returns whether the export platform targets Windows.
+static func _is_windows_platform(platform: EditorExportPlatform) -> bool:
 	if platform is EditorExportPlatformWindows:
 		return true
-	if platform != null and platform.get_os_name() == "Windows":
-		return true
-	return false
+	return platform != null and platform.get_os_name() == "Windows"
+
+## Declares whether this export plugin supports the target platform.
+func _supports_platform(platform: EditorExportPlatform) -> bool:
+	return _is_windows_platform(platform)
 
 ## Exposes custom export options for Windows Desktop in the Export dialog.
 func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
@@ -170,6 +174,16 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 				"usage": PROPERTY_USAGE_DEFAULT
 			},
 			"default_value": false,
+		},
+		{
+			"option": {
+				"name": OPTION_STORE_UNCOMPRESSED_TEXTURES,
+				"type": TYPE_BOOL,
+				"hint": PROPERTY_HINT_NONE,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT
+			},
+			"default_value": not _is_windows_platform(platform),
 		},
 		{
 			"option": {
@@ -256,6 +270,10 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
+	_store_uncompressed_textures = _option_bool(
+		OPTION_STORE_UNCOMPRESSED_TEXTURES,
+		not _is_windows_platform(platform)
+	)
 	# A preset created before an option existed has no key and returns nil;
 	# treat that as the default instead of silently disabling an output.
 	_include_dsgd_license_file = _option_bool(OPTION_INCLUDE_DSGD_LICENSE_FILE, true)
@@ -340,6 +358,12 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		return
 
 	_apply_steampipe_alignment()
+	if _dspkg.has_method("set_repack_uncompressed"):
+		_dspkg.set_repack_uncompressed(_store_uncompressed_textures)
+		if _store_uncompressed_textures:
+			print("[DirectStorage Exporter] Export-time uncompressed texture repack is ENABLED.")
+	elif _store_uncompressed_textures:
+		push_warning("[DirectStorage Exporter] Active DSPkg binary does not support 'set_repack_uncompressed'; archive will keep source compression.")
 	if _dspkg.has_method("set_payload_dedup_enabled"):
 		_dspkg.set_payload_dedup_enabled(true)
 
@@ -542,6 +566,20 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 
 	var action: String = _policy.resolve_file_action(_outcome, _archive_failed, _dspkg != null)
 	if action == _policy.ACTION_PACK:
+		if _store_uncompressed_textures and ClassDB.class_exists("DSTex"):
+			var tex_repacker := ClassDB.instantiate("DSTex")
+			if tex_repacker != null and tex_repacker.has_method("repack_uncompressed_to_buffer"):
+				var repacked: PackedByteArray = tex_repacker.call("repack_uncompressed_to_buffer", dstex_path)
+				if not repacked.is_empty():
+					# The engine writes `<path>.import` after the plugin
+					# callbacks, so skip() drops it, and remap=false drops the
+					# `<path>.remap` alternative: the PCK would then hold the
+					# payload with nothing pointing at it. Keep the mapping.
+					add_file(dstex_path, repacked, dstex_path != path)
+					skip()
+					print("[DirectStorage Exporter] Repacked uncompressed .dstex into PCK: ", dstex_path)
+					return
+				push_warning("[DirectStorage Exporter] Failed to repack '" + dstex_path + "' uncompressed; keeping original .dstex in PCK.")
 		# Intended CPU fallback: let Godot export .dstex directly into the PCK.
 		return
 	if action == _policy.ACTION_SKIP:

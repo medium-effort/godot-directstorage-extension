@@ -146,6 +146,7 @@ public:
 	Dictionary read_from_file(const String &p_path);
 	/// Convenience alias for read_header; returns the same header metadata dictionary.
 	Dictionary get_file_info(const String &p_path);
+	PackedByteArray repack_uncompressed_to_buffer(const String &p_src_path);
 
 	static DSTexMipLayout get_mip_layout(uint32_t p_width, uint32_t p_height, int p_image_format);
 	/// Translate a chunk's [p_storage_row, p_storage_row + p_storage_rows) band inside one mip

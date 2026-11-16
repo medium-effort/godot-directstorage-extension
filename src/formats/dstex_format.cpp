@@ -1,5 +1,6 @@
 #include "dstex_format.h"
 #include "compression/gdeflate_compressor.h"
+#include "compression/gdeflate_decompressor.h"
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
@@ -965,6 +966,7 @@ void DSTex::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("read_header", "path"), &DSTex::read_header);
 	ClassDB::bind_method(D_METHOD("read_from_file", "path"), &DSTex::read_from_file);
 	ClassDB::bind_method(D_METHOD("get_file_info", "path"), &DSTex::get_file_info);
+	ClassDB::bind_method(D_METHOD("repack_uncompressed_to_buffer", "src_path"), &DSTex::repack_uncompressed_to_buffer);
 
 	ClassDB::bind_static_method("DSTex", D_METHOD("is_format_supported", "image_format"), &DSTex::is_format_supported);
 	ClassDB::bind_static_method("DSTex", D_METHOD("godot_format_to_rd_format", "image_format", "is_srgb"), &DSTex::godot_format_to_rd_format, DEFVAL(false));
@@ -2362,6 +2364,225 @@ Dictionary DSTex::read_from_file(const String &p_path) {
 // Keep the legacy file-info API as an explicit convenience alias for read_header.
 Dictionary DSTex::get_file_info(const String &p_path) {
 	return read_header(p_path);
+}
+
+PackedByteArray DSTex::repack_uncompressed_to_buffer(const String &p_src_path) {
+	Dictionary hdr = read_header(p_src_path);
+	if (hdr.is_empty()) {
+		return PackedByteArray();
+	}
+
+	const int version = hdr.get("version", 0);
+	const int comp_fmt = hdr.get("compression_format", 1);
+	const int gacl = hdr.get("gacl_transform", 0);
+	const bool chunked = hdr.get("chunked", false);
+	const bool uncompressed_source = comp_fmt == static_cast<int>(DSCompressionFormat::NONE);
+	if (uncompressed_source && gacl == static_cast<int>(DSGaclTransform::NONE) && !chunked) {
+		return FileAccess::get_file_as_bytes(p_src_path);
+	}
+	if (gacl != static_cast<int>(DSGaclTransform::NONE) ||
+			(!uncompressed_source && comp_fmt != static_cast<int>(DSCompressionFormat::GDEFLATE))) {
+		UtilityFunctions::push_error("DSTex: Unsupported codec/transform for uncompressed repack: ", p_src_path);
+		return PackedByteArray();
+	}
+	if (version == 1) {
+		// v1 payloads store natural rows: their mip table carries no
+		// uncompressed size or row pitch, and the repacked container is a v3
+		// GPU footprint. Inferring one here would emit a table that
+		// mip_table_is_sane() rejects, so refuse instead of guessing.
+		UtilityFunctions::push_error("DSTex: v1 containers carry no GPU mip footprint and cannot be repacked uncompressed: ", p_src_path);
+		return PackedByteArray();
+	}
+
+	const uint32_t width = hdr.get("width", 0);
+	const uint32_t height = hdr.get("height", 0);
+	const uint32_t logical_width = hdr.get("logical_width", width);
+	const uint32_t logical_height = hdr.get("logical_height", height);
+	const uint32_t pixel_format = hdr.get("pixel_format", 0);
+	const uint32_t mip_count = hdr.get("mip_count", 0);
+	const uint32_t flags = hdr.get("flags", 0);
+	if (mip_count == 0 || mip_count > DSTEX_MAX_MIP_COUNT) {
+		UtilityFunctions::push_error("DSTex: Invalid mip count for uncompressed repack: ", p_src_path);
+		return PackedByteArray();
+	}
+
+	const PackedInt64Array src_mip_offsets = hdr.get("mip_offsets", PackedInt64Array());
+	const PackedInt32Array src_mip_sizes = hdr.get("mip_sizes", PackedInt32Array());
+	const PackedInt32Array src_mip_uncomp = hdr.get("mip_uncompressed_sizes", PackedInt32Array());
+	const PackedInt32Array src_mip_pitches = hdr.get("mip_row_pitches", PackedInt32Array());
+	if (src_mip_offsets.size() != static_cast<int64_t>(mip_count) ||
+			src_mip_sizes.size() != static_cast<int64_t>(mip_count)) {
+		UtilityFunctions::push_error("DSTex: Incomplete mip table for uncompressed repack: ", p_src_path);
+		return PackedByteArray();
+	}
+	if (src_mip_uncomp.size() != static_cast<int64_t>(mip_count) ||
+			src_mip_pitches.size() != static_cast<int64_t>(mip_count)) {
+		UtilityFunctions::push_error("DSTex: Missing GPU mip metadata for uncompressed repack: ", p_src_path);
+		return PackedByteArray();
+	}
+
+	const PackedInt32Array src_chunk_counts = hdr.get("mip_chunk_counts", PackedInt32Array());
+	const PackedInt64Array src_chunk_offsets = hdr.get("chunk_offsets", PackedInt64Array());
+	const PackedInt32Array src_chunk_comp = hdr.get("chunk_compressed_sizes", PackedInt32Array());
+	const PackedInt32Array src_chunk_uncomp = hdr.get("chunk_uncompressed_sizes", PackedInt32Array());
+
+	Ref<FileAccess> file = FileAccess::open(p_src_path, FileAccess::READ);
+	if (file.is_null() || !file->is_open()) {
+		UtilityFunctions::push_error("DSTex: Failed to open source for uncompressed repack: ", p_src_path);
+		return PackedByteArray();
+	}
+
+	Ref<GDeflateDecompressor> decompressor;
+	decompressor.instantiate();
+	std::vector<PackedByteArray> mip_footprints(mip_count);
+	uint64_t footprint_total = 0;
+	int64_t chunk_cursor = 0;
+
+	for (uint32_t m = 0; m < mip_count; ++m) {
+		const uint32_t expected_mip_bytes = static_cast<uint32_t>(src_mip_uncomp[m]);
+		if (expected_mip_bytes == 0 || expected_mip_bytes > DSTEX_MAX_TOTAL_BYTES ||
+				footprint_total > DSTEX_MAX_TOTAL_BYTES - expected_mip_bytes) {
+			file->close();
+			UtilityFunctions::push_error("DSTex: Uncompressed footprint exceeds limit: ", p_src_path);
+			return PackedByteArray();
+		}
+		footprint_total += expected_mip_bytes;
+
+		const int32_t chunks = chunked ? src_chunk_counts[m] : 1;
+		if (chunks <= 1) {
+			const int64_t comp_bytes = static_cast<int64_t>(static_cast<uint32_t>(src_mip_sizes[m]));
+			file->seek(src_mip_offsets[m]);
+			PackedByteArray comp = file->get_buffer(comp_bytes);
+			if (comp.size() != comp_bytes) {
+				file->close();
+				UtilityFunctions::push_error("DSTex: Truncated mip payload during uncompressed repack: ", p_src_path);
+				return PackedByteArray();
+			}
+			if (uncompressed_source) {
+				// A NONE mip is already the footprint, so copy it instead of
+				// handing raw bytes to the GDeflate decoder.
+				if (comp.size() != static_cast<int64_t>(expected_mip_bytes)) {
+					file->close();
+					UtilityFunctions::push_error("DSTex: NONE mip size mismatch during uncompressed repack: ", p_src_path);
+					return PackedByteArray();
+				}
+				mip_footprints[m] = std::move(comp);
+			} else {
+				PackedByteArray dec = decompressor->decompress(comp, static_cast<int>(expected_mip_bytes));
+				if (dec.size() != static_cast<int64_t>(expected_mip_bytes)) {
+					file->close();
+					UtilityFunctions::push_error("DSTex: Failed to decompress mip during uncompressed repack: ", p_src_path);
+					return PackedByteArray();
+				}
+				mip_footprints[m] = std::move(dec);
+			}
+		} else {
+			PackedByteArray mip_buf;
+			mip_buf.resize(static_cast<int64_t>(expected_mip_bytes));
+			uint64_t mip_written = 0;
+			for (int32_t c = 0; c < chunks; ++c) {
+				if (chunk_cursor >= src_chunk_offsets.size() ||
+						chunk_cursor >= src_chunk_comp.size() ||
+						chunk_cursor >= src_chunk_uncomp.size()) {
+					file->close();
+					UtilityFunctions::push_error("DSTex: Chunk table mismatch during uncompressed repack: ", p_src_path);
+					return PackedByteArray();
+				}
+				const int64_t c_comp_bytes = static_cast<int64_t>(static_cast<uint32_t>(src_chunk_comp[chunk_cursor]));
+				const int64_t c_uncomp_bytes = static_cast<int64_t>(static_cast<uint32_t>(src_chunk_uncomp[chunk_cursor]));
+				file->seek(src_chunk_offsets[chunk_cursor]);
+				PackedByteArray c_comp = file->get_buffer(c_comp_bytes);
+				if (c_comp.size() != c_comp_bytes) {
+					file->close();
+					UtilityFunctions::push_error("DSTex: Truncated chunk payload during uncompressed repack: ", p_src_path);
+					return PackedByteArray();
+				}
+				PackedByteArray c_dec;
+				const uint8_t *chunk_bytes = nullptr;
+				if (uncompressed_source) {
+					// A NONE chunk is a raw row slice (compressed == uncompressed),
+					// so it is copied straight into the mip footprint.
+					if (c_comp_bytes != c_uncomp_bytes) {
+						file->close();
+						UtilityFunctions::push_error("DSTex: NONE chunk sizes must match during uncompressed repack: ", p_src_path);
+						return PackedByteArray();
+					}
+					chunk_bytes = c_comp.ptr();
+				} else {
+					c_dec = decompressor->decompress(c_comp, static_cast<int>(c_uncomp_bytes));
+					if (c_dec.size() != c_uncomp_bytes) {
+						file->close();
+						UtilityFunctions::push_error("DSTex: Failed to decompress chunk during uncompressed repack: ", p_src_path);
+						return PackedByteArray();
+					}
+					chunk_bytes = c_dec.ptr();
+				}
+				if (mip_written + static_cast<uint64_t>(c_uncomp_bytes) > expected_mip_bytes) {
+					file->close();
+					UtilityFunctions::push_error("DSTex: Chunk exceeds the mip footprint during uncompressed repack: ", p_src_path);
+					return PackedByteArray();
+				}
+				memcpy(mip_buf.ptrw() + mip_written, chunk_bytes, static_cast<size_t>(c_uncomp_bytes));
+				mip_written += static_cast<uint64_t>(c_uncomp_bytes);
+				++chunk_cursor;
+			}
+			if (mip_written != expected_mip_bytes) {
+				file->close();
+				UtilityFunctions::push_error("DSTex: Chunked mip size mismatch during uncompressed repack: ", p_src_path);
+				return PackedByteArray();
+			}
+			mip_footprints[m] = std::move(mip_buf);
+		}
+	}
+	file->close();
+
+	uint64_t data_offset = sizeof(DSTexHeaderV3) + (sizeof(DSTexMipEntryV2) * static_cast<uint64_t>(mip_count));
+	if (!align_up(data_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, data_offset)) {
+		return PackedByteArray();
+	}
+	std::vector<DSTexMipEntryV2> mip_entries(mip_count);
+	uint64_t running_offset = data_offset;
+	for (uint32_t m = 0; m < mip_count; ++m) {
+		if (!align_up(running_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, running_offset)) {
+			return PackedByteArray();
+		}
+		mip_entries[m].offset = running_offset;
+		mip_entries[m].compressed_size = static_cast<uint32_t>(mip_footprints[m].size());
+		mip_entries[m].uncompressed_size = static_cast<uint32_t>(mip_footprints[m].size());
+		mip_entries[m].row_pitch = static_cast<uint32_t>(src_mip_pitches[m]);
+		mip_entries[m].chunk_count = 1;
+		running_offset += static_cast<uint64_t>(mip_footprints[m].size());
+	}
+
+	DSTexHeader out_hdr{};
+	out_hdr.magic = 0x58455444; // "DTEX"
+	out_hdr.version = 3;
+	out_hdr.flags = flags;
+	out_hdr.width = width;
+	out_hdr.height = height;
+	out_hdr.pixel_format = pixel_format;
+	out_hdr.mip_count = mip_count;
+	out_hdr.original_size = footprint_total;
+	out_hdr.compressed_size = footprint_total;
+	out_hdr.reserved = static_cast<uint64_t>(DSCompressionFormat::NONE);
+
+	DSTexHeaderV3Ext out_ext{};
+	out_ext.logical_width = (logical_width != width || logical_height != height) ? logical_width : 0;
+	out_ext.logical_height = (logical_width != width || logical_height != height) ? logical_height : 0;
+	out_ext.depth_or_layers = 0;
+	out_ext.reserved0 = 0;
+
+	PackedByteArray out_buf;
+	out_buf.resize(static_cast<int64_t>(running_offset));
+	memset(out_buf.ptrw(), 0, static_cast<size_t>(running_offset));
+	uint8_t *dst = out_buf.ptrw();
+	memcpy(dst, &out_hdr, sizeof(DSTexHeader));
+	memcpy(dst + sizeof(DSTexHeader), &out_ext, sizeof(DSTexHeaderV3Ext));
+	memcpy(dst + sizeof(DSTexHeaderV3), mip_entries.data(), sizeof(DSTexMipEntryV2) * mip_count);
+	for (uint32_t m = 0; m < mip_count; ++m) {
+		memcpy(dst + mip_entries[m].offset, mip_footprints[m].ptr(), static_cast<size_t>(mip_footprints[m].size()));
+	}
+	return out_buf;
 }
 
 } // namespace godot
