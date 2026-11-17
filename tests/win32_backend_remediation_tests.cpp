@@ -4311,3 +4311,105 @@ GDEX_TEST_ASYNC_T(win32_remediation, concurrent_gpu_destination_enqueues_all_acc
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, transition_abort_clears_staged_request_names, ::gdextest::TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    const char *fixture_path = "user://transition_abort_names_fixture.dstex";
+    remove_temp_file(fixture_path);
+    ctx.add_teardown([fixture_path]() { remove_temp_file(fixture_path); });
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+    GDEX_ASSERT_TRUE(write_temp_dstex(fixture_path, 64, 64, 1, 16384));
+
+    ctx.add_teardown([backend]() {
+        backend->_debug_set_force_transition_failure_for_testing(false);
+        backend->_debug_set_enqueue_window_hook_for_testing({});
+    });
+
+    // 1) Async submit abort path: transition failure must clear request_names on both slots.
+    godot::Ref<godot::DSRequest> async_aborted = make_dummy_request(fixture_path, 1024);
+    async_aborted->set_uncompressed_size(1024);
+    async_aborted->set_priority(godot::DSRequest::PRIORITY_LOW);
+    GDEX_ASSERT_TRUE(backend->enqueue_request(async_aborted));
+
+    backend->_debug_set_force_transition_failure_for_testing(true);
+    backend->submit_async();
+    backend->_debug_set_force_transition_failure_for_testing(false);
+
+    GDEX_EXPECT_EQ(static_cast<int64_t>(async_aborted->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(backend->_debug_staged_request_names_for_testing(0, 0).is_empty());
+    GDEX_EXPECT_TRUE(backend->_debug_staged_request_names_for_testing(0, 1).is_empty());
+
+    // Subsequent async batch must not inherit stale names from the aborted slot.
+    int64_t observed_async_names = -1;
+    backend->_debug_set_enqueue_window_hook_for_testing([&]() {
+        const godot::PackedStringArray slot0 = backend->_debug_staged_request_names_for_testing(0, 0);
+        const godot::PackedStringArray slot1 = backend->_debug_staged_request_names_for_testing(0, 1);
+        observed_async_names = slot0.size() + slot1.size();
+    });
+    godot::Ref<godot::DSRequest> async_follow = make_dummy_request(fixture_path, 1024);
+    async_follow->set_uncompressed_size(1024);
+    async_follow->set_priority(godot::DSRequest::PRIORITY_LOW);
+    GDEX_ASSERT_TRUE(backend->enqueue_request(async_follow));
+    backend->submit_async();
+    backend->_debug_set_enqueue_window_hook_for_testing({});
+    GDEX_EXPECT_EQ(observed_async_names, static_cast<int64_t>(1));
+
+    const uint64_t async_fence = backend->get_completion_fence();
+    GDEX_EXPECT_TRUE(backend->wait_for_completion(async_fence, 5000));
+    const auto async_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < async_deadline) {
+        backend->poll_batch_status();
+        if (backend->is_batch_complete() && async_follow->get_status() == godot::DSRequest::STATUS_COMPLETED) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(async_follow->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+
+    // 2) Sync submit abort path: transition failure must also clear request_names on both slots.
+    godot::Ref<godot::DSRequest> sync_aborted = make_dummy_request(fixture_path, 1024);
+    sync_aborted->set_uncompressed_size(1024);
+    sync_aborted->set_priority(godot::DSRequest::PRIORITY_LOW);
+    GDEX_ASSERT_TRUE(backend->enqueue_request(sync_aborted));
+
+    backend->_debug_set_force_transition_failure_for_testing(true);
+    backend->submit_batch();
+    backend->_debug_set_force_transition_failure_for_testing(false);
+
+    GDEX_EXPECT_EQ(static_cast<int64_t>(sync_aborted->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    // sync_aborted staged into slot 0 (active_batch_slot rotated back to 0 after async_follow).
+    GDEX_EXPECT_TRUE(backend->_debug_staged_request_names_for_testing(0, 0).is_empty());
+
+    int64_t observed_sync_names = -1;
+    backend->_debug_set_enqueue_window_hook_for_testing([&]() {
+        const godot::PackedStringArray slot0 = backend->_debug_staged_request_names_for_testing(0, 0);
+        const godot::PackedStringArray slot1 = backend->_debug_staged_request_names_for_testing(0, 1);
+        observed_sync_names = slot0.size() + slot1.size();
+    });
+    godot::Ref<godot::DSRequest> sync_follow = make_dummy_request(fixture_path, 1024);
+    sync_follow->set_uncompressed_size(1024);
+    sync_follow->set_priority(godot::DSRequest::PRIORITY_LOW);
+    GDEX_ASSERT_TRUE(backend->enqueue_request(sync_follow));
+    backend->submit_batch();
+    backend->_debug_set_enqueue_window_hook_for_testing({});
+    GDEX_EXPECT_EQ(observed_sync_names, static_cast<int64_t>(1));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(sync_follow->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+#else
+    (void)ctx;
+    GDEX_SKIP("The transition-failure injection seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+

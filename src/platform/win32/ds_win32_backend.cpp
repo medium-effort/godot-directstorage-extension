@@ -2028,6 +2028,27 @@ void Win32Backend::close_slot_files(BatchSlot &p_slot) {
 	p_slot.dstorage_requests.clear();
 }
 
+void Win32Backend::abort_batch_slot_locked(BatchSlot &r_slot) {
+	for (int i = 0; i < r_slot.requests.size(); i++) {
+		if (r_slot.requests[i].is_valid()) {
+			r_slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
+			r_slot.requests[i]->set_error_message("GPU resource barrier transition failed.");
+			r_slot.requests[i]->set_gpu_in_flight(false);
+		}
+	}
+	complete_chunked_requests();
+	release_resource_guards(r_slot.requests);
+	close_slot_files(r_slot);
+	r_slot.requests.clear();
+	r_slot.request_names.clear();
+	r_slot.dstorage_requests.clear();
+	r_slot.request_name_map.clear();
+	r_slot.gpu_transitions.clear();
+	r_slot.closing = false;
+	r_slot.submitted = false;
+	r_slot.completion_ready = false;
+}
+
 // Releases every backend-level cached file handle. Caller must hold
 // batch_mutex or guarantee no concurrent enqueue (init before the
 // completion thread starts, shutdown after it joins).
@@ -5213,28 +5234,17 @@ bool Win32Backend::submit_async() {
 	}
 #endif
 
-	if (!pre_transitions.is_empty()) {
-		if (!execute_transitions(pre_transitions, true)) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	const bool force_transition_abort_async = debug_force_transition_failure;
+#else
+	const bool force_transition_abort_async = false;
+#endif
+	if (!pre_transitions.is_empty() || force_transition_abort_async) {
+		if (force_transition_abort_async || !execute_transitions(pre_transitions, true)) {
 			UtilityFunctions::push_error("[DirectStorage] Failed to transition GPU destination textures to D3D12_RESOURCE_STATE_COMMON; aborting batch submit.");
 			std::lock_guard<std::mutex> lock(batch_mutex);
 			for (QueueState &queue : priority_queues) {
-				BatchSlot &slot = queue.batch_slots[submit_slot_index];
-				for (int i = 0; i < slot.requests.size(); i++) {
-					if (slot.requests[i].is_valid()) {
-						slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
-						slot.requests[i]->set_error_message("GPU resource barrier transition failed.");
-						slot.requests[i]->set_gpu_in_flight(false);
-					}
-				}
-				complete_chunked_requests();
-				release_resource_guards(slot.requests);
-				close_slot_files(slot);
-				slot.requests.clear();
-				slot.dstorage_requests.clear();
-				slot.gpu_transitions.clear();
-				slot.closing = false;
-				slot.submitted = false;
-				slot.completion_ready = false;
+				abort_batch_slot_locked(queue.batch_slots[submit_slot_index]);
 			}
 			batch_in_flight.store(has_in_flight_batches_locked());
 			update_profiler_queue_depth_locked();
@@ -5505,28 +5515,17 @@ void Win32Backend::submit_batch() {
 		enqueue_window_hook();
 	}
 #endif
-	if (!pre_transitions.is_empty()) {
-		if (!execute_transitions(pre_transitions, true)) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	const bool force_transition_abort_async = debug_force_transition_failure;
+#else
+	const bool force_transition_abort_async = false;
+#endif
+	if (!pre_transitions.is_empty() || force_transition_abort_async) {
+		if (force_transition_abort_async || !execute_transitions(pre_transitions, true)) {
 			UtilityFunctions::push_error("[DirectStorage] Failed to transition GPU destination textures to D3D12_RESOURCE_STATE_COMMON; aborting batch submit.");
 			std::lock_guard<std::mutex> lock(batch_mutex);
 			for (int queue_index = 0; queue_index < QUEUE_COUNT; queue_index++) {
-				BatchSlot &slot = priority_queues[queue_index].batch_slots[submit_slot_index];
-				for (int i = 0; i < slot.requests.size(); i++) {
-					if (slot.requests[i].is_valid()) {
-						slot.requests[i]->set_status(DSRequest::STATUS_FAILED);
-						slot.requests[i]->set_error_message("GPU resource barrier transition failed.");
-						slot.requests[i]->set_gpu_in_flight(false);
-					}
-				}
-				complete_chunked_requests();
-				release_resource_guards(slot.requests);
-				close_slot_files(slot);
-				slot.requests.clear();
-				slot.dstorage_requests.clear();
-				slot.gpu_transitions.clear();
-				slot.closing = false;
-				slot.submitted = false;
-				slot.completion_ready = false;
+				abort_batch_slot_locked(priority_queues[queue_index].batch_slots[submit_slot_index]);
 			}
 			sync_batch_in_flight.store(false);
 			batch_in_flight.store(has_in_flight_batches_locked());
@@ -6217,6 +6216,14 @@ Dictionary Win32Backend::_debug_instance_state_for_testing() const {
 	state["staging_buffer_warnings"] = static_cast<int64_t>(staging_buffer_warnings.size());
 #endif
 	return state;
+}
+
+void Win32Backend::_debug_set_force_transition_failure_for_testing(bool p_force) {
+#ifdef _WIN32
+	debug_force_transition_failure = p_force;
+#else
+	(void)p_force;
+#endif
 }
 #endif
 

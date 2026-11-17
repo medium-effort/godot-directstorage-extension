@@ -300,6 +300,10 @@ private:
 	// completion counters. A test parks there and asks another thread whether
 	// batch_mutex is held at that instant. Never bound in _bind_methods().
 	std::function<void()> drain_counter_access_hook;
+	// Test-only seam: forces the pre-submit transition gate in submit_async() and
+	// submit_batch() to abort even when pre_transitions is empty, so transition-abort
+	// slot cleanup can be tested without a live D3D12 device removal. Never bound in _bind_methods().
+	bool debug_force_transition_failure = false;
 #endif
 
 #ifdef _WIN32
@@ -351,6 +355,10 @@ private:
 	int count_logical_requests(const Vector<Ref<DSRequest>> &p_requests) const;
 	void complete_chunked_requests();
 	void close_slot_files(BatchSlot &p_slot);
+	// Aborts an unsubmitted slot after pre-submit barrier failure: fails its
+	// requests, releases guards and handles, and clears all four staging
+	// containers so the slot is clean for reuse. Caller holds batch_mutex.
+	void abort_batch_slot_locked(BatchSlot &r_slot);
 	void clear_persistent_files();
 	IDStorageFile *resolve_source_file(const std::wstring &p_wpath, String &r_error);
 	void release_source_file(const std::wstring &p_wpath, IDStorageFile *p_file);
@@ -560,6 +568,9 @@ public:
 	// the file-level statics, which is exactly what the isolation test
 	// discriminates on. Never bound in _bind_methods().
 	Dictionary _debug_instance_state_for_testing() const;
+	// Test-only seam: toggles forced transition-failure aborts in submit_async() and
+	// submit_batch(). Never bound in _bind_methods().
+	void _debug_set_force_transition_failure_for_testing(bool p_force);
 	// Test-only seam: runs the .dstex/.dspkg mip parser without a live queue or
 	// device. The parser is pure file I/O + validation, so this stays
 	// headless-safe and lets the v3/v5 guard suite pin forged headers.
