@@ -102,6 +102,7 @@ var _has_set_background_pacing: bool = false
 ## gameplay background streaming (completion-gated GPU + adaptive headroom).
 var _background_pacing: bool = false
 var _cpu_poll_cooldown_frames: int = 0
+var _gpu_pump_cooldown_frames: int = 0
 const GPU_LOADING_PUMP_MAX_CHUNKS_PER_FRAME: int = 8
 const GPU_LOADING_PUMP_BUDGET_USEC: int = 5000
 ## Adaptive slice backpressure
@@ -179,6 +180,8 @@ func set_background_pacing(enabled: bool) -> void:
 	_background_pacing = enabled
 	_gpu_pump_frames_since = 0
 	_cpu_poll_cooldown_frames = 0
+	_gpu_pump_cooldown_frames = 0
+	_gpu_pump_cooldown_frames = 0
 	if ClassDB.class_exists("DSTextureCache"):
 		var cache = Engine.get_singleton("DSTextureCache")
 		if cache != null and cache.has_method("set_background_pacing"):
@@ -200,6 +203,15 @@ func reset_slice_stats() -> void:
 	_smooth_streak = 2
 	_gpu_pump_frames_since = 0
 	_cpu_poll_cooldown_frames = 0
+	_gpu_pump_cooldown_frames = 0
+
+
+func _is_frame_capped() -> bool:
+	if Engine.max_fps > 0:
+		return true
+	if DisplayServer.get_name() != "headless":
+		return DisplayServer.window_get_vsync_mode() != DisplayServer.VSYNC_DISABLED
+	return false
 
 
 func _get_target_frame_ms() -> float:
@@ -592,12 +604,21 @@ func _process(delta: float) -> void:
 			var gpu_heavy_budget_ms: float = GPU_FRAME_BUDGET_HEAVY_MS
 			if _background_pacing:
 				var target_frame_ms: float = _get_target_frame_ms()
-				if _baseline_init:
-					mild_at = minf(target_frame_ms * 0.65, maxf(6.0, _baseline_ema_ms + 4.0))
+				if _is_frame_capped():
+					# When max_fps or VSync is active, delta * 1000.0 includes
+					# frame-pacer sleep (~target_frame_ms + OS timer jitter).
+					# Trigger mild/heavy backoff only on actual overshoot above
+					# target_frame_ms so smooth 60/120/144 Hz frames stay "warm".
+					warm_at = maxf(target_frame_ms * 1.05, target_frame_ms + 1.0)
+					mild_at = maxf(target_frame_ms * 1.10, target_frame_ms + 1.5)
+					heavy_at = maxf(mild_at + 4.0, target_frame_ms * 1.35)
 				else:
-					mild_at = target_frame_ms * 0.65
-				heavy_at = maxf(mild_at + 4.0, target_frame_ms * 0.95)
-				warm_at = maxf(4.0, mild_at * 0.75)
+					if _baseline_init:
+						mild_at = minf(target_frame_ms * 0.65, maxf(6.0, _baseline_ema_ms + 4.0))
+					else:
+						mild_at = target_frame_ms * 0.65
+					heavy_at = maxf(mild_at + 4.0, target_frame_ms * 0.95)
+					warm_at = maxf(4.0, mild_at * 0.75)
 				gpu_mild_budget_ms = mild_at
 				gpu_heavy_budget_ms = heavy_at
 			elif _baseline_init:
@@ -648,10 +669,14 @@ func _process(delta: float) -> void:
 			var gpu_slice_label := _effective_gpu_slice_label(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms)
 			if _has_pump_gpu:
 				if _background_pacing:
+					if _is_frame_capped() and frame_ms > gpu_mild_budget_ms and has_gpu_unbuilt:
+						_gpu_pump_cooldown_frames = maxi(_gpu_pump_cooldown_frames, 1)
 					var gpu_in_flight := _has_gpu_requests_in_flight and bool(cache.has_gpu_requests_in_flight(0))
-					if not gpu_in_flight and _should_pump_gpu_now(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms):
+					if _gpu_pump_cooldown_frames > 0:
+						_gpu_pump_cooldown_frames -= 1
+					elif not gpu_in_flight and _should_pump_gpu_now(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms):
 						cache.pump_gpu_prewarm()
-				elif _should_pump_gpu_now(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms):
+				else:
 					var pump_start_usec: int = Time.get_ticks_usec()
 					for _p in GPU_LOADING_PUMP_MAX_CHUNKS_PER_FRAME:
 						cache.pump_gpu_prewarm()

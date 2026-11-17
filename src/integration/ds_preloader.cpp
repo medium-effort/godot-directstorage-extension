@@ -1686,11 +1686,10 @@ void DSPreloader::pump_gpu_prewarm() {
 						count_gpu_requests_for_payload(dead_chunk.items[i].meta));
 			}
 		}
-		if (!s.gpu_chunk_in_flight && !s.gpu_chunks.empty() && is_gpu_prewarm_available()) {
-			s.gpu_current = s.gpu_chunks.front();
+		const size_t max_in_flight_chunks = s.background_pacing.load(std::memory_order_relaxed) ? 1 : 8;
+		if (s.gpu_posted_chunks.size() < max_in_flight_chunks && !s.gpu_chunks.empty() && is_gpu_prewarm_available()) {
+			s.gpu_posted_chunks.push_back(s.gpu_chunks.front());
 			s.gpu_chunks.pop_front();
-			s.gpu_current_valid = true;
-			s.gpu_chunk_in_flight = true;
 			have_chunk = true;
 		}
 	}
@@ -1707,8 +1706,9 @@ void DSPreloader::pump_gpu_prewarm() {
 		} else {
 			std::lock_guard<std::mutex> lock(state().mutex);
 			State &s = state();
-			s.gpu_current_valid = false;
-			s.gpu_chunk_in_flight = false;
+			if (!s.gpu_posted_chunks.empty()) {
+				s.gpu_posted_chunks.pop_back();
+			}
 		}
 	}
 	pump_gpu_orphans();
@@ -1908,13 +1908,11 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 	{
 		std::lock_guard<std::mutex> lock(state().mutex);
 		State &s = state();
-		if (!s.gpu_current_valid) {
-			s.gpu_chunk_in_flight = false;
+		if (s.gpu_posted_chunks.empty()) {
 			return;
 		}
-		chunk = s.gpu_current;
-		s.gpu_current.items.clear();
-		s.gpu_current_valid = false;
+		chunk = s.gpu_posted_chunks.front();
+		s.gpu_posted_chunks.pop_front();
 	}
 	if (rs == nullptr || !rs->is_on_render_thread()) {
 		// Wrong thread (should not happen: posted via
@@ -1922,7 +1920,6 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 		std::lock_guard<std::mutex> lock(state().mutex);
 		State &s = state();
 		s.gpu_chunks.push_front(chunk);
-		s.gpu_chunk_in_flight = false;
 		return;
 	}
 	RenderingDevice *rd = rs->get_rendering_device();
@@ -1937,7 +1934,6 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 			}
 			count_gpu_shortfall(ctx, chunk.tag, count_gpu_requests_for_payload(chunk.items[i].meta));
 		}
-		s.gpu_chunk_in_flight = false;
 		return;
 	}
 	if (rd == nullptr || ctx == nullptr || !ctx->is_d3d12_backend() || !ctx->is_gpu_decompression_enabled()) {
@@ -1952,7 +1948,6 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 				count_gpu_shortfall(ctx, chunk.tag, count_gpu_requests_for_payload(chunk.items[i].meta));
 			}
 		}
-		s.gpu_chunk_in_flight = false;
 		UtilityFunctions::push_warning("DSPreloader: GPU chunk dropped (D3D12 unavailable at alloc time); sync load remains available.");
 		return;
 	}
@@ -1963,10 +1958,6 @@ void DSPreloader::process_gpu_chunk_on_render_thread() {
 	// inline (zero rendezvous). ERR_BUSY keeps requests queued for the
 	// batch-manager retry on the main thread (slower rendezvous, rare).
 	ctx->flush_stream_async();
-	{
-		std::lock_guard<std::mutex> lock(state().mutex);
-		state().gpu_chunk_in_flight = false;
-	}
 }
 
 static uint64_t estimate_payload_bytes(const DSPreloader::Payload &p_meta) {
@@ -2837,9 +2828,7 @@ void DSPreloader::shutdown() {
 			s.pending.clear();
 			s.pending_paths.clear();
 			s.gpu_chunks.clear();
-			s.gpu_current.items.clear();
-			s.gpu_current_valid = false;
-			s.gpu_chunk_in_flight = false;
+			s.gpu_posted_chunks.clear();
 			s.gpu_orphans.clear();
 			s.gpu_orphan_free_posted = false;
 			s.pending_cv.notify_all();

@@ -356,15 +356,13 @@ private:
 		uint64_t header_cache_generation = 0;
 
 		// GPU prewarm chunk queue: pending chunks awaiting one
-		// render-thread callback each (pump_gpu_prewarm posts at most one
-		// per frame). gpu_current holds the chunk being processed;
-		// gpu_chunk_in_flight prevents pile-up. gpu_orphans holds
+		// render-thread callback each (background mode caps posted chunks
+		// to 1; loading-screen mode pipelines up to 8). gpu_posted_chunks
+		// holds chunks posted to the render thread. gpu_orphans holds
 		// destination RIDs whose requests failed, released on the render
 		// thread (free_rid is render-thread-only).
 		std::deque<GpuChunk> gpu_chunks;
-		GpuChunk gpu_current;
-		bool gpu_current_valid = false;
-		bool gpu_chunk_in_flight = false;
+		std::deque<GpuChunk> gpu_posted_chunks;
 		std::vector<RID> gpu_orphans;
 		bool gpu_orphan_free_posted = false;
 	};
