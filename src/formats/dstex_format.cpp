@@ -1353,8 +1353,6 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		return footprint;
 	};
 
-	Ref<GDeflateCompressor> compressor;
-	compressor.instantiate();
 	// Per-mip chunk payloads. chunk_size_kb == 0 keeps the historic one-stream
 	// per mip layout; a non-zero target splits a mip into row-aligned chunks so
 	// no single request has to stage the whole mip. Each chunk is an independent
@@ -1365,12 +1363,16 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 	const bool block_format = dstex_is_block_format(p_format);
 	std::vector<std::vector<PackedByteArray>> chunk_payloads;
 	std::vector<std::vector<uint32_t>> chunk_uncompressed_sizes;
-	chunk_payloads.reserve(mip_count);
-	chunk_uncompressed_sizes.reserve(mip_count);
 	bool any_chunked = false;
-	uint64_t source_offset = 0;
 	uint64_t total_compressed_size = 0;
-	for (int mip = 0; mip < mip_count; ++mip) {
+
+	if (p_compression_level > 0) {
+		Ref<GDeflateCompressor> compressor;
+		compressor.instantiate();
+		chunk_payloads.reserve(mip_count);
+		chunk_uncompressed_sizes.reserve(mip_count);
+		uint64_t source_offset = 0;
+		for (int mip = 0; mip < mip_count; ++mip) {
 		const DSTexMipLayout &layout = layouts[mip];
 		const uint64_t source_mip_size = input_is_footprint_aligned ? layout.footprint_size : layout.source_size;
 		if (source_mip_size > input_size || source_offset > input_size - source_mip_size) {
@@ -1436,16 +1438,17 @@ Error DSTex::write_to_file(const String &p_path, const PackedByteArray &p_raw_da
 		chunk_payloads.push_back(std::move(chunks));
 		chunk_uncompressed_sizes.push_back(std::move(chunk_sizes));
 		source_offset += source_mip_size;
+		}
 	}
 
-	// Compression is not a benefit when the codec expands the payload: shipping
-	// the GDeflate stream would cost more disk bytes AND still require a
-	// decompression at load. Store the footprint bytes verbatim instead. NONE has
-	// no representation in the v2 layout (v2 carries no codec field), so this
-	// decision forces the v3 header below. The payload is still split on the same
-	// row grid (a NONE chunk is just a raw row slice), so an incompressible
-	// texture keeps the request-size bound that chunking provides.
-	const bool store_uncompressed = total_compressed_size >= footprint_size;
+	// Compression is not a benefit when the caller disables it (p_compression_level <= 0)
+	// or when the codec expands the payload: shipping the GDeflate stream would cost more
+	// disk bytes AND still require a decompression at load. Store the footprint bytes
+	// verbatim instead. NONE has no representation in the v2 layout (v2 carries no codec
+	// field), so this decision forces the v3 header below. The payload is still split on
+	// the same row grid (a NONE chunk is just a raw row slice), so an uncompressed or
+	// incompressible texture keeps the request-size bound that chunking provides.
+	const bool store_uncompressed = (p_compression_level <= 0) || (total_compressed_size >= footprint_size);
 	if (store_uncompressed) {
 		chunk_payloads.clear();
 		chunk_payloads.reserve(mip_count);

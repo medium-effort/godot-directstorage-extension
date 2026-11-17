@@ -174,6 +174,13 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 			"hint_string": "sRGB Friendly,Optimized",
 		},
 		{
+			"name": "compression/disk_compression",
+			"default_value": 1,
+			"property_hint": PROPERTY_HINT_ENUM,
+			"hint_string": "None,GDeflate",
+			"usage": PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_UPDATE_ALL_IF_MODIFIED,
+		},
+		{
 			"name": "compression/gdeflate_level",
 			"default_value": 3,
 			"property_hint": PROPERTY_HINT_RANGE,
@@ -241,10 +248,12 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 		}
 	]
 
-## Hides options that do not apply to the current compression mode.
+## Hides options that do not apply to the current compression mode or disk compression codec.
 func _get_option_visibility(path: String, option_name: StringName, options: Dictionary) -> bool:
 	if option_name == &"compression/high_quality" or option_name == &"compress/channel_pack":
 		return int(options.get("compression/mode", 0)) == 0
+	if option_name == &"compression/gdeflate_level":
+		return int(options.get("compression/disk_compression", 1)) == 1
 	return true
 
 ## Returns true for an asset whose .import still stores the
@@ -508,7 +517,9 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	var format := img.get_format()
 	var mip_count: int = (img.get_mipmap_count() + 1) if img.has_mipmaps() else 1
 	raw_data = _pad_texture_data(raw_data, width, height, format, mip_count)
+	var disk_compression: int = int(options.get("compression/disk_compression", 1))
 	var gdeflate_level: int = int(options.get("compression/gdeflate_level", options.get("compression/level", 1)))
+	var effective_compression_level: int = gdeflate_level if disk_compression == 1 else 0
 	var chunk_size_kb: int = int(options.get("compression/chunk_size_kb", 8192))
 
 	var is_srgb: bool = int(color_options["color_space"]) == COLOR_SPACE_SRGB
@@ -517,7 +528,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	# The codec may round dimensions itself; logical dims never exceed storage.
 	var v3_logical_width := mini(logical_width, width)
 	var v3_logical_height := mini(logical_height, height)
-	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, gdeflate_level, is_srgb, as_image_texture, v3_logical_width, v3_logical_height, 0, chunk_size_kb)
+	var write_err: Error = dstex.write_to_file(out_file_path, raw_data, width, height, format, mip_count, effective_compression_level, is_srgb, as_image_texture, v3_logical_width, v3_logical_height, 0, chunk_size_kb)
 	if write_err != OK:
 		push_error("[DirectStorage Importer] Failed to write .dstex file to: " + out_file_path)
 		return write_err

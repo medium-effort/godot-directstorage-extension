@@ -15,6 +15,11 @@
 	<tutorials>
 	</tutorials>
 	<members>
+		<member name="compression/disk_compression" type="int" setter="" getter="" default="1">
+			Selects the on-disk / DirectStorage stream compression codec applied to the GPU-ready texture payload in the generated [code].dstex[/code] file:
+			[b]None (0):[/b] Stores the raw 256-byte-pitch-aligned footprint verbatim ([code]DSCompressionFormat::NONE[/code], v3 header) with zero runtime decompression cost.
+			[b]GDeflate (1):[/b] Compresses each mip or chunk with Microsoft GDeflate for smaller disk footprints and hardware-accelerated GPU decompression on DirectStorage-capable Windows systems.
+		</member>
 		<member name="compression/gdeflate_level" type="int" setter="" getter="" default="3">
 			The Microsoft GDeflate compression level applied to the texture data payload in the generated [code].dstex[/code] file, ranging from [code]1[/code] through [code]12[/code].
 			Defaults to [code]3[/code], which is close to free in encode time and already captures a meaningful share of the reduction on both paths: roughly [code]1[/code] to [code]2[/code] percent on block-compressed payloads (VRAM Compressed) and [code]6[/code] to [code]27[/code] percent on uncompressed payloads (VRAM Uncompressed).

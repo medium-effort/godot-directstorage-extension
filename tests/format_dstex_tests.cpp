@@ -540,3 +540,75 @@ GDEX_TEST_T(dstex, repack_uncompressed_chunked_none_roundtrip, TAG_INTEGRATION) 
     godot::DirAccess::remove_absolute(godot::String(src_path));
     godot::DirAccess::remove_absolute(godot::String(out_path));
 }
+
+GDEX_TEST_T(dstex, write_compression_level_zero_writes_none_roundtrip, TAG_INTEGRATION) {
+    // Passing p_compression_level <= 0 must bypass GDeflate even on highly
+    // compressible data, emit a v3 NONE .dstex with compressed_size == original_size,
+    // and round-trip identically for both single-chunk and multi-chunk layouts.
+    const char *single_path = "user://gdextest_dstex_level0_single.dstex";
+    const char *chunked_path = "user://gdextest_dstex_level0_chunked.dstex";
+    godot::DirAccess::remove_absolute(godot::String(single_path));
+    godot::DirAccess::remove_absolute(godot::String(chunked_path));
+
+    godot::PackedByteArray payload;
+    payload.resize(64 * 64 * 4);
+    memset(payload.ptrw(), 0x5A, static_cast<size_t>(payload.size()));
+
+    godot::Ref<godot::DSTex> dstex;
+    dstex.instantiate();
+    GDEX_ASSERT_TRUE(dstex.is_valid());
+
+    GDEX_ASSERT_EQ(static_cast<int64_t>(dstex->write_to_file(
+                           godot::String(single_path), payload, 64, 64, godot::Image::FORMAT_RGBA8, 1, 0)),
+            static_cast<int64_t>(godot::OK));
+    godot::Dictionary single_hdr = dstex->read_header(godot::String(single_path));
+    GDEX_ASSERT_TRUE(!single_hdr.is_empty());
+    GDEX_EXPECT_EQ(static_cast<int64_t>(single_hdr["version"]), static_cast<int64_t>(3));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(single_hdr["compression_format"]),
+            static_cast<int64_t>(godot::DSCompressionFormat::NONE));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(single_hdr["compressed_size"]),
+            static_cast<int64_t>(single_hdr["original_size"]));
+    GDEX_EXPECT_FALSE(static_cast<bool>(single_hdr["chunked"]));
+
+    godot::Dictionary single_decoded = dstex->read_from_file(godot::String(single_path));
+    godot::Array single_mips = single_decoded["mip_data"];
+    GDEX_ASSERT_EQ(static_cast<int64_t>(single_mips.size()), static_cast<int64_t>(1));
+    godot::PackedByteArray single_mip0 = single_mips[0];
+    GDEX_ASSERT_EQ(static_cast<int64_t>(single_mip0.size()), static_cast<int64_t>(payload.size()));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(memcmp(single_mip0.ptr(), payload.ptr(), static_cast<size_t>(payload.size()))),
+            static_cast<int64_t>(0));
+
+    GDEX_ASSERT_EQ(static_cast<int64_t>(dstex->write_to_file(
+                           godot::String(chunked_path), payload, 64, 64, godot::Image::FORMAT_RGBA8, 1, 0,
+                           false, false, 0, 0, 0, 1)),
+            static_cast<int64_t>(godot::OK));
+    godot::Dictionary chunked_hdr = dstex->read_header(godot::String(chunked_path));
+    GDEX_ASSERT_TRUE(!chunked_hdr.is_empty());
+    GDEX_EXPECT_EQ(static_cast<int64_t>(chunked_hdr["version"]), static_cast<int64_t>(3));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(chunked_hdr["compression_format"]),
+            static_cast<int64_t>(godot::DSCompressionFormat::NONE));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(chunked_hdr["compressed_size"]),
+            static_cast<int64_t>(chunked_hdr["original_size"]));
+    GDEX_EXPECT_TRUE(static_cast<bool>(chunked_hdr["chunked"]));
+
+    godot::PackedByteArray repacked = dstex->repack_uncompressed_to_buffer(godot::String(chunked_path));
+    GDEX_ASSERT_TRUE(repacked.size() > 0);
+    const char *repacked_path = "user://gdextest_dstex_level0_chunked_repacked.dstex";
+    godot::DirAccess::remove_absolute(godot::String(repacked_path));
+    godot::Ref<godot::FileAccess> f = godot::FileAccess::open(godot::String(repacked_path), godot::FileAccess::WRITE);
+    GDEX_ASSERT_TRUE(f.is_valid() && f->is_open());
+    f->store_buffer(repacked);
+    f->close();
+
+    godot::Dictionary chunked_decoded = dstex->read_from_file(godot::String(repacked_path));
+    godot::Array chunked_mips = chunked_decoded["mip_data"];
+    GDEX_ASSERT_EQ(static_cast<int64_t>(chunked_mips.size()), static_cast<int64_t>(1));
+    godot::PackedByteArray chunked_mip0 = chunked_mips[0];
+    GDEX_ASSERT_EQ(static_cast<int64_t>(chunked_mip0.size()), static_cast<int64_t>(payload.size()));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(memcmp(chunked_mip0.ptr(), payload.ptr(), static_cast<size_t>(payload.size()))),
+            static_cast<int64_t>(0));
+
+    godot::DirAccess::remove_absolute(godot::String(single_path));
+    godot::DirAccess::remove_absolute(godot::String(chunked_path));
+    godot::DirAccess::remove_absolute(godot::String(repacked_path));
+}

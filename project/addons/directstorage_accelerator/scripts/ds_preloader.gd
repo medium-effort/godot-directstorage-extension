@@ -148,7 +148,8 @@ static func _resolve_dependency_path(raw_dep: String) -> String:
 ## Resolves the physical path of textures.dspkg in exported builds (exe dir).
 ## In editor mode, returns empty string so live imported assets are crawled instead.
 static func _resolve_dspkg_path() -> String:
-	if OS.has_feature("editor") or Engine.is_editor_hint():
+	var force_archive := bool(ProjectSettings.get_setting("dsgd_extension/force_archive_resolution", false))
+	if Engine.is_editor_hint() or (OS.has_feature("editor") and not force_archive):
 		return ""
 	var archive_name := String(ProjectSettings.get_setting("dsgd_extension/archive_name", "textures.dspkg"))
 	if archive_name.is_empty():
@@ -189,6 +190,7 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 	# Fast-path for exported builds / packages: when textures.dspkg exists and coverage dirs are provided,
 	# query DSPkg entries directly (<0.5 ms) and avoid the slow 100+ ms recursive dependency crawl.
 	var pkg_path: String = _resolve_dspkg_path()
+	var skip_import_check := bool(ProjectSettings.get_setting("dsgd_extension/skip_archive_import_check", false))
 	if not extra_scan_dirs.is_empty() and not pkg_path.is_empty() and ClassDB.class_exists("DSPkg"):
 		var dspkg: RefCounted = ClassDB.instantiate("DSPkg")
 		if dspkg != null and dspkg.has_method("open") and dspkg.has_method("get_entries"):
@@ -198,7 +200,7 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 				for entry in pkg_entries:
 					var entry_str := String(entry)
 					for dir in dirs.keys():
-						if entry_str.begins_with(dir) and _is_prewarmable_texture(entry_str) and not _is_excluded_import(entry_str):
+						if entry_str.begins_with(dir) and _is_prewarmable_texture(entry_str) and (skip_import_check or not _is_excluded_import(entry_str)):
 							found[entry_str] = true
 							break
 				if not found.is_empty():
@@ -239,7 +241,7 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 				for entry in pkg_entries:
 					var entry_str := String(entry)
 					for dir in dirs.keys():
-						if entry_str.begins_with(dir) and _is_prewarmable_texture(entry_str) and not _is_excluded_import(entry_str):
+						if entry_str.begins_with(dir) and _is_prewarmable_texture(entry_str) and (skip_import_check or not _is_excluded_import(entry_str)):
 							found[entry_str] = true
 							break
 	for dir in dirs.keys():
