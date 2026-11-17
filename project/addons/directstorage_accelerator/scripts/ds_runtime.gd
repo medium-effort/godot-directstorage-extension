@@ -96,6 +96,14 @@ var _has_get_unbuilt_cpu: bool = false
 var _has_get_unbuilt_gpu: bool = false
 var _has_poll: bool = false
 var _has_pump_gpu: bool = false
+var _has_gpu_requests_in_flight: bool = false
+var _has_set_background_pacing: bool = false
+## Streaming profile: false = loading screen (max throughput), true = active
+## gameplay background streaming (completion-gated GPU + adaptive headroom).
+var _background_pacing: bool = false
+var _cpu_poll_cooldown_frames: int = 0
+const GPU_LOADING_PUMP_MAX_CHUNKS_PER_FRAME: int = 8
+const GPU_LOADING_PUMP_BUDGET_USEC: int = 5000
 ## Adaptive slice backpressure
 ## EMA of main-thread frame time; slice budgets passed by value to the
 ## worker via bind() so no cross-thread mutable read occurs.
@@ -161,6 +169,27 @@ func set_slice_debug(enabled: bool) -> void:
 	_slice_debug = enabled
 
 
+## Enables/disables active-gameplay background streaming pacing.
+## When false (default, loading screens), DSRuntime maximizes throughput;
+## when true, DSRuntime gates GPU pumping on in-flight request completion
+## and uses adaptive frame-headroom thresholds.
+func set_background_pacing(enabled: bool) -> void:
+	if _background_pacing == enabled:
+		return
+	_background_pacing = enabled
+	_gpu_pump_frames_since = 0
+	_cpu_poll_cooldown_frames = 0
+	if ClassDB.class_exists("DSTextureCache"):
+		var cache = Engine.get_singleton("DSTextureCache")
+		if cache != null and cache.has_method("set_background_pacing"):
+			cache.set_background_pacing(enabled)
+
+
+## Returns true when active-gameplay background pacing is enabled.
+func is_background_pacing() -> bool:
+	return _background_pacing
+
+
 ## Clears per-batch slice counters (called at benchmark start).
 ## Baseline + EMA intentionally survive so Play inherits menu calibration.
 func reset_slice_stats() -> void:
@@ -170,15 +199,26 @@ func reset_slice_stats() -> void:
 	_drain_reported = true
 	_smooth_streak = 2
 	_gpu_pump_frames_since = 0
+	_cpu_poll_cooldown_frames = 0
+
+
+func _get_target_frame_ms() -> float:
+	if Engine.max_fps > 0:
+		return 1000.0 / float(Engine.max_fps)
+	if DisplayServer.get_name() != "headless":
+		var hz: float = DisplayServer.screen_get_refresh_rate()
+		if hz > 1.0:
+			return 1000.0 / hz
+	return GPU_FRAME_BUDGET_MILD_MS
 
 
 ## Resolves the effective GPU prewarm backpressure label, escalating
-## immediately when a single frame exceeds 60 FPS / 30 FPS budgets so
-## GPU chunk pumping backs off before the EMA catches up.
-func _effective_gpu_slice_label(slice_label: String, frame_ms: float = 0.0) -> String:
-	if slice_label == "heavy" or frame_ms > GPU_FRAME_BUDGET_HEAVY_MS:
+## immediately when a single frame exceeds 60 FPS / 30 FPS (or adaptive
+## background) budgets so GPU chunk pumping backs off before the EMA catches up.
+func _effective_gpu_slice_label(slice_label: String, frame_ms: float = 0.0, mild_budget_ms: float = GPU_FRAME_BUDGET_MILD_MS, heavy_budget_ms: float = GPU_FRAME_BUDGET_HEAVY_MS) -> String:
+	if slice_label == "heavy" or frame_ms > heavy_budget_ms:
 		return "heavy"
-	if slice_label == "mild" or frame_ms > GPU_FRAME_BUDGET_MILD_MS:
+	if slice_label == "mild" or frame_ms > mild_budget_ms:
 		return "mild"
 	return "warm"
 
@@ -186,8 +226,8 @@ func _effective_gpu_slice_label(slice_label: String, frame_ms: float = 0.0) -> S
 ## Decides whether this frame pumps one GPU prewarm chunk and advances the
 ## pacing counter. Pure state arithmetic (no engine calls) so the cadence can be
 ## asserted without frame timing: "heavy" is paced, never stopped.
-func _should_pump_gpu_now(slice_label: String, frame_ms: float = 0.0) -> bool:
-	var effective := _effective_gpu_slice_label(slice_label, frame_ms)
+func _should_pump_gpu_now(slice_label: String, frame_ms: float = 0.0, mild_budget_ms: float = GPU_FRAME_BUDGET_MILD_MS, heavy_budget_ms: float = GPU_FRAME_BUDGET_HEAVY_MS) -> bool:
+	var effective := _effective_gpu_slice_label(slice_label, frame_ms, mild_budget_ms, heavy_budget_ms)
 	var stride: int = 1
 	if effective == "heavy":
 		stride = GPU_PUMP_FRAME_STRIDE_HEAVY
@@ -521,6 +561,10 @@ func _process(delta: float) -> void:
 				_has_get_unbuilt_gpu = cache.has_method("get_unbuilt_gpu_prewarm_count")
 				_has_poll = cache.has_method("poll_completed")
 				_has_pump_gpu = cache.has_method("pump_gpu_prewarm")
+				_has_gpu_requests_in_flight = cache.has_method("has_gpu_requests_in_flight")
+				_has_set_background_pacing = cache.has_method("set_background_pacing")
+				if _has_set_background_pacing:
+					cache.set_background_pacing(_background_pacing)
 				_cache_caps_probed = true
 			# Adaptive backpressure: EMA over clamped delta + 2-frame streak
 			# gate (Rev1: immediate delta is noisy under the 120-148ms clamp).
@@ -544,7 +588,19 @@ func _process(delta: float) -> void:
 			var heavy_at: float = 45.0
 			var mild_at: float = 20.0
 			var warm_at: float = 10.0
-			if _baseline_init:
+			var gpu_mild_budget_ms: float = GPU_FRAME_BUDGET_MILD_MS
+			var gpu_heavy_budget_ms: float = GPU_FRAME_BUDGET_HEAVY_MS
+			if _background_pacing:
+				var target_frame_ms: float = _get_target_frame_ms()
+				if _baseline_init:
+					mild_at = minf(target_frame_ms * 0.65, maxf(6.0, _baseline_ema_ms + 4.0))
+				else:
+					mild_at = target_frame_ms * 0.65
+				heavy_at = maxf(mild_at + 4.0, target_frame_ms * 0.95)
+				warm_at = maxf(4.0, mild_at * 0.75)
+				gpu_mild_budget_ms = mild_at
+				gpu_heavy_budget_ms = heavy_at
+			elif _baseline_init:
 				heavy_at = maxf(45.0, _baseline_ema_ms * 2.5)
 				mild_at = maxf(20.0, _baseline_ema_ms * 1.5)
 				warm_at = maxf(10.0, _baseline_ema_ms * 1.1)
@@ -565,38 +621,55 @@ func _process(delta: float) -> void:
 				_smooth_streak += 1
 				if _smooth_streak >= 2:
 					if _slice_ema_ms < warm_at:
-						slice_items = 3
-						slice_usec = 4000
+						if _background_pacing:
+							slice_items = 3
+							slice_usec = 4000
+						else:
+							slice_items = 12
+							slice_usec = 8000
 					else:
-						slice_items = 2
-						slice_usec = 4000
+						if _background_pacing:
+							slice_items = 2
+							slice_usec = 4000
+						else:
+							slice_items = 6
+							slice_usec = 6000
 					slice_label = "warm"
 			if slice_label != _slice_label:
 				if _slice_debug:
 					print("[DirectStorage] DSRuntime slice: %s -> %s (ema %.1f ms)" % [_slice_label, slice_label, _slice_ema_ms])
 				_slice_label = slice_label
-			# Phase-2 GPU prewarm: at most one render-thread chunk per
-			# frame; no-op while idle, in flight, or without D3D12.
-			# Paced by adaptive backpressure ("warm" every frame, "mild"
-			# every 2nd, "heavy" every 8th) so slow GPUs drain back to
-			# baseline between chunks. Heavy stays paced rather than
-			# stopped: this loop is the only pump, so a hard stop would
-			# wedge the chunk queue and every waiter on the tag.
+			# Phase-2 GPU prewarm: in background mode, gate on GPU request
+			# completion and adaptive frame headroom; in loading-screen mode,
+			# pump multiple chunks per frame up to GPU_LOADING_PUMP_BUDGET_USEC.
 			var has_gpu_unbuilt := false
 			if _has_get_unbuilt_gpu:
 				has_gpu_unbuilt = int(cache.get_unbuilt_gpu_prewarm_count(0)) > 0
-			var gpu_slice_label := _effective_gpu_slice_label(slice_label, frame_ms)
-			if _has_pump_gpu and _should_pump_gpu_now(slice_label, frame_ms):
-				cache.pump_gpu_prewarm()
+			var gpu_slice_label := _effective_gpu_slice_label(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms)
+			if _has_pump_gpu:
+				if _background_pacing:
+					var gpu_in_flight := _has_gpu_requests_in_flight and bool(cache.has_gpu_requests_in_flight(0))
+					if not gpu_in_flight and _should_pump_gpu_now(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms):
+						cache.pump_gpu_prewarm()
+				elif _should_pump_gpu_now(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms):
+					var pump_start_usec: int = Time.get_ticks_usec()
+					for _p in GPU_LOADING_PUMP_MAX_CHUNKS_PER_FRAME:
+						cache.pump_gpu_prewarm()
+						if Time.get_ticks_usec() - pump_start_usec >= GPU_LOADING_PUMP_BUDGET_USEC:
+							break
 			# Main-thread texture drain: Texture2DRD wrappers must be
 			# instantiated on the main or render thread (GODOT_QUIRKS Sec02 & Sec25).
 			# Fast (<2us per texture): drain completed GPU textures within budget.
 			# Never gated on _poll_task_id so the main thread is never starved.
 			if _has_poll:
 				cache.poll_completed(0, 32, 2000, true)
+			var reaped_cpu_task := false
 			if _poll_task_id != -1 and WorkerThreadPool.is_task_completed(_poll_task_id):
 				WorkerThreadPool.wait_for_task_completion(_poll_task_id)
 				_poll_task_id = -1
+				reaped_cpu_task = true
+			if _background_pacing and reaped_cpu_task:
+				_cpu_poll_cooldown_frames = 1
 			var has_cpu_unbuilt := false
 			if _has_get_unbuilt_cpu:
 				has_cpu_unbuilt = int(cache.get_unbuilt_cpu_prewarm_count(0)) > 0
@@ -604,9 +677,12 @@ func _process(delta: float) -> void:
 				has_cpu_unbuilt = int(cache.get_unbuilt_prewarm_count(0)) > 0
 			var recorded_slice := false
 			if _poll_task_id == -1 and has_cpu_unbuilt:
-				_poll_task_id = WorkerThreadPool.add_task(_background_poll_slice.bind(slice_items, slice_usec), false, "DS_PollCompleted")
-				_record_slice_stat(slice_label)
-				recorded_slice = true
+				if _background_pacing and _cpu_poll_cooldown_frames > 0:
+					_cpu_poll_cooldown_frames -= 1
+				else:
+					_poll_task_id = WorkerThreadPool.add_task(_background_poll_slice.bind(slice_items, slice_usec), false, "DS_PollCompleted")
+					_record_slice_stat(slice_label)
+					recorded_slice = true
 			if not recorded_slice and has_gpu_unbuilt:
 				_record_slice_stat(gpu_slice_label)
 			if not _drain_reported and _poll_task_id == -1 and _has_get_unbuilt and int(cache.get_unbuilt_prewarm_count(0)) == 0:

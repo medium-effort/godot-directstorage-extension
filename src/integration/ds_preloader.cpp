@@ -2095,6 +2095,7 @@ bool DSPreloader::offload_cpu_build_locked(int64_t p_id) {
 	job->id = p_id;
 	job->entry = it->second;
 	job->generation = s.shutdown_generation;
+	job->job_bytes = estimate_payload_bytes(it->second.meta);
 	it->second.build_in_flight = true;
 	const int64_t task = pool->add_native_task(&DSPreloader::run_offloaded_cpu_build, job, false, "DS CPU build");
 	if (task == static_cast<int64_t>(WorkerThreadPool::INVALID_TASK_ID)) {
@@ -2104,6 +2105,7 @@ bool DSPreloader::offload_cpu_build_locked(int64_t p_id) {
 	}
 	s.build_jobs[task] = job;
 	s.in_flight_builds++;
+	s.in_flight_build_bytes += job->job_bytes;
 	return true;
 }
 
@@ -2129,6 +2131,7 @@ void DSPreloader::run_offloaded_cpu_build(void *p_user) {
 		s.pending.erase(job->id);
 		unblock_pending_paths_locked(job->entry);
 		s.in_flight_builds--;
+		s.in_flight_build_bytes = (s.in_flight_build_bytes >= job->job_bytes) ? (s.in_flight_build_bytes - job->job_bytes) : 0;
 		job->done.store(true);
 	}
 }
@@ -2540,11 +2543,15 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 
 	uint64_t slice_bytes_processed = 0;
 	constexpr uint64_t kMaxBytesPerSlice = 64ULL * 1024ULL * 1024ULL; // 64 MiB slice cap
-	// Offload at most this many CPU builds per slice. Posting is O(1) and
-	// allocates nothing beyond the entry's already-resident buffers, but an
-	// uncapped loop would let a caller whose slice rate exceeds the build rate
-	// grow the pool queue without bound.
-	constexpr int kMaxOffloadsPerSlice = 2;
+	// Offload limits depend on streaming mode: loading screens saturate
+	// multi-core CPUs (up to 8 offloads/slice, 192 MiB in-flight); background
+	// gameplay streaming caps concurrency (1 offload/slice, 16 MiB in-flight)
+	// so large ImageTexture uploads cannot burst RenderingServer::command_queue.
+	const bool bg_pacing = state().background_pacing.load(std::memory_order_relaxed);
+	const int max_offloads_per_slice = bg_pacing ? 1 : 8;
+	constexpr uint64_t kMaxInFlightBytesLoading = 192ULL * 1024ULL * 1024ULL;
+	constexpr uint64_t kMaxInFlightBytesBackground = 16ULL * 1024ULL * 1024ULL;
+	const uint64_t max_in_flight_bytes = bg_pacing ? kMaxInFlightBytesBackground : kMaxInFlightBytesLoading;
 	int offloads = 0;
 
 	for (size_t ti = 0; ti < terminal_ids.size(); ++ti) {
@@ -2609,8 +2616,9 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 						entry_id = it->first;
 						it->second.build_in_flight = true;
 						found = true;
-					} else if (offloads >= kMaxOffloadsPerSlice) {
-						// Budget for this slice is spent; the next call offloads more.
+					} else if (offloads >= max_offloads_per_slice ||
+							(s.in_flight_builds > 0 && (s.in_flight_build_bytes + est_bytes > max_in_flight_bytes))) {
+						// Budget for this slice or in-flight byte cap is spent; the next call offloads more.
 						budget_exhausted = true;
 					} else if (offload_cpu_build_locked(it->first)) {
 						offloaded = true;
@@ -2725,6 +2733,34 @@ int DSPreloader::get_unbuilt_gpu_prewarm_count(uint64_t p_tag) {
 		}
 	}
 	return count;
+}
+
+bool DSPreloader::has_gpu_requests_in_flight(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	const State &s = state();
+	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+		const Tracked &t = it->second;
+		if (p_tag != 0 && t.tag != p_tag) {
+			continue;
+		}
+		if (!t.is_gpu || t.gpu_failed || t.requests.is_empty()) {
+			continue;
+		}
+		for (int i = 0; i < t.requests.size(); ++i) {
+			if (!is_terminal(t.requests[i])) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void DSPreloader::set_background_pacing(bool p_enabled) {
+	state().background_pacing.store(p_enabled, std::memory_order_relaxed);
+}
+
+bool DSPreloader::is_background_pacing() {
+	return state().background_pacing.load(std::memory_order_relaxed);
 }
 
 void DSPreloader::shutdown() {

@@ -48,9 +48,9 @@ const TRAVERSABLE_EXTENSIONS: PackedStringArray = ["tscn", "scn", "tres", "res",
 ## headroom for 60 FPS loading-screen rendering.
 const FALLBACK_FRAME_BUDGET_USEC: int = 8000
 
-## Recommended GPU prewarm chunk byte cap (4 MiB) for background streaming
+## Recommended GPU prewarm chunk byte cap (2 MiB) for background streaming
 ## during active gameplay; keeps per-frame D3D12 allocation bursts bounded.
-const BACKGROUND_GPU_CHUNK_BYTES: int = 4 * 1024 * 1024
+const BACKGROUND_GPU_CHUNK_BYTES: int = 2 * 1024 * 1024
 
 ## Name of the autoload that drives the async stream queue, and the legacy
 ## autoload older addon versions installed. One of them must exist in the tree

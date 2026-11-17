@@ -108,6 +108,9 @@ public:
 	int get_unbuilt_prewarm_count(uint64_t p_tag = 0) const;
 	int get_unbuilt_cpu_prewarm_count(uint64_t p_tag = 0) const;
 	int get_unbuilt_gpu_prewarm_count(uint64_t p_tag = 0) const;
+	bool has_gpu_requests_in_flight(uint64_t p_tag = 0) const;
+	void set_background_pacing(bool p_enabled);
+	bool is_background_pacing() const;
 
 	void set_enabled(bool p_enabled);
 	bool is_enabled() const;

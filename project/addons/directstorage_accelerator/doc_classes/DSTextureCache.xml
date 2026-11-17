@@ -72,6 +72,15 @@
 			<param index="0" name="tag" type="int" default="0" />
 			<description>Returns the number of direct GPU DMA prewarm textures for [param tag] awaiting main-thread [method poll_completed] wrapping into Texture2DRD.</description>
 		</method>
+		<method name="has_gpu_requests_in_flight" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="tag" type="int" default="0" />
+			<description>Returns [code]true[/code] when any GPU prewarm entry for [param tag] (or any tag when [code]0[/code]) still has non-terminal DirectStorage requests in flight.</description>
+		</method>
+		<method name="is_background_pacing" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] when active-gameplay background pacing is enabled for offloaded CPU texture builds.</description>
+		</method>
 		<method name="is_cache_mode_ignored" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="cache_mode" type="int" enum="DSTextureCache.CacheMode" />
@@ -84,6 +93,11 @@
 		<method name="is_gpu_prewarm_available">
 			<return type="bool" />
 			<description>Returns whether hardware GPU DirectStorage prewarming is currently available (requires an initialized D3D12 DirectStorage backend with GPU decompression enabled and a live D3D12 [RenderingDevice]).</description>
+		</method>
+		<method name="set_background_pacing">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>Enables or disables active-gameplay background pacing limits for offloaded CPU texture builds in [method poll_completed].</description>
 		</method>
 		<method name="poll_completed">
 			<return type="int" />

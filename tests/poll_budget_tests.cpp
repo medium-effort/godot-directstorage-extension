@@ -64,6 +64,26 @@ struct PrewarmBudgetTest {
 		return publish(tracked);
 	}
 
+	static int64_t inject_gpu_request_entry(uint64_t p_tag, const DSPreloader::Payload &p_meta,
+			const Ref<DSRequest> &p_req) {
+		DSPreloader::Tracked tracked;
+		tracked.tag = p_tag;
+		tracked.meta = p_meta;
+		tracked.is_gpu = true;
+		tracked.requests.push_back(p_req);
+		return publish(tracked);
+	}
+
+	static uint64_t get_in_flight_build_bytes() {
+		std::lock_guard<std::mutex> lock(DSPreloader::state().mutex);
+		return DSPreloader::state().in_flight_build_bytes;
+	}
+
+	static int get_in_flight_builds() {
+		std::lock_guard<std::mutex> lock(DSPreloader::state().mutex);
+		return DSPreloader::state().in_flight_builds;
+	}
+
 private:
 	static int64_t publish(DSPreloader::Tracked &p_tracked) {
 		std::lock_guard<std::mutex> lock(DSPreloader::state().mutex);
@@ -440,4 +460,75 @@ GDEX_TEST_T(poll_budget, concurrent_worker_poll_keeps_unbuilt_until_cached, TAG_
 	for (int i = 0; i < kCount; ++i) {
 		GDEX_EXPECT_TRUE(all_cached_at_zero[i]);
 	}
+}
+
+GDEX_TEST_T(poll_budget, has_gpu_requests_in_flight_tracks_non_terminal_gpu_entries, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag_a = 98011ULL;
+	const uint64_t tag_b = 98012ULL;
+
+	GDEX_EXPECT_FALSE(cache->has_gpu_requests_in_flight(0));
+	GDEX_EXPECT_FALSE(cache->has_gpu_requests_in_flight(tag_a));
+
+	godot::Ref<godot::DSRequest> req_submitted;
+	req_submitted.instantiate();
+	req_submitted->set_status(godot::DSRequest::STATUS_SUBMITTED);
+
+	godot::DSPreloader::Payload meta = make_payload("res://gpu_inflight_a.png", 64);
+	godot::PrewarmBudgetTest::inject_gpu_request_entry(tag_a, meta, req_submitted);
+
+	GDEX_EXPECT_TRUE(cache->has_gpu_requests_in_flight(0));
+	GDEX_EXPECT_TRUE(cache->has_gpu_requests_in_flight(tag_a));
+	GDEX_EXPECT_FALSE(cache->has_gpu_requests_in_flight(tag_b));
+
+	// Transition to terminal: no longer in flight.
+	req_submitted->set_status(godot::DSRequest::STATUS_COMPLETED);
+	GDEX_EXPECT_FALSE(cache->has_gpu_requests_in_flight(tag_a));
+	GDEX_EXPECT_FALSE(cache->has_gpu_requests_in_flight(0));
+}
+
+GDEX_TEST_T(poll_budget, background_pacing_caps_in_flight_build_bytes_while_allowing_first_oversize, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const bool prev_bg = cache->is_background_pacing();
+	ctx.add_teardown([cache, prev_bg]() {
+		if (cache) {
+			cache->set_background_pacing(prev_bg);
+		}
+	});
+	cache->set_background_pacing(true);
+	GDEX_EXPECT_TRUE(cache->is_background_pacing());
+
+	const uint64_t tag = 98020ULL;
+	godot::PackedByteArray data;
+	data.resize(static_cast<int64_t>(kUnboundedEntryBytes)); // 24 MiB > 16 MiB background cap
+
+	auto make_24m = [](const char *p_path) {
+		godot::DSPreloader::Payload p = make_payload(p_path, 4096);
+		p.height = 1536;
+		p.mip_uncompressed_sizes.push_back(static_cast<int32_t>(kUnboundedEntryBytes));
+		return p;
+	};
+
+	// Inject two 24 MiB entries; with background pacing on, poll_completed(0, 0, 100)
+	// must offload only the first (since in_flight_builds == 0) and defer the second
+	// until in_flight_builds drops back to 0.
+	godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, make_24m("res://bg_cap_0.png"), data);
+	godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, make_24m("res://bg_cap_1.png"), data);
+	warm_worker_pool();
+
+	const int stored = cache->poll_completed(tag, 0, 100, false);
+	GDEX_EXPECT_EQ(stored, 0);
+	// Immediately after the slice, at most 1 offloaded build (24 MiB) is in flight.
+	GDEX_EXPECT_TRUE(godot::PrewarmBudgetTest::get_in_flight_builds() <= 1);
+	GDEX_EXPECT_TRUE(godot::PrewarmBudgetTest::get_in_flight_build_bytes() <= kUnboundedEntryBytes);
+
+	// Wait for the offloaded build(s) to drain, then poll the remaining entry.
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	while (cache->get_unbuilt_prewarm_count(tag) > 0 && std::chrono::steady_clock::now() < deadline) {
+		cache->poll_completed(tag, 0, 100, false);
+		std::this_thread::yield();
+	}
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+	GDEX_EXPECT_EQ(godot::PrewarmBudgetTest::get_in_flight_builds(), 0);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(godot::PrewarmBudgetTest::get_in_flight_build_bytes()), 0);
 }

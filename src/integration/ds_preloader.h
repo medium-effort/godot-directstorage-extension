@@ -214,6 +214,9 @@ public:
 	static int get_unbuilt_prewarm_count(uint64_t p_tag = 0);
 	static int get_unbuilt_cpu_prewarm_count(uint64_t p_tag = 0);
 	static int get_unbuilt_gpu_prewarm_count(uint64_t p_tag = 0);
+	static bool has_gpu_requests_in_flight(uint64_t p_tag = 0);
+	static void set_background_pacing(bool p_enabled);
+	static bool is_background_pacing();
 
 	// Release all held Refs + the archive handle. Called from
 	// ~DSTextureCache (module teardown) so no Ref outlives Godot.
@@ -295,6 +298,7 @@ private:
 		int64_t id = 0;
 		Tracked entry;
 		uint64_t generation = 0;
+		uint64_t job_bytes = 0;
 		std::atomic<bool> done{false};
 	};
 
@@ -319,6 +323,8 @@ private:
 		// (the id is retired and the call errors with "Invalid Task ID").
 		std::unordered_map<int64_t, BuildJob *> build_jobs;
 		int in_flight_builds = 0;
+		uint64_t in_flight_build_bytes = 0;
+		std::atomic<bool> background_pacing{false};
 		// Incremented by shutdown(); a job captured an older generation must not
 		// store into the cache of the next session (teardown of one test's cache
 		// must not poison the next test's offloaded builds).
