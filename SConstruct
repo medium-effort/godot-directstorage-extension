@@ -769,6 +769,7 @@ if env["platform"] == "windows":
 # builds and broke the link with undefined crypto_aead_lock/crypto_aead_unlock/
 # crypto_blake2b/crypto_wipe.
 thirdparty_objects = thirdparty_sources + monocypher_sources
+bmi2_objects = []
 if env["platform"] == "windows" and "msvc" in env["TOOLS"]:
     thirdparty_env = env.Clone()
     thirdparty_env.Append(CCFLAGS=["/wd4244", "/wd4127", "/wd4267", "/wd4100", "/wd4245", "/wd4456", "/wd4018", "/wd4146", "/wd4310", "/FS"])
@@ -776,6 +777,11 @@ if env["platform"] == "windows" and "msvc" in env["TOOLS"]:
     monocypher_env.Append(CFLAGS=["/std:c11"])
     monocypher_objects = monocypher_env.SharedObject(monocypher_sources)
     thirdparty_objects = thirdparty_env.SharedObject(thirdparty_sources) + monocypher_objects
+    if env["arch"] == "x86_64":
+        bmi2_env = thirdparty_env.Clone()
+        bmi2_env.Append(CCFLAGS=["/arch:AVX2"])
+        bmi2_objects = bmi2_env.SharedObject("src/compression/gdeflate_decompress_bmi2_msvc.c")
+        thirdparty_objects += bmi2_objects
 
 sources = project_sources + thirdparty_objects
 
@@ -944,6 +950,8 @@ if env["tests"]:
         if "msvc" in _gdex_env.get("TOOLS", []):
             _gdex_env.Append(LINKFLAGS=["/ignore:4199"])
             _gdex_env.Append(CFLAGS=["/std:c11"])
+            if bmi2_objects:
+                _gdex_env.Append(LIBS=bmi2_objects)
         _gdex_exports = {"env": _gdex_env, "gdextest": {}}
         if _gdex_env.get("platform", "") != "windows":
             # gdextest has no per-platform sources: .gdextest.toml lists both

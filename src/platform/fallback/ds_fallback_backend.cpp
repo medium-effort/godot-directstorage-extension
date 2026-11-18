@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <string>
+#include <utility>
 #include "GDeflate.h"
 #include "TileStream.h"
 #include "../../compression/gdeflate_decompressor.h"
@@ -14,6 +16,11 @@
 #include "../../formats/dstex_format.h"
 
 namespace godot {
+
+struct FallbackBackend::WorkerScratch {
+	static constexpr size_t MAX_OPEN_FILES = 16;
+	std::unordered_map<std::string, Ref<FileAccess>> open_files;
+};
 
 FallbackBackend::FallbackBackend() {
 	OS *os = OS::get_singleton();
@@ -59,53 +66,63 @@ bool FallbackBackend::should_drop_request(const Ref<DSRequest> &p_request, bool 
 	return true;
 }
 
-void FallbackBackend::completion_thread_func() {
-	while (true) {
-		Vector<Ref<DSRequest>> batch;
-		AsyncBatchInfo batch_info;
-		{
-			std::unique_lock<std::mutex> lock(batch_mutex);
-			batch_cv.wait(lock, [this]() {
-				return completion_thread_stop.load() || !completion_queue.empty();
-			});
-			if (completion_queue.empty() && completion_thread_stop.load()) {
-				batch_in_flight.store(false);
-				return;
-			}
-			batch = completion_queue.front();
-			completion_queue.pop_front();
-			if (!in_flight_batch_infos.empty()) {
-				batch_info = in_flight_batch_infos.front();
-				in_flight_batch_infos.pop_front();
-			}
-		}
-		worker_processing.store(true);
-
-		// CPU file I/O + GDeflate decompression stay on this worker thread,
-		// never on the main thread. No Godot scene/render API calls here;
-		// completion is observed via status polling (is_batch_complete).
-		for (int i = 0; i < batch.size(); i++) {
-			if (should_drop_request(batch[i], true)) {
-				continue;
-			}
-			process_request(batch[i]);
-		}
-
-		worker_processing.store(false);
-		{
-			std::lock_guard<std::mutex> lock(batch_mutex);
-			completed_batches.push_back(batch);
-			if (completed_batches.size() > MAX_COMPLETED_BATCHES) {
-				completed_batches.pop_front();
-			}
-			if (batch_info.batch_id != 0) {
-				completed_batch_infos.push_back(batch_info);
+void FallbackBackend::finish_batch_request_locked(uint64_t p_batch_id) {
+	if (p_batch_id == 0) {
+		return;
+	}
+	for (auto it = in_flight_batch_infos.begin(); it != in_flight_batch_infos.end(); ++it) {
+		if (it->batch_id == p_batch_id) {
+			if (it->remaining_requests > 1) {
+				it->remaining_requests--;
+			} else {
+				it->remaining_requests = 0;
+				completed_batch_infos.push_back(*it);
 				if (completed_batch_infos.size() > MAX_COMPLETED_BATCHES) {
 					completed_batch_infos.pop_front();
 				}
+				in_flight_batch_infos.erase(it);
 			}
-			batch_in_flight.store(!completion_queue.empty());
-			batch_cv.notify_all();
+			break;
+		}
+	}
+}
+
+void FallbackBackend::worker_thread_func() {
+	WorkerScratch scratch;
+	while (true) {
+		QueuedRequest item;
+		{
+			std::unique_lock<std::mutex> lock(batch_mutex);
+			batch_cv.wait(lock, [this]() {
+				return completion_thread_stop.load() || !request_queue.empty();
+			});
+			if (request_queue.empty() && completion_thread_stop.load()) {
+				return;
+			}
+			item = request_queue.front();
+			request_queue.pop_front();
+			active_workers++;
+			batch_in_flight.store(true);
+		}
+
+		// CPU file I/O + GDeflate decompression stay on this worker thread,
+		// never on the main thread. No Godot scene/render/WorkerThreadPool API
+		// calls here (Q22/Q48); completion is observed via status polling.
+		if (!should_drop_request(item.request, true)) {
+			process_request(item.request, &scratch);
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(batch_mutex);
+			finish_batch_request_locked(item.batch_id);
+			if (active_workers > 0) {
+				active_workers--;
+			}
+			const bool still_busy = !request_queue.empty() || active_workers > 0;
+			batch_in_flight.store(still_busy);
+			if (!still_busy) {
+				batch_cv.notify_all();
+			}
 		}
 	}
 }
@@ -121,43 +138,47 @@ String FallbackBackend::get_name() const {
 bool FallbackBackend::initialize() {
 	completion_thread_stop.store(false);
 	batch_in_flight.store(false);
-	worker_processing.store(false);
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
+		active_workers = 0;
 		pending_requests.clear();
-		completion_queue.clear();
-		completed_batches.clear();
+		request_queue.clear();
 		in_flight_batch_infos.clear();
 		completed_batch_infos.clear();
 		cancelled_tags.clear();
 		next_async_batch_id = 1;
 		async_batches_submitted = 0;
 	}
-	completion_thread = std::thread(&FallbackBackend::completion_thread_func, this);
+	worker_threads.clear();
+	worker_threads.reserve(num_workers);
+	for (uint32_t i = 0; i < num_workers; ++i) {
+		worker_threads.emplace_back(&FallbackBackend::worker_thread_func, this);
+	}
 	UtilityFunctions::print("[DirectStorage] FallbackBackend initialized (CPU Workers: " + String::num_int64(num_workers) + ").");
 	return true;
 }
 
 void FallbackBackend::shutdown() {
 	{
-		// Store the stop flag under batch_mutex. The worker evaluates its wait
+		// Store the stop flag under batch_mutex. Workers evaluate their wait
 		// predicate while holding that mutex, so this store is either observed
 		// by a worker that is already blocked (the notify below wakes it) or by
 		// a worker that has not yet entered wait() (its predicate then sees the
-		// flag immediately). Notifying without the lock leaves a window where a
-		// worker that already checked the predicate but has not yet registered
-		// as a waiter misses the notify and blocks in join() forever.
+		// flag immediately).
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		completion_thread_stop.store(true);
 	}
 	batch_cv.notify_all();
-	if (completion_thread.joinable()) {
-		completion_thread.join();
+	for (std::thread &t : worker_threads) {
+		if (t.joinable()) {
+			t.join();
+		}
 	}
+	worker_threads.clear();
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
-		completion_queue.clear();
-		completed_batches.clear();
+		active_workers = 0;
+		request_queue.clear();
 		in_flight_batch_infos.clear();
 		completed_batch_infos.clear();
 		cancelled_tags.clear();
@@ -195,7 +216,7 @@ bool FallbackBackend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend:
 	return true;
 }
 
-bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
+bool FallbackBackend::process_request(Ref<DSRequest> p_request, WorkerScratch *p_scratch) {
 	if (p_request.is_null()) {
 		return false;
 	}
@@ -207,11 +228,29 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 	}
 
 	String path = p_request->get_file_path();
-	Ref<FileAccess> file = FileAccess::open(path, FileAccess::READ);
+	Ref<FileAccess> file;
+	std::string path_key;
+	if (p_scratch != nullptr) {
+		const CharString utf8 = path.utf8();
+		path_key.assign(utf8.get_data() ? utf8.get_data() : "", static_cast<size_t>(utf8.length()));
+		auto it = p_scratch->open_files.find(path_key);
+		if (it != p_scratch->open_files.end()) {
+			file = it->second;
+		}
+	}
 	if (file.is_null()) {
-		p_request->set_status(DSRequest::STATUS_FAILED);
-		p_request->set_error_message("FallbackBackend: Failed to open file '" + path + "'.");
-		return false;
+		file = FileAccess::open(path, FileAccess::READ);
+		if (file.is_null()) {
+			p_request->set_status(DSRequest::STATUS_FAILED);
+			p_request->set_error_message("FallbackBackend: Failed to open file '" + path + "'.");
+			return false;
+		}
+		if (p_scratch != nullptr) {
+			if (p_scratch->open_files.size() >= WorkerScratch::MAX_OPEN_FILES) {
+				p_scratch->open_files.clear();
+			}
+			p_scratch->open_files.emplace(std::move(path_key), file);
+		}
 	}
 
 	uint64_t offset = p_request->get_offset();
@@ -227,9 +266,8 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 		return false;
 	}
 
-	if (offset > 0) {
-		file->seek(offset);
-	}
+	// Always seek when reusing per-worker FileAccess handles (offset 0 included).
+	file->seek(offset);
 
 	PackedByteArray raw_bytes = file->get_buffer(read_size);
 	if (raw_bytes.size() < read_size) {
@@ -269,10 +307,12 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 		}
 
 		uint32_t effective_workers = 1;
-		if (raw_bytes.size() >= static_cast<int64_t>(sizeof(GDeflate::TileStream))) {
+		GDeflate::ParallelForFn parallel_fn = nullptr;
+		if (p_scratch == nullptr && raw_bytes.size() >= static_cast<int64_t>(sizeof(GDeflate::TileStream))) {
 			const GDeflate::TileStream *header = reinterpret_cast<const GDeflate::TileStream *>(raw_bytes.ptr());
 			if (header && header->numTiles > 2) {
 				effective_workers = std::min(num_workers, static_cast<uint32_t>(header->numTiles / 2u));
+				parallel_fn = &ds_gdeflate_parallel_for;
 			}
 		}
 
@@ -282,7 +322,7 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request) {
 				raw_bytes.ptr(),
 				raw_bytes.size(),
 				effective_workers,
-				&ds_gdeflate_parallel_for);
+				parallel_fn);
 
 		if (!ok) {
 			p_request->set_status(DSRequest::STATUS_FAILED);
@@ -352,17 +392,18 @@ bool FallbackBackend::submit_async() {
 		AsyncBatchInfo info;
 		info.batch_id = next_async_batch_id++;
 		info.total_requests = static_cast<size_t>(batch.size());
+		info.remaining_requests = static_cast<size_t>(batch.size());
 		for (int i = 0; i < batch.size(); i++) {
 			if (batch[i].is_valid()) {
 				info.per_tag_counts[batch[i]->get_cancellation_tag()]++;
 			}
+			request_queue.push_back(QueuedRequest{batch[i], info.batch_id});
 		}
-		completion_queue.push_back(batch);
 		in_flight_batch_infos.push_back(info);
 		async_batches_submitted++;
 		batch_in_flight.store(true);
 	}
-	batch_cv.notify_one();
+	batch_cv.notify_all();
 	return true;
 }
 
@@ -382,7 +423,6 @@ size_t FallbackBackend::get_in_flight_async_batch_count() const {
 
 void FallbackBackend::collect_completed_results() {
 	std::lock_guard<std::mutex> lock(batch_mutex);
-	completed_batches.clear();
 	completed_batch_infos.clear();
 }
 
@@ -391,10 +431,10 @@ void FallbackBackend::cancel_requests_with_tag(uint64_t p_tag) {
 		return;
 	}
 	std::lock_guard<std::mutex> lock(batch_mutex);
-	// Remember the tag so the worker drops a request that was already
-	// popped from the queue (mid-processing race) before buffer writes.
+	// Remember the tag so workers drop a request that was already popped
+	// from the queue (mid-processing race) before buffer writes.
 	// Bounded: tags are never reused, eviction only weakens the race guard
-	// (queued batches are still covered by per-request status checks).
+	// (queued requests are still covered by per-request status checks).
 	if (cancelled_tags.find(p_tag) == cancelled_tags.end()) {
 		if (cancelled_tags.size() >= MAX_CANCELLED_TAGS) {
 			cancelled_tags.clear();
@@ -413,33 +453,23 @@ void FallbackBackend::cancel_requests_with_tag(uint64_t p_tag) {
 		}
 	}
 	pending_requests = remaining;
-	// Same treatment for async batches submitted but not yet processed:
-	// mark terminal FAILED (progress-ready) and erase so the worker never
-	// touches their buffers. Batches drained empty are removed with their
-	// accounting info (parallel FIFO with completion_queue).
-	for (size_t q = 0; q < completion_queue.size();) {
-		Vector<Ref<DSRequest>> kept;
-		for (int i = 0; i < completion_queue[q].size(); i++) {
-			Ref<DSRequest> req = completion_queue[q][i];
-			if (req.is_valid() && req->get_cancellation_tag() == p_tag &&
-					req->get_status() == DSRequest::STATUS_SUBMITTED) {
-				req->set_status(DSRequest::STATUS_FAILED);
-				req->set_error_message("Request cancelled by tag.");
-			} else {
-				kept.push_back(req);
-			}
-		}
-		if (kept.size() == 0) {
-			completion_queue.erase(completion_queue.begin() + q);
-			if (q < in_flight_batch_infos.size()) {
-				in_flight_batch_infos.erase(in_flight_batch_infos.begin() + q);
-			}
+	// Same treatment for async requests submitted but not yet popped:
+	// mark terminal FAILED (progress-ready) and erase so workers never
+	// touch their buffers. Decrement remaining_requests so in_flight_batch_infos
+	// stays accurate.
+	for (auto it = request_queue.begin(); it != request_queue.end();) {
+		Ref<DSRequest> req = it->request;
+		if (req.is_valid() && req->get_cancellation_tag() == p_tag &&
+				req->get_status() == DSRequest::STATUS_SUBMITTED) {
+			req->set_status(DSRequest::STATUS_FAILED);
+			req->set_error_message("Request cancelled by tag.");
+			finish_batch_request_locked(it->batch_id);
+			it = request_queue.erase(it);
 		} else {
-			completion_queue[q] = kept;
-			q++;
+			++it;
 		}
 	}
-	batch_in_flight.store(!completion_queue.empty() || worker_processing.load());
+	batch_in_flight.store(!request_queue.empty() || active_workers > 0);
 	batch_cv.notify_all();
 }
 
