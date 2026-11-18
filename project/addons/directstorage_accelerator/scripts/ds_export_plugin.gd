@@ -433,9 +433,11 @@ func _resolve_outcome() -> String:
 		return _policy.OUTCOME_PROTECTED
 
 	if not key_present:
-		_protection_failure_reason = "the preset has no PCK encryption key"
+		_protection_failure_reason = "the preset has no PCK encryption key (set one under Encryption > 'Encryption Key')"
+	elif not _filter_matches(preset.get_encryption_in_filter(), KEY_FILE_PATH):
+		_protection_failure_reason = KEY_FILE_PATH + " is not encrypted by the preset (add '.dspkg/*' or '*' to Encryption > 'Filters to include files/folders')"
 	else:
-		_protection_failure_reason = KEY_FILE_PATH + " is not encrypted by the preset's include/exclude filters"
+		_protection_failure_reason = KEY_FILE_PATH + " is not encrypted by the preset because it matches an exclude filter (remove it from Encryption > 'Filters to exclude files/folders')"
 	return _policy.OUTCOME_FAILED
 
 ## True when the engine would encrypt this path with the active preset.
@@ -740,7 +742,10 @@ func _export_end() -> void:
 	_cleanup_staging()
 	_cleanup_legacy_user_temp()
 	if not dspkg_ok:
-		_mark_export_failed()
+		var detail := ""
+		if _outcome == _policy.OUTCOME_FAILED and not _protection_failure_reason.is_empty():
+			detail = "Protection was requested but cannot be delivered: %s; %s was not deployed." % [_protection_failure_reason, _archive_name]
+		_mark_export_failed(detail)
 		return
 	if not pack_ok:
 		_mark_export_failed(_pack_failure_detail)
