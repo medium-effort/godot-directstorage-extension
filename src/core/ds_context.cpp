@@ -7,6 +7,7 @@
 #include "../platform/win32/ds_win32_backend.h"
 #endif
 
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
@@ -605,15 +606,20 @@ void DSContext::note_loader_cache_hit() {
 	loader_cache_hits.fetch_add(1, std::memory_order_relaxed);
 }
 
-void DSContext::note_loader_cpu_fallback(LoaderFallback p_reason) {
+void DSContext::note_loader_cpu_fallback(LoaderFallback p_reason, const String &p_path) {
 	if (p_reason < 0 || p_reason >= LOADER_FALLBACK_COUNT) {
 		return;
 	}
 	loader_fallbacks[p_reason].fetch_add(1, std::memory_order_relaxed);
 	// Thread affinity is the only fallback the user can act on, and the per-load
-	// detail stays on print_verbose. Say it once per process: a background scene
-	// load would otherwise print one line per texture.
+	// detail stays on print_verbose. Say it once per process (never in the editor,
+	// where background thumbnail/preview generation loads on worker threads): a
+	// background scene load would otherwise print one line per texture.
 	if (p_reason != LOADER_FALLBACK_WORKER_THREAD && p_reason != LOADER_FALLBACK_SEPARATE_THREAD) {
+		return;
+	}
+	Engine *engine = Engine::get_singleton();
+	if (engine && engine->is_editor_hint()) {
 		return;
 	}
 	if (loader_thread_fallback_warned.exchange(true, std::memory_order_relaxed)) {
@@ -622,11 +628,13 @@ void DSContext::note_loader_cpu_fallback(LoaderFallback p_reason) {
 	const char *reason = p_reason == LOADER_FALLBACK_WORKER_THREAD
 			? "this load ran on a worker thread (background/threaded loading)"
 			: "the rendering thread is separate from the main thread (rendering/driver/threads/thread_model = Separate)";
+	const String first_seen = p_path.is_empty() ? String("") : String(" (first seen on '") + p_path + "')";
 	UtilityFunctions::push_warning(
-			"DirectStorage: GPU decompression is inactive for this texture load because ",
+			"DirectStorage: GPU decompression is inactive for this texture load", first_seen, " because ",
 			reason, ". Threaded texture loads decompress on the CPU; load on the main thread "
 			"under the default thread model, or prewarm with DSPreloader.prewarm_gpu_async(), "
-			"to reach the GPU path. Counted in get_capability_report()[\"loader_cpu_fallbacks\"].");
+			"to reach the GPU path. Logged once per session; all occurrences are counted in "
+			"DSContext.get_loader_stats() / get_capability_report()[\"loader_cpu_fallbacks\"].");
 }
 
 Dictionary DSContext::get_loader_stats() const {

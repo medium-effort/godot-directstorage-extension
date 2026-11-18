@@ -582,9 +582,9 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	// Every outcome is recorded (review item R3). The availability flags in
 	// get_capability_report() cannot tell "GPU path configured" from "GPU path
 	// taken", and a threaded load falls back with print_verbose only.
-	auto note_fallback = [ds_ctx](DSContext::LoaderFallback p_reason) {
+	auto note_fallback = [ds_ctx, &p_cache_key](DSContext::LoaderFallback p_reason) {
 		if (ds_ctx != nullptr) {
-			ds_ctx->note_loader_cpu_fallback(p_reason);
+			ds_ctx->note_loader_cpu_fallback(p_reason, p_cache_key);
 		}
 	};
 	if (p_as_image_texture) {

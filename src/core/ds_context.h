@@ -288,10 +288,10 @@ public:
 	// scene load rather than absolute values, since other loads move them too.
 	void note_loader_gpu_load();
 	void note_loader_cache_hit();
-	// One `push_warning` per process when the reason is a thread-affinity fallback
-	// (worker thread or Separate render thread): that is the only fallback a user
-	// can act on, and every other reason stays at print_verbose.
-	void note_loader_cpu_fallback(LoaderFallback p_reason);
+	// One `push_warning` per process (outside the editor) when the reason is a
+	// thread-affinity fallback (worker thread or Separate render thread): that is
+	// the only fallback a user can act on, and every other reason stays at print_verbose.
+	void note_loader_cpu_fallback(LoaderFallback p_reason, const String &p_path = String());
 	// Snapshot of the same counters without the GPU/adapter queries
 	// get_capability_report() performs. Keys: loader_gpu_loads, loader_cache_hits,
 	// loader_cpu_fallbacks (reason -> count). Not bound to script: the capability
