@@ -323,3 +323,38 @@ GDEX_TEST(gdeflate, decompress_runs_inside_worker_thread_pool_task) {
     GDEX_EXPECT_TRUE(job.ok);
     GDEX_EXPECT_TRUE(destination == original);
 }
+
+// Regression test for libdeflate_gdeflate_compress_bound() omitting the GDeflate
+// stream-interleaving slack when HIDE_INTERFACE suppresses deflate_compress.c's
+// #ifdef GDEFLATE bound. A 64 KiB tile whose dynamic Huffman cost sits just below
+// the 65536-byte two-block uncompressed threshold (~524344 bits) picks
+// DYNAMIC_HUFFMAN and writes past 65708 bytes of scratch space.
+GDEX_TEST(gdeflate, borderline_incompressible_full_tile_round_trip) {
+    godot::PackedByteArray tile;
+    tile.resize(kTileSize);
+    uint8_t *dst = tile.ptrw();
+    uint32_t state = 0x9E3779B9u;
+    for (int i = 0; i < kTileSize; ++i) {
+        state = state * 1664525u + 1013904223u;
+        const uint8_t v = static_cast<uint8_t>((state >> 24) & 0xFFu);
+        // ~1.5% bias toward 0x80 puts dynamic Huffman cost right near 524,300 bits
+        // on a 65536-byte tile (similar to high-entropy RGTC_RG normal maps).
+        dst[i] = ((state & 0x3Fu) == 0u) ? 0x80u : v;
+    }
+
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
+
+    for (int level : { 1, 3, 5 }) {
+        const godot::PackedByteArray compressed = compressor->compress(tile, level);
+        GDEX_EXPECT_GT(compressed.size(), 0);
+        if (compressed.size() == 0) {
+            continue;
+        }
+        const godot::PackedByteArray decompressed = decompressor->decompress(compressed, kTileSize);
+        GDEX_EXPECT_EQ(decompressed.size(), kTileSize);
+        GDEX_EXPECT_TRUE(decompressed == tile);
+    }
+}
