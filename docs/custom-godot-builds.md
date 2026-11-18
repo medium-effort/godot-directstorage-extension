@@ -43,14 +43,18 @@ scons platform=windows target=template_release \
     module_mbedtls_enabled=yes \
     module_betsy_enabled=yes \
     module_etcpak_enabled=yes \
-    module_webp_enabled=yes
+    module_webp_enabled=yes \
+    module_tga_enabled=yes \
+    module_dds_enabled=yes \
+    module_bcdec_enabled=yes
 ```
 
 ### Module Breakdown
 * **`module_zip_enabled=yes`**: Required by the in-editor DirectStorage Runtime Manager to inspect and extract official Microsoft NuGet `.nupkg` packages (`ZIPReader`). The module's `minizip` option (global, default `yes`) must not be turned off either, but note that `minizip=yes` alone does **not** restore the module once `module_zip_enabled=no` is in effect.
 * **`module_mbedtls_enabled=yes`**: Backs Godot's `Crypto` class (used by the export plugin to generate random archive encryption keys) and powers TLS/HTTPS in `HTTPRequest` for package downloads.
 * **`module_betsy_enabled=yes` & `module_etcpak_enabled=yes`**: Implements S3TC/BC texture compression in `Image.compress()` during `.dstex` import. If disabled, the importer cannot compress textures into VRAM block formats and falls back to uncompressed VRAM.
-* **`module_webp_enabled=yes` (and `module_jpg_enabled=yes`)**: Required if importing `.webp` or `.jpg` source images into `.dstex`.
+* **`module_webp_enabled=yes` (and `module_jpg_enabled=yes`, `module_tga_enabled=yes`, `module_dds_enabled=yes`)**: Required in editor builds if importing `.webp`, `.jpg`, `.tga`, or `.dds` source images into `.dstex` (`.dds` uses `Image.load_dds_from_buffer()`). Export templates only load `.dstex` / `.dspkg` and do not need these source-format modules.
+* **`module_bcdec_enabled=yes`**: Required in editor builds if importing compressed `.dds` files with pixel-modifying options (e.g., `size_limit`, `channel_remap`, `normal_map`, `fix_alpha_border`, `premult_alpha`, `compression/mode = Uncompressed`, or mipmap generation on a 1-mip `.dds`), which call `Image.decompress()`.
 
 ### Core Classes Are Not Optional
 
@@ -71,3 +75,6 @@ If you optimize Godot by maintaining a list of disabled modules in `custom.py` o
 | `module_mbedtls_enabled` | `Crypto.new()` fails, breaking package encryption key generation on export; HTTPS package downloads fail. |
 | `module_zip_enabled` | NuGet runtime package extraction disabled in the editor. |
 | `module_betsy_enabled` / `module_etcpak_enabled` | VRAM block compression disabled during texture import. |
+| `module_dds_enabled` | `.dds` import fails (`Image.load_dds_from_buffer()` unavailable in editor builds). |
+| `module_bcdec_enabled` | Decompress-on-demand fallback fails when importing compressed `.dds` with pixel transforms or `Uncompressed` mode. |
+| `module_tga_enabled` | `.tga` import fails (`Image.load_from_file()` cannot decode `.tga` in editor builds). |

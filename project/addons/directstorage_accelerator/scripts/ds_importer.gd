@@ -36,6 +36,22 @@ const CHANNEL_REMAP_GREEN := 1
 const CHANNEL_REMAP_BLUE := 2
 const CHANNEL_REMAP_ALPHA := 3
 
+const DDS_SUPPORTED_COMPRESSED_FORMATS := [
+	Image.FORMAT_DXT1,
+	Image.FORMAT_DXT3,
+	Image.FORMAT_DXT5,
+	Image.FORMAT_RGTC_R,
+	Image.FORMAT_RGTC_RG,
+	Image.FORMAT_BPTC_RGBA,
+	Image.FORMAT_BPTC_RGBF,
+	Image.FORMAT_BPTC_RGBFU,
+]
+const DDS_MAGIC := 0x20534444
+const DDS_FOURCC_DX10 := 0x30315844
+const DDS_CAPS2_CUBEMAP := 0x200
+const DDS_CAPS2_VOLUME := 0x200000
+const DDS_DIMENSION_TEXTURE2D := 3
+
 # Keys introduced by the color-option split. Their presence in an asset's .import file
 # means the user (or a previous import with the new options) already owns the channel settings,
 # so the legacy compression/source shim must not override them.
@@ -44,7 +60,7 @@ const COLOR_OPTION_KEYS := ["compression/color_space", "compress/normal_map", "c
 ## DirectStorage Texture Import Plugin
 ##
 ## Author: MediumEffort
-## Description: Converts .png, .jpg, .jpeg, and .webp sources into .dstex
+## Description: Converts .png, .jpg, .jpeg, .webp, .tga, and .dds sources into .dstex
 ## resources. The importer runs in the editor and exposes compression settings
 ## in the Import dock:
 ## - [b]compression/mode[/b]: VRAM block compression vs VRAM uncompressed.
@@ -84,7 +100,7 @@ func _get_visible_name() -> String:
 
 ## Returns the source image extensions handled by this importer.
 func _get_recognized_extensions() -> PackedStringArray:
-	return PackedStringArray(["png", "jpg", "jpeg", "webp"])
+	return PackedStringArray(["png", "jpg", "jpeg", "webp", "tga", "dds"])
 
 ## Returns the generated resource extension.
 func _get_save_extension() -> String:
@@ -395,17 +411,82 @@ static func _pad_texture_data(raw_data: PackedByteArray, width: int, height: int
 		source_offset += row_bytes * row_count
 	return padded
 
-## Converts one source image into a compressed .dstex file and reports it to
-## Godot's import pipeline through gen_files.
-func _import(source_file: String, save_path: String, options: Dictionary, platform_variants: Array[String], gen_files: Array[String]) -> Error:
-	var global_path := ProjectSettings.globalize_path(source_file)
+## Rejects DDS cubemaps, volume textures, and texture arrays before load_dds_from_buffer(),
+## because Image.load_dds_from_buffer() silently returns only the first 2D slice.
+static func _validate_dds_2d_header(bytes: PackedByteArray, source_file: String) -> Error:
+	if bytes.size() < 128 or bytes.decode_u32(0) != DDS_MAGIC:
+		push_error("[DirectStorage Importer] Invalid DDS header: " + source_file)
+		return ERR_FILE_CORRUPT
+	var caps2: int = bytes.decode_u32(112)
+	if (caps2 & (DDS_CAPS2_CUBEMAP | DDS_CAPS2_VOLUME)) != 0:
+		push_error("[DirectStorage Importer] Unsupported DDS cubemap or volume texture: " + source_file)
+		return ERR_UNAVAILABLE
+	var fourcc: int = bytes.decode_u32(84)
+	if fourcc == DDS_FOURCC_DX10:
+		if bytes.size() < 148:
+			push_error("[DirectStorage Importer] Truncated DX10 DDS header: " + source_file)
+			return ERR_FILE_CORRUPT
+		var resource_dimension: int = bytes.decode_u32(132)
+		var array_size: int = bytes.decode_u32(140)
+		if resource_dimension != DDS_DIMENSION_TEXTURE2D or array_size > 1:
+			push_error("[DirectStorage Importer] Unsupported DDS DX10 non-2D or texture array: " + source_file)
+			return ERR_UNAVAILABLE
+	return OK
+
+## Loads a source image, routing .dds files through Image.load_dds_from_buffer().
+static func _load_source_image(source_file: String, global_path: String) -> Dictionary:
+	if source_file.get_extension().to_lower() == "dds":
+		var dds_bytes := FileAccess.get_file_as_bytes(source_file)
+		if dds_bytes.is_empty():
+			dds_bytes = FileAccess.get_file_as_bytes(global_path)
+		if dds_bytes.is_empty():
+			var open_err := FileAccess.get_open_error()
+			return {"image": null, "error": open_err if open_err != OK else ERR_CANT_OPEN}
+		var header_err := _validate_dds_2d_header(dds_bytes, source_file)
+		if header_err != OK:
+			return {"image": null, "error": header_err}
+		var dds_img := Image.new()
+		var dds_err := dds_img.load_dds_from_buffer(dds_bytes)
+		if dds_err != OK or dds_img.is_empty():
+			return {"image": null, "error": dds_err if dds_err != OK else ERR_CANT_CREATE}
+		return {"image": dds_img, "error": OK}
+
 	var img := Image.load_from_file(global_path)
 	if img == null or img.is_empty():
 		img = Image.new()
 		var err := img.load(source_file)
 		if err != OK:
-			push_error("[DirectStorage Importer] Failed to load source image: " + source_file)
-			return err
+			return {"image": null, "error": err}
+	return {"image": img, "error": OK}
+
+## Normalizes uncompressed DDS/source formats that DSTex does not map directly,
+## or rejects integer / shared-exponent formats with ERR_UNAVAILABLE.
+static func _ensure_dstex_uncompressed_format(img: Image, source_file: String) -> Error:
+	match img.get_format():
+		Image.FORMAT_RGB565, Image.FORMAT_RGBA4444:
+			img.convert(Image.FORMAT_RGBA8)
+		Image.FORMAT_R16I, Image.FORMAT_RG16I, Image.FORMAT_RGBA16I, Image.FORMAT_RGBE9995:
+			push_error("[DirectStorage Importer] Unsupported pixel format for .dstex: " + source_file)
+			return ERR_UNAVAILABLE
+	return OK
+
+## Returns a descriptive codec label for compressed DDS passthrough imports.
+static func _passthrough_codec_label(img_format: int) -> String:
+	match img_format:
+		Image.FORMAT_BPTC_RGBA, Image.FORMAT_BPTC_RGBF, Image.FORMAT_BPTC_RGBFU:
+			return "DDS Passthrough (BPTC)"
+		_:
+			return "DDS Passthrough (S3TC)"
+
+## Converts one source image into a compressed .dstex file and reports it to
+## Godot's import pipeline through gen_files.
+func _import(source_file: String, save_path: String, options: Dictionary, platform_variants: Array[String], gen_files: Array[String]) -> Error:
+	var global_path := ProjectSettings.globalize_path(source_file)
+	var load_result := _load_source_image(source_file, global_path)
+	if load_result["error"] != OK or load_result["image"] == null:
+		push_error("[DirectStorage Importer] Failed to load source image: " + source_file)
+		return load_result["error"]
+	var img: Image = load_result["image"]
 
 	var compression_mode: int = int(options.get("compression/mode", 0))
 	var high_quality: bool = bool(options.get("compression/high_quality", false))
@@ -416,6 +497,10 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 	var size_limit: int = clampi(int(options.get("process/size_limit", 0)), 0, DSTEX_MAX_DIMENSION)
 	var fix_alpha_border: bool = bool(options.get("process/fix_alpha_border", false))
 	var premult_alpha: bool = bool(options.get("process/premult_alpha", false))
+	var remap_r: int = int(options.get("process/channel_remap/red", CHANNEL_REMAP_RED))
+	var remap_g: int = int(options.get("process/channel_remap/green", CHANNEL_REMAP_GREEN))
+	var remap_b: int = int(options.get("process/channel_remap/blue", CHANNEL_REMAP_BLUE))
+	var remap_a: int = int(options.get("process/channel_remap/alpha", CHANNEL_REMAP_ALPHA))
 
 	if not ClassDB.class_exists("DSTex"):
 		push_error("[DirectStorage Importer] ClassDB entry 'DSTex' missing. Is GDExtension built?")
@@ -425,91 +510,128 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 		push_error("[DirectStorage Importer] Failed to instantiate DSTex.")
 		return ERR_CANT_CREATE
 
-	# L8/LA8 have no RD sRGB/luminance swizzle in .dstex; RGB8 needs an alpha
-	# channel for the alpha options. R8/RG8 are exact and stay as-is.
-	match img.get_format():
-		Image.FORMAT_L8, Image.FORMAT_LA8, Image.FORMAT_RGB8:
-			img.convert(Image.FORMAT_RGBA8)
-
-	# Bound the source before mip generation and compression.
 	var limit := size_limit if size_limit > 0 else DSTEX_MAX_DIMENSION
-	var implicit_limit := size_limit == 0
-	var source_width := img.get_width()
-	var source_height := img.get_height()
-	if source_width > limit or source_height > limit:
-		var new_width: int
-		var new_height: int
-		if source_width >= source_height:
-			new_width = limit
-			new_height = maxi(1, int(round(float(source_height) * float(limit) / float(source_width))))
-		else:
-			new_height = limit
-			new_width = maxi(1, int(round(float(source_width) * float(limit) / float(source_height))))
-		img.resize(new_width, new_height, Image.INTERPOLATE_CUBIC)
-		if implicit_limit:
-			push_warning("[DirectStorage Importer] Asset '%s' exceeded the %d px container limit and was resized from %dx%d to %dx%d." % [source_file, DSTEX_MAX_DIMENSION, source_width, source_height, new_width, new_height])
+	var identity_remap := (
+		remap_r == CHANNEL_REMAP_RED and
+		remap_g == CHANNEL_REMAP_GREEN and
+		remap_b == CHANNEL_REMAP_BLUE and
+		remap_a == CHANNEL_REMAP_ALPHA
+	)
+	var can_passthrough := (
+		img.is_compressed() and
+		DDS_SUPPORTED_COMPRESSED_FORMATS.has(img.get_format()) and
+		compression_mode == 0 and
+		not is_normal_map and
+		not fix_alpha_border and
+		not premult_alpha and
+		identity_remap and
+		img.get_width() <= limit and
+		img.get_height() <= limit and
+		(not generate_mipmaps or img.has_mipmaps())
+	)
 
-	# Block codecs pad to 4x4 blocks internally; align first so the mip chain and
-	# the written dimensions agree. The pre-align size is the logical
-	# (authoring) size; the post-compression size is the storage size. When
-	# they differ the writer emits a v3 file so the loader can size-override
-	# back to the logical dimensions.
 	var logical_width := img.get_width()
 	var logical_height := img.get_height()
-	if compression_mode == 0:
-		var aligned_width := img.get_width()
-		var aligned_height := img.get_height()
-		var target_width := aligned_width if aligned_width <= 2 else (aligned_width + 3) & ~3
-		var target_height := aligned_height if aligned_height <= 2 else (aligned_height + 3) & ~3
-		if target_width != aligned_width or target_height != aligned_height:
-			img.resize(target_width, target_height, Image.INTERPOLATE_CUBIC)
-			push_warning("[DirectStorage Importer] Asset '%s' dimensions %dx%d are not a multiple of 4; block compression stores them as %dx%d. GPU-decoded textures report the padded %dx%d size (Texture2DRD has no size setter); enable compatibility/as_image_texture to load it as a %dx%d ImageTexture." % [source_file, aligned_width, aligned_height, target_width, target_height, target_width, target_height, aligned_width, aligned_height])
-
-	# Godot remaps channels right after the size-limit resize; do the same so
-	# packed PBR masks and normal-map swizzles apply before normalization.
-	ClassDB.class_call_static("DSTex", "remap_channels", img,
-			int(options.get("process/channel_remap/red", CHANNEL_REMAP_RED)),
-			int(options.get("process/channel_remap/green", CHANNEL_REMAP_GREEN)),
-			int(options.get("process/channel_remap/blue", CHANNEL_REMAP_BLUE)),
-			int(options.get("process/channel_remap/alpha", CHANNEL_REMAP_ALPHA)))
-
-	# Godot normalizes the base level only after a size-limit resize; do it for
-	# every normal map so the source normals are unit length before mips.
-	if is_normal_map:
-		ClassDB.class_call_static("DSTex", "normalize_image", img)
-
-	if fix_alpha_border:
-		img.fix_alpha_edges()
-	if premult_alpha:
-		img.premultiply_alpha()
-
-	if generate_mipmaps:
-		img.generate_mipmaps(is_normal_map)
-	else:
-		img.clear_mipmaps()
-
 	var effective_codec := "Uncompressed"
-	if compression_mode == 0:
-		var requested_codec := "BPTC" if high_quality else "S3TC"
-		var compressed := false
-		if high_quality:
-			var bptc_error := img.compress(Image.COMPRESS_BPTC, compression_source)
-			compressed = bptc_error == OK and img.is_compressed() and img.get_format() == Image.FORMAT_BPTC_RGBA
-			if compressed:
-				effective_codec = "BPTC"
-		if not compressed:
-			var s3tc_error := img.compress(Image.COMPRESS_S3TC, compression_source)
-			var s3tc_formats := [Image.FORMAT_DXT1, Image.FORMAT_DXT3, Image.FORMAT_DXT5, Image.FORMAT_RGTC_R, Image.FORMAT_RGTC_RG]
-			compressed = s3tc_error == OK and img.is_compressed() and s3tc_formats.has(img.get_format())
-			if compressed:
-				effective_codec = "S3TC"
-		if not compressed:
-			if img.get_format() != Image.FORMAT_RGBA8:
+
+	if can_passthrough:
+		if not generate_mipmaps:
+			img.clear_mipmaps()
+		effective_codec = _passthrough_codec_label(img.get_format())
+	else:
+		if img.is_compressed():
+			if not DDS_SUPPORTED_COMPRESSED_FORMATS.has(img.get_format()):
+				push_error("[DirectStorage Importer] Unsupported compressed source format: " + source_file)
+				return ERR_UNAVAILABLE
+			var decomp_err := img.decompress()
+			if decomp_err != OK:
+				push_error("[DirectStorage Importer] Failed to decompress source image: " + source_file)
+				return decomp_err
+
+		var fmt_err := _ensure_dstex_uncompressed_format(img, source_file)
+		if fmt_err != OK:
+			return fmt_err
+
+		# L8/LA8 have no RD sRGB/luminance swizzle in .dstex; RGB8 needs an alpha
+		# channel for the alpha options. R8/RG8 are exact and stay as-is.
+		match img.get_format():
+			Image.FORMAT_L8, Image.FORMAT_LA8, Image.FORMAT_RGB8:
 				img.convert(Image.FORMAT_RGBA8)
-			effective_codec = "Uncompressed"
-			push_warning("[DirectStorage Importer] Asset '%s': requested %s compression failed (codec unavailable or unsupported); wrote uncompressed RGBA8." % [source_file, requested_codec])
-		elif effective_codec != requested_codec:
-			push_warning("[DirectStorage Importer] Asset '%s': requested %s compression unavailable; wrote %s." % [source_file, requested_codec, effective_codec])
+
+		# Bound the source before mip generation and compression.
+		var implicit_limit := size_limit == 0
+		var source_width := img.get_width()
+		var source_height := img.get_height()
+		if source_width > limit or source_height > limit:
+			var new_width: int
+			var new_height: int
+			if source_width >= source_height:
+				new_width = limit
+				new_height = maxi(1, int(round(float(source_height) * float(limit) / float(source_width))))
+			else:
+				new_height = limit
+				new_width = maxi(1, int(round(float(source_width) * float(limit) / float(source_height))))
+			img.resize(new_width, new_height, Image.INTERPOLATE_CUBIC)
+			if implicit_limit:
+				push_warning("[DirectStorage Importer] Asset '%s' exceeded the %d px container limit and was resized from %dx%d to %dx%d." % [source_file, DSTEX_MAX_DIMENSION, source_width, source_height, new_width, new_height])
+
+		# Block codecs pad to 4x4 blocks internally; align first so the mip chain and
+		# the written dimensions agree. The pre-align size is the logical
+		# (authoring) size; the post-compression size is the storage size. When
+		# they differ the writer emits a v3 file so the loader can size-override
+		# back to the logical dimensions.
+		logical_width = img.get_width()
+		logical_height = img.get_height()
+		if compression_mode == 0:
+			var aligned_width := img.get_width()
+			var aligned_height := img.get_height()
+			var target_width := aligned_width if aligned_width <= 2 else (aligned_width + 3) & ~3
+			var target_height := aligned_height if aligned_height <= 2 else (aligned_height + 3) & ~3
+			if target_width != aligned_width or target_height != aligned_height:
+				img.resize(target_width, target_height, Image.INTERPOLATE_CUBIC)
+				push_warning("[DirectStorage Importer] Asset '%s' dimensions %dx%d are not a multiple of 4; block compression stores them as %dx%d. GPU-decoded textures report the padded %dx%d size (Texture2DRD has no size setter); enable compatibility/as_image_texture to load it as a %dx%d ImageTexture." % [source_file, aligned_width, aligned_height, target_width, target_height, target_width, target_height, aligned_width, aligned_height])
+
+		# Godot remaps channels right after the size-limit resize; do the same so
+		# packed PBR masks and normal-map swizzles apply before normalization.
+		ClassDB.class_call_static("DSTex", "remap_channels", img, remap_r, remap_g, remap_b, remap_a)
+
+		# Godot normalizes the base level only after a size-limit resize; do it for
+		# every normal map so the source normals are unit length before mips.
+		if is_normal_map:
+			ClassDB.class_call_static("DSTex", "normalize_image", img)
+
+		if fix_alpha_border:
+			img.fix_alpha_edges()
+		if premult_alpha:
+			img.premultiply_alpha()
+
+		if generate_mipmaps:
+			img.generate_mipmaps(is_normal_map)
+		else:
+			img.clear_mipmaps()
+
+		if compression_mode == 0:
+			var requested_codec := "BPTC" if high_quality else "S3TC"
+			var compressed := false
+			if high_quality:
+				var bptc_error := img.compress(Image.COMPRESS_BPTC, compression_source)
+				var bptc_formats := [Image.FORMAT_BPTC_RGBA, Image.FORMAT_BPTC_RGBF, Image.FORMAT_BPTC_RGBFU]
+				compressed = bptc_error == OK and img.is_compressed() and bptc_formats.has(img.get_format())
+				if compressed:
+					effective_codec = "BPTC"
+			if not compressed:
+				var s3tc_error := img.compress(Image.COMPRESS_S3TC, compression_source)
+				var s3tc_formats := [Image.FORMAT_DXT1, Image.FORMAT_DXT3, Image.FORMAT_DXT5, Image.FORMAT_RGTC_R, Image.FORMAT_RGTC_RG]
+				compressed = s3tc_error == OK and img.is_compressed() and s3tc_formats.has(img.get_format())
+				if compressed:
+					effective_codec = "S3TC"
+			if not compressed:
+				if img.get_format() != Image.FORMAT_RGBA8 and img.get_format() != Image.FORMAT_RGBH:
+					img.convert(Image.FORMAT_RGBA8)
+				effective_codec = "Uncompressed"
+				push_warning("[DirectStorage Importer] Asset '%s': requested %s compression failed (codec unavailable or unsupported); wrote uncompressed %s." % [source_file, requested_codec, "RGBH" if img.get_format() == Image.FORMAT_RGBH else "RGBA8"])
+			elif effective_codec != requested_codec:
+				push_warning("[DirectStorage Importer] Asset '%s': requested %s compression unavailable; wrote %s." % [source_file, requested_codec, effective_codec])
 
 	var raw_data := img.get_data()
 	var width := img.get_width()
