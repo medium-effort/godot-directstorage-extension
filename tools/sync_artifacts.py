@@ -353,9 +353,9 @@ def describe_wrong_addon_target(target):
     return ""
 
 
-def sync_addon_target(addon_dir, env, log, dry_run, content_compare=False):
-    """addon dir -> SYNC_ADDON_DIR."""
-    target = env.get("SYNC_ADDON_DIR", "").strip()
+def sync_addon_target(addon_dir, env, log, dry_run, content_compare=False, target_override=None):
+    """addon dir -> SYNC_ADDON_DIR (or target_override)."""
+    target = (target_override if target_override is not None else env.get("SYNC_ADDON_DIR", "")).strip()
     result = TargetResult("addon", target)
     if not target:
         result.attempted = False
@@ -615,6 +615,8 @@ def main(argv=None):
                         help="checkout to copy from (default: this one), typically a worktree path")
     parser.add_argument("--source-label", default="", dest="source_label",
                         help="name of --source-root for the log (default: derived from the path)")
+    parser.add_argument("--addon-dir", default=None, dest="addon_dir",
+                        help="override SYNC_ADDON_DIR for the addon target")
     args = parser.parse_args(argv)
 
     repo_root = os.path.abspath(args.repo_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -653,7 +655,8 @@ def main(argv=None):
     if "copyable" in targets:
         results.append(sync_copyable_target(addon_dir, src_dir, os.environ, log, args.dry_run, content_compare))
     if "addon" in targets:
-        results.append(sync_addon_target(addon_dir, os.environ, log, args.dry_run, content_compare))
+        addon_override = os.path.abspath(args.addon_dir) if args.addon_dir else None
+        results.append(sync_addon_target(addon_dir, os.environ, log, args.dry_run, content_compare, addon_override))
 
     patch_manifest(results, source_root, repo_root, os.environ, log, args.dry_run)
 
@@ -681,7 +684,7 @@ def main(argv=None):
 
     print(
         f"[sync] SUMMARY targets={','.join(r.name for r in attempted)} "
-        f"copied={copied_total} src_copied={src_total} failed={','.join(failed)}"
+        f"copied={copied_total} src_copied={src_total} failed={','.join(failed) or 'none'}"
         + (f" source={source_label}" if content_compare else ""),
         flush=True,
     )

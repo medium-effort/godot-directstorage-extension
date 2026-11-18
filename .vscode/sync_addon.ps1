@@ -7,6 +7,7 @@
 #
 #   .\sync_addon.ps1                        -> current checkout, SYNC_ADDON_DIR
 #   .\sync_addon.ps1 -Source <worktree>     -> publish that worktree's addon
+#   .\sync_addon.ps1 -AddonDir <path>       -> override SYNC_ADDON_DIR for this run
 #   .\sync_addon.ps1 -ListSources           -> show the sources you can pick
 #   .\sync_addon.ps1 -Targets all           -> test, copyable and addon targets
 #   .\sync_addon.ps1 -Targets copyable      -> SYNC_ADDON_COPYABLE_DIR only
@@ -22,6 +23,7 @@ param(
     [switch]$Verbose,
     [string]$Targets = "addon",
     [string]$Source = "",
+    [string]$AddonDir = "",
     [switch]$DryRun,
     [switch]$ListSources
 )
@@ -162,6 +164,7 @@ if (-not $IsCurrentCheckout) {
 $SyncArgs = @($SyncScript, "--targets", $Targets)
 if ($Verbose) { $SyncArgs += "--verbose" }
 if ($DryRun) { $SyncArgs += "--dry-run" }
+if (-not [string]::IsNullOrWhiteSpace($AddonDir)) { $SyncArgs += @("--addon-dir", $AddonDir.Trim()) }
 if (-not $IsCurrentCheckout) { $SyncArgs += @("--source-root", $SourceRoot, "--source-label", $SourceLabel) }
 
 & python @SyncArgs
