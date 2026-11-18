@@ -814,7 +814,14 @@ bool DSTextureCache::is_gpu_prewarm_available() {
 }
 
 int DSTextureCache::poll_completed(uint64_t p_tag, int p_max_items, int p_max_usec, bool p_gpu_only) {
-	return DSPreloader::poll_completed(p_tag, p_max_items, (uint32_t)std::max(0, p_max_usec), String(), p_gpu_only);
+	uint32_t max_usec = 0;
+	if (p_max_usec < 0) {
+		UtilityFunctions::push_warning("DSTextureCache::poll_completed: negative max_usec (", p_max_usec, ") clamped to 1 us; pass 0 for unbounded.");
+		max_usec = 1;
+	} else {
+		max_usec = static_cast<uint32_t>(p_max_usec);
+	}
+	return DSPreloader::poll_completed(p_tag, p_max_items, max_usec, String(), p_gpu_only);
 }
 
 int DSTextureCache::get_pending_prewarm_count(uint64_t p_tag) const {

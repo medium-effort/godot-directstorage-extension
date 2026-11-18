@@ -532,3 +532,53 @@ GDEX_TEST_T(poll_budget, background_pacing_caps_in_flight_build_bytes_while_allo
 	GDEX_EXPECT_EQ(godot::PrewarmBudgetTest::get_in_flight_builds(), 0);
 	GDEX_EXPECT_EQ(static_cast<int64_t>(godot::PrewarmBudgetTest::get_in_flight_build_bytes()), 0);
 }
+
+// Negative max_usec must not clamp to 0 (the explicit unbounded-time sentinel):
+// it must resolve to a bounded 1 us slice and offload oversized CPU entries
+// rather than building up to 64 MiB inline on the calling thread.
+GDEX_TEST_T(poll_budget, negative_budget_does_not_become_unbounded, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF0144ULL;
+
+	godot::PackedByteArray data;
+	data.resize(static_cast<int64_t>(kUnboundedEntryBytes));
+	uint8_t *w = data.ptrw();
+	for (int64_t i = 0; i < data.size(); i += 4093) {
+		w[i] = static_cast<uint8_t>(i & 0xFF);
+	}
+
+	const char *paths[3] = {
+		"user://gdextest_poll_neg_a.png",
+		"user://gdextest_poll_neg_b.png",
+		"user://gdextest_poll_neg_c.png",
+	};
+	for (int i = 0; i < 3; ++i) {
+		godot::DSPreloader::Payload meta = make_payload(paths[i], 4096);
+		meta.height = 1536;
+		meta.original_size = kUnboundedEntryBytes;
+		meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(kUnboundedEntryBytes));
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	}
+	GDEX_ASSERT_EQ(cache->get_unbuilt_prewarm_count(tag), 3);
+	warm_worker_pool();
+
+	const uint64_t t0 = godot::Time::get_singleton()->get_ticks_usec();
+	const int stored = cache->poll_completed(tag, 0, -1);
+	const uint64_t elapsed = godot::Time::get_singleton()->get_ticks_usec() - t0;
+
+	// With p_max_usec == 1, 24 MiB entries (est_usec == 12600 > 1) offload instead
+	// of building 48 MiB inline (which p_max_usec == 0 would do, returning stored == 2).
+	GDEX_EXPECT_EQ(stored, 0);
+	GDEX_EXPECT_LT(elapsed, static_cast<uint64_t>(3500));
+
+	// Drain any remaining entries with subsequent bounded slices.
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (cache->get_unbuilt_prewarm_count(tag) > 0 && std::chrono::steady_clock::now() < deadline) {
+		cache->poll_completed(tag, 0, 100);
+		std::this_thread::yield();
+	}
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+	for (int i = 0; i < 3; ++i) {
+		GDEX_EXPECT_TRUE(cache->get_cached(godot::String(paths[i])).is_valid());
+	}
+}
