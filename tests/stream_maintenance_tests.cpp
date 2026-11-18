@@ -38,6 +38,8 @@
 #include <godot_cpp/variant/string.hpp>
 
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -415,4 +417,93 @@ GDEX_TEST_T(request_payload_immutability, setters_rejected_when_submitted_or_gpu
 
     req->set_file_path("res://gpu_tampered.bin");
     GDEX_EXPECT_TRUE(req->get_file_path() == "res://initial_path.bin");
+}
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+// Regression for #0277: when submit_async() returns false (ERR_BUSY) after
+// draining the last items from stream_queue, stream_pending_submit_requests > 0
+// must keep has_stream_pending() true and get_stream_pending_count() > 0 so
+// DSRuntime._process() continues calling flush_stream_async().
+GDEX_TEST_T(stream_maintenance, has_stream_pending_counts_staged_submit_retries, TAG_INTEGRATION) {
+    godot::DSContext *ds = require_initialized_context(ctx);
+    GDEX_EXPECT_FALSE(ds->has_stream_pending());
+    GDEX_EXPECT_EQ(ds->get_stream_pending_count(), 0);
+
+    ds->_debug_set_stream_pending_submit_requests_for_testing(4);
+    ctx.add_teardown([ds]() {
+        ds->_debug_set_stream_pending_submit_requests_for_testing(0);
+    });
+
+    GDEX_EXPECT_TRUE(ds->has_stream_pending());
+    GDEX_EXPECT_EQ(ds->get_stream_pending_count(), 4);
+
+    ds->_debug_set_stream_pending_submit_requests_for_testing(0);
+    GDEX_EXPECT_FALSE(ds->has_stream_pending());
+    GDEX_EXPECT_EQ(ds->get_stream_pending_count(), 0);
+}
+#endif
+
+// Regression for #0277: concurrent worker + main-thread flush_stream_async()
+// calls over >128 requests (spanning multiple flushes) must never strand
+// staged requests in an unsubmitted slot with has_stream_pending() == false.
+GDEX_TEST_T(stream_maintenance, concurrent_flush_stream_async_drains_all_requests, TAG_INTEGRATION) {
+    godot::DSContext *ds = require_initialized_context(ctx);
+
+    constexpr const char *kPath = "user://gdextest_concurrent_stream_flush.bin";
+    if (!write_probe_file(kPath)) {
+        GDEX_FAIL("failed to stage probe file.");
+    }
+    ctx.add_teardown([kPath]() { remove_probe_file(kPath); });
+
+    constexpr int kRequestCount = 160; // > max_logical_requests (128) in flush_stream_async()
+    std::vector<godot::Ref<godot::DSRequest>> reqs;
+    reqs.reserve(kRequestCount);
+    for (int i = 0; i < kRequestCount; ++i) {
+        godot::Ref<godot::DSRequest> req = make_memory_request(kPath);
+        GDEX_EXPECT_TRUE(ds->enqueue_request(req, true));
+        reqs.push_back(req);
+    }
+    GDEX_EXPECT_TRUE(ds->has_stream_pending());
+
+    std::thread worker([ds]() {
+        for (int i = 0; i < 10; ++i) {
+            ds->flush_stream_async();
+        }
+    });
+    for (int i = 0; i < 10; ++i) {
+        ds->flush_stream_async();
+    }
+    worker.join();
+
+    godot::OS *os = godot::OS::get_singleton();
+    for (int pass = 0; pass < 80; ++pass) {
+        if (ds->has_stream_pending()) {
+            ds->flush_stream_async();
+        }
+        ds->wait_for_completion(200);
+        if (os != nullptr) {
+            os->delay_msec(20);
+        }
+        ds->collect_completed_results();
+        if (!ds->has_stream_pending()) {
+            bool all_done = true;
+            for (int i = 0; i < kRequestCount; ++i) {
+                const auto st = reqs[i]->get_status();
+                if (st != godot::DSRequest::STATUS_COMPLETED && st != godot::DSRequest::STATUS_FAILED) {
+                    all_done = false;
+                    break;
+                }
+            }
+            if (all_done) {
+                break;
+            }
+        }
+    }
+
+    GDEX_EXPECT_FALSE(ds->has_stream_pending());
+    GDEX_EXPECT_EQ(ds->get_stream_pending_count(), 0);
+    for (int i = 0; i < kRequestCount; ++i) {
+        GDEX_EXPECT_EQ(static_cast<int64_t>(reqs[i]->get_status()),
+                static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+    }
 }

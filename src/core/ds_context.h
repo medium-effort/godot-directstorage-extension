@@ -172,6 +172,10 @@ private:
 		bool fixed_total = false;
 	};
 	mutable std::mutex stream_mutex;
+	// Outermost lock for flush_stream_async() (acquired with try_to_lock before
+	// backend_lifecycle_mutex / context_mutex / stream_mutex) so two threads
+	// cannot interleave staging into backend batch slots concurrently.
+	mutable std::mutex stream_flush_mutex;
 	std::deque<Ref<DSRequest>> stream_queue; // pending, not yet submitted
 	// Requests this path staged into the backend but could not submit because
 	// another batch had already claimed the slot (submit_async() returned
@@ -394,6 +398,11 @@ public:
 	// Test-only seam: number of backends deliberately left unreleased because a drain
 	// timeout detached their completion thread. Never bound in _bind_methods().
 	int _debug_abandoned_backend_count_for_testing() const;
+	// Test-only seam: sets stream_pending_submit_requests directly to reproduce
+	// an ERR_BUSY retry with an empty stream_queue. Never bound in _bind_methods().
+	void _debug_set_stream_pending_submit_requests_for_testing(int p_count) {
+		stream_pending_submit_requests.store(p_count, std::memory_order_release);
+	}
 #endif
 };
 

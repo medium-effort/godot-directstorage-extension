@@ -1538,6 +1538,13 @@ Error DSContext::flush_stream_async() {
 	// via the stream internal enqueue (validation + tracking + Ref holding;
 	// per-request collect/finalize hoisted to once per flush),
 	// then submits non-blocking via submit_async().
+	// Serialize flushes non-blockingly so a worker prewarm and main-thread
+	// DSRuntime._process() cannot interleave staging into Win32Backend slots
+	// concurrently or split a single flush across active_batch_slot flips.
+	std::unique_lock<std::mutex> flush_lock(stream_flush_mutex, std::try_to_lock);
+	if (!flush_lock.owns_lock()) {
+		return ERR_BUSY;
+	}
 	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return ERR_UNCONFIGURED;
@@ -1672,12 +1679,12 @@ Error DSContext::flush_stream_async() {
 
 bool DSContext::has_stream_pending() const {
 	std::lock_guard<std::mutex> lock(stream_mutex);
-	return !stream_queue.empty();
+	return !stream_queue.empty() || stream_pending_submit_requests.load(std::memory_order_acquire) > 0;
 }
 
 int DSContext::get_stream_pending_count() const {
 	std::lock_guard<std::mutex> lock(stream_mutex);
-	return static_cast<int>(stream_queue.size());
+	return static_cast<int>(stream_queue.size()) + stream_pending_submit_requests.load(std::memory_order_acquire);
 }
 
 uint64_t DSContext::prewarm_async(const PackedStringArray &p_paths) {
