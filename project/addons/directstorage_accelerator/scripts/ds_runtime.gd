@@ -128,6 +128,7 @@ var _background_pacing: bool = false
 var _cpu_poll_cooldown_frames: int = 0
 var _gpu_pump_cooldown_frames: int = 0
 var _cpu_pump_cooldown_frames: int = 0
+var _gpu_window_chunks: int = 1
 var _cpu_window_init: bool = false
 var _cpu_window_items: int = 4
 var _cpu_window_bytes: int = 4 * 1024 * 1024
@@ -307,7 +308,7 @@ func set_background_pacing(enabled: bool) -> void:
 	_gpu_pump_frames_since = 0
 	_cpu_poll_cooldown_frames = 0
 	_gpu_pump_cooldown_frames = 0
-	_gpu_pump_cooldown_frames = 0
+	_gpu_window_chunks = 1
 	if ClassDB.class_exists("DSTextureCache"):
 		var cache = Engine.get_singleton("DSTextureCache")
 		if cache != null and cache.has_method("set_background_pacing"):
@@ -330,6 +331,7 @@ func reset_slice_stats() -> void:
 	_gpu_pump_frames_since = 0
 	_cpu_poll_cooldown_frames = 0
 	_gpu_pump_cooldown_frames = 0
+	_gpu_window_chunks = 1
 
 
 func _is_frame_capped() -> bool:
@@ -802,13 +804,28 @@ func _process(delta: float) -> void:
 			var gpu_slice_label := _effective_gpu_slice_label(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms)
 			if _has_pump_gpu:
 				if _background_pacing:
-					if _is_frame_capped() and frame_ms > gpu_mild_budget_ms and has_gpu_unbuilt:
-						_gpu_pump_cooldown_frames = maxi(_gpu_pump_cooldown_frames, 1)
 					var gpu_in_flight := _has_gpu_requests_in_flight and bool(cache.has_gpu_requests_in_flight(0))
+					if has_gpu_unbuilt:
+						if gpu_slice_label == "heavy":
+							_gpu_window_chunks = 1
+							_gpu_pump_cooldown_frames = maxi(_gpu_pump_cooldown_frames, 1)
+						elif gpu_slice_label == "mild":
+							_gpu_window_chunks = maxi(1, _gpu_window_chunks - 1)
+							if _is_frame_capped() and frame_ms > gpu_mild_budget_ms:
+								_gpu_pump_cooldown_frames = maxi(_gpu_pump_cooldown_frames, 1)
+						elif not gpu_in_flight and _smooth_streak >= 2 and frame_ms <= gpu_mild_budget_ms:
+							_gpu_window_chunks = mini(4, _gpu_window_chunks + 1)
 					if _gpu_pump_cooldown_frames > 0:
 						_gpu_pump_cooldown_frames -= 1
-					elif not gpu_in_flight and _should_pump_gpu_now(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms):
-						cache.pump_gpu_prewarm()
+					elif not gpu_in_flight:
+						if gpu_slice_label == "warm":
+							var bg_pump_start_usec: int = Time.get_ticks_usec()
+							for _p in _gpu_window_chunks:
+								cache.pump_gpu_prewarm()
+								if Time.get_ticks_usec() - bg_pump_start_usec >= 2000:
+									break
+						elif _should_pump_gpu_now(slice_label, frame_ms, gpu_mild_budget_ms, gpu_heavy_budget_ms):
+							cache.pump_gpu_prewarm()
 				else:
 					var pump_start_usec: int = Time.get_ticks_usec()
 					for _p in GPU_LOADING_PUMP_MAX_CHUNKS_PER_FRAME:

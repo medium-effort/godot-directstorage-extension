@@ -1843,7 +1843,9 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 				item_requests.push_back(static_cast<uint64_t>(count_gpu_requests_for_payload(chunk.items[i].meta)));
 				item_bytes.push_back(estimate_payload_bytes(chunk.items[i].meta));
 			}
-			const uint64_t chunk_byte_cap = p_max_chunk_bytes > 0 ? static_cast<uint64_t>(p_max_chunk_bytes) : kGpuPrewarmBytesPerCallback;
+			const uint64_t bg_chunk_cap = 2ULL * 1024ULL * 1024ULL;
+			const uint64_t default_chunk_cap = s.background_pacing.load(std::memory_order_relaxed) ? bg_chunk_cap : kGpuPrewarmBytesPerCallback;
+			const uint64_t chunk_byte_cap = p_max_chunk_bytes > 0 ? static_cast<uint64_t>(p_max_chunk_bytes) : default_chunk_cap;
 			const std::vector<GpuChunkSlice> slices = plan_gpu_chunk_slices(item_requests, item_bytes,
 					static_cast<size_t>(std::max(1, chunk_size)), callback_request_cap, chunk_byte_cap);
 			for (size_t slice_index = 0; slice_index < slices.size(); ++slice_index) {
@@ -1872,8 +1874,12 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 	if (enqueued > 0) {
 		ctx->flush_stream_async();
 	}
-	// Kick the first GPU chunk without waiting for a batch-manager tick.
-	pump_gpu_prewarm();
+	// Kick the first GPU chunk immediately in loading-screen mode; in background
+	// pacing mode let DSRuntime._process() pump on the next frame so initiation
+	// never stacks a render-thread alloc/flush onto the same frame.
+	if (!state().background_pacing.load(std::memory_order_relaxed)) {
+		pump_gpu_prewarm();
+	}
 	if (npot_gpu > 0) {
 		UtilityFunctions::push_warning("DSPreloader: ", npot_gpu, " of ", (int64_t)gpu_items.size(),
 				" GPU-prewarmed textures are non-multiple-of-4; Texture2DRD reports their padded storage dimensions. Enable compatibility/as_image_texture to load them as ImageTexture at their logical size.");
@@ -1900,7 +1906,7 @@ void DSPreloader::pump_gpu_prewarm() {
 						count_gpu_requests_for_payload(dead_chunk.items[i].meta));
 			}
 		}
-		const size_t max_in_flight_chunks = s.background_pacing.load(std::memory_order_relaxed) ? 1 : 8;
+		const size_t max_in_flight_chunks = s.background_pacing.load(std::memory_order_relaxed) ? 4 : 8;
 		if (s.gpu_posted_chunks.size() < max_in_flight_chunks && !s.gpu_chunks.empty() && is_gpu_prewarm_available()) {
 			s.gpu_posted_chunks.push_back(s.gpu_chunks.front());
 			s.gpu_chunks.pop_front();
