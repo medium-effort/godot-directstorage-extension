@@ -197,11 +197,12 @@ Why that matters for DirectStorage settings:
 
 ## Export Preset Options
 
-The exporter adds six options to every Windows Desktop preset, on the **Options** tab (`Project -> Export... -> Windows Desktop -> Options`):
+The exporter adds seven options to every Windows Desktop preset, on the **Options** tab (`Project -> Export... -> Windows Desktop -> Options`):
 
 | Export Option | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `dsgd_extension/bundle_textures_dspkg` | `bool` | `true` | Bundles exported textures into `textures.dspkg` for unbuffered DirectStorage DMA loading. |
+| `dsgd_extension/verify_pack_on_export` | `bool` | `true` | Scans a protected standalone `.pck` after export to verify its header, non-empty directory, and absence of plaintext key-file magic (`PACK_VERIFY status=ok`). Embedded PCKs print `status=unverified`; turning this off prints `status=skipped` with a warning and leaves the build unverified. |
 | `dsgd_extension/enforce_archive_pairing` | `bool` | `true` | Publishes a random 64-bit archive id per export and compares it, in full, when the runtime opens the archive. Set to `false` only for local tooling: it publishes `0`, which skips the check in that build, and writes an archive carrying id `0` that any build expecting a real id rejects. |
 | `dsgd_extension/steampipe_1mb_alignment` | `bool` | `false` | Aligns texture payloads to 1 MiB chunks for SteamPipe differential patching efficiency. |
 | `dsgd_extension/include_dsgd_license_file` | `bool` | `true` | Writes `dsgd_LICENSE.txt` next to the exported binaries, containing the project license and the third-party components of `dsgd_64.dll`. Disable when you carry those attributions in-game instead; the source texts stay in the addon folder. |

@@ -10,12 +10,20 @@ extends EditorExportPlugin
 ## freshly copied project (#0187). A runtime load happens after the scan, when the uid is
 ## known. Kept as a uid, not a res:// path, so renaming the addon directory cannot break it.
 const POLICY_UID: String = "uid://bpbf4g8bgjeec"
+const VERIFY_UID: String = "uid://bjyun30ppok5g"
 
 
 static func _load_policy() -> GDScript:
 	var script: GDScript = ResourceLoader.load(POLICY_UID, "GDScript") as GDScript
 	if script == null:
 		push_error("[DirectStorage] Export policy script not found (%s)." % POLICY_UID)
+	return script
+
+
+static func _load_verifier() -> GDScript:
+	var script: GDScript = ResourceLoader.load(VERIFY_UID, "GDScript") as GDScript
+	if script == null:
+		push_error("[DirectStorage] Pack verifier script not found (%s)." % VERIFY_UID)
 	return script
 
 
@@ -33,6 +41,7 @@ var _policy: GDScript = _load_policy()
 ## DLL relocation is performed by this plugin.
 
 const OPTION_BUNDLE_DSPKG: StringName = &"dsgd_extension/bundle_textures_dspkg"
+const OPTION_VERIFY_PACK: StringName = &"dsgd_extension/verify_pack_on_export"
 const OPTION_ENFORCE_ARCHIVE_PAIRING: StringName = &"dsgd_extension/enforce_archive_pairing"
 const OPTION_STEAMPIPE_1MB_ALIGNMENT: StringName = &"dsgd_extension/steampipe_1mb_alignment"
 const OPTION_STORE_UNCOMPRESSED_TEXTURES: StringName = &"dsgd_extension/store_uncompressed_textures"
@@ -117,6 +126,8 @@ var _export_features: PackedStringArray = []
 var _is_debug_export: bool = false
 var _is_windows_export: bool = true
 var _bundle_dspkg_enabled: bool = false
+var _verify_pack_enabled: bool = true
+var _pack_failure_detail: String = ""
 var _enforce_pairing_enabled: bool = true
 var _steampipe_1mb_alignment_enabled: bool = false
 var _store_uncompressed_textures: bool = false
@@ -153,6 +164,16 @@ func _get_export_options(platform: EditorExportPlatform) -> Array[Dictionary]:
 		{
 			"option": {
 				"name": OPTION_BUNDLE_DSPKG,
+				"type": TYPE_BOOL,
+				"hint": PROPERTY_HINT_NONE,
+				"hint_string": "",
+				"usage": PROPERTY_USAGE_DEFAULT
+			},
+			"default_value": true,
+		},
+		{
+			"option": {
+				"name": OPTION_VERIFY_PACK,
 				"type": TYPE_BOOL,
 				"hint": PROPERTY_HINT_NONE,
 				"hint_string": "",
@@ -280,6 +301,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_is_debug_export = is_debug
 	_is_windows_export = _is_windows_platform(platform)
 	_bundle_dspkg_enabled = bool(get_option(OPTION_BUNDLE_DSPKG))
+	_verify_pack_enabled = _option_bool(OPTION_VERIFY_PACK, true)
 	_enforce_pairing_enabled = bool(get_option(OPTION_ENFORCE_ARCHIVE_PAIRING))
 	_steampipe_1mb_alignment_enabled = bool(get_option(OPTION_STEAMPIPE_1MB_ALIGNMENT))
 	_store_uncompressed_textures = _option_bool(
@@ -300,6 +322,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_dspkg_static = null
 	_dspkg_static_unavailable = false
 	_protection_failure_reason = ""
+	_pack_failure_detail = ""
 	_staging_dspkg_path = ""
 	_target_dspkg_path = ""
 	_archive_key = PackedByteArray()
@@ -710,11 +733,17 @@ func _export_end() -> void:
 	elif not _archive_failed and _dspkg != null and _outcome != _policy.OUTCOME_DISABLED and _outcome != _policy.OUTCOME_FAILED:
 		print("[DirectStorage Exporter] Export finished. No DirectStorage (.dstex) textures were found to bundle.")
 
+	var pack_ok := true
+	if _outcome == _policy.OUTCOME_PROTECTED:
+		pack_ok = _verify_pack_protection()
 	_dspkg = null
 	_cleanup_staging()
 	_cleanup_legacy_user_temp()
 	if not dspkg_ok:
 		_mark_export_failed()
+		return
+	if not pack_ok:
+		_mark_export_failed(_pack_failure_detail)
 		return
 
 
@@ -1144,12 +1173,70 @@ func _core_export_reports_error() -> bool:
 ## this the result dialog would report success for an export that deployed no
 ## archive. An EXPORT_MESSAGE_ERROR makes fill_log_messages report "Failed.";
 ## the artifact set is already fail-closed (no archive was deployed).
-func _mark_export_failed() -> void:
+func _mark_export_failed(detail: String = "") -> void:
 	var platform: EditorExportPlatform = get_export_platform()
 	if platform == null or not platform.has_method("add_message"):
 		return
-	platform.add_message(EditorExportPlatform.EXPORT_MESSAGE_ERROR, "DirectStorage",
+	var text := detail if not detail.is_empty() else (
 			"The DirectStorage archive step failed; " + _archive_name + " was not deployed (see the errors above).")
+	platform.add_message(EditorExportPlatform.EXPORT_MESSAGE_ERROR, "DirectStorage", text)
+
+
+func _resolve_pack_path() -> String:
+	if _target_export_path.is_empty():
+		return ""
+	var extension := _target_export_path.get_extension().to_lower()
+	if extension == "zip":
+		return ""
+	if extension == "pck":
+		return _target_export_path
+	return _target_export_path.get_basename() + ".pck"
+
+
+func _report_pack_unverified(text: String) -> void:
+	push_warning("[DirectStorage Exporter] " + text)
+	var platform: EditorExportPlatform = get_export_platform()
+	if platform != null and platform.has_method("add_message"):
+		platform.add_message(EditorExportPlatform.EXPORT_MESSAGE_WARNING, "DirectStorage", text)
+
+
+func _verify_pack_protection() -> bool:
+	_pack_failure_detail = ""
+	var verify: GDScript = _load_verifier()
+	if verify == null:
+		# A preset that disabled the scan did not promise anything, so a missing
+		# helper is a warning there and a failure only where verification was on.
+		if not _verify_pack_enabled:
+			_report_pack_unverified("Pack verification is disabled and the verifier script is missing; nothing was checked.")
+			return true
+		_pack_failure_detail = "The exported PCK could not be verified: the pack verifier script is missing. Treat this build as unprotected."
+		push_error("[DirectStorage Exporter] " + _pack_failure_detail)
+		return false
+	if not _verify_pack_enabled:
+		var off: Dictionary = verify.call("skipped", "disabled_by_setting")
+		print("[DirectStorage Exporter] " + String(verify.call("format_line", off, _target_export_path)))
+		_report_pack_unverified("Pack verification is disabled in this preset; the exported PCK was not scanned, so this build is not verified.")
+		return true
+	var pack_path: String = _resolve_pack_path()
+	var result: Dictionary
+	if _preset_embeds_pck():
+		pack_path = _target_export_path
+		result = verify.call("unverified", "embedded_pck")
+	elif pack_path.is_empty():
+		pack_path = _target_export_path
+		result = verify.call("skipped", "zip_export")
+	else:
+		result = verify.call("verify_pack", pack_path)
+	print("[DirectStorage Exporter] " + String(verify.call("format_line", result, pack_path)))
+	# ok means "nothing to fail on", not "verified": unverified/skipped are named
+	# in the status word and never counted as verified.
+	if bool(result.get("ok", false)):
+		if String(result.get("status", "")) == "unverified":
+			_report_pack_unverified("The PCK is embedded in the executable; the pack scan cannot read it, so PCK protection is not verified for this build.")
+		return true
+	_pack_failure_detail = "The exported PCK failed verification (reason: %s). Do not distribute this build as a protected build; see the PACK_VERIFY line above." % String(result.get("reason", "unknown"))
+	push_error("[DirectStorage Exporter] " + _pack_failure_detail)
+	return false
 
 func _is_disk_space_error(err: Error) -> bool:
 	return err == ERR_FILE_CANT_WRITE or err == ERR_FILE_CANT_OPEN or err == ERR_CANT_CREATE or err == FAILED

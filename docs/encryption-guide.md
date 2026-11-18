@@ -21,8 +21,9 @@ You get the strongest configuration by doing five things in this order:
    `res://.dspkg/toc.key`. Without it, turning on PCK encryption encrypts nothing.
 4. **Export.** The add-on generates a fresh archive key, builds the archive with it, and injects it
    into the encrypted PCK.
-5. **Boot the exported player and run the pack scan.** A build counts as protected only after both
-   checks pass on the exact files you ship.
+5. **Boot the exported player and check the pack scan.** A build counts as protected only after the
+   export's own pack scan passes. For a standalone `.pck` preset the export performs that scan; for
+   an embedded PCK it prints `status=unverified`, so the scan below is still yours to run.
 
 ---
 
@@ -195,8 +196,9 @@ Three similarly named filters, easy to confuse:
 Why the filter is mandatory: **Encrypt Exported PCK** on its own **encrypts nothing**. Godot decides
 per file from the include and exclude globs. With an empty include list the injected key entry would
 be written in the clear and anyone holding the pack could open the archive. The exporter checks this
-before it injects anything and fails closed when the filter misses; it cannot stop Godot from writing
-a pack, so the pack scan is the check you run on the result.
+before it injects anything and fails closed when the filter misses; after the export writes the pack,
+the exporter scans the pack it wrote: a standalone `.pck` export ends with a `PACK_VERIFY` line, and
+`status=fail` there marks the export failed.
 
 #### Export modes
 
@@ -215,14 +217,22 @@ Export normally. During the export the add-on:
 4. injects `res://.dspkg/toc.key` (48 bytes) into the PCK,
 5. skips each bundled texture payload from the PCK,
 6. reopens the written archive with the generated key and id as a writer round-trip, and reports
-   `Writer round-trip verified`.
+   `Writer round-trip verified`,
+7. reads the written `.pck` back and verifies its header, non-empty directory and absence of the
+   key-file magic, printing `PACK_VERIFY status=ok ... file=<pack>` (an embedded PCK prints
+   `status=unverified` with a warning).
+
+The export option `dsgd_extension/verify_pack_on_export` (enabled by default) controls step 7. When
+turned off, the export prints `PACK_VERIFY status=skipped reason=disabled_by_setting` with a warning
+and verifies nothing — a build exported with this setting off has not been checked.
 
 The log states which mode was used: `protected`, `plaintext`, or an error explaining why protection
 cannot be delivered. If it says plaintext while you expected protection, stop and read the log.
 
 ### 6. Verify: boot sentinel and pack scan
 
-Two checks. Both must pass.
+Three checks. The export performs the pack scan itself for a standalone `.pck`; the boot sentinel and
+the independent scan below are what you require on the files you ship.
 
 ```powershell
 <export-dir>\game.exe --headless -- --dspkg-validate=protected

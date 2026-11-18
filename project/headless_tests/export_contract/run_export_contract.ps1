@@ -271,7 +271,8 @@ function Write-Preset {
         [bool]$EncryptDirectory = $false,
         [bool]$Bundle = $true,
         [bool]$Pairing = $true,
-        [string]$Customized = '{}'
+        [string]$Customized = '{}',
+        [string]$VerifyPack = ''
     )
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('[runnable_presets]')
@@ -304,6 +305,9 @@ function Write-Preset {
     $lines.Add('binary_format/architecture="x86_64"')
     $lines.Add('application/modify_resources=false')
     $lines.Add('dsgd_extension/bundle_textures_dspkg=' + $Bundle.ToString().ToLowerInvariant())
+    if (-not [string]::IsNullOrEmpty($VerifyPack)) {
+        $lines.Add('dsgd_extension/verify_pack_on_export=' + $VerifyPack)
+    }
     $lines.Add('dsgd_extension/enforce_archive_pairing=' + $Pairing.ToString().ToLowerInvariant())
     $lines.Add('dsgd_extension/steampipe_1mb_alignment=false')
     Write-Utf8NoBom -Path (Join-Path $ProjectDir 'export_presets.cfg') -Text (($lines -join "`r`n") + "`r`n")
@@ -486,6 +490,8 @@ function Assert-BootFail {
     }
 }
 
+$verifyRegex = New-Object System.Text.RegularExpressions.Regex('(?m)^\[DirectStorage Exporter\] PACK_VERIFY status=(\w+) reason=(\w+) dir_encrypted=(\w+) entries=(\d+) bytes=(\d+) ms=(\d+) file=(.+)$')
+
 function Invoke-Scan {
     param([string]$PackPath)
     $arguments = '--headless --path "' + $MasterProject + '" --script "' + $ScannerScript + '" -- --pack "' + $PackPath + '"'
@@ -631,6 +637,11 @@ Invoke-Case 'protected_success' {
 
         $scan = Invoke-Scan -PackPath (Join-Path $stage 'game.pck')
         Add-Check 'protected_success.scan_ok' ($scan.Ok -and -not $scan.TimedOut) ('verdict=' + $scan.Verdict)
+        $verify = $verifyRegex.Match($log)
+        $verifyLine = (($log -split "`n" | Where-Object { $_ -match 'PACK_VERIFY' }) -join ' | ')
+        Add-Check 'protected_success.pack_verify_line' ($verify.Success -and ($verify.Groups[1].Value -eq 'ok')) ('line=' + $verifyLine)
+        Add-Check 'protected_success.pack_verify_matches_gate_scan' ($verify.Success -and $scan.Ok -and ([int]$verify.Groups[4].Value -eq $scan.Entries)) ('export_entries=' + $verify.Groups[4].Value + ' gate_entries=' + $scan.Entries)
+        Add-Check 'protected_success.pack_verify_dir_not_encrypted' ($verify.Success -and ($verify.Groups[3].Value -eq 'false')) ('dir_encrypted=' + $verify.Groups[3].Value)
         $probe = Invoke-PackProbe -PackPath (Join-Path $stage 'game.pck')
         Add-Check 'protected_success.pack_publishes_archive' ($probe.Bundle -and $probe.Protected) ('bundle=' + $probe.Bundle + ' protected=' + $probe.Protected)
         Add-Check 'protected_success.magic_absent_from_packed_scripts' (($probe.MagicHits -eq 0) -and ($probe.UnreadableScripts -eq 0) -and ($probe.ScriptsScanned -gt 0)) ('scripts=' + $probe.ScriptsScanned + ' unreadable=' + $probe.UnreadableScripts + ' magic_hits=' + $probe.MagicHits)
@@ -670,6 +681,33 @@ Invoke-Case 'protected_encrypt_directory_on' {
         }
         $scan = Invoke-Scan -PackPath (Join-Path $stage 'game.pck')
         Add-Check 'protected_encrypt_directory_on.scan_ok' ($scan.Ok -and -not $scan.TimedOut) ('verdict=' + $scan.Verdict)
+        $verify = $verifyRegex.Match($log)
+        $verifyLine = (($log -split "`n" | Where-Object { $_ -match 'PACK_VERIFY' }) -join ' | ')
+        Add-Check 'protected_encrypt_directory_on.pack_verify_dir_encrypted' ($verify.Success -and ($verify.Groups[1].Value -eq 'ok') -and ($verify.Groups[3].Value -eq 'true')) ('line=' + $verifyLine)
+    }
+}
+
+# ---------------------------------------------------------------- verify disabled
+
+Invoke-Case 'verify_disabled' {
+    if (-not $ProtectedAvailable) {
+        Add-NotCovered 'verify_disabled' $TemplateReason
+    } else {
+        $proj = New-ProjectCopy 'verify_disabled'
+        Write-Preset -ProjectDir $proj -Name 'contract_verify_disabled' -Runnable $true -Template $TemplatePath -EncryptInclude '.dspkg/*' -EncryptPck $true -EncryptDirectory $false -Bundle $true -Pairing $true -VerifyPack 'false'
+        Write-CredentialFile -ProjectDir $proj -KeyHex $TemplateKey
+        $out = Join-Path $proj 'release'
+        $run = Export-Release -ProjectDir $proj -Preset 'contract_verify_disabled' -OutputDir $out
+        $log = Get-ExportText $run
+        Save-Log -Name 'verify_disabled' -Text $log
+        Add-Check 'verify_disabled.export_exit' (($run.ExitCode -eq 0) -and -not $run.TimedOut) ('exit=' + $run.ExitCode)
+        Add-Check 'verify_disabled.deployed' ($log -match 'Successfully deployed standalone textures archive') 'archive must be deployed'
+        $archives = @(Get-ArchiveList $out)
+        Add-Check 'verify_disabled.archive_present' ($archives.Count -eq 1) ('archives=' + $archives.Count)
+        $verify = $verifyRegex.Match($log)
+        $verifyLine = (($log -split "`n" | Where-Object { $_ -match 'PACK_VERIFY' }) -join ' | ')
+        Add-Check 'verify_disabled.skipped_line' ($verify.Success -and ($verify.Groups[1].Value -eq 'skipped') -and ($verify.Groups[2].Value -eq 'disabled_by_setting')) ('line=' + $verifyLine)
+        Add-Check 'verify_disabled.no_ok_line' (-not ($log -match 'PACK_VERIFY status=ok')) ('line=' + $verifyLine)
     }
 }
 
@@ -951,6 +989,7 @@ Invoke-Case 'include_filter_misses_key' {
         Add-Check 'include_filter_misses_key.payload_absent_from_pck' (($probe.PayloadUsed -eq $false) -and ($probe.PayloadUnused -eq $false) -and ($probe.PayloadTrigger -eq $false)) ('used=' + $probe.PayloadUsed + ' unused=' + $probe.PayloadUnused + ' trigger=' + $probe.PayloadTrigger)
         $scan = Invoke-Scan -PackPath $pck
         Add-Check 'include_filter_misses_key.scan_ok' ($scan.Ok) ('verdict=' + $scan.Verdict)
+        Add-Check 'include_filter_misses_key.pack_verify_absent' (-not $verifyRegex.Match($log).Success) 'OUTCOME_FAILED must not emit PACK_VERIFY'
         $stage = Copy-ReleaseStage -SourceDir $out -Name 'include_filter_misses_key'
         Assert-BootFail -Case 'include_filter_misses_key' -StageDir $stage -Reason 'missing_archive'
     }
