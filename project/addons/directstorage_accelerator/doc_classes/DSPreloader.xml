@@ -24,6 +24,11 @@
 			<param index="0" name="tag" type="int" />
 			<description>Marks prewarm batch [param tag] as cancelled so pending requests terminate and [method is_prewarm_complete] evaluates to [code]true[/code].</description>
 		</method>
+		<method name="cancel_scene_prewarm" qualifiers="static">
+			<return type="void" />
+			<param index="0" name="scene_tag" type="int" />
+			<description>Cancels an active scene prewarm started by [method start_scene_prewarm]. During Stage 1 (texture prewarm), cancels the texture stream and never starts Stage 2. During Stage 2 (threaded scene load), drains [code]load_threaded_get()[/code] safely on completion and emits [code]scene_prewarm_finished(..., null)[/code] on [code]DSRuntime[/code].</description>
+		</method>
 		<method name="collect_scene_textures" qualifiers="static">
 			<return type="PackedStringArray" />
 			<param index="0" name="scene_path" type="String" />
@@ -77,6 +82,27 @@
 			<param index="3" name="max_chunk_bytes" type="int" default="0" />
 			<description>Enqueues texture [param paths] for direct-to-GPU VRAM DMA streaming prewarm in chunks of [param chunk_size] and up to [param max_chunk_bytes] (when greater than [code]0[/code], otherwise the default 16 MiB cap) and returns the batch tag. Returns [code]0[/code] when the native singletons or the stream driver autoload ([code]DSRuntime[/code]) are unavailable.
 			[b]Note:[/b] A texture is eligible for the GPU path when its payload carries v2 per-mip footprint metadata, it was not imported with [code]compatibility/as_image_texture[/code], and its format is either a color format with an sRGB counterpart (BC1, BC2, BC3, BC7, the RGBA8/BGRA8 family) or one of the linear block formats used by 3D material data (BC4, BC5 - normal, roughness, AO and height maps). Uncompressed and float data formats (R8, RG8, RGB8, the R16 family, float formats, BC6H) always stay on the memory path and arrive as [ImageTexture] even when GPU prewarm is active. Non-multiple-of-4 textures are GPU-eligible, but the resulting [Texture2DRD] reports the padded storage dimensions (the engine exposes no size setter); enable [code]compatibility/as_image_texture[/code] when [method Texture2D.get_width] must report the authoring size.</description>
+		</method>
+		<method name="prewarm_scene_async" qualifiers="static">
+			<return type="PackedScene" />
+			<param index="0" name="scene_path" type="String" />
+			<param index="1" name="extra_scan_dirs" type="PackedStringArray" default="PackedStringArray()" />
+			<param index="2" name="chunk_size" type="int" default="16" />
+			<param index="3" name="prefer_gpu" type="bool" default="true" />
+			<param index="4" name="max_chunk_bytes" type="int" default="0" />
+			<param index="5" name="on_progress" type="Callable" default="Callable()" />
+			<param index="6" name="precollected_deps" type="PackedStringArray" default="PackedStringArray()" />
+			<description>Convenience [code]await[/code]-able wrapper around [method start_scene_prewarm]. Optional [param on_progress] receives [code](stage: String, progress: float)[/code] (stages: [code]"textures"[/code] 0.0..0.5, [code]"scene"[/code] 0.5..1.0, [code]"done"[/code] 1.0). Falls back to synchronous [method ResourceLoader.load] if [code]DSRuntime[/code] is unavailable. Returns the loaded [PackedScene], or [code]null[/code] on failure or cancellation.</description>
+		</method>
+		<method name="start_scene_prewarm" qualifiers="static">
+			<return type="int" />
+			<param index="0" name="scene_path" type="String" />
+			<param index="1" name="extra_scan_dirs" type="PackedStringArray" default="PackedStringArray()" />
+			<param index="2" name="chunk_size" type="int" default="16" />
+			<param index="3" name="prefer_gpu" type="bool" default="true" />
+			<param index="4" name="max_chunk_bytes" type="int" default="0" />
+			<param index="5" name="precollected_deps" type="PackedStringArray" default="PackedStringArray()" />
+			<description>Starts a non-blocking, cancellable two-stage scene prewarm via [code]DSRuntime[/code]. Stage 1 streams all scene textures (discovered via [method collect_scene_textures] or passed in [param precollected_deps]) via DirectStorage into [DSTextureCache]; Stage 2 loads the [PackedScene] on a worker thread via [code]ResourceLoader.load_threaded_request()[/code] with [code]CACHE_MODE_REUSE[/code] so textures hit the cache with zero CPU fallbacks. Returns a positive [code]scene_tag[/code], or [code]0[/code] if [code]DSRuntime[/code] is unavailable.</description>
 		</method>
 	</methods>
 	<constants>

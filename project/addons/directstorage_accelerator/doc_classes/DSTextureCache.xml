@@ -48,6 +48,16 @@
 			<return type="int" />
 			<description>Returns the number of textures currently cached.</description>
 		</method>
+		<method name="get_in_flight_cpu_prewarm_bytes" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="tag" type="int" default="0" />
+			<description>Returns the total estimated payload bytes of paced/CPU prewarm entries for [param tag] (or across all tags when [param tag] is [code]0[/code]) that have been submitted and still have non-terminal DirectStorage requests in flight.</description>
+		</method>
+		<method name="get_in_flight_cpu_prewarm_count" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="tag" type="int" default="0" />
+			<description>Returns the number of paced/CPU prewarm entries for [param tag] (or across all tags when [param tag] is [code]0[/code]) that have been submitted and still have non-terminal DirectStorage requests in flight.</description>
+		</method>
 		<method name="get_max_entries" qualifiers="const">
 			<return type="int" />
 			<description>Returns the maximum number of entries retained by the cache.</description>
@@ -56,6 +66,11 @@
 			<return type="int" />
 			<param index="0" name="tag" type="int" default="0" />
 			<description>Returns the number of prewarm textures for [param tag] with at least one unfinished stream request. Pass [code]0[/code] (the default) to count every tag. Compare with [method get_unbuilt_prewarm_count], which counts textures still awaiting [method poll_completed] regardless of request state.</description>
+		</method>
+		<method name="get_queued_cpu_prewarm_count" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="tag" type="int" default="0" />
+			<description>Returns the number of entries for [param tag] (or across all tags when [param tag] is [code]0[/code]) still waiting in the paced CPU prewarm queue before being submitted by [method pump_cpu_prewarm].</description>
 		</method>
 		<method name="get_unbuilt_prewarm_count" qualifiers="const">
 			<return type="int" />
@@ -112,6 +127,11 @@
 			<param index="0" name="paths" type="PackedStringArray" />
 			<description>Enqueues engine texture paths for asynchronous streaming prewarm and returns the stream tag. File remapping is resolved internally, and paths already in the cache are skipped without enqueueing. Track the tag with [method DSContext.is_prewarm_complete] and [method DSContext.get_prewarm_progress], or stop it early with [method DSContext.cancel_prewarm]. Returns [code]0[/code] when the extension is unavailable, or when the texture cache cannot take ownership of prewarmed textures (cache disabled via [code]directstorage/texture_cache_enabled[/code] or missing) - in that case nothing is streamed or decoded, and exactly one warning is emitted.</description>
 		</method>
+		<method name="prewarm_cpu_paced_async">
+			<return type="int" />
+			<param index="0" name="paths" type="PackedStringArray" />
+			<description>Enqueues engine texture [param paths] into the paced CPU prewarm queue without immediately expanding or submitting DirectStorage requests, and returns the stream tag. Entries are drained in bounded slices by [method pump_cpu_prewarm] (typically ticked by [code]DSRuntime[/code]) to prevent staging memory spikes and frame hitches during background streaming. Returns [code]0[/code] when the extension is unavailable or the texture cache cannot take ownership of prewarmed textures.</description>
+		</method>
 		<method name="prewarm_gpu_async">
 			<return type="int" />
 			<param index="0" name="paths" type="PackedStringArray" />
@@ -119,6 +139,12 @@
 			<param index="2" name="prefer_gpu" type="bool" default="true" />
 			<param index="3" name="max_chunk_bytes" type="int" default="0" />
 			<description>Enqueues engine texture paths for GPU-accelerated asynchronous streaming prewarm and returns the stream tag. When running under the D3D12 rendering driver with GPU decompression enabled, eligible color textures (v2 format, color-sampled, without the as_image_texture flag) are allocated directly as [Texture2DRD] resources on the render thread and filled via DirectStorage DMA decompression straight into VRAM. Ineligible textures or non-D3D12 platforms automatically fall back to the CPU [ImageTexture] memory stream path under the same stream tag. Textures are allocated in render-thread chunks bounded by [param chunk_size] (default 16) and [param max_chunk_bytes] (when greater than [code]0[/code], otherwise the default 16 MiB cap) to bound frame time. Returns [code]0[/code] when the extension is unavailable, or when the texture cache cannot take ownership of prewarmed textures (cache disabled via [code]directstorage/texture_cache_enabled[/code] or missing) - in that case the whole call, including its CPU fallback route, is skipped before any I/O or allocation, and exactly one warning is emitted.</description>
+		</method>
+		<method name="pump_cpu_prewarm">
+			<return type="void" />
+			<param index="0" name="max_items" type="int" />
+			<param index="1" name="max_bytes" type="int" />
+			<description>Pops and submits at most [param max_items] queued entries from the paced CPU prewarm queue up to [param max_bytes] total estimated payload bytes (when greater than [code]0[/code]; the first item is always popped even if it exceeds [param max_bytes]), expanding their DirectStorage requests and flushing the stream queue. Cancelled tags are discarded without enqueueing. Typically ticked per frame by [code]DSRuntime[/code].</description>
 		</method>
 		<method name="pump_gpu_prewarm">
 			<return type="void" />
