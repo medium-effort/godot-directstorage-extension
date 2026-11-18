@@ -362,6 +362,11 @@ void DSTextureCache::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_cached_count"), &DSTextureCache::get_cached_count);
 
 	ClassDB::bind_method(D_METHOD("prewarm_async", "paths"), &DSTextureCache::prewarm_async);
+	ClassDB::bind_method(D_METHOD("prewarm_cpu_paced_async", "paths"), &DSTextureCache::prewarm_cpu_paced_async);
+	ClassDB::bind_method(D_METHOD("pump_cpu_prewarm", "max_items", "max_bytes"), &DSTextureCache::pump_cpu_prewarm);
+	ClassDB::bind_method(D_METHOD("get_queued_cpu_prewarm_count", "tag"), &DSTextureCache::get_queued_cpu_prewarm_count, DEFVAL((uint64_t)0));
+	ClassDB::bind_method(D_METHOD("get_in_flight_cpu_prewarm_count", "tag"), &DSTextureCache::get_in_flight_cpu_prewarm_count, DEFVAL((uint64_t)0));
+	ClassDB::bind_method(D_METHOD("get_in_flight_cpu_prewarm_bytes", "tag"), &DSTextureCache::get_in_flight_cpu_prewarm_bytes, DEFVAL((uint64_t)0));
 	ClassDB::bind_method(D_METHOD("prewarm_gpu_async", "paths", "chunk_size", "prefer_gpu", "max_chunk_bytes"), &DSTextureCache::prewarm_gpu_async, DEFVAL(16), DEFVAL(true), DEFVAL((int64_t)0));
 	ClassDB::bind_method(D_METHOD("pump_gpu_prewarm"), &DSTextureCache::pump_gpu_prewarm);
 	ClassDB::bind_method(D_METHOD("is_gpu_prewarm_available"), &DSTextureCache::is_gpu_prewarm_available);
@@ -774,6 +779,26 @@ String DSTextureCache::get_canonical_path(const String &p_path) const {
 
 uint64_t DSTextureCache::prewarm_async(const PackedStringArray &p_paths) {
 	return DSPreloader::prewarm_async(p_paths);
+}
+
+uint64_t DSTextureCache::prewarm_cpu_paced_async(const PackedStringArray &p_paths) {
+	return DSPreloader::prewarm_cpu_paced_async(p_paths);
+}
+
+void DSTextureCache::pump_cpu_prewarm(int p_max_items, int64_t p_max_bytes) {
+	DSPreloader::pump_cpu_prewarm(p_max_items, p_max_bytes);
+}
+
+int DSTextureCache::get_queued_cpu_prewarm_count(uint64_t p_tag) const {
+	return DSPreloader::get_queued_cpu_prewarm_count(p_tag);
+}
+
+int DSTextureCache::get_in_flight_cpu_prewarm_count(uint64_t p_tag) const {
+	return DSPreloader::get_in_flight_cpu_prewarm_count(p_tag);
+}
+
+int64_t DSTextureCache::get_in_flight_cpu_prewarm_bytes(uint64_t p_tag) const {
+	return DSPreloader::get_in_flight_cpu_prewarm_bytes(p_tag);
 }
 
 uint64_t DSTextureCache::prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size, bool p_prefer_gpu, int64_t p_max_chunk_bytes) {

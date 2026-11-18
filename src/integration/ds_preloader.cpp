@@ -1297,6 +1297,220 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 	return tag;
 }
 
+static size_t count_cpu_requests_for_payload(const DSPreloader::Payload &p_meta) {
+	return (p_meta.is_v2 && p_meta.mip_count > 0) ? static_cast<size_t>(p_meta.mip_count) : 1;
+}
+
+uint64_t DSPreloader::prewarm_cpu_paced_async(const PackedStringArray &p_paths) {
+	DSContext *ctx = DSContext::get_singleton();
+	if (ctx == nullptr) {
+		UtilityFunctions::push_error("DSPreloader: DSContext singleton unavailable; prewarm_cpu_paced_async aborted.");
+		return 0;
+	}
+	DSTextureCache *prewarm_cache = DSTextureCache::get_singleton();
+	if (prewarm_cache == nullptr || !prewarm_cache->can_own(DSTextureCache::CACHE_MODE_REUSE)) {
+		UtilityFunctions::push_warning("DSPreloader: texture cache cannot own prewarmed textures (disabled or unavailable); prewarm_cpu_paced_async skipped.");
+		return 0;
+	}
+	std::vector<Payload> payloads;
+	int skipped_cached = 0;
+	int skipped_unresolvable = 0;
+	collect_prewarm_payloads(p_paths, payloads, skipped_cached, skipped_unresolvable);
+
+	uint64_t tag = ctx->prewarm_async(PackedStringArray());
+	size_t total_units = 0;
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		for (size_t i = 0; i < payloads.size(); ++i) {
+			int64_t id = s.next_id++;
+			if (s.next_id == 0) {
+				s.next_id = 1;
+			}
+			Tracked t;
+			t.tag = tag;
+			t.meta = payloads[i];
+			t.is_gpu = false;
+			t.cpu_queued = true;
+			s.pending[id] = t;
+			s.pending_paths[t.meta.engine_path]++;
+			if (t.meta.payload_key != t.meta.engine_path) {
+				s.pending_paths[t.meta.payload_key]++;
+			}
+			CpuQueueItem item;
+			item.pending_id = id;
+			item.tag = tag;
+			item.meta = payloads[i];
+			s.cpu_queue.push_back(item);
+			total_units += count_cpu_requests_for_payload(payloads[i]);
+		}
+	}
+	ctx->set_prewarm_total(tag, static_cast<int>(total_units));
+	UtilityFunctions::print_verbose("DSPreloader: paced cpu prewarm tag ", String::num_uint64(tag), " queued ", (int64_t)payloads.size(), " textures (", (int64_t)total_units, " units, ", (int64_t)skipped_cached, " cached, ", (int64_t)skipped_unresolvable, " skipped).");
+	return tag;
+}
+
+void DSPreloader::pump_cpu_prewarm(int p_max_items, int64_t p_max_bytes) {
+	if (p_max_items <= 0) {
+		return;
+	}
+	DSContext *ctx = DSContext::get_singleton();
+	if (ctx == nullptr) {
+		return;
+	}
+
+	std::vector<CpuQueueItem> batch;
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		while (!s.cpu_queue.empty() && ctx->is_tag_cancelled(s.cpu_queue.front().tag)) {
+			CpuQueueItem dead = s.cpu_queue.front();
+			s.cpu_queue.pop_front();
+			std::unordered_map<int64_t, Tracked>::iterator it = s.pending.find(dead.pending_id);
+			if (it != s.pending.end()) {
+				unblock_pending_paths_locked(it->second);
+				s.pending.erase(it);
+			}
+			count_gpu_shortfall(ctx, dead.tag, count_cpu_requests_for_payload(dead.meta));
+		}
+
+		int64_t bytes_accum = 0;
+		const int64_t byte_limit = p_max_bytes > 0 ? p_max_bytes : INT64_MAX;
+		while (!s.cpu_queue.empty() && static_cast<int>(batch.size()) < p_max_items) {
+			const CpuQueueItem &front = s.cpu_queue.front();
+			const int64_t item_bytes = static_cast<int64_t>(estimate_payload_bytes(front.meta));
+			if (!batch.empty() && bytes_accum + item_bytes > byte_limit) {
+				break;
+			}
+			batch.push_back(front);
+			s.cpu_queue.pop_front();
+			bytes_accum += item_bytes;
+		}
+	}
+
+	if (batch.empty()) {
+		return;
+	}
+
+	struct ExpandedItem {
+		int64_t pending_id = 0;
+		uint64_t tag = 0;
+		size_t expected_units = 1;
+		bool ok = false;
+		Vector<Ref<DSRequest>> reqs;
+	};
+	std::vector<ExpandedItem> expanded;
+	expanded.resize(batch.size());
+	int total_enqueued = 0;
+
+	for (size_t i = 0; i < batch.size(); ++i) {
+		ExpandedItem &out = expanded[i];
+		out.pending_id = batch[i].pending_id;
+		out.tag = batch[i].tag;
+		out.expected_units = count_cpu_requests_for_payload(batch[i].meta);
+		if (ctx->is_tag_cancelled(out.tag)) {
+			continue;
+		}
+		if (!expand_requests(batch[i].meta, out.tag, out.reqs)) {
+			continue;
+		}
+		bool all_queued = true;
+		for (int r = 0; r < out.reqs.size(); ++r) {
+			if (!ctx->enqueue_request(out.reqs[r], true)) {
+				all_queued = false;
+				break;
+			}
+		}
+		if (!all_queued) {
+			for (int r = 0; r < out.reqs.size(); ++r) {
+				if (out.reqs[r].is_valid() && out.reqs[r]->get_status() != DSRequest::STATUS_COMPLETED && out.reqs[r]->get_status() != DSRequest::STATUS_FAILED) {
+					out.reqs[r]->set_status(DSRequest::STATUS_FAILED);
+					out.reqs[r]->set_error_message("Paced CPU prewarm enqueue rejected.");
+				}
+			}
+			continue;
+		}
+		out.ok = true;
+		total_enqueued += out.reqs.size();
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(state().mutex);
+		State &s = state();
+		for (size_t i = 0; i < expanded.size(); ++i) {
+			const ExpandedItem &item = expanded[i];
+			std::unordered_map<int64_t, Tracked>::iterator it = s.pending.find(item.pending_id);
+			if (item.ok && it != s.pending.end()) {
+				it->second.requests = item.reqs;
+				it->second.cpu_queued = false;
+			} else {
+				if (it != s.pending.end()) {
+					unblock_pending_paths_locked(it->second);
+					s.pending.erase(it);
+				}
+				count_gpu_shortfall(ctx, item.tag, item.expected_units);
+			}
+		}
+	}
+
+	if (total_enqueued > 0) {
+		ctx->flush_stream_async();
+	}
+}
+
+int DSPreloader::get_queued_cpu_prewarm_count(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	const State &s = state();
+	if (p_tag == 0) {
+		return static_cast<int>(s.cpu_queue.size());
+	}
+	int count = 0;
+	for (size_t i = 0; i < s.cpu_queue.size(); ++i) {
+		if (s.cpu_queue[i].tag == p_tag) {
+			count++;
+		}
+	}
+	return count;
+}
+
+int DSPreloader::get_in_flight_cpu_prewarm_count(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	const State &s = state();
+	int count = 0;
+	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+		const Tracked &t = it->second;
+		if ((p_tag != 0 && t.tag != p_tag) || t.is_gpu || t.cpu_queued || t.requests.is_empty()) {
+			continue;
+		}
+		for (int i = 0; i < t.requests.size(); ++i) {
+			if (!is_terminal(t.requests[i])) {
+				count++;
+				break;
+			}
+		}
+	}
+	return count;
+}
+
+int64_t DSPreloader::get_in_flight_cpu_prewarm_bytes(uint64_t p_tag) {
+	std::lock_guard<std::mutex> lock(state().mutex);
+	const State &s = state();
+	int64_t bytes = 0;
+	for (std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.begin(); it != s.pending.end(); ++it) {
+		const Tracked &t = it->second;
+		if ((p_tag != 0 && t.tag != p_tag) || t.is_gpu || t.cpu_queued || t.requests.is_empty()) {
+			continue;
+		}
+		for (int i = 0; i < t.requests.size(); ++i) {
+			if (!is_terminal(t.requests[i])) {
+				bytes += static_cast<int64_t>(estimate_payload_bytes(t.meta));
+				break;
+			}
+		}
+	}
+	return bytes;
+}
+
 // --- Phase 2: prewarm-owned GPU path ---------------------------------------
 // Design: texture_create + stream-enqueue + flush-attempt all run inside
 // one render-thread callback per chunk, so backend destination queries
@@ -2506,7 +2720,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				if (!cand.gpu_failed && (cand.requests.is_empty() || !can_build_gpu)) {
 					continue;
 				}
-			} else if (p_gpu_only) {
+			} else if (p_gpu_only || cand.cpu_queued) {
 				continue;
 			}
 			bool all_terminal = true;
@@ -2707,7 +2921,7 @@ int DSPreloader::get_unbuilt_cpu_prewarm_count(uint64_t p_tag) {
 		// In-flight offloaded builds are excluded: ds_runtime.gd:523 spawns a
 		// worker slice whenever this count is non-zero, and an entry already
 		// being built would only make it post a no-op task every frame.
-		if ((p_tag == 0 || it->second.tag == p_tag) && !it->second.is_gpu && !it->second.build_in_flight) {
+		if ((p_tag == 0 || it->second.tag == p_tag) && !it->second.is_gpu && !it->second.cpu_queued && !it->second.build_in_flight) {
 			count++;
 		}
 	}
@@ -2828,6 +3042,7 @@ void DSPreloader::shutdown() {
 			s.pending.clear();
 			s.pending_paths.clear();
 			s.gpu_chunks.clear();
+			s.cpu_queue.clear();
 			s.gpu_posted_chunks.clear();
 			s.gpu_orphans.clear();
 			s.gpu_orphan_free_posted = false;

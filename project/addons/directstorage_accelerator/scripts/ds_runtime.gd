@@ -118,11 +118,19 @@ var _has_poll: bool = false
 var _has_pump_gpu: bool = false
 var _has_gpu_requests_in_flight: bool = false
 var _has_set_background_pacing: bool = false
+var _has_pump_cpu: bool = false
+var _has_get_queued_cpu: bool = false
+var _has_get_in_flight_cpu: bool = false
+var _has_get_in_flight_cpu_bytes: bool = false
 ## Streaming profile: false = loading screen (max throughput), true = active
 ## gameplay background streaming (completion-gated GPU + adaptive headroom).
 var _background_pacing: bool = false
 var _cpu_poll_cooldown_frames: int = 0
 var _gpu_pump_cooldown_frames: int = 0
+var _cpu_pump_cooldown_frames: int = 0
+var _cpu_window_init: bool = false
+var _cpu_window_items: int = 4
+var _cpu_window_bytes: int = 4 * 1024 * 1024
 const GPU_LOADING_PUMP_MAX_CHUNKS_PER_FRAME: int = 8
 const GPU_LOADING_PUMP_BUDGET_USEC: int = 5000
 ## Adaptive slice backpressure
@@ -193,15 +201,31 @@ func start_scene_prewarm(scene_path: String, deps: PackedStringArray, chunk_size
 		return 0
 	var scene_tag: int = _next_scene_tag
 	_next_scene_tag += 1
-	var tex_tag: int = 0
+	var prep_state := { "tex_tag": 0 }
+	var prep_task_id: int = -1
 	if not deps.is_empty() and PRELOADER_SCRIPT.is_stream_prewarm_available():
-		if prefer_gpu and PRELOADER_SCRIPT.is_gpu_prewarm_available():
-			tex_tag = PRELOADER_SCRIPT.prewarm_gpu_async(deps, chunk_size, prefer_gpu, max_chunk_bytes)
-		else:
-			tex_tag = PRELOADER_SCRIPT.prewarm_async(deps)
+		var use_gpu: bool = prefer_gpu and PRELOADER_SCRIPT.is_gpu_prewarm_available()
+		var use_paced_cpu: bool = (not use_gpu) and _background_pacing
+		var cache: Object = Engine.get_singleton("DSTextureCache") if ClassDB.class_exists("DSTextureCache") else null
+		if cache != null:
+			prep_task_id = WorkerThreadPool.add_task(func() -> void:
+				var tag: int = 0
+				if use_gpu and cache.has_method("prewarm_gpu_async"):
+					if max_chunk_bytes > 0:
+						tag = int(cache.call("prewarm_gpu_async", deps, chunk_size, prefer_gpu, max_chunk_bytes))
+					else:
+						tag = int(cache.call("prewarm_gpu_async", deps, chunk_size, prefer_gpu))
+				elif use_paced_cpu and cache.has_method("prewarm_cpu_paced_async"):
+					tag = int(cache.call("prewarm_cpu_paced_async", deps))
+				elif cache.has_method("prewarm_async"):
+					tag = int(cache.call("prewarm_async", deps))
+				prep_state["tex_tag"] = tag
+			, false, "DSScenePrewarmPrep")
 	_scene_prewarms[scene_tag] = {
 		"scene_path": scene_path,
-		"tex_tag": tex_tag,
+		"tex_tag": 0,
+		"prep_task_id": prep_task_id,
+		"prep_state": prep_state,
 		"stage": _ScenePrewarmStage.STAGE_TEXTURE_PREWARM,
 		"stage_name": "textures",
 		"last_stage": "",
@@ -680,6 +704,10 @@ func _process(delta: float) -> void:
 				_has_pump_gpu = cache.has_method("pump_gpu_prewarm")
 				_has_gpu_requests_in_flight = cache.has_method("has_gpu_requests_in_flight")
 				_has_set_background_pacing = cache.has_method("set_background_pacing")
+				_has_pump_cpu = cache.has_method("pump_cpu_prewarm")
+				_has_get_queued_cpu = cache.has_method("get_queued_cpu_prewarm_count")
+				_has_get_in_flight_cpu = cache.has_method("get_in_flight_cpu_prewarm_count")
+				_has_get_in_flight_cpu_bytes = cache.has_method("get_in_flight_cpu_prewarm_bytes")
 				if _has_set_background_pacing:
 					cache.set_background_pacing(_background_pacing)
 				_cache_caps_probed = true
@@ -787,6 +815,39 @@ func _process(delta: float) -> void:
 						cache.pump_gpu_prewarm()
 						if Time.get_ticks_usec() - pump_start_usec >= GPU_LOADING_PUMP_BUDGET_USEC:
 							break
+			# Adaptive AIMD CPU/RAM prewarm pump: scales up on warm frames /
+			# high-core CPUs and backs off only when frame_ms or slice EMA
+			# overshoots target_frame_ms.
+			if _has_pump_cpu and _has_get_queued_cpu:
+				var queued_cpu: int = int(cache.get_queued_cpu_prewarm_count(0))
+				if queued_cpu > 0:
+					if _background_pacing:
+						var cores: int = maxi(2, OS.get_processor_count())
+						if not _cpu_window_init:
+							_cpu_window_items = clampi(cores / 2, 2, 16)
+							_cpu_window_bytes = clampi(cores / 4, 1, 8) * 2 * 1024 * 1024
+							_cpu_window_init = true
+						if slice_label == "heavy" or frame_ms > heavy_at:
+							_cpu_window_items = maxi(1, _cpu_window_items / 2)
+							_cpu_window_bytes = maxi(1024 * 1024, _cpu_window_bytes / 2)
+							_cpu_pump_cooldown_frames = maxi(_cpu_pump_cooldown_frames, 1)
+						elif slice_label == "mild" or frame_ms > mild_at:
+							_cpu_window_items = maxi(2, int(float(_cpu_window_items) * 0.75))
+							_cpu_window_bytes = maxi(2 * 1024 * 1024, int(float(_cpu_window_bytes) * 0.75))
+						elif slice_label == "warm" and frame_ms <= mild_at and _smooth_streak >= 2:
+							_cpu_window_items = mini(64, _cpu_window_items + maxi(1, cores / 4))
+							_cpu_window_bytes = mini(64 * 1024 * 1024, _cpu_window_bytes + 2 * 1024 * 1024)
+						if _cpu_pump_cooldown_frames > 0:
+							_cpu_pump_cooldown_frames -= 1
+						else:
+							var in_flight_items: int = int(cache.get_in_flight_cpu_prewarm_count(0)) if _has_get_in_flight_cpu else 0
+							var in_flight_bytes: int = int(cache.get_in_flight_cpu_prewarm_bytes(0)) if _has_get_in_flight_cpu_bytes else 0
+							var avail_items: int = _cpu_window_items - in_flight_items
+							var avail_bytes: int = _cpu_window_bytes - in_flight_bytes
+							if avail_items > 0 and avail_bytes > 0:
+								cache.pump_cpu_prewarm(avail_items, avail_bytes)
+					else:
+						cache.pump_cpu_prewarm(queued_cpu, 0)
 			# Main-thread texture drain: Texture2DRD wrappers must be
 			# instantiated on the main or render thread (GODOT_QUIRKS Sec02 & Sec25).
 			# Fast (<2us per texture): drain completed GPU textures within budget.
@@ -908,6 +969,19 @@ func _poll_scene_prewarms() -> void:
 		var scene_path: String = String(entry["scene_path"])
 		var stage: int = int(entry["stage"])
 		if stage == _ScenePrewarmStage.STAGE_TEXTURE_PREWARM:
+			var prep_task_id: int = int(entry.get("prep_task_id", -1))
+			if prep_task_id != -1:
+				if not WorkerThreadPool.is_task_completed(prep_task_id):
+					continue
+				WorkerThreadPool.wait_for_task_completion(prep_task_id)
+				entry["prep_task_id"] = -1
+				var prep_state: Dictionary = entry.get("prep_state", {})
+				var resolved_tag: int = int(prep_state.get("tex_tag", 0))
+				entry["tex_tag"] = resolved_tag
+				if resolved_tag > 0:
+					track_prewarm(resolved_tag)
+					if bool(entry["cancelled"]):
+						PRELOADER_SCRIPT.cancel_prewarm(resolved_tag)
 			var tex_tag: int = int(entry["tex_tag"])
 			if bool(entry["cancelled"]):
 				if tex_tag <= 0 or PRELOADER_SCRIPT.is_prewarm_complete(tex_tag):
@@ -987,6 +1061,12 @@ func _poll_legacy_completions(ctx: Object) -> void:
 ## Shuts down [DSContext] before the autoload is deleted.
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_PREDELETE:
+		for scene_tag in _scene_prewarms.keys():
+			var entry: Dictionary = _scene_prewarms[scene_tag]
+			var prep_id: int = int(entry.get("prep_task_id", -1))
+			if prep_id != -1:
+				WorkerThreadPool.wait_for_task_completion(prep_id)
+				entry["prep_task_id"] = -1
 		if _poll_task_id != -1:
 			WorkerThreadPool.wait_for_task_completion(_poll_task_id)
 			_poll_task_id = -1

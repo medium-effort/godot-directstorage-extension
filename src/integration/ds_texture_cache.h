@@ -100,6 +100,11 @@ public:
 	// builds textures for finished requests and stores them; returns
 	// textures stored by this call.
 	uint64_t prewarm_async(const PackedStringArray &p_paths);
+	uint64_t prewarm_cpu_paced_async(const PackedStringArray &p_paths);
+	void pump_cpu_prewarm(int p_max_items, int64_t p_max_bytes);
+	int get_queued_cpu_prewarm_count(uint64_t p_tag = 0) const;
+	int get_in_flight_cpu_prewarm_count(uint64_t p_tag = 0) const;
+	int64_t get_in_flight_cpu_prewarm_bytes(uint64_t p_tag = 0) const;
 	uint64_t prewarm_gpu_async(const PackedStringArray &p_paths, int p_chunk_size = 16, bool p_prefer_gpu = true, int64_t p_max_chunk_bytes = 0);
 	void pump_gpu_prewarm();
 	bool is_gpu_prewarm_available();

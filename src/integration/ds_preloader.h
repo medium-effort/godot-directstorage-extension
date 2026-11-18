@@ -147,6 +147,16 @@ public:
 	// until the batch manager drains them via flush_stream_async().
 	static uint64_t prewarm_async(const PackedStringArray &p_paths);
 
+	// Paced CPU/RAM prewarm: resolves payloads and queues them in state().cpu_queue
+	// instead of dumping all requests into DSContext at once. DSRuntime pumps
+	// items via pump_cpu_prewarm() using an adaptive AIMD window when
+	// background_pacing is active.
+	static uint64_t prewarm_cpu_paced_async(const PackedStringArray &p_paths);
+	static void pump_cpu_prewarm(int p_max_items, int64_t p_max_bytes);
+	static int get_queued_cpu_prewarm_count(uint64_t p_tag = 0);
+	static int get_in_flight_cpu_prewarm_count(uint64_t p_tag = 0);
+	static int64_t get_in_flight_cpu_prewarm_bytes(uint64_t p_tag = 0);
+
 	// GPU prewarm: same resolve/dedup/tag contract as prewarm_async, but
 	// GPU-eligible payloads (is_gpu_prewarm_eligible, D3D12 + GPU
 	// decompression active) are allocated as RenderingDevice textures on
@@ -283,6 +293,8 @@ private:
 		RID gpu_tex_rid;
 		bool is_gpu = false;
 		bool gpu_failed = false;
+		// Set while this CPU entry is awaiting paced submission in cpu_queue.
+		bool cpu_queued = false;
 		// Set while this CPU entry is being built by an offloaded worker task.
 		// The entry stays in `pending` (so the unbuilt counts stay honest) but
 		// the tag scan and every poll skip it, so it cannot be taken twice.
@@ -312,6 +324,12 @@ private:
 	struct GpuChunk {
 		uint64_t tag = 0;
 		std::vector<GpuChunkItem> items;
+	};
+
+	struct CpuQueueItem {
+		int64_t pending_id = 0;
+		uint64_t tag = 0;
+		Payload meta;
 	};
 
 	struct State {
@@ -365,6 +383,7 @@ private:
 		std::deque<GpuChunk> gpu_posted_chunks;
 		std::vector<RID> gpu_orphans;
 		bool gpu_orphan_free_posted = false;
+		std::deque<CpuQueueItem> cpu_queue;
 	};
 
 	static State &state();

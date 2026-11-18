@@ -423,12 +423,12 @@ static func cancel_scene_prewarm(scene_tag: int) -> void:
 ## (Q40, Q14) so textures hit the cache with zero CPU fallbacks.
 ## Returns a positive [code]scene_tag[/code], or [code]0[/code] if [DSRuntime]
 ## is unavailable.
-static func start_scene_prewarm(scene_path: String, extra_scan_dirs: PackedStringArray = PackedStringArray(), chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0) -> int:
+static func start_scene_prewarm(scene_path: String, extra_scan_dirs: PackedStringArray = PackedStringArray(), chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0, precollected_deps: PackedStringArray = PackedStringArray()) -> int:
 	var runtime: Node = _get_stream_pump()
 	if runtime == null or not runtime.has_method("start_scene_prewarm"):
 		push_warning("[DirectStorage] DSPreloader: DSRuntime autoload unavailable; start_scene_prewarm aborted.")
 		return 0
-	var deps: PackedStringArray = collect_scene_textures(scene_path, extra_scan_dirs)
+	var deps: PackedStringArray = precollected_deps if not precollected_deps.is_empty() else collect_scene_textures(scene_path, extra_scan_dirs)
 	return int(runtime.call("start_scene_prewarm", scene_path, deps, chunk_size, prefer_gpu, max_chunk_bytes))
 
 
@@ -437,7 +437,7 @@ static func start_scene_prewarm(scene_path: String, extra_scan_dirs: PackedStrin
 ## (stages: [code]"textures"[/code] 0.0..0.5, [code]"scene"[/code] 0.5..1.0,
 ## [code]"done"[/code] 1.0). Returns the loaded [PackedScene], or [code]null[/code]
 ## on failure or cancellation.
-static func prewarm_scene_async(scene_path: String, extra_scan_dirs: PackedStringArray = PackedStringArray(), chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0, on_progress: Callable = Callable()) -> PackedScene:
+static func prewarm_scene_async(scene_path: String, extra_scan_dirs: PackedStringArray = PackedStringArray(), chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0, on_progress: Callable = Callable(), precollected_deps: PackedStringArray = PackedStringArray()) -> PackedScene:
 	var runtime: Node = _get_stream_pump()
 	if runtime == null or not runtime.has_method("start_scene_prewarm"):
 		push_warning("[DirectStorage] DSPreloader: DSRuntime autoload unavailable; falling back to synchronous ResourceLoader.load().")
@@ -445,7 +445,7 @@ static func prewarm_scene_async(scene_path: String, extra_scan_dirs: PackedStrin
 		if fallback_loop is SceneTree:
 			await (fallback_loop as SceneTree).process_frame
 		return ResourceLoader.load(scene_path, "PackedScene", ResourceLoader.CACHE_MODE_REUSE) as PackedScene
-	var scene_tag: int = start_scene_prewarm(scene_path, extra_scan_dirs, chunk_size, prefer_gpu, max_chunk_bytes)
+	var scene_tag: int = start_scene_prewarm(scene_path, extra_scan_dirs, chunk_size, prefer_gpu, max_chunk_bytes, precollected_deps)
 	if scene_tag <= 0:
 		return null
 	var state := { "done": false, "packed": null }
