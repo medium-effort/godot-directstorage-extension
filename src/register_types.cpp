@@ -6,6 +6,7 @@
 #include "core/ds_context.h"
 #include "core/ds_crypto.h"
 #include "core/ds_error_handler.h"
+#include "core/ds_pack_scanner.h"
 #include "core/ds_profiler.h"
 #include "core/ds_request.h"
 #include "formats/dspkg_format.h"
@@ -93,6 +94,7 @@ void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_lev
 	ClassDB::register_class<DSRequest>();
 	ClassDB::register_class<DSErrorHandler>();
 	ClassDB::register_class<DSCrypto>();
+	ClassDB::register_class<DSPackScanner>();
 	// DSProfilerResult must be registered before DSProfiler. It was previously
 	// registered inside DSProfiler::_bind_methods() which is re-entrant and unsafe.
 	ClassDB::register_class<DSProfilerResult>();

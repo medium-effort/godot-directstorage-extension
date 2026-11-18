@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DSPackScanner" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Native byte-pattern scanner for exported Godot pack verification.
+	</brief_description>
+	<description>
+		Provides a native fast path for [code]dspkg_pack_scan_core.gd[/code] to search exported [code].pck[/code] files and raw byte buffers for the derived key-file magic without per-chunk GDScript allocations.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="buffer_contains_bytes" qualifiers="static">
+			<return type="bool" />
+			<param index="0" name="haystack" type="PackedByteArray" />
+			<param index="1" name="needle" type="PackedByteArray" />
+			<description>Returns [code]true[/code] if [param needle] occurs anywhere inside [param haystack].</description>
+		</method>
+		<method name="file_contains_bytes" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="path" type="String" />
+			<param index="1" name="needle" type="PackedByteArray" />
+			<description>Scans [param path] in 4 MiB chunks using a single reusable buffer and returns a dictionary with keys [code]ok[/code] ([bool]), [code]found[/code] ([bool]), and [code]size[/code] ([int]).</description>
+		</method>
+	</methods>
+</class>

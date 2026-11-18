@@ -52,6 +52,8 @@ const SCAN_CHUNK_SIZE := 4 * 1024 * 1024
 const SCAN_CARRY_SIZE := 31
 ## The needle prefix that anchors the search inside a slice.
 const ANCHOR_SIZE := 8
+## Per-window candidate cap before falling back to the 8-alignment word walk.
+const SCAN_CANDIDATE_BUDGET := 65536
 
 const EXIT_OK := 0
 const EXIT_FAIL := 1
@@ -82,6 +84,8 @@ var _hit: bool = false
 var _short_read: bool = false
 var _finished: bool = false
 var _open_detail: String = "the file could not be opened for reading"
+var _pack_path: String = ""
+var _native_scanner: Object = ClassDB.instantiate(&"DSPackScanner") if ClassDB.class_exists(&"DSPackScanner") else null
 
 
 ## Opens the pack and parses its header. The returned dictionary reports only
@@ -98,6 +102,7 @@ func start(pack_path: String) -> Dictionary:
 	_header = {}
 	_dir_encrypted = false
 	_dir_encrypted_known = false
+	_pack_path = pack_path
 
 	_file = FileAccess.open(pack_path, FileAccess.READ)
 	if _file == null:
@@ -116,12 +121,40 @@ func start(pack_path: String) -> Dictionary:
 	return {"ok": true, "reason": "", "detail": ""}
 
 
+## Scans the entire file in one call. Uses the native whole-file scanner when
+## available so large packs avoid per-chunk GDScript buffer copies; otherwise
+## steps through the file in SCAN_CHUNK_SIZE slices.
+func scan_all() -> Dictionary:
+	if _finished or _file == null:
+		_finished = true
+		return {"done": true, "scanned": _position, "size": _size}
+	if _native_scanner != null and _position == 0:
+		var res: Dictionary = _native_scanner.call(&"file_contains_bytes", _pack_path, _needle)
+		if not bool(res.get("ok", false)):
+			_short_read = true
+			_finished = true
+			return {"done": true, "scanned": _position, "size": _size}
+		_position = _size
+		if bool(res.get("found", false)):
+			_hit = true
+		_finished = true
+		return {"done": true, "scanned": _size, "size": _size}
+	while true:
+		var s := step(SCAN_CHUNK_SIZE)
+		if s.get("done", true):
+			return s
+	return {"done": true, "scanned": _position, "size": _size}
+
+
 ## Reads at most `max_bytes` more of the file and reports progress. Returns
 ## {"done": bool, "scanned": int, "size": int}. Call repeatedly until done.
 func step(max_bytes: int) -> Dictionary:
 	if _finished or _file == null:
 		_finished = true
 		return {"done": true, "scanned": _position, "size": _size}
+
+	if _native_scanner != null and _position == 0 and max_bytes >= _size:
+		return scan_all()
 
 	var want: int = mini(maxi(1, max_bytes), _size - _position)
 	if want > 0:
@@ -281,12 +314,36 @@ func _header_failure(reason: String, detail: String) -> Dictionary:
 	return {"ok": false, "reason": reason, "detail": detail}
 
 
+## Single-pass anchor search over one slice, with a bounded fallback to the
+## 8-alignment word walk so pathological data full of `_needle[0]` cannot
+## regress below the original scan speed.
+func _window_contains_needle(window: PackedByteArray) -> bool:
+	if _native_scanner != null:
+		return bool(_native_scanner.call(&"buffer_contains_bytes", window, _needle))
+
+	var last_start := window.size() - _needle.size()
+	if last_start < 0:
+		return false
+
+	var first_byte := int(_needle[0])
+	var pos := window.find(first_byte, 0)
+	var candidates := 0
+	while pos >= 0 and pos <= last_start:
+		if window.decode_s64(pos) == _anchor and window.slice(pos, pos + _needle.size()) == _needle:
+			return true
+		candidates += 1
+		if candidates >= SCAN_CANDIDATE_BUDGET:
+			return _window_contains_needle_aligned(window.slice(pos + 1))
+		pos = window.find(first_byte, pos + 1)
+	return false
+
+
 ## Byte-wise search of one slice, done natively: the 8-byte needle prefix is
 ## looked up in a packed 64-bit view of the slice for each of the 8 possible
 ## alignments, which covers every byte offset exactly once. Only an anchor match
 ## is compared against the full needle. Both the packed view and `decode_s64`
 ## read little-endian words, as every supported host does.
-func _window_contains_needle(window: PackedByteArray) -> bool:
+func _window_contains_needle_aligned(window: PackedByteArray) -> bool:
 	var last_start := window.size() - _needle.size()
 	if last_start < 0:
 		return false

@@ -36,8 +36,7 @@ func _init() -> void:
 	var core := ScanCore.new()
 	var opened: Dictionary = core.start(pack_path)
 	if opened["ok"]:
-		while not core.step(ScanCore.SCAN_CHUNK_SIZE)["done"]:
-			pass
+		core.scan_all()
 
 	var verdict: Dictionary = core.get_verdict()
 	if not verdict["ok"]:
