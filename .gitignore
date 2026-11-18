@@ -10,6 +10,7 @@ compile_commands.json
 # C/C++ Compiled Objects & MSVC Build Artifacts
 # ==============================================================================
 *.obj
+*.obj.import
 *.o
 *.os
 *.idb

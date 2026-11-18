@@ -67,11 +67,31 @@ signal prewarm_progress(tag: int, done: int, total: int)
 ## true: every stream request is terminal AND every completed texture has been
 ## built into `DSTextureCache` (an offloaded build may outlive request completion).
 signal prewarm_finished(tag: int)
+## Per-scene prewarm progress: (scene_tag: int, stage: String, progress: float).
+## Emitted at most once per frame when `stage` changes or `progress` advances by >= 0.005.
+signal scene_prewarm_progress(scene_tag: int, stage: String, progress: float)
+## Fired once per `start_scene_prewarm()` tag when the chained texture prewarm
+## + threaded scene load completes (`packed_scene` non-null) or is cancelled/fails (`null`).
+signal scene_prewarm_finished(scene_tag: int, scene_path: String, packed_scene: PackedScene)
+
+enum _ScenePrewarmStage {
+	STAGE_TEXTURE_PREWARM,
+	STAGE_THREADED_SCENE_LOAD,
+	STAGE_CANCELLING_SCENE_LOAD,
+}
+const SCENE_PROGRESS_EPSILON: float = 0.005
 
 ## Tags under progress watch: tag (int) -> last emitted Vector2i(done, total).
 var _tracked_tags: Dictionary = {}
 ## Tags already reported finished (prevents duplicate `prewarm_finished`).
 var _finished_tags: Dictionary = {}
+## Active scene prewarms keyed by scene_tag (int).
+var _scene_prewarms: Dictionary = {}
+## Completed PackedScene results waiting for take_scene_prewarm_result().
+var _scene_prewarm_results: Dictionary = {}
+## Finished/cancelled scene prewarm tags.
+var _scene_prewarm_done: Dictionary = {}
+var _next_scene_tag: int = 1
 ## True while DSProfiler has a frame-time window open for the current load.
 var _frame_window_open: bool = false
 ## Lazily resolved DSProfiler singleton + frame-window capability (probed once,
@@ -162,6 +182,88 @@ func untrack_prewarm(tag: int) -> void:
 ## Returns true while a tag is under progress watch.
 func is_tracking_prewarm(tag: int) -> bool:
 	return _tracked_tags.has(tag)
+
+
+## Starts a chained scene prewarm (Stage 1: DirectStorage texture prewarm,
+## Stage 2: ResourceLoader.load_threaded_request with use_sub_threads = false
+## and CACHE_MODE_REUSE). Returns a positive `scene_tag` or `0` on invalid input.
+func start_scene_prewarm(scene_path: String, deps: PackedStringArray, chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0) -> int:
+	if scene_path.is_empty():
+		push_warning("[DirectStorage] DSRuntime: start_scene_prewarm called with empty scene_path.")
+		return 0
+	var scene_tag: int = _next_scene_tag
+	_next_scene_tag += 1
+	var tex_tag: int = 0
+	if not deps.is_empty() and PRELOADER_SCRIPT.is_stream_prewarm_available():
+		if prefer_gpu and PRELOADER_SCRIPT.is_gpu_prewarm_available():
+			tex_tag = PRELOADER_SCRIPT.prewarm_gpu_async(deps, chunk_size, prefer_gpu, max_chunk_bytes)
+		else:
+			tex_tag = PRELOADER_SCRIPT.prewarm_async(deps)
+	_scene_prewarms[scene_tag] = {
+		"scene_path": scene_path,
+		"tex_tag": tex_tag,
+		"stage": _ScenePrewarmStage.STAGE_TEXTURE_PREWARM,
+		"stage_name": "textures",
+		"last_stage": "",
+		"last_progress": -1.0,
+		"cancelled": false,
+	}
+	return scene_tag
+
+
+## Cancels an active scene prewarm. During Stage 1, cancels the texture prewarm
+## and never starts Stage 2. During Stage 2, transitions to a Q42 drain state
+## until load_threaded_get_status() finishes, then releases the result cleanly.
+func cancel_scene_prewarm(scene_tag: int) -> void:
+	if not _scene_prewarms.has(scene_tag):
+		return
+	var entry: Dictionary = _scene_prewarms[scene_tag]
+	entry["cancelled"] = true
+	var stage: int = int(entry["stage"])
+	if stage == _ScenePrewarmStage.STAGE_TEXTURE_PREWARM:
+		var tex_tag: int = int(entry["tex_tag"])
+		if tex_tag > 0:
+			PRELOADER_SCRIPT.cancel_prewarm(tex_tag)
+	elif stage == _ScenePrewarmStage.STAGE_THREADED_SCENE_LOAD:
+		entry["stage"] = _ScenePrewarmStage.STAGE_CANCELLING_SCENE_LOAD
+		entry["stage_name"] = "cancelling"
+
+
+## Returns true when `scene_tag` is no longer active (completed, cancelled, or unknown).
+func is_scene_prewarm_complete(scene_tag: int) -> bool:
+	return not _scene_prewarms.has(scene_tag)
+
+
+## Returns a snapshot dictionary for `scene_tag`.
+func get_scene_prewarm_state(scene_tag: int) -> Dictionary:
+	if _scene_prewarms.has(scene_tag):
+		var entry: Dictionary = _scene_prewarms[scene_tag]
+		return {
+			"active": true,
+			"complete": false,
+			"stage": String(entry["stage_name"]),
+			"progress": maxf(0.0, float(entry["last_progress"])),
+			"cancelled": bool(entry["cancelled"]),
+			"tex_tag": int(entry["tex_tag"]),
+			"scene_path": String(entry["scene_path"]),
+		}
+	return {
+		"active": false,
+		"complete": true,
+		"stage": "done" if _scene_prewarm_done.has(scene_tag) else "",
+		"progress": 1.0 if _scene_prewarm_results.has(scene_tag) else 0.0,
+		"cancelled": false,
+		"tex_tag": 0,
+		"scene_path": "",
+	}
+
+
+## Retrieves and clears the completed PackedScene for `scene_tag` so DSRuntime
+## does not retain a strong reference after handoff.
+func take_scene_prewarm_result(scene_tag: int) -> PackedScene:
+	var packed: PackedScene = _scene_prewarm_results.get(scene_tag, null) as PackedScene
+	_scene_prewarm_results.erase(scene_tag)
+	return packed
 
 
 ## Enables/disables backpressure slice logging. Off by default so regular
@@ -536,9 +638,11 @@ func _process(delta: float) -> void:
 					return
 
 	if not ClassDB.class_exists("DSContext"):
+		_poll_scene_prewarms()
 		return
 	var ctx = Engine.get_singleton("DSContext")
 	if ctx == null or not ctx.is_initialized():
+		_poll_scene_prewarms()
 		return
 	# Compatibility guard: if the loaded extension build lacks the stream
 	# API, there is nothing safe to submit; stay silent after one warning
@@ -548,6 +652,7 @@ func _process(delta: float) -> void:
 			_stream_api_missing_warned = true
 			push_warning("[DirectStorage] DSRuntime: stream API (flush_stream_async/has_stream_pending) missing; async prewarm disabled, sync loads unaffected.")
 		_poll_legacy_completions(ctx)
+		_poll_scene_prewarms()
 		return
 	# 1. Harvest already-finished batches first (non-blocking). This frees
 	#    batch slots so the stream flush below can submit in the same frame
@@ -726,7 +831,7 @@ func _process(delta: float) -> void:
 			_has_frame_window = _profiler != null and _profiler.has_method("record_frame") and _profiler.has_method("begin_load_window") and _profiler.has_method("end_load_window")
 	if _has_frame_window:
 		_profiler.record_frame(delta)
-		var streaming_active: bool = not _tracked_tags.is_empty() or ctx.has_stream_pending()
+		var streaming_active: bool = not _tracked_tags.is_empty() or not _scene_prewarms.is_empty() or ctx.has_stream_pending()
 		if streaming_active and not _frame_window_open:
 			_frame_window_open = true
 			_profiler.begin_load_window()
@@ -735,6 +840,8 @@ func _process(delta: float) -> void:
 			_profiler.end_load_window()
 	# 5. Emit per-tag progress / finished for tracked tags.
 	_poll_prewarm_progress(ctx)
+	# 6. Advance chained scene prewarms (Stage 1 textures -> Stage 2 threaded load).
+	_poll_scene_prewarms()
 
 
 ## Polls tracked tags and emits `prewarm_progress` / `prewarm_finished`.
@@ -767,6 +874,83 @@ func _poll_prewarm_progress(ctx: Object) -> void:
 			_tracked_tags.erase(tag)
 			_finished_tags[tag] = true
 			prewarm_finished.emit(tag)
+
+
+func _emit_scene_prewarm_progress(scene_tag: int, entry: Dictionary, stage_name: String, progress: float) -> void:
+	var clamped: float = clampf(progress, 0.0, 1.0)
+	var last_stage: String = String(entry["last_stage"])
+	var last_progress: float = float(entry["last_progress"])
+	if stage_name != last_stage or absf(clamped - last_progress) >= SCENE_PROGRESS_EPSILON:
+		entry["last_stage"] = stage_name
+		entry["last_progress"] = clamped
+		scene_prewarm_progress.emit(scene_tag, stage_name, clamped)
+
+
+func _finish_scene_prewarm(scene_tag: int, scene_path: String, packed: PackedScene) -> void:
+	if packed != null:
+		_scene_prewarm_results[scene_tag] = packed
+	_scene_prewarm_done[scene_tag] = true
+	_scene_prewarms.erase(scene_tag)
+	scene_prewarm_finished.emit(scene_tag, scene_path, packed)
+
+
+## Advances active scene prewarms: Stage 1 (DirectStorage texture prewarm)
+## waits for `is_prewarm_complete(tex_tag)` before starting Stage 2
+## (`ResourceLoader.load_threaded_request` with `use_sub_threads = false` per Q40
+## and `CACHE_MODE_REUSE` per Q14). Stage 2 cancellations drain via Q42.
+func _poll_scene_prewarms() -> void:
+	if _scene_prewarms.is_empty():
+		return
+	for scene_tag in _scene_prewarms.keys():
+		if not _scene_prewarms.has(scene_tag):
+			continue
+		var entry: Dictionary = _scene_prewarms[scene_tag]
+		var scene_path: String = String(entry["scene_path"])
+		var stage: int = int(entry["stage"])
+		if stage == _ScenePrewarmStage.STAGE_TEXTURE_PREWARM:
+			var tex_tag: int = int(entry["tex_tag"])
+			if bool(entry["cancelled"]):
+				if tex_tag <= 0 or PRELOADER_SCRIPT.is_prewarm_complete(tex_tag):
+					_finish_scene_prewarm(scene_tag, scene_path, null)
+				continue
+			var frac: float = 0.0
+			if tex_tag > 0:
+				var tex_prog: Vector2i = PRELOADER_SCRIPT.get_prewarm_progress(tex_tag)
+				if tex_prog.y > 0:
+					frac = clampf(float(tex_prog.x) / float(tex_prog.y), 0.0, 1.0)
+			_emit_scene_prewarm_progress(scene_tag, entry, "textures", frac * 0.5)
+			if tex_tag <= 0 or PRELOADER_SCRIPT.is_prewarm_complete(tex_tag):
+				var err: Error = ResourceLoader.load_threaded_request(scene_path, "PackedScene", false, ResourceLoader.CACHE_MODE_REUSE)
+				if err != OK:
+					push_warning("[DirectStorage] DSRuntime: load_threaded_request failed for '", scene_path, "' (err=", err, ").")
+					_finish_scene_prewarm(scene_tag, scene_path, null)
+					continue
+				entry["stage"] = _ScenePrewarmStage.STAGE_THREADED_SCENE_LOAD
+				entry["stage_name"] = "scene"
+				_emit_scene_prewarm_progress(scene_tag, entry, "scene", 0.5)
+		elif stage == _ScenePrewarmStage.STAGE_THREADED_SCENE_LOAD:
+			var progress_arr: Array = []
+			var status: ResourceLoader.ThreadLoadStatus = ResourceLoader.load_threaded_get_status(scene_path, progress_arr)
+			if status == ResourceLoader.THREAD_LOAD_IN_PROGRESS:
+				var p: float = float(progress_arr[0]) if not progress_arr.is_empty() else 0.0
+				_emit_scene_prewarm_progress(scene_tag, entry, "scene", 0.5 + clampf(p, 0.0, 1.0) * 0.5)
+			elif status == ResourceLoader.THREAD_LOAD_LOADED:
+				var packed: PackedScene = ResourceLoader.load_threaded_get(scene_path) as PackedScene
+				_emit_scene_prewarm_progress(scene_tag, entry, "done", 1.0)
+				_finish_scene_prewarm(scene_tag, scene_path, packed)
+			else:
+				push_warning("[DirectStorage] DSRuntime: threaded scene load failed for '", scene_path, "' (status=", status, ").")
+				_finish_scene_prewarm(scene_tag, scene_path, null)
+		elif stage == _ScenePrewarmStage.STAGE_CANCELLING_SCENE_LOAD:
+			var status: ResourceLoader.ThreadLoadStatus = ResourceLoader.load_threaded_get_status(scene_path)
+			if status == ResourceLoader.THREAD_LOAD_IN_PROGRESS:
+				var cur_prog: float = float(entry["last_progress"])
+				_emit_scene_prewarm_progress(scene_tag, entry, "cancelling", cur_prog if cur_prog >= 0.0 else 0.5)
+			else:
+				if status == ResourceLoader.THREAD_LOAD_LOADED:
+					var discarded: Resource = ResourceLoader.load_threaded_get(scene_path)
+					discarded = null
+				_finish_scene_prewarm(scene_tag, scene_path, null)
 
 
 ## Background texture ingestion: exactly one bounded slice per task.

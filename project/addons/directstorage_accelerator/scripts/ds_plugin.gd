@@ -50,6 +50,7 @@ var _tools_submenu: PopupMenu = null
 ## One deferred re-initialization at a time: `extension_loaded` and
 ## `extensions_reloaded` can both fire for the same reload.
 var _native_reinit_queued: bool = false
+var _is_disabling: bool = false
 
 
 ## Registers the autoload, import plugin, export plugin, and DirectStorage
@@ -165,10 +166,12 @@ func _exit_tree() -> void:
 	_sync_native_reload_signals(false)
 	_checked_scenes.clear()
 
-	print(
-		"[DirectStorage] Plugin stopped (addon still enabled); %s autoload kept in project.godot."
-		% AUTOLOAD_NAME
-	)
+	if not _is_disabling:
+		print(
+			"[DirectStorage] Editor hooks unloaded (%s autoload kept in project.godot)."
+			% AUTOLOAD_NAME
+		)
+	_is_disabling = false
 
 
 ## Called by the engine only when the user disables the addon in the Plugin tab
@@ -176,9 +179,13 @@ func _exit_tree() -> void:
 ## the single place that unregisters the autoload, so a plain editor shutdown
 ## cannot strip it from project.godot again.
 func _disable_plugin() -> void:
+	_is_disabling = true
 	_sync_autoload(AUTOLOAD_NAME, "")
 
-	print("[DirectStorage] Plugin disabled. Autoload, Importer, and Exporter unregistered.")
+	print(
+		"[DirectStorage] Addon disabled in Project Settings. %s autoload and editor hooks unregistered."
+		% AUTOLOAD_NAME
+	)
 
 
 ## Carries export-preset options across the settings rename.

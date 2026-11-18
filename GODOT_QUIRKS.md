@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 12 November 2026
+Last updated: 18 November 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1949,4 +1949,19 @@ completion documents storage dims). The addon exposes the CPU escape as `compati
 `src/integration/ds_preloader.cpp` (prewarm build). Related: Q05 (Texture2DRD CPU-pixel
 gaps), Q27 (Texture2DRD RID ownership), Q36 (which RID to validate). Upstream report:
 `.agents/godot-bug-reports/texture2drd-no-size-override.md`.
+
+---
+
+## 80. D3D12 RenderingDevice defers texture VRAM release past frame 2
+
+### The Engine Reality
+On Godot 4.7's D3D12 `RenderingDevice`, calling `free_rid()` (or dropping `Texture2DRD` owners via `DSTextureCache.clear_unused()`) does not immediately retire the underlying GPU allocation. Freed texture resources remain in the deferred deletion queue until the multi-frame GPU command-buffer fence ring completes, which takes more than 2 frames.
+
+### The Trap / Symptom
+Scenario C in `benchmark/benchmark_runner.gd` waited 2 `process_frame`s + `RenderingServer.frame_post_draw` after `clear_unused()` and reported only `-4.3 MiB` (`standard`) / `-44.2 MiB` (`arena`) reclaimed out of `1474.8–2067.0 MiB` allocated. Isolating 512 MiB of `Texture2DRD` / `RenderingDevice` textures in `.agents/scratch/diag_vram_evict.gd` showed both `RENDER_VIDEO_MEM_USED` (`527.6 MiB`) and `RENDERING_INFO_TEXTURE_MEM_USED` (`517.7 MiB`) still at full allocation at frame 2, then dropping completely back to baseline (`13.4 MiB` / `5.7 MiB`) by frame 10.
+
+### The Rule
+Never assert or measure VRAM reclamation after `free_rid()` / `clear_unused()` with only a 2-frame drain; wait at least 10 frames (past the D3D12 GPU fence ring) before sampling `RENDER_VIDEO_MEM_USED` or `RENDERING_INFO_TEXTURE_MEM_USED`.
+
+Implemented as a 10-frame + `RenderingServer.frame_post_draw` drain in `benchmark/benchmark_runner.gd` (`_run_scenario_c()`). Related: Q27 (`Texture2DRD` RID ownership), Q78 (`RENDER_VIDEO_MEM_USED` refresh timing).
 
