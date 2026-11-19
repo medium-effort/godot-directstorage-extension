@@ -4,6 +4,7 @@
 #include "compression/gdeflate_decompressor.h"
 #include "formats/dspkg_format.h"
 #include "formats/dstex_format.h"
+#include "gen/dspkg_encryption_key.h"
 #include "monocypher.h"
 
 #include <godot_cpp/classes/dir_access.hpp>
@@ -185,6 +186,20 @@ godot::PackedByteArray make_toc_key_file(const godot::String &p_key_hex, int64_t
 	}
 	return file;
 }
+
+#if DSPKG_ENCRYPTION_ENABLED
+// The baked key this binary carries, rebuilt from the generated header with the same
+// XOR the reader applies. Test-only probe: it reads what is already compiled into the
+// DLL, and it is compiled out of a keyless build.
+godot::String baked_key_hex() {
+	godot::PackedByteArray raw;
+	raw.resize(32);
+	for (int i = 0; i < 32; ++i) {
+		raw.set(i, static_cast<uint8_t>(dspkg_key::MASK[i] ^ dspkg_key::MASKED_KEY[i]));
+	}
+	return raw.hex_encode();
+}
+#endif
 
 bool write_file_bytes(const char *p_path, const godot::PackedByteArray &p_bytes) {
 	const godot::String path(p_path);
@@ -1627,7 +1642,16 @@ GDEX_TEST_T(dspkg, toc_key_wrong_length_rejected, TAG_INTEGRATION) {
 	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
 	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
 
-	// 2. 64 bytes: magic16 || key32 || 16 trailing bytes. Bytes 16..47 are the
+	// 2. 47 bytes: magic16 || key[0..30]. The input a baked-key build must not fall
+	// back from, refused on every build - the rejecting arm may differ, the verdict
+	// must not.
+	GDEX_ASSERT_TRUE(write_file_bytes(TOC_KEY_PATH, make_toc_key_file(key_hex, TOC_KEY_BYTES - 1)));
+	GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(TOC_KEY_PATH).size(), int64_t(47));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
+
+	// 3. 64 bytes: magic16 || key32 || 16 trailing bytes. Bytes 16..47 are the
 	// real key, so only the exact-length rule can reject this file.
 	GDEX_ASSERT_TRUE(write_file_bytes(TOC_KEY_PATH, make_toc_key_file(key_hex, TOC_KEY_BYTES, 16)));
 	GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(TOC_KEY_PATH).size(), int64_t(64));
@@ -1635,13 +1659,63 @@ GDEX_TEST_T(dspkg, toc_key_wrong_length_rejected, TAG_INTEGRATION) {
 	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
 	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), initial_key_id);
 
-	// 3. Exactly 48 bytes: accepted, so length was the only rejection reason.
+	// 4. Exactly 48 bytes: accepted, so length was the only rejection reason.
 	GDEX_ASSERT_TRUE(install_toc_key_file(key_hex));
 	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::OK);
 	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
 
 	remove_temp_file(dstex_path);
 	remove_temp_file(dspkg_path);
+}
+
+// A delivered key entry is authoritative: when res://.dspkg/toc.key is present but
+// malformed, the reader refuses the open instead of selecting another key source.
+// Only a legacy build with a baked key has a second source, so the case runs there
+// and keys the archive with that baked key - the legacy layout, and the only
+// configuration in which a fallback would open the archive on the DLL key.
+GDEX_TEST_T(dspkg, malformed_toc_key_does_not_use_baked_key, TAG_INTEGRATION) {
+#if DSPKG_ENCRYPTION_ENABLED
+	const char *dstex_path = "user://gdextest_probe_baked_bad_entry.dstex";
+	const char *dspkg_path = "user://gdextest_probe_baked_bad_entry.dspkg";
+	const char *virtual_path = "res://textures/probe_baked_bad_entry.dstex";
+	const godot::String baked_hex = baked_key_hex();
+
+	TocKeySandbox sandbox;
+	GDEX_ASSERT_EQ(baked_hex.length(), 64);
+	// A0: the unmask helper reproduces the id the binary advertises for its baked key.
+	GDEX_ASSERT_TRUE(godot::DSPkg::get_global_encryption_key_id() == godot::DSPkg::compute_key_id(baked_hex));
+	GDEX_ASSERT_TRUE(build_single_entry_archive(dstex_path, dspkg_path, 0ULL, baked_hex, virtual_path));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_ASSERT_TRUE(reader.is_valid());
+
+	// A1: 47 bytes = magic16 || 31 key bytes. Nothing but the exact-length rule can
+	// reject it, and the baked key would open the archive if the reader fell back.
+	GDEX_ASSERT_TRUE(write_file_bytes(TOC_KEY_PATH, make_toc_key_file(baked_hex, TOC_KEY_BYTES - 1)));
+	GDEX_EXPECT_EQ(godot::FileAccess::get_file_as_bytes(TOC_KEY_PATH).size(), int64_t(47));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 0);
+
+	// A2 control: same archive, same build, entry absent -> the baked key still opens it.
+	godot::DSPkg::set_global_encryption_key("");
+	remove_toc_key_file();
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+
+	// A3: a well-formed 48-byte entry carrying a different key must also refuse - and it
+	// always did, which is what makes the fallback specific to malformed entries.
+	godot::DSPkg::set_global_encryption_key("");
+	const godot::String other_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+	GDEX_ASSERT_TRUE(install_toc_key_file(other_hex));
+	GDEX_EXPECT_EQ(reader->open(godot::String(dspkg_path)), godot::ERR_UNAUTHORIZED);
+
+	remove_temp_file(dstex_path);
+	remove_temp_file(dspkg_path);
+#else
+	(void)ctx;
+	GDEX_SKIP("Keyless build: there is no baked key, so no second key source exists to fall back to.");
+#endif
 }
 
 GDEX_TEST_T(dspkg, toc_key_wrong_key_rejected, TAG_INTEGRATION) {

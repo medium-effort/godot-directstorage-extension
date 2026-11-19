@@ -131,7 +131,7 @@ static void wipe_key_bytes(std::array<uint8_t, 32> &r_key_bytes) {
 // caller's job and happens only after the candidate reproduces the archive
 // header's key_id and decrypts the TOC, so a stale or undecryptable key file
 // cannot pin the process to a key that a later PCK mount would have replaced.
-static bool resolve_encryption_key(std::array<uint8_t, 32> &r_key_bytes, uint64_t &r_key_id) {
+static bool resolve_encryption_key(std::array<uint8_t, 32> &r_key_bytes, uint64_t &r_key_id, String &r_error) {
 	KeyResolutionState state = KEY_STATE_DEFAULT;
 	{
 		std::lock_guard<std::mutex> lock(s_key_mutex);
@@ -154,27 +154,40 @@ static bool resolve_encryption_key(std::array<uint8_t, 32> &r_key_bytes, uint64_
 	// read is kernel I/O, so it stays outside s_key_mutex. A missing file leaves
 	// the resolution state untouched: the next open() after a PCK mount retries.
 	PackedByteArray key_file;
-	if (FileAccess::file_exists(DSPKG_TOC_KEY_PATH)) {
+	const bool key_file_present = FileAccess::file_exists(DSPKG_TOC_KEY_PATH);
+	if (key_file_present) {
 		key_file = FileAccess::get_file_as_bytes(DSPKG_TOC_KEY_PATH);
 	}
 	const std::array<uint8_t, DSPKG_TOC_KEY_MAGIC_SIZE> &magic = get_toc_key_magic();
 	const bool key_file_is_valid = key_file.size() == DSPKG_TOC_KEY_FILE_SIZE &&
 			memcmp(key_file.ptr(), magic.data(), DSPKG_TOC_KEY_MAGIC_SIZE) == 0;
+	const int64_t key_file_size = key_file.size();
 	if (key_file_is_valid) {
 		memcpy(r_key_bytes.data(), key_file.ptr() + DSPKG_TOC_KEY_MAGIC_SIZE, 32);
 	}
-	if (key_file.size() > 0) {
-		crypto_wipe(key_file.ptrw(), static_cast<size_t>(key_file.size()));
+	if (key_file_size > 0) {
+		crypto_wipe(key_file.ptrw(), static_cast<size_t>(key_file_size));
 	}
 	key_file = PackedByteArray();
 	if (key_file_is_valid) {
 		compute_key_id_from_bytes(r_key_bytes.data(), r_key_id);
 		return true;
 	}
+	// A delivered entry is authoritative: its presence is what selects the PCK key
+	// source, so a malformed one is an error, never an invitation to try another.
+	// Falling through here would open a legacy baked-key build on the weaker
+	// DLL-resident key and report success, hiding a broken or foreign entry.
+	if (key_file_present) {
+		r_error = String("res://.dspkg/toc.key is malformed (") + String::num_int64(key_file_size) +
+				" bytes; expected " + String::num_int64(DSPKG_TOC_KEY_FILE_SIZE) +
+				" with the archive key magic). Refusing to fall back to another key source.";
+		return false;
+	}
 
 #if DSPKG_ENCRYPTION_ENABLED
-	// A source build that bakes a key has no PCK delivery, so exactly one key
-	// source exists per configuration rather than a fallback chain.
+	// A source build that bakes a key has no PCK delivery, so an absent entry is the
+	// normal legacy case and selects the baked key. A present entry never reaches this
+	// branch: it was either accepted above or refused.
 	unmask_baked_key(r_key_bytes);
 	compute_key_id_from_bytes(r_key_bytes.data(), r_key_id);
 	return true;
@@ -2140,9 +2153,12 @@ Error DSPkg::open(const String &p_path, uint64_t p_expected_id) {
 	if (is_encrypted) {
 		std::array<uint8_t, 32> candidate_key = {};
 		uint64_t candidate_key_id = 0;
-		if (!resolve_encryption_key(candidate_key, candidate_key_id)) {
+		String key_resolution_error;
+		if (!resolve_encryption_key(candidate_key, candidate_key_id, key_resolution_error)) {
 			wipe_key_bytes(candidate_key);
-			return fail(ERR_UNAUTHORIZED, "No decryption key available. Expected res://.dspkg/toc.key inside an encrypted PCK.");
+			return fail(ERR_UNAUTHORIZED, key_resolution_error.is_empty()
+					? String("No decryption key available. Expected res://.dspkg/toc.key inside an encrypted PCK.")
+					: key_resolution_error);
 		}
 		if (loaded_header.key_id != candidate_key_id) {
 			wipe_key_bytes(candidate_key);
