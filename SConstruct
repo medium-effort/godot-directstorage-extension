@@ -770,6 +770,7 @@ if env["platform"] == "windows":
 # crypto_blake2b/crypto_wipe.
 thirdparty_objects = thirdparty_sources + monocypher_sources
 bmi2_objects = []
+avx2_objects = []
 if env["platform"] == "windows" and "msvc" in env["TOOLS"]:
     thirdparty_env = env.Clone()
     thirdparty_env.Append(CCFLAGS=["/wd4244", "/wd4127", "/wd4267", "/wd4100", "/wd4245", "/wd4456", "/wd4018", "/wd4146", "/wd4310", "/FS"])
@@ -782,6 +783,12 @@ if env["platform"] == "windows" and "msvc" in env["TOOLS"]:
         bmi2_env.Append(CCFLAGS=["/arch:AVX2"])
         bmi2_objects = bmi2_env.SharedObject("src/compression/gdeflate_decompress_bmi2_msvc.c")
         thirdparty_objects += bmi2_objects
+        # Same isolation for the compressor: second copy of the GDeflate/deflate
+        # hot path with /arch:AVX2, dispatched at runtime by GDeflateCompress.cpp.
+        avx2_env = thirdparty_env.Clone()
+        avx2_env.Append(CCFLAGS=["/arch:AVX2"])
+        avx2_objects = avx2_env.SharedObject("src/compression/gdeflate_compress_avx2_msvc.c")
+        thirdparty_objects += avx2_objects
 
 sources = project_sources + thirdparty_objects
 
@@ -952,6 +959,8 @@ if env["tests"]:
             _gdex_env.Append(CFLAGS=["/std:c11"])
             if bmi2_objects:
                 _gdex_env.Append(LIBS=bmi2_objects)
+            if avx2_objects:
+                _gdex_env.Append(LIBS=avx2_objects)
         _gdex_exports = {"env": _gdex_env, "gdextest": {}}
         if _gdex_env.get("platform", "") != "windows":
             # gdextest has no per-platform sources: .gdextest.toml lists both

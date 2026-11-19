@@ -385,3 +385,70 @@ GDEX_TEST(gdeflate, compress_small_mip_fans_out_across_cpu_budget) {
     GDEX_EXPECT_EQ(decompressed.size(), original.size());
     GDEX_EXPECT_TRUE(decompressed == original);
 }
+
+// Audit 3.2: the MSVC /arch:AVX2 compressor must produce byte-identical streams,
+// otherwise switching dispatch would silently change archive contents.
+GDEX_TEST(gdeflate, avx2_compressor_matches_baseline_bytes) {
+    if (!GDeflate::is_avx2_compressor_available()) {
+        GDEX_SKIP("AVX2 compressor unavailable on this host");
+    }
+    const GDeflate::CompressorDispatch prior = GDeflate::get_compressor_dispatch();
+    godot::PackedByteArray original = make_pattern(kTileSize * 4);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
+
+    for (int level : { 1, 3, 5 }) {
+        GDeflate::set_compressor_dispatch(GDeflate::CompressorDispatch::Baseline);
+        const godot::PackedByteArray baseline = compressor->compress(original, level);
+        GDeflate::set_compressor_dispatch(GDeflate::CompressorDispatch::Avx2);
+        const godot::PackedByteArray avx2 = compressor->compress(original, level);
+        GDeflate::set_compressor_dispatch(prior);
+
+        GDEX_EXPECT_GT(baseline.size(), 0);
+        GDEX_EXPECT_EQ(avx2.size(), baseline.size());
+        GDEX_EXPECT_TRUE(avx2 == baseline);
+        if (avx2.size() == 0) {
+            continue;
+        }
+        godot::Ref<godot::GDeflateDecompressor> decompressor;
+        decompressor.instantiate();
+        const godot::PackedByteArray decompressed =
+                decompressor->decompress(avx2, static_cast<int>(original.size()));
+        GDEX_EXPECT_EQ(decompressed.size(), original.size());
+        GDEX_EXPECT_TRUE(decompressed == original);
+    }
+}
+
+// The #0275 bound fix must hold in the AVX2 copy too: a borderline-incompressible
+// full tile selects dynamic Huffman and needs the stream-interleaving slack.
+GDEX_TEST(gdeflate, avx2_borderline_tile_round_trip) {
+    if (!GDeflate::is_avx2_compressor_available()) {
+        GDEX_SKIP("AVX2 compressor unavailable on this host");
+    }
+    godot::PackedByteArray tile;
+    tile.resize(kTileSize);
+    uint8_t *dst = tile.ptrw();
+    uint32_t state = 0x9E3779B9u;
+    for (int i = 0; i < kTileSize; ++i) {
+        state = state * 1664525u + 1013904223u;
+        const uint8_t v = static_cast<uint8_t>((state >> 24) & 0xFFu);
+        dst[i] = ((state & 0x3Fu) == 0u) ? 0x80u : v;
+    }
+
+    const GDeflate::CompressorDispatch prior = GDeflate::get_compressor_dispatch();
+    GDeflate::set_compressor_dispatch(GDeflate::CompressorDispatch::Avx2);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
+    const godot::PackedByteArray compressed = compressor->compress(tile, 3);
+    GDeflate::set_compressor_dispatch(prior);
+
+    GDEX_EXPECT_GT(compressed.size(), 0);
+    if (compressed.size() == 0) {
+        return;
+    }
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
+    const godot::PackedByteArray decompressed = decompressor->decompress(compressed, kTileSize);
+    GDEX_EXPECT_EQ(decompressed.size(), kTileSize);
+    GDEX_EXPECT_TRUE(decompressed == tile);
+}

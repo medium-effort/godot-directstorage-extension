@@ -20,6 +20,7 @@
 #include "GDeflate.h"
 #include "TileStream.h"
 #include "Utils.h"
+#include "gdeflate_cpu_dispatch.h"
 
 #include <libdeflate.h>
 
@@ -45,36 +46,9 @@ libdeflate_gdeflate_decompress_bmi2_msvc(struct libdeflate_gdeflate_decompressor
                                          size_t* actual_out_nbytes_ret);
 }
 
-static bool has_avx2_bmi2_support()
-{
-    int cpu_info[4] = {0, 0, 0, 0};
-    __cpuid(cpu_info, 0);
-    if (cpu_info[0] < 7)
-    {
-        return false;
-    }
-    __cpuid(cpu_info, 1);
-    const bool has_osxsave = (cpu_info[2] & (1 << 27)) != 0;
-    const bool has_avx = (cpu_info[2] & (1 << 28)) != 0;
-    if (!has_osxsave || !has_avx)
-    {
-        return false;
-    }
-    const unsigned long long xcr0 = _xgetbv(0);
-    if ((xcr0 & 0x6ULL) != 0x6ULL)
-    {
-        return false;
-    }
-    __cpuidex(cpu_info, 7, 0);
-    const bool has_bmi1 = (cpu_info[1] & (1 << 3)) != 0;
-    const bool has_avx2 = (cpu_info[1] & (1 << 5)) != 0;
-    const bool has_bmi2 = (cpu_info[1] & (1 << 8)) != 0;
-    return has_bmi1 && has_avx2 && has_bmi2;
-}
-
 static bool use_bmi2_msvc_decoder()
 {
-    static const bool s_supported = has_avx2_bmi2_support();
+    static const bool s_supported = GDeflate::has_avx2_bmi2_support();
     return s_supported;
 }
 #endif

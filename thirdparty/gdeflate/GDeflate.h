@@ -32,6 +32,19 @@ namespace GDeflate
         COMPRESS_SINGLE_THREAD = 0x200, /*!< Force compression using a single thread. */
     };
 
+    // Selector for the MSVC /arch:AVX2 compressor. Auto probes the CPU once;
+    // the explicit modes exist for native tests and A/B measurement.
+    enum class CompressorDispatch
+    {
+        Auto = 0,
+        Avx2 = 1,
+        Baseline = 2,
+    };
+
+    void set_compressor_dispatch(CompressorDispatch p_mode);
+    CompressorDispatch get_compressor_dispatch();
+    bool is_avx2_compressor_available();
+
     // Runs p_job(p_user, p_index) for every p_index in [0, p_workers) and returns only
     // after all invocations finished. The codecs never create threads of their own: with
     // p_parallelFor == nullptr the work runs inline on the calling thread, otherwise the

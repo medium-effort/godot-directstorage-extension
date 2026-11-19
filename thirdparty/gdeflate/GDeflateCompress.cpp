@@ -21,6 +21,7 @@
 #include "TileStream.h"
 #include "Utils.h"
 #include "config.h"
+#include "gdeflate_cpu_dispatch.h"
 
 #include <assert.h>
 #include <libdeflate.h>
@@ -32,14 +33,49 @@
 #include <thread> // hardware_concurrency() only: this file spawns no threads
 #include <vector>
 
-template<>
-struct std::default_delete<libdeflate_gdeflate_compressor>
+#if defined(_MSC_VER) && defined(_M_X64)
+extern "C" {
+LIBDEFLATEEXPORT struct libdeflate_gdeflate_compressor* LIBDEFLATEAPI
+libdeflate_alloc_gdeflate_compressor_avx2_msvc(int compression_level);
+
+LIBDEFLATEEXPORT void LIBDEFLATEAPI
+libdeflate_free_gdeflate_compressor_avx2_msvc(struct libdeflate_gdeflate_compressor* comp);
+
+LIBDEFLATEEXPORT size_t LIBDEFLATEAPI
+libdeflate_gdeflate_compress_avx2_msvc(struct libdeflate_gdeflate_compressor* compressor,
+        const void* in, size_t in_nbytes,
+        struct libdeflate_gdeflate_out_page* out_pages, size_t out_npages);
+}
+#endif
+
+namespace {
+
+// An AVX2 compressor must be released by the matching AVX2 deallocator.
+struct CompressorHandle
 {
-    void operator()(libdeflate_gdeflate_compressor* p) const
+    libdeflate_gdeflate_compressor* ptr = nullptr;
+    bool avx2 = false;
+
+    CompressorHandle() = default;
+    CompressorHandle(const CompressorHandle&) = delete;
+    CompressorHandle& operator=(const CompressorHandle&) = delete;
+
+    ~CompressorHandle()
     {
-        libdeflate_free_gdeflate_compressor(p);
+        if (ptr == nullptr)
+            return;
+#if defined(_MSC_VER) && defined(_M_X64)
+        if (avx2)
+        {
+            libdeflate_free_gdeflate_compressor_avx2_msvc(ptr);
+            return;
+        }
+#endif
+        libdeflate_free_gdeflate_compressor(ptr);
     }
 };
+
+} // namespace
 
 namespace GDeflate
 {
@@ -47,6 +83,44 @@ namespace GDeflate
     // 64 KiB tiles: 8 tiles = 512 KiB of work per runner, so a 4 MiB mip can
     // use the whole CPU budget instead of the old 2-runner (4 MiB/worker) floor.
     static constexpr uint32_t kMinTilesPerWorker = 8;
+
+    static std::atomic<int> s_compressor_dispatch{ static_cast<int>(CompressorDispatch::Auto) };
+
+    void set_compressor_dispatch(CompressorDispatch p_mode)
+    {
+        s_compressor_dispatch.store(static_cast<int>(p_mode));
+    }
+
+    CompressorDispatch get_compressor_dispatch()
+    {
+        return static_cast<CompressorDispatch>(s_compressor_dispatch.load());
+    }
+
+    bool is_avx2_compressor_available()
+    {
+#if defined(_MSC_VER) && defined(_M_X64)
+        return has_avx2_support();
+#else
+        return false;
+#endif
+    }
+
+    // CPU features cannot change at runtime: probe once on first use instead of
+    // on every tile-compression job. The dispatch mode itself stays live below.
+    static bool avx2_capability_cached()
+    {
+        static const bool supported = is_avx2_compressor_available();
+        return supported;
+    }
+
+    static bool should_use_avx2_compressor()
+    {
+        const CompressorDispatch mode = get_compressor_dispatch();
+        if (mode == CompressorDispatch::Baseline)
+            return false;
+        // Auto and explicit AVX2 both require a runtime-probed capable CPU.
+        return avx2_capability_cached();
+    }
 
     struct OutputStreamWrapper
     {
@@ -121,8 +195,17 @@ namespace GDeflate
         // remaining stack, and the size is only known here.
         std::vector<uint8_t> scratch(scratchSize);
 
-        std::unique_ptr<libdeflate_gdeflate_compressor> compressor(libdeflate_alloc_gdeflate_compressor(level));
-        if (!compressor)
+        const bool use_avx2 = should_use_avx2_compressor();
+        CompressorHandle compressor;
+        compressor.avx2 = use_avx2;
+#if defined(_MSC_VER) && defined(_M_X64)
+        compressor.ptr = use_avx2
+                ? libdeflate_alloc_gdeflate_compressor_avx2_msvc(level)
+                : libdeflate_alloc_gdeflate_compressor(level);
+#else
+        compressor.ptr = libdeflate_alloc_gdeflate_compressor(level);
+#endif
+        if (!compressor.ptr)
         {
             context.failed = true;
             return;
@@ -145,12 +228,21 @@ namespace GDeflate
 
             libdeflate_gdeflate_out_page compressedPage{scratch.data(), scratchSize};
 
-            size_t result = libdeflate_gdeflate_compress(
-                compressor.get(),
-                context.inputPtr + tilePos,
-                uncompressedSize,
-                &compressedPage,
-                1);
+            size_t result = 0;
+#if defined(_MSC_VER) && defined(_M_X64)
+            if (use_avx2)
+            {
+                result = libdeflate_gdeflate_compress_avx2_msvc(
+                        compressor.ptr, context.inputPtr + tilePos, uncompressedSize,
+                        &compressedPage, 1);
+            }
+            else
+#endif
+            {
+                result = libdeflate_gdeflate_compress(
+                        compressor.ptr, context.inputPtr + tilePos, uncompressedSize,
+                        &compressedPage, 1);
+            }
 
             if (result == 0)
             {
