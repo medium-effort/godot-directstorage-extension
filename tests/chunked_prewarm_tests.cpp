@@ -294,3 +294,63 @@ GDEX_TEST_T(chunked_prewarm, corrupt_chunk_table_tracks_nothing, TAG_INTEGRATION
 	GDEX_EXPECT_EQ(static_cast<int64_t>(gpu_progress.x), (int64_t)0);
 	GDEX_EXPECT_EQ(static_cast<int64_t>(gpu_progress.y), (int64_t)0);
 }
+
+// The paced CPU path locks its tag total at resolution time through
+// count_cpu_requests_for_payload(). That helper used to count mips only, while
+// expand_requests() emits one request per chunk for a chunked v3 payload, so a
+// 4K/8K texture reported complete while the remaining chunks were still
+// streaming. No stream work is pumped here: the total is fixed synchronously
+// by prewarm_cpu_paced_async(), which keeps the red/green deterministic and
+// headless-safe.
+GDEX_TEST_T(chunked_prewarm, paced_cpu_prewarm_counts_chunks, TAG_INTEGRATION) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	if (!ds->is_initialized() && !ds->initialize_ds()) {
+		GDEX_SKIP("DSContext backend unavailable (initialize_ds failed).");
+	}
+
+	const char *path = "user://gdextest_chunked_paced_prewarm.dstex";
+	track_cleanup(ctx, path);
+
+	const godot::PackedByteArray source = make_noise();
+	godot::Ref<godot::DSTex> dstex;
+	dstex.instantiate();
+	GDEX_ASSERT_EQ(dstex->write_to_file(godot::String(path), source, kSize, kSize,
+						   godot::Image::FORMAT_RGBA8, kMipCount, 1, false, false, 0, 0, 0, 256),
+			godot::OK);
+	const godot::Dictionary header = dstex->read_header(godot::String(path));
+	GDEX_ASSERT_TRUE(!header.is_empty());
+	GDEX_ASSERT_TRUE(static_cast<bool>(header["chunked"]));
+	const godot::PackedInt32Array counts = header["mip_chunk_counts"];
+	int64_t expected_requests = 0;
+	for (int64_t mip = 0; mip < counts.size(); ++mip) {
+		expected_requests += counts[mip] > 1 ? counts[mip] : 1;
+	}
+	GDEX_ASSERT_EQ(expected_requests, (int64_t)16);
+
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	cache->clear();
+	godot::DSPreloader::shutdown();
+
+	godot::PackedStringArray paths;
+	paths.push_back(godot::String(path));
+	const uint64_t tag = godot::DSPreloader::prewarm_cpu_paced_async(paths);
+	GDEX_ASSERT_TRUE(tag != 0);
+	ctx.add_teardown([ds, cache, tag]() {
+		ds->cancel_prewarm(tag);
+		godot::DSPreloader::shutdown();
+		cache->clear();
+		memdelete(cache);
+	});
+
+	// Nothing has been pumped yet, so no completion can race the total.
+	// At HEAD this is mip_count (1); with the fix it is the chunk count (16).
+	GDEX_EXPECT_EQ(godot::DSPreloader::get_queued_cpu_prewarm_count(tag), 1);
+	const godot::Vector2i progress = ds->get_prewarm_progress(tag);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(progress.x), (int64_t)0);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(progress.y), expected_requests);
+}

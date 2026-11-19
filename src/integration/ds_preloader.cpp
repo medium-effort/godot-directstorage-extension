@@ -1298,7 +1298,24 @@ uint64_t DSPreloader::prewarm_async(const PackedStringArray &p_paths) {
 }
 
 static size_t count_cpu_requests_for_payload(const DSPreloader::Payload &p_meta) {
-	return (p_meta.is_v2 && p_meta.mip_count > 0) ? static_cast<size_t>(p_meta.mip_count) : 1;
+	if (!p_meta.is_v2 || p_meta.mip_count == 0) {
+		return 1;
+	}
+	if (!p_meta.chunked) {
+		return static_cast<size_t>(p_meta.mip_count);
+	}
+	// Mirror expand_requests(): a chunked v3 payload emits one request per
+	// chunk (or one whole-mip request when a mip has <= 1 chunk). This total
+	// is locked at resolution time and drives is_prewarm_complete(), so it
+	// must count the same units the enqueue loop actually produces.
+	size_t requests = 0;
+	for (uint32_t i = 0; i < p_meta.mip_count; ++i) {
+		const int32_t chunks = p_meta.mip_chunk_counts.size() > static_cast<int64_t>(i)
+				? p_meta.mip_chunk_counts[i]
+				: 1;
+		requests += (chunks > 1) ? static_cast<size_t>(chunks) : 1;
+	}
+	return requests;
 }
 
 uint64_t DSPreloader::prewarm_cpu_paced_async(const PackedStringArray &p_paths) {
