@@ -4281,6 +4281,13 @@ GDEX_TEST_ASYNC_T(win32_remediation, concurrent_gpu_destination_enqueues_all_acc
 #if !defined(_WIN32)
     (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+    // Every GDEX_TEST_ASYNC body must remain a coroutine on every platform:
+    // the only co_await lives in the Windows branch, so without an unconditional
+    // co_return the non-Windows build compiles this as an ordinary function and
+    // GDEX_SKIP throws out of start_next_test()'s async_fn() call, which is not
+    // inside a try/catch -> uncaught TestSkipped -> std::terminate. Unreachable,
+    // but it keeps the promise (and its skip capture) in play on Linux/macOS.
+    co_return;
 #else
     godot::RenderingServer *rs = godot::RenderingServer::get_singleton();
     godot::RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
