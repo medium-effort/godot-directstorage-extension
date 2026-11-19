@@ -4,7 +4,6 @@ extends EditorImportPlugin
 
 static var _staging_warnings: Dictionary = {}
 
-const D3D12_TEXTURE_DATA_PITCH_ALIGNMENT := 256
 const DSTEX_MAX_DIMENSION := 16384
 
 const IMPORT_PROFILE_SETTING := "dsgd_extension/default_import_profile"
@@ -327,90 +326,6 @@ func _resolve_color_options(source_file: String, options: Dictionary) -> Diction
 		"compress_source": compress_source,
 	}
 
-## Aligns an integer value up to the nearest multiple of alignment.
-static func _align_up(value: int, alignment: int) -> int:
-	return int((value + alignment - 1) / alignment) * alignment
-
-## Computes the unaligned row byte size and total row count for one mip level.
-static func _get_mip_row_layout(width: int, height: int, format: int) -> Array:
-	var row_bytes := width * 4
-	var row_count := height
-	match format:
-		Image.FORMAT_L8, Image.FORMAT_R8:
-			row_bytes = width
-		Image.FORMAT_LA8, Image.FORMAT_RG8:
-			row_bytes = width * 2
-		Image.FORMAT_RGB8:
-			row_bytes = width * 3
-		Image.FORMAT_RGBA8:
-			row_bytes = width * 4
-		Image.FORMAT_RF:
-			row_bytes = width * 4
-		Image.FORMAT_RGF:
-			row_bytes = width * 8
-		Image.FORMAT_RGBF:
-			row_bytes = width * 12
-		Image.FORMAT_RGBAF:
-			row_bytes = width * 16
-		Image.FORMAT_RH:
-			row_bytes = width * 2
-		Image.FORMAT_RGH:
-			row_bytes = width * 4
-		Image.FORMAT_RGBH:
-			row_bytes = width * 6
-		Image.FORMAT_RGBAH:
-			row_bytes = width * 8
-		Image.FORMAT_R16:
-			row_bytes = width * 2
-		Image.FORMAT_RG16:
-			row_bytes = width * 4
-		Image.FORMAT_RGB16:
-			row_bytes = width * 6
-		Image.FORMAT_RGBA16:
-			row_bytes = width * 8
-		Image.FORMAT_DXT1, Image.FORMAT_RGTC_R:
-			row_bytes = maxi(1, ceili(float(width) / 4.0)) * 8
-			row_count = maxi(1, ceili(float(height) / 4.0))
-		Image.FORMAT_DXT3, Image.FORMAT_DXT5, Image.FORMAT_RGTC_RG, Image.FORMAT_BPTC_RGBA, Image.FORMAT_BPTC_RGBF, Image.FORMAT_BPTC_RGBFU:
-			row_bytes = maxi(1, ceili(float(width) / 4.0)) * 16
-			row_count = maxi(1, ceili(float(height) / 4.0))
-	return [row_bytes, row_count]
-
-## Pads raw texture rows to D3D12 256-byte pitch alignment for direct GPU decompression.
-static func _pad_texture_data(raw_data: PackedByteArray, width: int, height: int, format: int, mip_count: int) -> PackedByteArray:
-	var natural_size := 0
-	var footprint_size := 0
-	var mip_width := width
-	var mip_height := height
-	var layouts: Array[Array] = []
-	for _mip in mip_count:
-		var layout := _get_mip_row_layout(mip_width, mip_height, format)
-		var row_bytes: int = layout[0]
-		var row_count: int = layout[1]
-		var row_pitch := _align_up(row_bytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)
-		layouts.append([row_bytes, row_count, row_pitch])
-		natural_size += row_bytes * row_count
-		footprint_size += row_pitch * row_count
-		mip_width = maxi(1, int(mip_width / 2))
-		mip_height = maxi(1, int(mip_height / 2))
-
-	if raw_data.size() != natural_size:
-		return raw_data
-
-	var padded := PackedByteArray()
-	var source_offset := 0
-	for layout in layouts:
-		var row_bytes: int = layout[0]
-		var row_count: int = layout[1]
-		var row_pitch: int = layout[2]
-		var row_padding := PackedByteArray()
-		row_padding.resize(row_pitch - row_bytes)
-		for row in row_count:
-			padded.append_array(raw_data.slice(source_offset + row * row_bytes, source_offset + (row + 1) * row_bytes))
-			padded.append_array(row_padding)
-		source_offset += row_bytes * row_count
-	return padded
-
 ## Rejects DDS cubemaps, volume textures, and texture arrays before load_dds_from_buffer(),
 ## because Image.load_dds_from_buffer() silently returns only the first 2D slice.
 static func _validate_dds_2d_header(bytes: PackedByteArray, source_file: String) -> Error:
@@ -633,12 +548,14 @@ func _import(source_file: String, save_path: String, options: Dictionary, platfo
 			elif effective_codec != requested_codec:
 				push_warning("[DirectStorage Importer] Asset '%s': requested %s compression unavailable; wrote %s." % [source_file, requested_codec, effective_codec])
 
+	# Hand write_to_file() the natural mip chain: it builds the 256-byte row-pitch
+	# footprint itself (one memcpy per row into a zero-filled buffer), so padding
+	# here would only duplicate that work in GDScript.
 	var raw_data := img.get_data()
 	var width := img.get_width()
 	var height := img.get_height()
 	var format := img.get_format()
 	var mip_count: int = (img.get_mipmap_count() + 1) if img.has_mipmaps() else 1
-	raw_data = _pad_texture_data(raw_data, width, height, format, mip_count)
 	var disk_compression: int = int(options.get("compression/disk_compression", 1))
 	var gdeflate_level: int = int(options.get("compression/gdeflate_level", options.get("compression/level", 1)))
 	var effective_compression_level: int = gdeflate_level if disk_compression == 1 else 0

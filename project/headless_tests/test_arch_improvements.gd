@@ -83,8 +83,7 @@ func _generate_synthetic_dstex(path: String, width: int, height: int, mip_count:
 	if err != OK:
 		return {"error": err}
 
-	var importer_script = load("uid://kqg57i3wmiw")
-	var expected_data: PackedByteArray = importer_script._pad_texture_data(raw_data, width, height, Image.FORMAT_RGBA8, mip_count) if importer_script != null else raw_data
+	var expected_data: PackedByteArray = _pad_rows_rgba8(raw_data, width, height, mip_count)
 	var header: Dictionary = dstex.read_header(path)
 	var decoded: Dictionary = dstex.read_from_file(path)
 	var data_offset: int = decoded["mip_offsets"][0] if decoded.has("mip_offsets") and decoded["mip_offsets"].size() > 0 else (48 + (12 * mip_count))
@@ -101,6 +100,26 @@ func _generate_synthetic_dstex(path: String, width: int, height: int, mip_count:
 		"original_size": header.get("original_size", total_bytes),
 		"header": header
 	}
+
+## Ground truth for the GPU-decompression byte comparisons: the 256-byte
+## row-pitch footprint of an RGBA8 mip chain, built independently of DSTex.
+func _pad_rows_rgba8(raw_data: PackedByteArray, width: int, height: int, mip_count: int) -> PackedByteArray:
+	var padded: PackedByteArray = PackedByteArray()
+	var source_offset: int = 0
+	var w: int = width
+	var h: int = height
+	for _mip in range(mip_count):
+		var row_bytes: int = w * 4
+		var row_pitch: int = int((row_bytes + 255) / 256) * 256
+		var row_padding: PackedByteArray = PackedByteArray()
+		row_padding.resize(row_pitch - row_bytes)
+		for row in range(h):
+			padded.append_array(raw_data.slice(source_offset + row * row_bytes, source_offset + (row + 1) * row_bytes))
+			padded.append_array(row_padding)
+		source_offset += row_bytes * h
+		w = maxi(1, w / 2)
+		h = maxi(1, h / 2)
+	return padded
 
 func _create_request(fix: Dictionary, priority: int = DSRequest.PRIORITY_NORMAL, cancellation_tag: int = 0) -> DSRequest:
 	var req: DSRequest = DSRequest.new()
