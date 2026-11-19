@@ -72,23 +72,92 @@ def load_env_file(repo_root, env_path=None):
     """Fill missing environment variables from .env (env vars keep precedence).
 
     Mirrors SConstruct's load_env_file(): comments, quotes and utf-8-sig BOM
-    tolerated, existing environment values never overwritten.
+    tolerated, existing environment values never overwritten. Supports quoted
+    multiline values ("..." / '...') and lines ending with ';'.
     """
     path = env_path or os.path.join(repo_root, ".env")
     if not os.path.isfile(path):
         return
+    key_assign_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=")
     try:
+        pending_key = None
+        pending_quote = None
+        pending_lines = []
+
+        def flush_pending(strip_outer_quotes=False):
+            if pending_key and pending_key not in os.environ:
+                joined = "\n".join(pending_lines).strip()
+                if strip_outer_quotes:
+                    joined = joined.strip('"').strip("'")
+                os.environ[pending_key] = joined
+
+        def reset_pending():
+            nonlocal pending_key, pending_quote, pending_lines
+            pending_key = None
+            pending_quote = None
+            pending_lines = []
+
         with open(path, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
+            for raw_line in f:
+                line = raw_line.strip()
+                if pending_quote is not None:
+                    if line.endswith(pending_quote):
+                        pending_lines.append(line[:-1])
+                        flush_pending(strip_outer_quotes=False)
+                        reset_pending()
+                    else:
+                        pending_lines.append(line)
+                    continue
+
+                if not line or line.startswith("#"):
+                    continue
+
+                if pending_key is not None and not key_assign_re.match(line):
+                    pending_lines.append(line)
+                    if not line.endswith(";"):
+                        flush_pending(strip_outer_quotes=True)
+                        reset_pending()
+                    continue
+
+                if pending_key is not None:
+                    flush_pending(strip_outer_quotes=True)
+                    reset_pending()
+
+                if "=" in line:
                     key, value = line.split("=", 1)
                     key = key.strip()
-                    value = value.strip().strip('"').strip("'")
-                    if key and key not in os.environ:
-                        os.environ[key] = value
+                    value = value.strip()
+                    if value[:1] in ('"', "'") and not (len(value) >= 2 and value.endswith(value[0])):
+                        pending_key = key
+                        pending_quote = value[0]
+                        pending_lines = [value[1:]]
+                    elif value.endswith(";"):
+                        pending_key = key
+                        pending_lines = [value]
+                    elif key and key not in os.environ:
+                        os.environ[key] = value.strip('"').strip("'")
+        if pending_key is not None:
+            flush_pending(strip_outer_quotes=(pending_quote is None))
     except Exception:
         pass
+
+
+def parse_path_list(raw):
+    """Split a semicolon- or newline-delimited path list, trimming and deduplicating."""
+    if not raw:
+        return []
+    paths = []
+    seen = set()
+    for entry in re.split(r"[;\r\n]+", raw):
+        item = entry.strip().strip('"').strip("'").strip()
+        if not item:
+            continue
+        key = os.path.normcase(os.path.abspath(item))
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(item)
+    return paths
 
 
 # --------------------------------------------------------------------------- #
@@ -353,14 +422,9 @@ def describe_wrong_addon_target(target):
     return ""
 
 
-def sync_addon_target(addon_dir, env, log, dry_run, content_compare=False, target_override=None):
-    """addon dir -> SYNC_ADDON_DIR (or target_override)."""
-    target = (target_override if target_override is not None else env.get("SYNC_ADDON_DIR", "")).strip()
+def _sync_single_addon_target(addon_dir, target, log, dry_run, content_compare=False):
+    """Mirror addon_dir into a single validated addon target directory."""
     result = TargetResult("addon", target)
-    if not target:
-        result.attempted = False
-        log.info("addon    : skipped (SYNC_ADDON_DIR is not configured)")
-        return result
 
     problem = describe_wrong_addon_target(target)
     if problem:
@@ -388,6 +452,27 @@ def sync_addon_target(addon_dir, env, log, dry_run, content_compare=False, targe
         result.error = str(exc)
         log.warn(f"addon target failed ({target}): {exc}")
     return result
+
+
+def sync_addon_targets(addon_dir, env, log, dry_run, content_compare=False, target_override=None):
+    """addon dir -> one or more semicolon-separated SYNC_ADDON_DIR targets."""
+    raw = target_override if target_override is not None else env.get("SYNC_ADDON_DIR", "")
+    targets = parse_path_list(raw)
+    if not targets:
+        result = TargetResult("addon", "")
+        result.attempted = False
+        log.info("addon    : skipped (SYNC_ADDON_DIR is not configured)")
+        return [result]
+
+    return [
+        _sync_single_addon_target(addon_dir, target, log, dry_run, content_compare)
+        for target in targets
+    ]
+
+
+def sync_addon_target(addon_dir, env, log, dry_run, content_compare=False, target_override=None):
+    """addon dir -> single SYNC_ADDON_DIR (kept for single-target callers)."""
+    return sync_addon_targets(addon_dir, env, log, dry_run, content_compare, target_override)[0]
 
 
 def sync_copyable_target(addon_dir, src_dir, env, log, dry_run, content_compare=False):
@@ -496,6 +581,7 @@ def patch_manifest(results, source_root, repo_root, env, log, dry_run):
     addon.setdefault("synced", False)
     addon.setdefault("copied_files_count", 0)
 
+    addon_results = [r for r in attempted if r.name == "addon"]
     for result in attempted:
         if result.name == "test":
             node = pbs
@@ -514,16 +600,40 @@ def patch_manifest(results, source_root, repo_root, env, log, dry_run):
             if result.error:
                 node["error"] = result.error
         elif result.name == "addon":
-            node = addon
-            node["target_path"] = result.target_path
-            node["synced"] = bool(result.synced)
-            node["copied_files_count"] = result.copied
-            if result.error:
-                node["error"] = result.error
+            continue
         else:  # pragma: no cover - defensive
             continue
         if not result.error:
             node.pop("error", None)
+
+    if len(addon_results) == 1:
+        result = addon_results[0]
+        addon["target_path"] = result.target_path
+        addon["synced"] = bool(result.synced)
+        addon["copied_files_count"] = result.copied
+        addon.pop("targets", None)
+        if result.error:
+            addon["error"] = result.error
+        else:
+            addon.pop("error", None)
+    elif addon_results:
+        addon["target_path"] = ";".join(r.target_path for r in addon_results)
+        addon["synced"] = all(r.synced and not r.error for r in addon_results)
+        addon["copied_files_count"] = sum(r.copied for r in addon_results)
+        addon["targets"] = [
+            {
+                "target_path": r.target_path,
+                "synced": bool(r.synced),
+                "copied_files_count": r.copied,
+                **({"error": r.error} if r.error else {}),
+            }
+            for r in addon_results
+        ]
+        errors = [f"{r.target_path}: {r.error}" for r in addon_results if r.error]
+        if errors:
+            addon["error"] = "; ".join(errors)
+        else:
+            addon.pop("error", None)
 
     if dry_run:
         log.info("manifest : would record sync result (dry run)")
@@ -616,7 +726,7 @@ def main(argv=None):
     parser.add_argument("--source-label", default="", dest="source_label",
                         help="name of --source-root for the log (default: derived from the path)")
     parser.add_argument("--addon-dir", default=None, dest="addon_dir",
-                        help="override SYNC_ADDON_DIR for the addon target")
+                        help="override SYNC_ADDON_DIR for the addon target (semicolon-separated for multiple)")
     args = parser.parse_args(argv)
 
     repo_root = os.path.abspath(args.repo_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -655,18 +765,23 @@ def main(argv=None):
     if "copyable" in targets:
         results.append(sync_copyable_target(addon_dir, src_dir, os.environ, log, args.dry_run, content_compare))
     if "addon" in targets:
-        addon_override = os.path.abspath(args.addon_dir) if args.addon_dir else None
-        results.append(sync_addon_target(addon_dir, os.environ, log, args.dry_run, content_compare, addon_override))
+        addon_override = (
+            ";".join(os.path.abspath(p) for p in parse_path_list(args.addon_dir))
+            if args.addon_dir is not None
+            else None
+        )
+        results.extend(sync_addon_targets(addon_dir, os.environ, log, args.dry_run, content_compare, addon_override))
 
     patch_manifest(results, source_root, repo_root, os.environ, log, args.dry_run)
 
     # Orphan report for the addon mirror (files the addon no longer contains).
     if "addon" in targets:
-        addon_result = next((r for r in results if r.name == "addon"), None)
-        if addon_result and addon_result.synced and os.path.isdir(addon_result.target_path):
+        addon_results = [r for r in results if r.name == "addon" and r.synced and os.path.isdir(r.target_path)]
+        for addon_result in addon_results:
             orphans = find_orphans(addon_dir, addon_result.target_path)
             if orphans:
-                log.info(f"orphaned file(s) in mirror ({len(orphans)}) - no longer in the addon:")
+                scope = f" in {addon_result.target_path}" if len(addon_results) > 1 else ""
+                log.info(f"orphaned file(s) in mirror{scope} ({len(orphans)}) - no longer in the addon:")
                 if log.verbose:
                     for orphan in orphans:
                         log.detail(f"- {orphan}")
@@ -675,7 +790,8 @@ def main(argv=None):
                 log.info("remove them manually if they are no longer needed")
 
     attempted = [r for r in results if r.attempted]
-    failed = [r.name for r in attempted if r.error]
+    target_names = list(dict.fromkeys(r.name for r in attempted))
+    failed = list(dict.fromkeys(r.name for r in attempted if r.error))
     copied_total = sum(r.copied for r in attempted)
     src_total = sum(r.src_copied for r in attempted)
 
@@ -683,13 +799,13 @@ def main(argv=None):
         log.info("no sync target configured (SYNC_TEST_DIR / SYNC_ADDON_COPYABLE_DIR / SYNC_ADDON_DIR)")
 
     print(
-        f"[sync] SUMMARY targets={','.join(r.name for r in attempted)} "
+        f"[sync] SUMMARY targets={','.join(target_names)} "
         f"copied={copied_total} src_copied={src_total} failed={','.join(failed) or 'none'}"
         + (f" source={source_label}" if content_compare else ""),
         flush=True,
     )
 
-    fatal_failures = [r.name for r in attempted if r.error and r.name in fatal]
+    fatal_failures = list(dict.fromkeys(r.name for r in attempted if r.error and r.name in fatal))
     if fatal_failures:
         print(f"[sync] ERROR: fatal sync failure in: {', '.join(fatal_failures)}", flush=True)
         return 1
