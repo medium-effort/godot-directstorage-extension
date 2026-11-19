@@ -3,6 +3,7 @@
 #include "compression/gdeflate_compressor.h"
 #include "compression/gdeflate_decompressor.h"
 #include "compression/gdeflate_parallel.h"
+#include "core/ds_cpu_budget.h"
 #include "GDeflate.h"
 #include <godot_cpp/classes/ref.hpp>
 #include <godot_cpp/classes/worker_thread_pool.hpp>
@@ -357,4 +358,30 @@ GDEX_TEST(gdeflate, borderline_incompressible_full_tile_round_trip) {
         GDEX_EXPECT_EQ(decompressed.size(), kTileSize);
         GDEX_EXPECT_TRUE(decompressed == tile);
     }
+}
+
+// Audit 3.2: the old 64-tiles-per-worker floor let a 4 MiB (64-tile) mip fan out
+// to only 2 workers even on a many-core CPU. Assert the dispatched worker count
+// scales with the shared budget, then prove the finer tiling still round-trips.
+GDEX_TEST(gdeflate, compress_small_mip_fans_out_across_cpu_budget) {
+    if (godot::ds_get_max_cpu_threads() < 4) {
+        GDEX_SKIP("Shared CPU budget too small to prove multi-worker fan-out");
+    }
+    godot::PackedByteArray original = make_pattern(kTileSize * 64);
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
+    godot::ds_reset_parallel_for_workers_for_testing();
+    const godot::PackedByteArray compressed = compressor->compress(original, 1);
+    GDEX_EXPECT_GT(compressed.size(), 0);
+    if (compressed.size() == 0) {
+        return;
+    }
+    GDEX_EXPECT_GT(godot::ds_get_last_parallel_for_workers_for_testing(), 2u);
+
+    godot::Ref<godot::GDeflateDecompressor> decompressor;
+    decompressor.instantiate();
+    const godot::PackedByteArray decompressed =
+            decompressor->decompress(compressed, static_cast<int>(original.size()));
+    GDEX_EXPECT_EQ(decompressed.size(), original.size());
+    GDEX_EXPECT_TRUE(decompressed == original);
 }

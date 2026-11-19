@@ -42,6 +42,9 @@ namespace GDeflate
 
     size_t CompressBound(size_t size);
 
+    // p_max_workers caps the workers requested from p_parallelFor; 0 keeps the
+    // codec's legacy hardware-concurrency limit. It is never a hard ceiling on
+    // correctness: one runner always covers every tile.
     bool Compress(
         uint8_t* output,
         size_t* outputSize,
@@ -49,7 +52,8 @@ namespace GDeflate
         size_t inSize,
         uint32_t level,
         uint32_t flags,
-        ParallelForFn p_parallelFor = nullptr);
+        ParallelForFn p_parallelFor = nullptr,
+        uint32_t p_max_workers = 0);
 
     bool Decompress(
         uint8_t* output,

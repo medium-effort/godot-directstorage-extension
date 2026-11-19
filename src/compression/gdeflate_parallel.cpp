@@ -4,6 +4,8 @@
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/worker_thread_pool.hpp>
 
+#include <atomic>
+
 namespace godot {
 
 namespace {
@@ -17,6 +19,10 @@ struct JobBridge {
 // written once on the main thread before any load can dispatch a job, and only read
 // afterwards.
 int g_pool_threads = 1;
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+std::atomic<uint32_t> g_last_parallel_workers{ 0 };
+#endif
 
 void run_element(void *p_user, uint32_t p_index) {
 	JobBridge *bridge = static_cast<JobBridge *>(p_user);
@@ -44,6 +50,9 @@ int ds_gdeflate_get_pool_capacity() {
 }
 
 void ds_gdeflate_parallel_for(void *p_user, void (*p_job)(void *, uint32_t), uint32_t p_workers) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	g_last_parallel_workers.store(p_workers);
+#endif
 	if (p_job == nullptr) {
 		return;
 	}
@@ -69,5 +78,15 @@ void ds_gdeflate_parallel_for(void *p_user, void (*p_job)(void *, uint32_t), uin
 	}
 	pool->wait_for_group_task_completion(group);
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+uint32_t ds_get_last_parallel_for_workers_for_testing() {
+	return g_last_parallel_workers.load();
+}
+
+void ds_reset_parallel_for_workers_for_testing() {
+	g_last_parallel_workers.store(0);
+}
+#endif
 
 } // namespace godot

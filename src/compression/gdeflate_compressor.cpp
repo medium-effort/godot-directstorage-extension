@@ -1,6 +1,7 @@
 #include "gdeflate_compressor.h"
 #include "gdeflate_decompressor.h"
 #include "gdeflate_parallel.h"
+#include "../core/ds_cpu_budget.h"
 #include "../core/ds_error_handler.h"
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -108,7 +109,8 @@ PackedByteArray GDeflateCompressor::compress(const PackedByteArray &p_input, int
 			p_input.size(),
 			static_cast<uint32_t>(level),
 			0,
-			&ds_gdeflate_parallel_for);
+			&ds_gdeflate_parallel_for,
+			static_cast<uint32_t>(ds_get_max_cpu_threads()));
 
 	if (!ok) {
 		report_compression_error("GDeflateCompressor: Compression failed.");

@@ -23,4 +23,11 @@ void ds_gdeflate_init_pool_capacity();
 // logical processors). Used by the shared CPU budget as an upper bound.
 int ds_gdeflate_get_pool_capacity();
 
+// Native-test observation point: the worker count a codec requested on the
+// most recent dispatch. Not bound to ClassDB.
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+uint32_t ds_get_last_parallel_for_workers_for_testing();
+void ds_reset_parallel_for_workers_for_testing();
+#endif
+
 } // namespace godot

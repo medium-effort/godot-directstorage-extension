@@ -44,7 +44,9 @@ struct std::default_delete<libdeflate_gdeflate_compressor>
 namespace GDeflate
 {
     static constexpr uint32_t kMaxWorkers = 31;
-    static constexpr uint32_t kMinTilesPerWorker = 64;
+    // 64 KiB tiles: 8 tiles = 512 KiB of work per runner, so a 4 MiB mip can
+    // use the whole CPU budget instead of the old 2-runner (4 MiB/worker) floor.
+    static constexpr uint32_t kMinTilesPerWorker = 8;
 
     struct OutputStreamWrapper
     {
@@ -180,7 +182,8 @@ namespace GDeflate
         size_t inSize,
         uint32_t level,
         uint32_t flags,
-        ParallelForFn p_parallelFor)
+        ParallelForFn p_parallelFor,
+        uint32_t p_max_workers)
     {
         if (outputSize == nullptr || output == nullptr || in == nullptr || inSize == 0)
             return false;
@@ -196,7 +199,11 @@ namespace GDeflate
         context.tiles.resize(context.numItems);
         context.failed = false;
 
-        const uint32_t maxWorkers = std::min(kMaxWorkers, std::thread::hardware_concurrency());
+        const uint32_t hardwareWorkers = std::min<uint32_t>(
+                kMaxWorkers, std::max<uint32_t>(1u, std::thread::hardware_concurrency()));
+        const uint32_t maxWorkers = p_max_workers == 0
+                ? hardwareWorkers
+                : std::min(hardwareWorkers, p_max_workers);
 
         // The old expression counted extra threads next to the inline one, so the total
         // is one more; a single-thread request stays at one runner.
@@ -284,9 +291,10 @@ namespace GDeflate
         return numTiles * tileSize + sizeof(TileStream) + sizeof(uint64_t);
     }
 
-    bool Compress(uint8_t* output, size_t* outputSize, const uint8_t* in, size_t inSize, uint32_t level, uint32_t flags, ParallelForFn p_parallelFor)
+    bool Compress(uint8_t* output, size_t* outputSize, const uint8_t* in, size_t inSize, uint32_t level,
+            uint32_t flags, ParallelForFn p_parallelFor, uint32_t p_max_workers)
     {
-        return DoCompress(output, outputSize, in, inSize, level, flags, p_parallelFor);
+        return DoCompress(output, outputSize, in, inSize, level, flags, p_parallelFor, p_max_workers);
     }
 
 } // namespace GDeflate
