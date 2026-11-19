@@ -1,4 +1,5 @@
 #include "ds_fallback_backend.h"
+#include "core/ds_cpu_budget.h"
 #include "core/ds_settings.h"
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/os.hpp>
@@ -23,13 +24,7 @@ struct FallbackBackend::WorkerScratch {
 };
 
 FallbackBackend::FallbackBackend() {
-	OS *os = OS::get_singleton();
-	if (os) {
-		int cpus = os->get_processor_count();
-		num_workers = static_cast<uint32_t>(Math::clamp(cpus, 1, 8));
-	} else {
-		num_workers = 4;
-	}
+	num_workers = static_cast<uint32_t>(ds_get_max_cpu_threads());
 }
 
 FallbackBackend::~FallbackBackend() {

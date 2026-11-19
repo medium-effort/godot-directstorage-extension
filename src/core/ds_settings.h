@@ -50,6 +50,8 @@ inline constexpr SettingMapping MIGRATED_SETTINGS[] = {
 	{ "bundle_dspkg", "export/bundle_dspkg" },
 	{ "archive_id", "export/archive_id" },
 	{ "protected", "export/protected" },
+	// Renamed in place: the old dsgd_extension key is moved by register_types.cpp.
+	{ "max_cpu_threads", "cpu_decompression_threads" },
 };
 
 inline bool has_setting(const char *p_suffix, const char *p_legacy_suffix) {

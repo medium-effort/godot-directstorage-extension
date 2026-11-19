@@ -2,6 +2,7 @@
 #include "ds_render_handoff_queue.h"
 #include "../../core/ds_backend_config.h"
 #include "../../core/ds_context.h"
+#include "../../core/ds_cpu_budget.h"
 #include "../../core/ds_error_handler.h"
 #include "../../core/ds_profiler.h"
 #include "core/ds_settings.h"
@@ -3105,13 +3106,9 @@ void Win32Backend::apply_dstorage_configuration() {
 	options.disable_gpu_decompression_metacommand = ctx ? ctx->get_disable_gpu_decompression_metacommand() : false;
 	options.force_disable_bypass_io = ctx ? ctx->get_force_disable_bypass_io() : false;
 	options.force_file_buffering = s_desired_file_buffering.load();
-	options.cpu_decompression_threads = 0;
-	if (ProjectSettings *ps = ProjectSettings::get_singleton()) {
-		const String cpu_threads_key = dsgd_settings::key("cpu_decompression_threads");
-		if (ps->has_setting(cpu_threads_key)) {
-			options.cpu_decompression_threads = static_cast<int32_t>(int64_t(ps->get_setting(cpu_threads_key)));
-		}
-	}
+	// Raw setting, not the resolved budget: 0 must stay 0 so DirectStorage
+	// keeps its own best-guess CPU pool size.
+	options.cpu_decompression_threads = static_cast<int32_t>(ds_get_max_cpu_threads_setting());
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	// Benchmark seams (never bound, debug/dev only). The production decision
 	// comes from the asset volume's media class; the env switches let the probe

@@ -39,6 +39,10 @@ void ds_gdeflate_init_pool_capacity() {
 	g_pool_threads = static_cast<int>(resolved);
 }
 
+int ds_gdeflate_get_pool_capacity() {
+	return g_pool_threads;
+}
+
 void ds_gdeflate_parallel_for(void *p_user, void (*p_job)(void *, uint32_t), uint32_t p_workers) {
 	if (p_job == nullptr) {
 		return;

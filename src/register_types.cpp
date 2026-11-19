@@ -4,6 +4,7 @@
 #include "compression/gdeflate_parallel.h"
 #include "core/ds_build_provenance.h"
 #include "core/ds_context.h"
+#include "core/ds_cpu_budget.h"
 #include "core/ds_crypto.h"
 #include "core/ds_error_handler.h"
 #include "core/ds_pack_scanner.h"
@@ -47,6 +48,17 @@ static void register_directstorage_project_settings() {
 	// beforehand would occupy the new key and mask the user's legacy value.
 	dsgd_settings::migrate_all();
 
+	// Rename inside this namespace too: carry an existing value over before the
+	// new default is registered, then drop the old key so only one knob exists.
+	if (!ps->has_setting(dsgd_settings::key("max_cpu_threads")) &&
+			ps->has_setting(dsgd_settings::key("cpu_decompression_threads"))) {
+		ps->set_setting(dsgd_settings::key("max_cpu_threads"),
+				ps->get_setting(dsgd_settings::key("cpu_decompression_threads")));
+	}
+	if (ps->has_setting(dsgd_settings::key("cpu_decompression_threads"))) {
+		ps->clear(dsgd_settings::key("cpu_decompression_threads"));
+	}
+
 	auto register_setting = [ps](const StringName &p_name, Variant::Type p_type, const Variant &p_default, PropertyHint p_hint, const String &p_hint_string) {
 		if (!ps->has_setting(p_name)) {
 			ps->set_setting(p_name, p_default);
@@ -67,7 +79,7 @@ static void register_directstorage_project_settings() {
 	register_setting(dsgd_settings::key("disable_gpu_decompression"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("disable_gpu_decompression_metacommand"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("force_disable_bypass_io"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
-	register_setting(dsgd_settings::key("cpu_decompression_threads"), Variant::INT, 0, PROPERTY_HINT_RANGE, "0,64,1");
+	register_setting(dsgd_settings::key("max_cpu_threads"), Variant::INT, 0, PROPERTY_HINT_RANGE, "0,32,1");
 	register_setting(dsgd_settings::key("debug_break_on_error"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("queue_capacity"), Variant::INT, 512, PROPERTY_HINT_RANGE, "128,8192,64");
 	register_setting(dsgd_settings::key("auto_tune_for_integrated_gpu"), Variant::BOOL, true, PROPERTY_HINT_NONE, "");
@@ -89,6 +101,7 @@ void initialize_directstorage_accelerator_module(ModuleInitializationLevel p_lev
 	// both values are process-wide and must not be read per decompression.
 	(void)WorkerThreadPool::get_singleton();
 	ds_gdeflate_init_pool_capacity();
+	ds_init_max_cpu_threads(ds_gdeflate_get_pool_capacity());
 
 	ClassDB::register_class<DSContext>();
 	ClassDB::register_class<DSRequest>();

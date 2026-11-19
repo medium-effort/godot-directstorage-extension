@@ -2,6 +2,7 @@
 #include "ds_texture_cache.h"
 #include "core/ds_settings.h"
 #include "../core/ds_context.h"
+#include "../core/ds_cpu_budget.h"
 #include "../core/ds_request.h"
 #include "../formats/dspkg_format.h"
 #include "../formats/dstex_format.h"
@@ -2776,7 +2777,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 	// gameplay streaming caps concurrency (1 offload/slice, 16 MiB in-flight)
 	// so large ImageTexture uploads cannot burst RenderingServer::command_queue.
 	const bool bg_pacing = state().background_pacing.load(std::memory_order_relaxed);
-	const int max_offloads_per_slice = bg_pacing ? 1 : 8;
+	const int max_offloads_per_slice = bg_pacing ? 1 : std::max(2, ds_get_max_cpu_threads());
 	constexpr uint64_t kMaxInFlightBytesLoading = 192ULL * 1024ULL * 1024ULL;
 	constexpr uint64_t kMaxInFlightBytesBackground = 16ULL * 1024ULL * 1024ULL;
 	const uint64_t max_in_flight_bytes = bg_pacing ? kMaxInFlightBytesBackground : kMaxInFlightBytesLoading;

@@ -19,4 +19,8 @@ void ds_gdeflate_parallel_for(void *p_user, void (*p_job)(void *, uint32_t), uin
 // single worker is never waited on.
 void ds_gdeflate_init_pool_capacity();
 
+// Effective pool capacity resolved at module init (a configured -1 means all
+// logical processors). Used by the shared CPU budget as an upper bound.
+int ds_gdeflate_get_pool_capacity();
+
 } // namespace godot

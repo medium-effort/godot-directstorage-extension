@@ -1,5 +1,6 @@
 #include "gdeflate_decompressor.h"
 #include "gdeflate_parallel.h"
+#include "../core/ds_cpu_budget.h"
 #include "../core/ds_error_handler.h"
 #include "../formats/dstex_format.h"
 #include <godot_cpp/classes/os.hpp>
@@ -44,32 +45,14 @@ void GDeflateDecompressor::_bind_methods() {
 }
 
 GDeflateDecompressor::GDeflateDecompressor() {
-	OS *os = OS::get_singleton();
-	if (os) {
-		int cpus = os->get_processor_count();
-		if (cpus < 1) {
-			worker_count = 1;
-		} else if (cpus > 8) {
-			worker_count = 8;
-		} else {
-			worker_count = cpus;
-		}
-	} else {
-		worker_count = 4;
-	}
+	worker_count = ds_get_max_cpu_threads();
 }
 
 GDeflateDecompressor::~GDeflateDecompressor() {
 }
 
 void GDeflateDecompressor::set_worker_count(int p_count) {
-	if (p_count < 1) {
-		worker_count = 1;
-	} else if (p_count > 8) {
-		worker_count = 8;
-	} else {
-		worker_count = p_count;
-	}
+	worker_count = std::clamp(p_count, 1, ds_get_max_cpu_threads());
 }
 
 int GDeflateDecompressor::get_worker_count() const {
