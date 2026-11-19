@@ -1097,8 +1097,11 @@ bool DSContext::initialize_ds_locked() {
 	//
 	// The DirectStorage factory owns up to four staging buffers at the sized
 	// value (system, upload heap, and two VRAM staging buffers on the
-	// GPU-decompression path), so the 128 MiB default is up to ~512 MiB of
-	// residency; that is the residency the low-VRAM tier caps protect.
+	// GPU-decompression path), so the 32 MiB default is up to ~128 MiB of
+	// residency. It was lowered from 128 MiB when 8 MiB chunked imports made a
+	// single 64 MiB mip fit in the default. The tiers below are reduction-only
+	// guardrails: they clamp a *project-configured* larger buffer on low-VRAM
+	// or integrated hardware and never raise the default.
 	if (auto_tune_for_integrated_gpu.load() || auto_tune_for_low_vram_gpu.load()) {
 		const Dictionary adapter = get_gpu_adapter_info();
 		const bool adapter_available = static_cast<bool>(adapter.get("available", false));

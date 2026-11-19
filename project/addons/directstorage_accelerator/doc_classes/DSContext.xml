@@ -272,12 +272,12 @@
 		<method name="set_auto_tune_for_integrated_gpu">
 			<return type="void" />
 			<param index="0" name="enable" type="bool" />
-			<description>Enables or disables integrated-GPU auto-tune (see [member auto_tune_for_integrated_gpu]). When enabled and the PC's graphics share system RAM instead of having dedicated VRAM, the effective staging buffer and queue capacity are lowered to 64 MiB / 256 at initialization. Never raises values; set [code]false[/code] to use your configured values exactly.</description>
+			<description>Enables or disables integrated-GPU auto-tune (see [member auto_tune_for_integrated_gpu]). When enabled and the PC's graphics share system RAM instead of having dedicated VRAM, the effective staging buffer (64 MiB), queue capacity (256), and [code]texture_cache_max_entries[/code] (128) are capped at startup and GPU prewarms route to System RAM. Never raises values; set [code]false[/code] to use your configured values exactly.</description>
 		</method>
 		<method name="set_auto_tune_for_low_vram_gpu">
 			<return type="void" />
 			<param index="0" name="enable" type="bool" />
-			<description>Enables or disables low-VRAM discrete-GPU staging auto-tune (see [member auto_tune_for_low_vram_gpu]). When enabled, a discrete adapter's effective staging buffer is capped by dedicated VRAM (32 MiB under 2 GiB, 64 MiB under 8 GiB; 8 GiB and above are untouched). Never raises values and never changes the queue; set [code]false[/code] to use your configured value exactly.</description>
+			<description>Enables or disables the low-VRAM discrete-GPU guardrail (see [member auto_tune_for_low_vram_gpu]). When enabled, a discrete adapter's [code]texture_cache_max_entries[/code] (128 under 4 GiB, 256 on 4-8 GiB) and any project-raised [code]staging_buffer_size_mb[/code] (32 MiB under 2 GiB, 64 MiB under 8 GiB; 8 GiB and above are untouched) are capped by dedicated VRAM. Never raises values and never changes the queue; set [code]false[/code] to use your configured values exactly.</description>
 		</method>
 		<method name="set_disable_gpu_decompression">
 			<return type="void" />
@@ -310,7 +310,7 @@
 		<method name="set_staging_buffer_size_mb">
 			<return type="void" />
 			<param index="0" name="size_mb" type="int" />
-			<description>Sets the staging buffer size in MiB. A value less than or equal to zero restores the default of [code]128[/code] MiB.</description>
+			<description>Sets the staging buffer size in MiB. A value less than or equal to zero restores the default of [code]32[/code] MiB.</description>
 		</method>
 		<method name="shutdown_ds">
 			<return type="void" />
@@ -337,10 +337,10 @@
 	</methods>
 	<members>
 		<member name="auto_tune_for_integrated_gpu" type="bool" setter="set_auto_tune_for_integrated_gpu" getter="get_auto_tune_for_integrated_gpu" default="true">
-			Automatically shrinks DirectStorage memory usage on integrated GPUs (laptop/handheld graphics that share system RAM instead of having their own VRAM). When [code]true[/code] and such a GPU is detected, the effective staging buffer and queue capacity are lowered to 64 MiB / 256 at startup, and the log states the before/after values. Only ever lowers, never raises: values you set below the caps pass through untouched, your saved settings are never rewritten, and discrete-GPU PCs are unaffected. Set [code]false[/code] for full manual control.
+			Automatically shrinks DirectStorage memory usage on integrated GPUs (laptop/handheld graphics that share system RAM instead of having their own VRAM). When [code]true[/code] and such a GPU is detected, the effective staging buffer (64 MiB), queue capacity (256), and [code]texture_cache_max_entries[/code] (128) are capped at startup, GPU prewarms route to System RAM, and any staging/queue clamp is logged with before/after values. Only ever lowers, never raises: values you set below the caps pass through untouched, your saved settings are never rewritten, and discrete-GPU PCs are unaffected. Set [code]false[/code] for full manual control.
 		</member>
 		<member name="auto_tune_for_low_vram_gpu" type="bool" setter="set_auto_tune_for_low_vram_gpu" getter="get_auto_tune_for_low_vram_gpu" default="true">
-			Caps DirectStorage staging memory on discrete GPUs with little dedicated VRAM. When [code]true[/code], the effective staging buffer is capped at 64 MiB on 2-8 GiB cards and 32 MiB under 2 GiB, and the log states the before/after values. 8 GiB and above are unaffected, the queue is never changed, and a lower configured value passes through untouched. This is independent of [member auto_tune_for_integrated_gpu]. Set [code]false[/code] to use your configured value on every GPU.
+			Player-hardware VRAM guardrail for discrete GPUs with little dedicated VRAM. When [code]true[/code], caps [code]texture_cache_max_entries[/code] (128 under 4 GiB, 256 on 4-8 GiB) so the 512-entry default stays safe on small cards, and clamps any project-raised [code]staging_buffer_size_mb[/code] (64 MiB on 2-8 GiB cards, 32 MiB under 2 GiB, logging before/after values once) since up to four internal staging buffers multiply residency by ~4x. 8 GiB and above are unaffected, the queue is never changed, and lower configured values pass through untouched. Independent of [member auto_tune_for_integrated_gpu]. Set [code]false[/code] to use your configured values verbatim on every GPU.
 		</member>
 		<member name="disable_gpu_decompression" type="bool" setter="set_disable_gpu_decompression" getter="get_disable_gpu_decompression" default="false">
 			If [code]true[/code], forces DirectStorage runtime to perform CPU decompression instead of GPU decompression shaders.
