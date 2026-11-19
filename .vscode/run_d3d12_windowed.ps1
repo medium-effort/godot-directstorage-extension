@@ -78,6 +78,7 @@ param(
     [int]$QuitAfterFrames = 30,
     [int]$TimeoutSec = 180,
     [int]$ShutdownGraceSec = 15,
+    [int]$MinFreeDiskMB = 256,
     [string]$GodotExe = $env:GODOT,
     [switch]$Verbose
 )
@@ -120,6 +121,34 @@ function Write-VerboseHost {
     }
 }
 
+function Test-FixtureDiskSpace {
+    param(
+        [string]$Path,
+        [int]$MinFreeMB = 256
+    )
+    if ($MinFreeMB -le 0) {
+        return @{ Ok = $true; Drive = ""; FreeMB = 0; RequiredMB = $MinFreeMB }
+    }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        $root = [System.IO.Path]::GetPathRoot($full)
+        if (-not $root) {
+            return @{ Ok = $true; Drive = ""; FreeMB = 0; RequiredMB = $MinFreeMB }
+        }
+        $drive = [System.IO.DriveInfo]::new($root)
+        if (-not $drive.IsReady) {
+            return @{ Ok = $true; Drive = $root; FreeMB = 0; RequiredMB = $MinFreeMB }
+        }
+        $freeBytes = [int64]$drive.AvailableFreeSpace
+        $freeMB = [int][Math]::Floor($freeBytes / 1MB)
+        $requiredBytes = [int64]$MinFreeMB * 1MB
+        return @{ Ok = ($freeBytes -ge $requiredBytes); Drive = $root; FreeMB = $freeMB; RequiredMB = $MinFreeMB }
+    } catch {
+        $null = $_
+        return @{ Ok = $true; Drive = ""; FreeMB = 0; RequiredMB = $MinFreeMB }
+    }
+}
+
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $RepoRoot
@@ -139,6 +168,12 @@ elseif ($null -eq $RunGuard.Owned) {
 }
 # $RunGuard (and the Mutex it references) must stay referenced for the rest of
 # the run: dropping the last reference would let the GC release the mutex early.
+
+$diskCheck = Test-FixtureDiskSpace -Path (Join-Path $RepoRoot "build/gdextest/project") -MinFreeMB $MinFreeDiskMB
+if (-not $diskCheck.Ok) {
+    Write-Host ("ERROR: Insufficient free disk space on {0}: {1} MiB available, need at least {2} MiB for fixture staging, Godot GDExtension shadow copy, and test logs. Free space and retry (or pass -MinFreeDiskMB 0 to bypass)." -f $diskCheck.Drive, $diskCheck.FreeMB, $diskCheck.RequiredMB) -ForegroundColor Red
+    exit 1
+}
 
 if (-not $GodotExe) {
     $GodotExe = Get-GodotConsolePath -RepoRoot $RepoRoot
@@ -272,6 +307,11 @@ if ($stillLocked.Count -gt 0) {
     exit 1
 }
 Get-ChildItem -Path $FixtureBin -Filter "~*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+$lockedShadow = @(Get-ChildItem -Path $FixtureBin -Filter "~*.dll" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+if ($lockedShadow.Count -gt 0) {
+    Write-Host ("ERROR: Locked shadow DLL(s) remain in fixture bin: {0}. Another Godot process still holds the test library mapped; stop it and retry." -f ($lockedShadow -join ", ")) -ForegroundColor Red
+    exit 1
+}
 
 $ArgList = @(
     "--editor",
@@ -294,6 +334,7 @@ Write-VerboseHost "Running windowed D3D12 test (hard bound ${TimeoutSec}s, shutd
 $p = Start-Process -FilePath $GodotExe -ArgumentList $ArgList `
     -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr `
     -PassThru -NoNewWindow
+$null = $p.Handle
 
 # Bounded wait in two phases.
 #
@@ -307,15 +348,59 @@ $p = Start-Process -FilePath $GodotExe -ArgumentList $ArgList `
 # $ShutdownGraceSec, then report it as its own failure instead of blaming the
 # suite.
 function Stop-ProcessTree {
-    param([System.Diagnostics.Process]$Process, [int]$GraceMs = 5000)
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [System.Diagnostics.Process]$Process,
+        [int]$GraceMs = 5000
+    )
+    if ($null -eq $Process) {
+        return
+    }
+    if (-not $PSCmdlet.ShouldProcess("PID $($Process.Id)", "Terminate process tree")) {
+        return
+    }
     try {
-        $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $($Process.Id)" -ErrorAction SilentlyContinue
-        foreach ($child in $children) {
-            try { Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+        $allProcs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+        $toVisit = [System.Collections.Generic.Queue[int]]::new()
+        $descendants = [System.Collections.Generic.List[int]]::new()
+        $seen = [System.Collections.Generic.HashSet[int]]::new()
+        $rootPid = [int]$Process.Id
+        $null = $seen.Add($rootPid)
+        $toVisit.Enqueue($rootPid)
+        while ($toVisit.Count -gt 0) {
+            $parentId = $toVisit.Dequeue()
+            foreach ($entry in $allProcs) {
+                if ([int]$entry.ParentProcessId -eq $parentId) {
+                    $cid = [int]$entry.ProcessId
+                    if ($seen.Add($cid)) {
+                        $descendants.Add($cid)
+                        $toVisit.Enqueue($cid)
+                    }
+                }
+            }
         }
-    } catch {}
-    try { if (-not $Process.HasExited) { $Process.Kill() } } catch {}
-    try { $Process.WaitForExit($GraceMs) | Out-Null } catch {}
+        for ($i = $descendants.Count - 1; $i -ge 0; $i--) {
+            try {
+                Stop-Process -Id $descendants[$i] -Force -ErrorAction SilentlyContinue
+            } catch {
+                $null = $_
+            }
+        }
+    } catch {
+        $null = $_
+    }
+    try {
+        if (-not $Process.HasExited) {
+            $Process.Kill()
+        }
+    } catch {
+        $null = $_
+    }
+    try {
+        $null = $Process.WaitForExit($GraceMs)
+    } catch {
+        $null = $_
+    }
 }
 
 $timedOut = $false

@@ -45,6 +45,9 @@ param(
     [string]$RenderingDriver = "",
     [string]$Json = "results.json",
     [string]$GodotExe = ($env:GODOT),
+    [int]$WarmupTimeoutSec = 60,
+    [int]$RunTimeoutSec = 180,
+    [int]$MinFreeDiskMB = 256,
     [switch]$Verbose
 )
 
@@ -109,11 +112,195 @@ function Show-StepFailure {
     exit $Code
 }
 
+function Test-FixtureDiskSpace {
+    param(
+        [string]$Path,
+        [int]$MinFreeMB = 256
+    )
+    if ($MinFreeMB -le 0) {
+        return @{ Ok = $true; Drive = ""; FreeMB = 0; RequiredMB = $MinFreeMB }
+    }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        $root = [System.IO.Path]::GetPathRoot($full)
+        if (-not $root) {
+            return @{ Ok = $true; Drive = ""; FreeMB = 0; RequiredMB = $MinFreeMB }
+        }
+        $drive = [System.IO.DriveInfo]::new($root)
+        if (-not $drive.IsReady) {
+            return @{ Ok = $true; Drive = $root; FreeMB = 0; RequiredMB = $MinFreeMB }
+        }
+        $freeBytes = [int64]$drive.AvailableFreeSpace
+        $freeMB = [int][Math]::Floor($freeBytes / 1MB)
+        $requiredBytes = [int64]$MinFreeMB * 1MB
+        return @{ Ok = ($freeBytes -ge $requiredBytes); Drive = $root; FreeMB = $freeMB; RequiredMB = $MinFreeMB }
+    } catch {
+        $null = $_
+        return @{ Ok = $true; Drive = ""; FreeMB = 0; RequiredMB = $MinFreeMB }
+    }
+}
+
+function Stop-ProcessTree {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [System.Diagnostics.Process]$Process,
+        [int]$GraceMs = 5000
+    )
+    if ($null -eq $Process) {
+        return
+    }
+    if (-not $PSCmdlet.ShouldProcess("PID $($Process.Id)", "Terminate process tree")) {
+        return
+    }
+    try {
+        $allProcs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+        $toVisit = [System.Collections.Generic.Queue[int]]::new()
+        $descendants = [System.Collections.Generic.List[int]]::new()
+        $seen = [System.Collections.Generic.HashSet[int]]::new()
+        $rootPid = [int]$Process.Id
+        $null = $seen.Add($rootPid)
+        $toVisit.Enqueue($rootPid)
+        while ($toVisit.Count -gt 0) {
+            $parentId = $toVisit.Dequeue()
+            foreach ($entry in $allProcs) {
+                if ([int]$entry.ParentProcessId -eq $parentId) {
+                    $cid = [int]$entry.ProcessId
+                    if ($seen.Add($cid)) {
+                        $descendants.Add($cid)
+                        $toVisit.Enqueue($cid)
+                    }
+                }
+            }
+        }
+        for ($i = $descendants.Count - 1; $i -ge 0; $i--) {
+            try {
+                Stop-Process -Id $descendants[$i] -Force -ErrorAction SilentlyContinue
+            } catch {
+                $null = $_
+            }
+        }
+    } catch {
+        $null = $_
+    }
+    try {
+        if (-not $Process.HasExited) {
+            $Process.Kill()
+        }
+    } catch {
+        $null = $_
+    }
+    try {
+        $null = $Process.WaitForExit($GraceMs)
+    } catch {
+        $null = $_
+    }
+}
+
+function Invoke-GodotBounded {
+    param(
+        [string]$Exe,
+        [string[]]$Arguments,
+        [int]$TimeoutSec,
+        [string]$StepName,
+        [string]$LogDir,
+        [string]$LogPrefix
+    )
+    if (-not (Test-Path -LiteralPath $LogDir)) {
+        $null = New-Item -ItemType Directory -Force -Path $LogDir
+    }
+    $outLog = Join-Path $LogDir ("{0}_stdout.log" -f $LogPrefix)
+    $errLog = Join-Path $LogDir ("{0}_stderr.log" -f $LogPrefix)
+    foreach ($logPath in @($outLog, $errLog)) {
+        if (Test-Path -LiteralPath $logPath) {
+            Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $logPath) {
+            return @{ Code = 1; TimedOut = $false; Output = @(); OutLog = $outLog; ErrLog = $errLog; LockedLog = $logPath }
+        }
+    }
+
+    $quotedArgs = @()
+    foreach ($a in $Arguments) {
+        if ($null -eq $a -or $a -eq "") {
+            $quotedArgs += '""'
+        } elseif ($a -match '[\s"]') {
+            $quotedArgs += ('"' + $a.Replace('"', '\"') + '"')
+        } else {
+            $quotedArgs += $a
+        }
+    }
+
+    # Q59: always launch Godot *console*.exe with file-based redirection, never
+    # ProcessStartInfo stdout/stderr pipes, or the console shim hangs indefinitely.
+    $proc = Start-Process -FilePath $Exe -ArgumentList $quotedArgs `
+        -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
+        -PassThru -NoNewWindow
+    $null = $proc.Handle
+
+    $timedOut = $false
+    $exitCode = 1
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        while (-not $proc.HasExited) {
+            if ($TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge $TimeoutSec) {
+                $timedOut = $true
+                Write-ReportText ("Godot exceeded the {0}s {1} timeout; terminating process tree so it cannot keep the fixture DLL mapped." -f $TimeoutSec, $StepName) -ForegroundColor Yellow -IsError
+                Stop-ProcessTree -Process $proc -GraceMs 5000
+                break
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if (-not $timedOut) {
+            $null = $proc.WaitForExit(5000)
+        }
+        if ($timedOut) {
+            $exitCode = 124
+        } elseif ($proc.HasExited) {
+            try {
+                if ($null -ne $proc.ExitCode) {
+                    $exitCode = [int]$proc.ExitCode
+                }
+            } catch {
+                $null = $_
+                $exitCode = 1
+            }
+        }
+    } finally {
+        try {
+            if (-not $proc.HasExited) {
+                Stop-ProcessTree -Process $proc -GraceMs 5000
+            }
+        } catch {
+            $null = $_
+        }
+        $proc.Dispose()
+    }
+
+    $outputLines = @()
+    foreach ($logPath in @($outLog, $errLog)) {
+        if (Test-Path -LiteralPath $logPath) {
+            $lines = Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue
+            if ($lines) {
+                $outputLines += @($lines)
+            }
+        }
+    }
+    return @{ Code = $exitCode; TimedOut = $timedOut; Output = $outputLines; OutLog = $outLog; ErrLog = $errLog; LockedLog = $null }
+}
+
 function Stop-OrphanFixtureProcess {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [string]$FixturePath
     )
+    $resolved = ""
+    if ($FixturePath) {
+        $resolved = [System.IO.Path]::GetFullPath($FixturePath)
+    }
+    $resolvedFwd = $resolved.Replace('\', '/')
+    if (-not $PSCmdlet.ShouldProcess($resolved, "Stop orphan Godot fixture processes and clean shadow DLLs")) {
+        return @()
+    }
     try {
         $godotProcs = Get-Process -Name "*godot*" -ErrorAction SilentlyContinue
         if ($godotProcs) {
@@ -124,13 +311,8 @@ function Stop-OrphanFixtureProcess {
             # parallel agent's fixture process in another worktree, and killing
             # that one is a cross-agent failure that looks like a random test
             # crash. Trade-off: an orphan left by an older runner that passed a
-            # relative --path is not reaped here; the locked-DLL retry below
+            # relative --path is not reaped here; the locked-DLL check below
             # still reports it instead of silently proceeding.
-            $resolved = ""
-            if ($FixturePath) {
-                $resolved = [System.IO.Path]::GetFullPath($FixturePath)
-            }
-            $resolvedFwd = $resolved.Replace('\', '/')
             foreach ($p in $godotProcs) {
                 $match = $false
                 try {
@@ -147,6 +329,14 @@ function Stop-OrphanFixtureProcess {
                 }
                 if ($match) {
                     Write-ReportText "Terminating orphan Godot fixture process (PID $($p.Id))..." -ForegroundColor Yellow
+                    try {
+                        $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $($p.Id)" -ErrorAction SilentlyContinue
+                        foreach ($child in $children) {
+                            Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue
+                        }
+                    } catch {
+                        $null = $_
+                    }
                     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
                     Start-Sleep -Milliseconds 250
                 }
@@ -184,7 +374,10 @@ function Stop-OrphanFixtureProcess {
                 Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
             }
         }
+        $remainingLocked = @(Get-ChildItem -Path $binDir -Filter "~*.dll" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+        return $remainingLocked
     }
+    return @()
 }
 
 function Get-GodotConsolePath {
@@ -295,6 +488,11 @@ elseif ($null -eq $RunGuard.Owned) {
 # $RunGuard (and the Mutex it references) must stay referenced for the rest of
 # the run: dropping the last reference would let the GC release the mutex early.
 
+$diskCheck = Test-FixtureDiskSpace -Path $FixtureAbs -MinFreeMB $MinFreeDiskMB
+if (-not $diskCheck.Ok) {
+    Show-StepFailure -Step "Disk Space Preflight" -Message ("Insufficient free disk space on {0}: {1} MiB available, need at least {2} MiB for fixture staging, Godot GDExtension shadow copy, and test logs. Free space and retry (or pass -MinFreeDiskMB 0 to bypass)." -f $diskCheck.Drive, $diskCheck.FreeMB, $diskCheck.RequiredMB) -Code 1
+}
+
 # Artifact names mirror .gdextest.toml: [gdextest.output] name and
 # [gdextest.fixture] project_name. Keep both in sync with that file.
 $TestLibraryName = "libdsgd_tests"
@@ -324,7 +522,10 @@ if ((-not $?) -or ($null -eq $DoctorCode) -or ($DoctorCode -ne 0)) {
 }
 
 # [2/5] fixture: generate the disposable Godot project for the test library.
-Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
+$lockedShadow = @(Stop-OrphanFixtureProcess -FixturePath $FixtureAbs)
+if ($lockedShadow.Count -gt 0) {
+    Show-StepFailure -Step "Step [2/5] Fixture" -Message ("Locked shadow DLL(s) remain in fixture bin after reaping orphans: {0}. Another process still holds the test library mapped." -f ($lockedShadow -join ", ")) -Code 1
+}
 Write-VerboseHost "[2/5] fixture: generating Godot fixture project..." -ForegroundColor Cyan
 $TestDll = Get-ChildItem -Path "./bin/$TestLibraryName*.dll" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
@@ -450,22 +651,33 @@ $WarmupArgs += $FixtureAbs
 $WarmupArgs += "--quit-after"
 $WarmupArgs += "2"
 
+$LogDir = Join-Path $RepoRoot "build/gdextest"
 $WarmupCode = 1
+$WarmupTimedOut = $false
 for ($attempt = 1; $attempt -le 2; $attempt++) {
-    $ErrorActionPreference = "Continue"
-    & $GodotExe @WarmupArgs *> $null
-    $WarmupCode = $LASTEXITCODE
-    $ErrorActionPreference = "Stop"
-    if ($null -eq $WarmupCode) { $WarmupCode = 1 }
+    $warmup = Invoke-GodotBounded -Exe $GodotExe -Arguments $WarmupArgs -TimeoutSec $WarmupTimeoutSec -StepName "warmup" -LogDir $LogDir -LogPrefix "local_warmup"
+    if ($warmup.LockedLog) {
+        Show-StepFailure -Step "Step [3/5] Warmup" -Message ("Warmup log file is locked by another process: {0}" -f $warmup.LockedLog) -Code 1
+    }
+    $WarmupCode = $warmup.Code
+    $WarmupTimedOut = $warmup.TimedOut
     if ($WarmupCode -eq 0 -or $WarmupCode -eq 134) { break }
+    if ($WarmupTimedOut) {
+        $null = Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
+    }
     Write-VerboseHost "Warmup attempt $attempt exited $WarmupCode; retrying once..." -ForegroundColor Yellow
 }
 if ($WarmupCode -eq 134) {
     Write-VerboseHost "Warmup exited 134 (cold-cache shutdown abort; import completed -- expected per upstream docs/cli.md)." -ForegroundColor Yellow
+} elseif ($WarmupTimedOut) {
+    Show-StepFailure -Step "Step [3/5] Warmup" -Message ("Warmup exceeded {0}s timeout twice and process tree was terminated." -f $WarmupTimeoutSec) -Code 124
 } elseif ($WarmupCode -ne 0) {
     Show-StepFailure -Step "Step [3/5] Warmup" -Message "Warmup pass failed twice." -Code $WarmupCode
 }
-Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
+$lockedAfterWarmup = @(Stop-OrphanFixtureProcess -FixturePath $FixtureAbs)
+if ($lockedAfterWarmup.Count -gt 0) {
+    Show-StepFailure -Step "Step [3/5] Warmup" -Message ("Locked shadow DLL(s) remain after warmup: {0}. Another process still holds the test library mapped." -f ($lockedAfterWarmup -join ", ")) -Code 1
+}
 
 # [4/5] run: renderer flag BEFORE `--`, runner flags AFTER `--`,
 # and never anything else after `--`. Test failures (exit 1) still proceed
@@ -495,17 +707,26 @@ Write-VerboseHost "Godot command: $GodotExe $($GodotArgs -join ' ')" -Foreground
 if (Test-Path $ReportJson) {
     Remove-Item -Force -Path $ReportJson -ErrorAction SilentlyContinue
 }
-# Same EAP relaxation as the warmup: engine warnings on stderr must not abort
-# the run before the JSON is written.
-$ErrorActionPreference = "Continue"
-if ($Verbose) {
-    & $GodotExe @GodotArgs
-} else {
-    $godotOut = & $GodotExe @GodotArgs 2>&1
+$runResult = Invoke-GodotBounded -Exe $GodotExe -Arguments $GodotArgs -TimeoutSec $RunTimeoutSec -StepName "test run" -LogDir $LogDir -LogPrefix "local_run"
+if ($runResult.LockedLog) {
+    Show-StepFailure -Step "Step [4/5] Run" -Message ("Test run log file is locked by another process: {0}" -f $runResult.LockedLog) -Code 1
 }
-$RunCode = $LASTEXITCODE
-$ErrorActionPreference = "Stop"
-if ($null -eq $RunCode) { $RunCode = 1 }
+$RunCode = $runResult.Code
+$godotOut = $runResult.Output
+if ($Verbose -and $godotOut) {
+    foreach ($line in $godotOut) {
+        Write-ReportText $line
+    }
+}
+if ($runResult.TimedOut) {
+    $null = Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
+    if (-not $Verbose -and $godotOut) {
+        Write-ReportText "--- Godot Engine Output (tail) ---" -ForegroundColor Red -IsError
+        $godotOut | Select-Object -Last 30 | ForEach-Object { Write-ReportText $_ -ForegroundColor Red -IsError }
+    }
+    $jsonNote = if (Test-Path $ReportJson) { "results JSON was written; engine shutdown likely hung" } else { "no results JSON written" }
+    Show-StepFailure -Step "Step [4/5] Run" -Message ("Godot test run exceeded {0}s timeout and process tree was terminated ({1})." -f $RunTimeoutSec, $jsonNote) -Code 124
+}
 # Exit 0 = all passed, 1 = test failures (both still write JSON). A negative
 # code (e.g. 0xC0000005-class abort) means the host crashed before writing.
 if ($RunCode -lt 0) {
@@ -522,7 +743,7 @@ if (-not (Test-Path $ReportJson)) {
     }
     Show-StepFailure -Step "Step [4/5] Run" -Message "Test run produced no results file at $ReportJson (exit $RunCode); the suite likely aborted during startup." -Code $(if ($RunCode -ne 0) { $RunCode } else { 1 })
 }
-Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
+$null = Stop-OrphanFixtureProcess -FixturePath $FixtureAbs
 if ($RunCode -ne 0) {
     Write-VerboseHost "Test run exited $RunCode; proceeding to report (report exit code gates the pipeline)." -ForegroundColor Yellow
 }
