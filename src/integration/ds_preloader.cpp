@@ -3082,6 +3082,7 @@ void DSPreloader::shutdown() {
 	{
 		std::lock_guard<std::mutex> lock(state().mutex);
 		state().shutdown_generation++;
+		state().pending_cv.notify_all();
 	}
 	{
 		const uint64_t deadline = Time::get_singleton() ? (Time::get_singleton()->get_ticks_usec() + 5000000ULL) : 0;
@@ -3232,25 +3233,35 @@ Ref<Texture2D> DSPreloader::await_pending_texture(const String &p_path, uint32_t
 	// to complete the in-flight stream request and store the texture into DSTextureCache.
 	std::unique_lock<std::mutex> lock(state().mutex);
 	State &s = state();
+	const uint64_t entry_generation = s.shutdown_generation;
 
 	if (!s.pending_paths.has(p_path)) {
 		lock.unlock();
-		if (cache != nullptr) {
-			return cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
+		DSTextureCache *post_cache = DSTextureCache::get_singleton();
+		if (post_cache != nullptr) {
+			return post_cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
 		}
 		return Ref<Texture2D>();
 	}
 
-	s.pending_cv.wait_for(lock, std::chrono::milliseconds(p_timeout_ms), [&s, &p_path]() {
-		return !s.pending_paths.has(p_path);
+	s.pending_cv.wait_for(lock, std::chrono::milliseconds(p_timeout_ms), [&s, &p_path, entry_generation]() {
+		return !s.pending_paths.has(p_path) || s.shutdown_generation != entry_generation;
 	});
-	if (s.pending_paths.has(p_path)) {
-		UtilityFunctions::print_verbose("[DirectStorage] await_pending_texture timed out waiting for '", p_path, "' after ", (int64_t)p_timeout_ms, " ms; falling through to cache/CPU path.");
-	}
+	const bool shut_down = (s.shutdown_generation != entry_generation);
+	const bool timed_out = !shut_down && s.pending_paths.has(p_path);
 
 	lock.unlock();
-	if (cache != nullptr) {
-		return cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
+	if (shut_down) {
+		return Ref<Texture2D>();
+	}
+	if (timed_out) {
+		UtilityFunctions::print_verbose("[DirectStorage] await_pending_texture timed out waiting for '", p_path, "' after ", (int64_t)p_timeout_ms, " ms; falling through to cache/CPU path.");
+	}
+	// Re-fetch after sleeping: DSTextureCache may have been replaced or torn
+	// down while this thread waited on pending_cv.
+	DSTextureCache *post_cache = DSTextureCache::get_singleton();
+	if (post_cache != nullptr) {
+		return post_cache->get_cached(p_path, DSTextureCache::CACHE_MODE_REUSE);
 	}
 	return Ref<Texture2D>();
 }

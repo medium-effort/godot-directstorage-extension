@@ -36,6 +36,12 @@ namespace godot {
 
 namespace {
 
+// Bounded wait for a threaded ResourceLoader worker that hits a texture already
+// in-flight in DSPreloader. Finite so a stalled prewarm cannot pin a worker
+// indefinitely; on timeout the worker falls through to the duplicate CPU decode
+// rather than blocking the load forever. The main/render-thread path uses 0.
+static constexpr uint32_t kThreadedLoaderAwaitPendingMs = 1000;
+
 // 0 means the archive is unpaired; pairing is the random archive id, compared
 // in full 64-bit width when the expected value is non-zero.
 uint64_t resolve_expected_fingerprint(ProjectSettings * /*p_ps*/) {
@@ -1204,7 +1210,12 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			}
 
 			// In-flight stream entries are pumped on the main/render thread.
-			// Worker threads must never block: fall through to CPU path.
+			// The render thread pumps completions inline (timeout 0). A threaded
+			// loader worker may instead block on a bounded wait: the prewarm pump
+			// is driven by the main/render threads and the worker pool, not by the
+			// waiting thread, so the wait cannot deadlock the pump. The main thread
+			// must never wait here - DSRuntime._process() drives the pump from it,
+			// so blocking would stall the prewarm this call is waiting for.
 			String wait_path;
 			if (DSPreloader::is_texture_pending(p_path)) {
 				wait_path = p_path;
@@ -1215,16 +1226,28 @@ Variant DSResourceFormatLoader::_load(const String &p_path, const String &p_orig
 			if (!wait_path.is_empty()) {
 				RenderingServer *rs_tmp = RenderingServer::get_singleton();
 				bool on_render = rs_tmp != nullptr && rs_tmp->is_on_render_thread();
-				if (on_render) {
-					cached = DSPreloader::await_pending_texture(wait_path, 0);
+				bool on_worker = !Thread::is_main_thread() && !on_render;
+				if (on_render || on_worker) {
+					cached = DSPreloader::await_pending_texture(wait_path, on_render ? 0U : kThreadedLoaderAwaitPendingMs);
 					if (cached.is_valid()) {
 						return cache_hit(cached);
 					}
 				}
-				if (!p_original_path.is_empty() && p_original_path != wait_path) {
-					cached = cache->get_cached(p_original_path, p_cache_mode);
-					if (cached.is_valid()) {
-						return cache_hit(cached);
+				// Re-fetch after a potentially sleeping wait: teardown may have
+				// cleared the cache singleton while we waited on pending_cv.
+				DSTextureCache *post_wait_cache = DSTextureCache::get_singleton();
+				if (post_wait_cache != nullptr) {
+					if (p_path != wait_path) {
+						cached = post_wait_cache->get_cached(p_path, p_cache_mode);
+						if (cached.is_valid()) {
+							return cache_hit(cached);
+						}
+					}
+					if (!p_original_path.is_empty() && p_original_path != wait_path) {
+						cached = post_wait_cache->get_cached(p_original_path, p_cache_mode);
+						if (cached.is_valid()) {
+							return cache_hit(cached);
+						}
 					}
 				}
 			}

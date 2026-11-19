@@ -428,16 +428,16 @@ DSTextureCache::DSTextureCache() {
 }
 
 DSTextureCache::~DSTextureCache() {
-	clear();
-	// Release preloader-held request Refs + archive handle while Godot is
-	// still alive so no Ref outlives module teardown.
-	DSPreloader::shutdown();
 	{
 		std::lock_guard<std::mutex> lock(singleton_mutex);
 		if (singleton == this) {
 			singleton = nullptr;
 		}
 	}
+	clear();
+	// Release preloader-held request Refs + archive handle while Godot is
+	// still alive so no Ref outlives module teardown.
+	DSPreloader::shutdown();
 }
 
 bool DSTextureCache::_is_entry_evictable_locked(const String &p_path, const Ref<Texture2D> &p_texture) const {

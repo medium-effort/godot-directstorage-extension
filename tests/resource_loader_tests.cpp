@@ -2,6 +2,7 @@
 #include "gdextest/registry.h"
 
 #include "core/ds_context.h"
+#include "integration/ds_preloader.h"
 #include "integration/ds_resource_format_loader.h"
 #include "integration/ds_texture_cache.h"
 #include "formats/dspkg_format.h"
@@ -18,6 +19,7 @@
 #include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/classes/resource_format_loader.hpp>
 #include <godot_cpp/classes/resource_loader.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/classes/texture2drd.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
@@ -741,6 +743,280 @@ GDEX_TEST_T(loader, load_outcome_counters_track_each_load, TAG_INTEGRATION) {
 	GDEX_EXPECT_EQ(fallback_total(), fallbacks_after_first);
 
 	remove_user_file(dstex_path);
+}
+
+// Finding 4.2 (high-end hardware scaling audit): a threaded ResourceLoader
+// worker that hits a texture already in-flight in DSPreloader must await that
+// prewarm instead of decoding a duplicate copy on the CPU. Both paths return a
+// valid Texture2D, so the discriminator is the loader outcome counter: the
+// awaited result returns via cache_hit(), the old path via a CPU fallback.
+// Headless-safe: the FallbackBackend builds the texture in poll_completed(),
+// which this test withholds until the worker is already waiting.
+GDEX_TEST_T(loader, worker_thread_awaits_in_flight_prewarm, TAG_INTEGRATION) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	if (!ds->is_initialized() && !ds->initialize_ds()) {
+		GDEX_SKIP("DSContext backend unavailable (initialize_ds failed).");
+	}
+	godot::OS *os = godot::OS::get_singleton();
+	godot::Time *time = godot::Time::get_singleton();
+	if (os == nullptr || time == nullptr) {
+		GDEX_SKIP("OS/Time singletons unavailable.");
+	}
+
+	const char *dstex_path = "user://gdextest_loader_042_await_prewarm.dstex";
+	if (!write_npot_v3_dstex(dstex_path)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+	ctx.add_teardown([dstex_path]() { remove_user_file(dstex_path); });
+
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	cache->clear();
+	// LIFO: the cancel-prewarm teardown registered below runs before this one.
+	ctx.add_teardown([cache]() {
+		godot::DSPreloader::shutdown();
+		cache->clear();
+		memdelete(cache);
+	});
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	auto fallback_total = [ds]() -> int64_t {
+		const godot::Dictionary counts = ds->get_loader_stats()["loader_cpu_fallbacks"];
+		int64_t total = 0;
+		const godot::Array keys = counts.keys();
+		for (int i = 0; i < keys.size(); ++i) {
+			total += static_cast<int64_t>(counts[keys[i]]);
+		}
+		return total;
+	};
+
+	godot::PackedStringArray paths;
+	paths.push_back(godot::String(dstex_path));
+	const uint64_t tag = godot::DSPreloader::prewarm_async(paths);
+	GDEX_ASSERT_TRUE(tag != 0);
+	ctx.add_teardown([ds, tag]() { ds->cancel_prewarm(tag); });
+	// Setup contract: prewarm_async stages + flushes requests but does not build
+	// or store the texture - that happens in poll_completed(), withheld here.
+	GDEX_ASSERT_TRUE(godot::DSPreloader::is_texture_pending(godot::String(dstex_path)));
+
+	const int64_t hits_before = static_cast<int64_t>(ds->get_loader_stats()["loader_cache_hits"]);
+	const int64_t fallbacks_before = fallback_total();
+
+	std::atomic<bool> worker_started{false};
+	godot::Variant worker_result;
+	std::thread worker([&]() {
+		worker_started.store(true);
+		worker_result = loader->_load(godot::String(dstex_path), godot::String(""), false,
+				godot::ResourceFormatLoader::CACHE_MODE_REUSE);
+	});
+	if (!wait_for_flag(worker_started, 5000)) {
+		worker.join();
+		GDEX_FAIL("worker thread did not start");
+		return;
+	}
+	// Let the worker pass the initial cache lookup and enter the bounded await
+	// before the prewarm is completed on this thread.
+	os->delay_msec(100);
+
+	const uint64_t deadline = time->get_ticks_msec() + 10000;
+	while (time->get_ticks_msec() < deadline) {
+		if (ds->has_stream_pending()) {
+			ds->flush_stream_async();
+		}
+		ds->collect_completed_results();
+		cache->poll_completed(tag, 0, 0);
+		if (cache->get_cached(godot::String(dstex_path), godot::DSTextureCache::CACHE_MODE_REUSE).is_valid()) {
+			break;
+		}
+		os->delay_msec(5);
+	}
+	worker.join();
+
+	const godot::Ref<godot::Texture2D> worker_texture(worker_result);
+	GDEX_ASSERT_TRUE(worker_texture.is_valid());
+	godot::Ref<godot::Texture2D> cached_tex = cache->get_cached(godot::String(dstex_path), godot::DSTextureCache::CACHE_MODE_REUSE);
+	GDEX_ASSERT_TRUE(cached_tex.is_valid());
+	GDEX_EXPECT_TRUE(worker_texture.ptr() == cached_tex.ptr());
+	const int64_t hits_after = static_cast<int64_t>(ds->get_loader_stats()["loader_cache_hits"]);
+	const int64_t fallbacks_after = fallback_total();
+	// With the fix the worker returns through cache_hit(); without it the worker
+	// falls through to a duplicate CPU decode (fallback counter, no cache hit).
+	GDEX_EXPECT_GE(hits_after - hits_before, static_cast<int64_t>(1));
+	GDEX_EXPECT_EQ(fallbacks_after - fallbacks_before, static_cast<int64_t>(0));
+}
+
+GDEX_TEST_T(loader, worker_thread_await_falls_back_on_timeout, TAG_INTEGRATION) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	if (!ds->is_initialized() && !ds->initialize_ds()) {
+		GDEX_SKIP("DSContext backend unavailable (initialize_ds failed).");
+	}
+	godot::OS *os = godot::OS::get_singleton();
+	godot::Time *time = godot::Time::get_singleton();
+	if (os == nullptr || time == nullptr) {
+		GDEX_SKIP("OS/Time singletons unavailable.");
+	}
+
+	const char *dstex_path = "user://gdextest_loader_042_await_timeout.dstex";
+	if (!write_npot_v3_dstex(dstex_path)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+	ctx.add_teardown([dstex_path]() { remove_user_file(dstex_path); });
+
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	cache->clear();
+	ctx.add_teardown([cache]() {
+		godot::DSPreloader::shutdown();
+		cache->clear();
+		memdelete(cache);
+	});
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	auto fallback_total = [ds]() -> int64_t {
+		const godot::Dictionary counts = ds->get_loader_stats()["loader_cpu_fallbacks"];
+		int64_t total = 0;
+		const godot::Array keys = counts.keys();
+		for (int i = 0; i < keys.size(); ++i) {
+			total += static_cast<int64_t>(counts[keys[i]]);
+		}
+		return total;
+	};
+
+	godot::PackedStringArray paths;
+	paths.push_back(godot::String(dstex_path));
+	const uint64_t tag = godot::DSPreloader::prewarm_async(paths);
+	GDEX_ASSERT_TRUE(tag != 0);
+	ctx.add_teardown([ds, tag]() {
+		ds->cancel_prewarm(tag);
+		ds->wait_for_completion(2000);
+		ds->collect_completed_results();
+	});
+	GDEX_ASSERT_TRUE(godot::DSPreloader::is_texture_pending(godot::String(dstex_path)));
+
+	const int64_t hits_before = static_cast<int64_t>(ds->get_loader_stats()["loader_cache_hits"]);
+	const int64_t fallbacks_before = fallback_total();
+
+	const uint64_t t0 = time->get_ticks_msec();
+	std::atomic<bool> worker_started{false};
+	godot::Variant worker_result;
+	std::thread worker([&]() {
+		worker_started.store(true);
+		worker_result = loader->_load(godot::String(dstex_path), godot::String(""), false,
+				godot::ResourceFormatLoader::CACHE_MODE_REUSE);
+	});
+	if (!wait_for_flag(worker_started, 5000)) {
+		worker.join();
+		GDEX_FAIL("worker thread did not start");
+		return;
+	}
+	worker.join();
+	const uint64_t elapsed_ms = time->get_ticks_msec() - t0;
+
+	const godot::Ref<godot::Texture2D> worker_texture(worker_result);
+	GDEX_ASSERT_TRUE(worker_texture.is_valid());
+	GDEX_EXPECT_GE(static_cast<int64_t>(elapsed_ms), static_cast<int64_t>(900));
+	GDEX_EXPECT_LT(static_cast<int64_t>(elapsed_ms), static_cast<int64_t>(5000));
+	const int64_t hits_after = static_cast<int64_t>(ds->get_loader_stats()["loader_cache_hits"]);
+	const int64_t fallbacks_after = fallback_total();
+	GDEX_EXPECT_EQ(hits_after - hits_before, static_cast<int64_t>(0));
+	GDEX_EXPECT_GE(fallbacks_after - fallbacks_before, static_cast<int64_t>(1));
+}
+
+GDEX_TEST_T(loader, worker_thread_await_unblocks_on_shutdown, TAG_INTEGRATION) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (ds == nullptr) {
+		GDEX_SKIP("DSContext singleton unavailable.");
+	}
+	if (!ds->is_initialized() && !ds->initialize_ds()) {
+		GDEX_SKIP("DSContext backend unavailable (initialize_ds failed).");
+	}
+	godot::OS *os = godot::OS::get_singleton();
+	godot::Time *time = godot::Time::get_singleton();
+	if (os == nullptr || time == nullptr) {
+		GDEX_SKIP("OS/Time singletons unavailable.");
+	}
+
+	const char *dstex_path = "user://gdextest_loader_042_await_shutdown.dstex";
+	if (!write_npot_v3_dstex(dstex_path)) {
+		GDEX_ABORT_TEST("fixture DSTex write failed");
+	}
+	ctx.add_teardown([dstex_path]() { remove_user_file(dstex_path); });
+
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	cache->clear();
+	ctx.add_teardown([cache]() {
+		godot::DSPreloader::shutdown();
+		cache->clear();
+		memdelete(cache);
+	});
+
+	godot::Ref<godot::DSResourceFormatLoader> loader;
+	loader.instantiate();
+	GDEX_ASSERT_TRUE(loader.is_valid());
+
+	auto fallback_total = [ds]() -> int64_t {
+		const godot::Dictionary counts = ds->get_loader_stats()["loader_cpu_fallbacks"];
+		int64_t total = 0;
+		const godot::Array keys = counts.keys();
+		for (int i = 0; i < keys.size(); ++i) {
+			total += static_cast<int64_t>(counts[keys[i]]);
+		}
+		return total;
+	};
+
+	godot::PackedStringArray paths;
+	paths.push_back(godot::String(dstex_path));
+	const uint64_t tag = godot::DSPreloader::prewarm_async(paths);
+	GDEX_ASSERT_TRUE(tag != 0);
+	ctx.add_teardown([ds, tag]() {
+		ds->cancel_prewarm(tag);
+		ds->wait_for_completion(2000);
+		ds->collect_completed_results();
+	});
+	GDEX_ASSERT_TRUE(godot::DSPreloader::is_texture_pending(godot::String(dstex_path)));
+
+	const int64_t fallbacks_before = fallback_total();
+
+	std::atomic<bool> worker_started{false};
+	godot::Variant worker_result;
+	std::thread worker([&]() {
+		worker_started.store(true);
+		worker_result = loader->_load(godot::String(dstex_path), godot::String(""), false,
+				godot::ResourceFormatLoader::CACHE_MODE_REUSE);
+	});
+	if (!wait_for_flag(worker_started, 5000)) {
+		worker.join();
+		GDEX_FAIL("worker thread did not start");
+		return;
+	}
+	os->delay_msec(100);
+
+	const uint64_t t0 = time->get_ticks_msec();
+	godot::DSPreloader::shutdown();
+	worker.join();
+	const uint64_t wake_ms = time->get_ticks_msec() - t0;
+
+	const godot::Ref<godot::Texture2D> worker_texture(worker_result);
+	GDEX_ASSERT_TRUE(worker_texture.is_valid());
+	GDEX_EXPECT_LT(static_cast<int64_t>(wake_ms), static_cast<int64_t>(500));
+	const int64_t fallbacks_after = fallback_total();
+	GDEX_EXPECT_GE(fallbacks_after - fallbacks_before, static_cast<int64_t>(1));
 }
 
 GDEX_TEST_T(loader, cache_mode_replace_refreshes_entry, TAG_INTEGRATION) {
