@@ -9,6 +9,7 @@
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/texture2drd.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
@@ -395,7 +396,33 @@ DSTextureCache::DSTextureCache() {
 	if (dsgd_settings::has_setting("texture_cache_max_entries", "texture_cache_max_entries")) {
 		max_entries = dsgd_settings::get_setting("texture_cache_max_entries", "texture_cache_max_entries");
 		if (max_entries < 1) {
-			max_entries = 256;
+			max_entries = 512;
+		}
+	}
+	// Reduction-only VRAM guard: the higher default must not turn a small-VRAM
+	// machine's prewarm into residency pressure. Read the settings directly:
+	// this singleton is built before DSContext::initialize_ds() reloads its
+	// auto-tune members, and a user who disabled them must still be honoured.
+	if (DSContext *ctx = DSContext::get_singleton()) {
+		const bool auto_integrated = static_cast<bool>(dsgd_settings::get_setting("auto_tune_for_integrated_gpu", "auto_tune_for_integrated_gpu", Variant(true)));
+		const bool auto_low_vram = static_cast<bool>(dsgd_settings::get_setting("auto_tune_for_low_vram_gpu", "auto_tune_for_low_vram_gpu", Variant(true)));
+		const Dictionary adapter = ctx->get_gpu_adapter_info();
+		const bool available = static_cast<bool>(adapter.get("available", false));
+		const bool integrated = static_cast<bool>(adapter.get("is_uma", false)) ||
+				static_cast<bool>(adapter.get("integrated_gpu_guess", false));
+		const int64_t dedicated_mb = static_cast<int64_t>(adapter.get("dedicated_vram_mb", static_cast<int64_t>(0)));
+		int cap = 0;
+		if (auto_integrated && integrated) {
+			cap = 128;
+		} else if (auto_low_vram && available && !integrated && dedicated_mb > 0) {
+			if (dedicated_mb < 4096) {
+				cap = 128;
+			} else if (dedicated_mb < 8192) {
+				cap = 256;
+			}
+		}
+		if (cap > 0) {
+			max_entries = std::min(max_entries, cap);
 		}
 	}
 }
@@ -446,6 +473,13 @@ bool DSTextureCache::_evict_oldest(std::vector<Ref<Texture2D>> &r_evicted) {
 		if (!cache_map.has(path)) {
 			lru_list.erase(e);
 		} else if (_is_entry_evictable_locked(path, cache_map[path].texture)) {
+			if (cache_map[path].prewarm_origin) {
+				prewarm_evictions++;
+				if (!warned_prewarm_eviction) {
+					warned_prewarm_eviction = true;
+					UtilityFunctions::push_warning("DSTextureCache: a prewarmed texture was evicted before its batch finished; raise dsgd_extension/texture_cache_max_entries or prewarm in smaller batches.");
+				}
+			}
 			r_evicted.push_back(cache_map[path].texture);
 			_remove_entry(path);
 			return true;
@@ -629,7 +663,7 @@ Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode
 	return result;
 }
 
-bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode, const String &p_alias_path) {
+bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode, const String &p_alias_path, bool p_prewarm) {
 	Ref<Texture2D> resident;
 	bool make_resident = false;
 	// Refs of replaced/evicted textures: held until their owned RIDs are
@@ -656,6 +690,7 @@ bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 				evicted.push_back(entry.texture);
 			}
 			entry.texture = p_texture;
+			entry.prewarm_origin = p_prewarm;
 			if (entry.lru_element && entry.lru_element != lru_list.front()) {
 				lru_list.move_to_front(entry.lru_element);
 			}
@@ -684,6 +719,7 @@ bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 			CacheEntry new_entry;
 			new_entry.texture = p_texture;
 			new_entry.lru_element = lru_list.front();
+			new_entry.prewarm_origin = p_prewarm;
 			cache_map[p_path] = new_entry;
 		}
 
@@ -1028,5 +1064,18 @@ int DSTextureCache::get_cached_count() const {
 	std::lock_guard<std::mutex> lock(cache_mutex);
 	return static_cast<int>(cache_map.size());
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+int64_t DSTextureCache::_get_prewarm_eviction_count_for_testing() const {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	return prewarm_evictions;
+}
+
+void DSTextureCache::_reset_prewarm_eviction_stats_for_testing() {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	prewarm_evictions = 0;
+	warned_prewarm_eviction = false;
+}
+#endif
 
 } // namespace godot

@@ -28,12 +28,17 @@ private:
 	static std::mutex singleton_mutex;
 	mutable std::mutex cache_mutex;
 	bool enabled = false;
-	int max_entries = 256;
+	int max_entries = 512;
+	// Evicted prewarm-origin entries (guarded by cache_mutex). One-shot warning
+	// makes the otherwise silent "prewarm self-eviction" failure diagnosable.
+	int prewarm_evictions = 0;
+	bool warned_prewarm_eviction = false;
 
 	struct CacheEntry {
 		Ref<Texture2D> texture;
 		List<String>::Element *lru_element = nullptr;
 		Vector<String> aliases;
+		bool prewarm_origin = false;
 	};
 
 	HashMap<String, CacheEntry> cache_map;
@@ -76,7 +81,9 @@ public:
 	// cleanup. Returning the decision instead of only logging it is what makes
 	// GPU ownership transfer race-free: the caller never assumes a store
 	// succeeded (#0126).
-	bool store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode = CACHE_MODE_REUSE, const String &p_alias_path = String());
+	// p_prewarm marks entries stored by a prewarm batch; evicting one before
+	// its batch finishes is counted/warned once (C++-only, not a new binding).
+	bool store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode = CACHE_MODE_REUSE, const String &p_alias_path = String(), bool p_prewarm = false);
 	void add_alias(const String &p_canonical_path, const String &p_alias_path);
 	void remove_alias(const String &p_alias_path);
 	bool has_alias(const String &p_alias_path) const;
@@ -114,6 +121,11 @@ public:
 	int get_unbuilt_cpu_prewarm_count(uint64_t p_tag = 0) const;
 	int get_unbuilt_gpu_prewarm_count(uint64_t p_tag = 0) const;
 	bool has_gpu_requests_in_flight(uint64_t p_tag = 0) const;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// C++-only test seams; deliberately not bound (no new GDScript surface).
+	int64_t _get_prewarm_eviction_count_for_testing() const;
+	void _reset_prewarm_eviction_stats_for_testing();
+#endif
 	void set_background_pacing(bool p_enabled);
 	bool is_background_pacing() const;
 

@@ -60,7 +60,7 @@ func _run() -> void:
 		"dsgd_extension/disable_gpu_decompression": false,
 		"dsgd_extension/queue_capacity": 512,
 		"dsgd_extension/texture_cache_enabled": true,
-		"dsgd_extension/texture_cache_max_entries": 128,
+		"dsgd_extension/texture_cache_max_entries": 512,
 	}
 	for setting_name in setting_defaults:
 		_check(ProjectSettings.has_setting(setting_name), "ProjectSettings registers " + setting_name)

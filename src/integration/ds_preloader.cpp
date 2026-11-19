@@ -2302,7 +2302,7 @@ void DSPreloader::complete_gpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 	const String alias = (p_entry.meta.payload_key != p_entry.meta.engine_path) ? p_entry.meta.payload_key : String();
 	// can_own() is a pre-check, not a reservation. If the cache was disabled
 	// between it and store(), store() reports refusal and we still own the RID.
-	if (!p_cache->store(p_entry.meta.engine_path, tex_rd, DSTextureCache::CACHE_MODE_REUSE, alias)) {
+	if (!p_cache->store(p_entry.meta.engine_path, tex_rd, DSTextureCache::CACHE_MODE_REUSE, alias, true)) {
 		queue_gpu_orphan_rid(p_entry.gpu_tex_rid);
 		UtilityFunctions::push_warning("DSPreloader: texture cache refused ownership of GPU prewarm texture '", p_entry.meta.engine_path, "' (disabled or raced); releasing its RID.");
 		return;
@@ -2462,7 +2462,7 @@ void DSPreloader::complete_cpu_entry(const Tracked &p_entry, DSTextureCache *p_c
 	const String alias = (p_entry.meta.payload_key != p_entry.meta.engine_path) ? p_entry.meta.payload_key : String();
 	// Report the decision: a refused store (cache disabled or raced) keeps
 	// nothing resident, so it must not count as stored.
-	if (p_cache->store(p_entry.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias)) {
+	if (p_cache->store(p_entry.meta.engine_path, tex, DSTextureCache::CACHE_MODE_REUSE, alias, true)) {
 		r_stored = 1;
 	} else {
 		UtilityFunctions::print_verbose("DSPreloader: cache refused prewarmed texture '", p_entry.meta.engine_path, "'; not counted as stored.");
