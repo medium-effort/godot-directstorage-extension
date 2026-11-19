@@ -275,6 +275,11 @@ public:
 	// Never bound in _bind_methods(): the GDScript surface is unchanged.
 	static Array _debug_plan_gpu_chunk_slices_for_testing(const PackedInt32Array &p_item_requests,
 			const PackedInt64Array &p_item_bytes, int p_item_cap, int p_request_cap, int64_t p_byte_cap);
+	// Test-only dispatch split for one poll_completed() call: CPU entries built
+	// on the calling thread vs posted to WorkerThreadPool. Never bound.
+	static void _reset_poll_dispatch_counters_for_testing();
+	static int _get_last_poll_inline_builds_for_testing();
+	static int _get_last_poll_offloads_for_testing();
 #endif
 
 	friend struct PreloaderUnpackTest;

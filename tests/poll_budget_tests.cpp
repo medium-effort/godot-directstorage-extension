@@ -14,6 +14,7 @@
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
 
+#include "core/ds_cpu_budget.h"
 #include "core/ds_request.h"
 #include "formats/dstex_format.h"
 #include "integration/ds_preloader.h"
@@ -27,6 +28,7 @@
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -167,6 +169,20 @@ bool wait_until_unbuilt(godot::DSTextureCache *p_cache, uint64_t p_tag, int p_ti
 	return p_cache->get_unbuilt_prewarm_count(p_tag) == 0;
 }
 
+// Additional polls let entries the first (item-bounded) slice deliberately
+// left behind drain, so tests can assert the FIRST poll's dispatch split and
+// still finish cleanly.
+bool pump_until_unbuilt(godot::DSTextureCache *p_cache, uint64_t p_tag, int p_rounds) {
+	godot::OS *os = godot::OS::get_singleton();
+	for (int round = 0; round < p_rounds && p_cache->get_unbuilt_prewarm_count(p_tag) > 0; ++round) {
+		p_cache->poll_completed(p_tag, 32, 8000);
+		if (os != nullptr) {
+			os->delay_msec(2);
+		}
+	}
+	return wait_until_unbuilt(p_cache, p_tag, 5000);
+}
+
 } // namespace
 
 // The closure case. Fails at HEAD on three asserts: HEAD stores the entry
@@ -196,6 +212,79 @@ GDEX_TEST_T(poll_budget, first_cpu_item_over_budget_is_offloaded, TAG_UNIT) {
 
 	GDEX_EXPECT_TRUE(wait_until_unbuilt(cache, tag, 5000));
 	GDEX_EXPECT_TRUE(cache->get_cached("user://gdextest_poll_budget_big.png").is_valid());
+}
+
+// Audit 3.1: p_max_items used to cap the candidate SCAN as well as inline
+// completions, so offload candidates past the first two were never examined.
+GDEX_TEST_T(poll_budget, offload_scans_beyond_item_budget, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF0151ULL;
+	const int budget = std::max(2, godot::ds_get_max_cpu_threads());
+	const int entries = 2 + budget + 4;
+	for (int i = 0; i < entries; ++i) {
+		godot::DSPreloader::Payload meta = make_payload("user://gdextest_poll_scan.png", 1024);
+		meta.original_size = 4ULL * 1024ULL * 1024ULL;
+		meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(meta.original_size));
+		godot::PackedByteArray data;
+		data.resize(static_cast<int64_t>(meta.original_size));
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	}
+	warm_worker_pool();
+
+	cache->poll_completed(tag, 2, 8000);
+	GDEX_EXPECT_GE(godot::DSPreloader::_get_last_poll_offloads_for_testing(), budget - 1);
+	GDEX_EXPECT_TRUE(pump_until_unbuilt(cache, tag, 16));
+}
+
+// Audit 3.1: loading-mode slices must seed parallel builds before spending the
+// 8 ms slice building small textures serially on the single poll worker.
+GDEX_TEST_T(poll_budget, loading_poll_seeds_parallel_builds_first, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF0152ULL;
+	for (int i = 0; i < 8; ++i) {
+		godot::DSPreloader::Payload meta = make_payload("user://gdextest_poll_parallel.png", 1024);
+		meta.original_size = 4ULL * 1024ULL * 1024ULL;
+		meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(meta.original_size));
+		godot::PackedByteArray data;
+		data.resize(static_cast<int64_t>(meta.original_size));
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	}
+	warm_worker_pool();
+
+	cache->poll_completed(tag, 8, 8000);
+	GDEX_EXPECT_LE(godot::DSPreloader::_get_last_poll_inline_builds_for_testing(), 1);
+	GDEX_EXPECT_GE(godot::DSPreloader::_get_last_poll_offloads_for_testing(), 6);
+	GDEX_EXPECT_TRUE(pump_until_unbuilt(cache, tag, 16));
+}
+
+// Guard: a named essential entry must never be handed to a worker, even when
+// the seeding pass runs, or await_pending_texture() would miss and duplicate it.
+GDEX_TEST_T(poll_budget, loading_poll_keeps_essential_entry_inline, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF0153ULL;
+	const char *essential_path = "user://gdextest_poll_essential.png";
+	{
+		godot::DSPreloader::Payload meta = make_payload(essential_path, 256);
+		meta.height = 4;
+		meta.original_size = 4096;
+		meta.mip_uncompressed_sizes.push_back(4096);
+		godot::PackedByteArray data;
+		data.resize(4096);
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	}
+	for (int i = 0; i < 4; ++i) {
+		godot::DSPreloader::Payload meta = make_payload("user://gdextest_poll_essential_other.png", 1024);
+		meta.original_size = 4ULL * 1024ULL * 1024ULL;
+		meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(meta.original_size));
+		godot::PackedByteArray data;
+		data.resize(static_cast<int64_t>(meta.original_size));
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	}
+	warm_worker_pool();
+
+	godot::DSPreloader::poll_completed(tag, 8, 8000, essential_path, false);
+	GDEX_EXPECT_TRUE(cache->get_cached(essential_path).is_valid());
+	GDEX_EXPECT_TRUE(pump_until_unbuilt(cache, tag, 16));
 }
 
 // Control: a small entry still builds inline in the same call. Guards against a
@@ -391,8 +480,11 @@ GDEX_TEST_T(poll_budget, gpu_only_poll_leaves_cpu_entries_for_worker, TAG_UNIT) 
 	GDEX_EXPECT_EQ(cache->get_unbuilt_gpu_prewarm_count(tag), 0);
 	GDEX_EXPECT_EQ(cache->get_unbuilt_cpu_prewarm_count(tag), 2);
 
+	// Loading-mode parallel-first keeps one inline runner and seeds the second
+	// to the worker pool even though both would fit the slice.
 	const int cpu_stored = cache->poll_completed(tag, 32, 2000, false);
-	GDEX_EXPECT_EQ(cpu_stored, 2);
+	GDEX_EXPECT_EQ(cpu_stored, 1);
+	GDEX_EXPECT_TRUE(pump_until_unbuilt(cache, tag, 8));
 	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
 }
 

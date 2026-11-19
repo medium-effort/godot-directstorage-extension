@@ -30,10 +30,16 @@
 #include <godot_cpp/variant/vector2i.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
 namespace godot {
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+static std::atomic<int> s_last_poll_inline_builds{ 0 };
+static std::atomic<int> s_last_poll_offloads{ 0 };
+#endif
 
 // Upper bound per prewarm request output buffer. The sync loader imposes no
 // cap, but prewarm fans out to dozens of speculative buffers, so a corrupt
@@ -2673,7 +2679,26 @@ Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vect
 	return Ref<Texture2D>();
 }
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+void DSPreloader::_reset_poll_dispatch_counters_for_testing() {
+	s_last_poll_inline_builds.store(0);
+	s_last_poll_offloads.store(0);
+}
+
+int DSPreloader::_get_last_poll_inline_builds_for_testing() {
+	return s_last_poll_inline_builds.load();
+}
+
+int DSPreloader::_get_last_poll_offloads_for_testing() {
+	return s_last_poll_offloads.load();
+}
+#endif
+
 int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_usec, const String &p_essential_path, bool p_gpu_only) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	s_last_poll_inline_builds.store(0);
+	s_last_poll_offloads.store(0);
+#endif
 	DSTextureCache *cache = DSTextureCache::get_singleton();
 	if (cache == nullptr) {
 		UtilityFunctions::push_warning("DSPreloader: DSTextureCache singleton unavailable during poll.");
@@ -2713,6 +2738,20 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 	// GPU entries wrap Texture2DRD (main/render-thread-only): worker polls
 	// skip them in the scan below and leave them for the main-thread poll.
 	const bool can_build_gpu = main_or_render_thread();
+
+	// Mode and offload budgets drive both the scan width and the dispatch
+	// split, so resolve them before collecting candidates.
+	const bool bg_pacing = state().background_pacing.load(std::memory_order_relaxed);
+	const int max_offloads_per_slice = bg_pacing ? 1 : std::max(2, ds_get_max_cpu_threads());
+	// Only bounded loading slices seed parallel builds up front: background
+	// pacing keeps its 1-offload cap, and unbounded callers keep the fit-first
+	// path used by await_pending_texture's essential entry.
+	const bool parallel_first = !bg_pacing && p_max_usec > 0 && !p_gpu_only;
+	constexpr uint64_t kMaxInFlightBytesLoading = 192ULL * 1024ULL * 1024ULL;
+	constexpr uint64_t kMaxInFlightBytesBackground = 16ULL * 1024ULL * 1024ULL;
+	const uint64_t max_in_flight_bytes = bg_pacing ? kMaxInFlightBytesBackground : kMaxInFlightBytesLoading;
+	const int scan_limit = p_max_items > 0 ? p_max_items + (parallel_first ? max_offloads_per_slice : 0) : 0;
+	int offloads = 0;
 
 	// Single-scan collect: gather terminal entry IDs under one lock instead
 	// of re-scanning the full pending map after every build (O(N^2)).
@@ -2760,7 +2799,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 				} else {
 					cpu_terminal_ids.push_back(it->first);
 				}
-				if (p_max_items > 0 && (int)(gpu_terminal_ids.size() + cpu_terminal_ids.size() + processed) >= p_max_items) {
+				if (scan_limit > 0 && (int)(gpu_terminal_ids.size() + cpu_terminal_ids.size()) >= scan_limit) {
 					break;
 				}
 			}
@@ -2770,18 +2809,46 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 		terminal_ids.insert(terminal_ids.end(), cpu_terminal_ids.begin(), cpu_terminal_ids.end());
 	}
 
+	// Loading screens: seed WorkerThreadPool with ready CPU entries BEFORE the
+	// single poll thread spends its microsecond slice building textures inline.
+	// One offload slot and the named essential entry stay with the main loop.
+	if (parallel_first && p_max_items > 0) {
+		bool inline_runner_reserved = false;
+		for (size_t si = 0; si < terminal_ids.size() && offloads + 1 < max_offloads_per_slice; ++si) {
+			const int64_t candidate_id = terminal_ids[si];
+			bool should_offload = false;
+			{
+				std::lock_guard<std::mutex> lock(state().mutex);
+				State &s = state();
+				std::unordered_map<int64_t, Tracked>::const_iterator it = s.pending.find(candidate_id);
+				if (it != s.pending.end()) {
+					const Tracked &cand = it->second;
+					const bool essential = !p_essential_path.is_empty() &&
+							(cand.meta.engine_path == p_essential_path ||
+									cand.meta.payload_key == p_essential_path);
+					if (!cand.is_gpu && !cand.build_in_flight && !essential &&
+							(p_tag == 0 || cand.tag == p_tag)) {
+						if (!inline_runner_reserved) {
+							inline_runner_reserved = true;
+						} else {
+							const uint64_t est_bytes = estimate_payload_bytes(cand.meta);
+							should_offload = (s.in_flight_builds == 0) ||
+									(s.in_flight_build_bytes + est_bytes <= max_in_flight_bytes);
+						}
+					}
+				}
+			}
+			if (should_offload && offload_cpu_build_locked(candidate_id)) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+				s_last_poll_offloads.fetch_add(1);
+#endif
+				++offloads;
+			}
+		}
+	}
+
 	uint64_t slice_bytes_processed = 0;
 	constexpr uint64_t kMaxBytesPerSlice = 64ULL * 1024ULL * 1024ULL; // 64 MiB slice cap
-	// Offload limits depend on streaming mode: loading screens saturate
-	// multi-core CPUs (up to 8 offloads/slice, 192 MiB in-flight); background
-	// gameplay streaming caps concurrency (1 offload/slice, 16 MiB in-flight)
-	// so large ImageTexture uploads cannot burst RenderingServer::command_queue.
-	const bool bg_pacing = state().background_pacing.load(std::memory_order_relaxed);
-	const int max_offloads_per_slice = bg_pacing ? 1 : std::max(2, ds_get_max_cpu_threads());
-	constexpr uint64_t kMaxInFlightBytesLoading = 192ULL * 1024ULL * 1024ULL;
-	constexpr uint64_t kMaxInFlightBytesBackground = 16ULL * 1024ULL * 1024ULL;
-	const uint64_t max_in_flight_bytes = bg_pacing ? kMaxInFlightBytesBackground : kMaxInFlightBytesLoading;
-	int offloads = 0;
 
 	for (size_t ti = 0; ti < terminal_ids.size(); ++ti) {
 		if (p_max_items > 0 && processed >= p_max_items) {
@@ -2850,6 +2917,9 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 						// Budget for this slice or in-flight byte cap is spent; the next call offloads more.
 						budget_exhausted = true;
 					} else if (offload_cpu_build_locked(it->first)) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+						s_last_poll_offloads.fetch_add(1);
+#endif
 						offloaded = true;
 					} else {
 						// No usable worker pool: build inline so the stream still
@@ -2877,6 +2947,9 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 			complete_gpu_entry(t, cache, stored);
 			slice_bytes_processed += estimate_payload_bytes(t.meta);
 		} else {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+			s_last_poll_inline_builds.fetch_add(1);
+#endif
 			int cpu_stored = 0;
 			uint64_t entry_bytes = 0;
 			complete_cpu_entry(t, cache, cpu_stored, entry_bytes);
