@@ -2058,6 +2058,63 @@ GDEX_TEST_T(win32_remediation, runtime_configuration_applies_per_loaded_instance
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, runtime_configuration_survives_module_release, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    godot::DSContext *ds = godot::DSContext::get_singleton();
+    if (ds == nullptr) {
+        GDEX_SKIP("DSContext singleton absent: real extension not loaded in this fixture.");
+    }
+    // A live backend owns a dstorage.dll reference of its own, and the control leg needs
+    // the module to be able to disappear; park the context for the duration.
+    const bool was_initialized = ds->is_initialized();
+    if (was_initialized) {
+        ds->shutdown_ds();
+    }
+    ctx.add_teardown([ds, was_initialized]() {
+        if (was_initialized && !ds->is_initialized()) {
+            ds->initialize_ds();
+        }
+    });
+
+    if (!godot::Win32Backend::probe_system_support()) {
+        GDEX_SKIP("DirectStorage runtime or a supported drive is absent on this machine.");
+    }
+
+    // A1: one live, configured, stashed instance.
+    GDEX_EXPECT_TRUE(godot::Win32Backend::probe_system_support());
+    const int64_t applied_before =
+            static_cast<int64_t>(godot::Win32Backend::_debug_dstorage_config_apply_count());
+
+    // A2: the next probe loads its own reference before releasing the stashed one, so the
+    // instance survives the swap. Its configuration is still in the module and must not be
+    // applied again.
+    GDEX_EXPECT_TRUE(godot::Win32Backend::probe_system_support());
+    const int64_t applied_after =
+            static_cast<int64_t>(godot::Win32Backend::_debug_dstorage_config_apply_count());
+    GDEX_FAIL_UNLESS(applied_after == applied_before,
+            std::string("a probe cycle re-applied DStorageSetConfiguration (") +
+            std::to_string(applied_before) + " -> " + std::to_string(applied_after) +
+            ") although the same module instance stayed loaded");
+
+    // A3 control: once the instance really goes away, the next load must configure again,
+    // so A2 cannot be satisfied by an apply path that stopped running.
+    godot::Win32Backend *unloader = memnew(godot::Win32Backend);
+    unloader->shutdown();
+    memdelete(unloader);
+    GDEX_EXPECT_TRUE(godot::Win32Backend::probe_system_support());
+    GDEX_EXPECT_EQ(static_cast<int64_t>(godot::Win32Backend::_debug_dstorage_config_apply_count()),
+            applied_after + 1);
+#else
+    (void)ctx;
+    GDEX_SKIP("The runtime-configuration counter is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 GDEX_TEST_T(win32_remediation, runtime_module_load_uses_hardened_search_flags, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)

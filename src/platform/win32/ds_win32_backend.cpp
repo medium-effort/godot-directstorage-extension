@@ -156,7 +156,16 @@ struct DSRuntimeProbe {
 // instance after the first running on SDK defaults (telemetry on, the GPU
 // decompression preference ignored).
 static std::mutex s_dstorage_config_mutex;
+// The instance the marker names, as a (module, load epoch) pair. A release only drops one
+// reference, and GetModuleHandleW() cannot tell "our last reference went away" from "the
+// loader still has the DLL resident for a delay-load binding" - so identity is tracked by
+// OUR own reference count instead. The epoch rises when that count goes 0 -> 1, i.e. a new
+// instance cycle begins: a release that leaves another of our references alive cannot
+// invalidate the configuration, while the next load after the last release re-applies it.
 static HMODULE s_dstorage_configured_module = nullptr;
+static uint64_t s_dstorage_configured_epoch = 0;
+static uint64_t s_dstorage_load_epoch = 0;
+static uint32_t s_dstorage_ref_count = 0;
 static std::atomic<int> s_dstorage_config_apply_count{ 0 };
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 // Test-only: last byte count handed to SetStagingBufferSize (no factory getter).
@@ -170,20 +179,17 @@ static std::atomic<bool> s_desired_file_buffering{ false };
 // Mode actually applied to s_dstorage_configured_module, for mismatch warnings.
 static std::atomic<bool> s_applied_file_buffering{ false };
 
-// Any release of dstorage.dll invalidates the marker: the settings did not survive
-// with it, and the loader may hand the same base address out again for a different
-// instance. A call that frees nothing (both handles null) must not clear it, or a
-// probe that replaces an empty stash would immediately forget what it just applied.
-static void forget_dstorage_configuration() {
-	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
-	s_dstorage_configured_module = nullptr;
+// Caller holds s_dstorage_config_mutex.
+static bool has_live_dstorage_configuration_locked() {
+	return s_dstorage_configured_module != nullptr &&
+			s_dstorage_ref_count > 0 &&
+			s_dstorage_configured_epoch == s_dstorage_load_epoch;
 }
 
 static void unload_runtime_modules(HMODULE p_core, HMODULE p_dstorage) {
-	if (p_dstorage) {
-		forget_dstorage_configuration();
-		FreeLibrary(p_dstorage);
-	}
+	// Only the reference goes away. Whether the settings survive is decided by the load
+	// epoch, not by this call: another owner may still hold the same instance.
+	Win32Backend::release_runtime_module(p_dstorage);
 	if (p_core) {
 		FreeLibrary(p_core);
 	}
@@ -215,7 +221,19 @@ HMODULE Win32Backend::load_runtime_module(const String &p_dir, const char *p_dll
 		s_last_runtime_load_flags = kRuntimeModuleSearchFlags;
 	}
 #endif
-	return LoadLibraryExW(w_path.c_str(), nullptr, kRuntimeModuleSearchFlags);
+	// Taking the lock across the load and the count update makes the epoch bump atomic
+	// against release_runtime_module() and apply_dstorage_configuration().
+	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
+	HMODULE module = LoadLibraryExW(w_path.c_str(), nullptr, kRuntimeModuleSearchFlags);
+	if (module != nullptr && std::strcmp(p_dll_name, "dstorage.dll") == 0) {
+		// An own-reference count, not GetModuleHandleW(): the loader can keep the DLL
+		// resident for a delay-load binding long after we dropped our last reference.
+		if (s_dstorage_ref_count == 0) {
+			++s_dstorage_load_epoch;
+		}
+		++s_dstorage_ref_count;
+	}
+	return module;
 }
 
 #if defined(_WIN32) && defined(_MSC_VER)
@@ -3081,15 +3099,6 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 
 #ifdef _WIN32
 void Win32Backend::apply_dstorage_configuration() {
-	// Every caller has just loaded or claimed the runtime modules, so the instance to
-	// configure is whatever `dstorage.dll` resolves to right now. Asking the loader
-	// instead of taking a handle parameter keeps this callable from DSContext during
-	// the pre-initialization capability probe, which owns the same modules.
-	HMODULE current_module = GetModuleHandleW(L"dstorage.dll");
-	if (current_module == nullptr) {
-		return;
-	}
-
 	DSContext *ctx = DSContext::get_singleton();
 	DSBackendConfigOptions options;
 	options.disable_gpu_decompression = ctx ? ctx->get_disable_gpu_decompression() : false;
@@ -3122,7 +3131,13 @@ void Win32Backend::apply_dstorage_configuration() {
 	const DSResolvedBackendConfig resolved = resolve_backend_config(options);
 
 	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
-	if (s_dstorage_configured_module == current_module) {
+	// Sampled under the lock: a concurrent load bumps the epoch, so this pair either
+	// describes the instance configured below or an older one.
+	const HMODULE current_module = GetModuleHandleW(L"dstorage.dll");
+	if (current_module == nullptr) {
+		return;
+	}
+	if (has_live_dstorage_configuration_locked()) {
 		if (s_applied_file_buffering.load() != resolved.force_file_buffering) {
 			UtilityFunctions::push_warning("[DirectStorage] I/O mode changed after the runtime was configured (requested " +
 					String(resolved.force_file_buffering ? "buffered" : "unbuffered") +
@@ -3169,12 +3184,23 @@ void Win32Backend::apply_dstorage_configuration() {
 	// Recorded either way: once a factory exists this call cannot succeed on the same
 	// instance, so retrying it would only repeat the failure log.
 	s_dstorage_configured_module = current_module;
+	s_dstorage_configured_epoch = s_dstorage_load_epoch;
 	s_applied_file_buffering.store(resolved.force_file_buffering);
 	s_dstorage_config_apply_count.fetch_add(1);
 }
 
-void Win32Backend::notify_runtime_modules_released() {
-	forget_dstorage_configuration();
+void Win32Backend::release_runtime_module(HMODULE p_module) {
+	if (p_module == nullptr) {
+		return;
+	}
+	// Serialised against load_runtime_module() so the count cannot be decremented while a
+	// load is deciding whether it starts a new instance cycle. The epoch is *not* bumped
+	// here: the next load from a zero count does that.
+	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
+	if (s_dstorage_ref_count > 0) {
+		--s_dstorage_ref_count;
+	}
+	FreeLibrary(p_module);
 }
 
 PackedStringArray Win32Backend::get_runtime_search_dirs() {
@@ -3332,7 +3358,9 @@ bool Win32Backend::probe_system_support() {
 	// configuration.
 	{
 		std::lock_guard<std::mutex> config_lock(s_dstorage_config_mutex);
-		if (s_dstorage_configured_module == nullptr) {
+		// Never overwrite a mode initialize() already applied; a marker that no longer
+		// names the loaded instance is not a live configuration.
+		if (!has_live_dstorage_configuration_locked()) {
 			s_desired_file_buffering.store(static_cast<bool>(drive_info.get("rotational", false)));
 		}
 	}
@@ -3356,7 +3384,6 @@ bool Win32Backend::probe_system_support() {
 }
 #else
 void Win32Backend::apply_dstorage_configuration() {}
-void Win32Backend::notify_runtime_modules_released() {}
 bool Win32Backend::probe_system_support() { return false; }
 PackedStringArray Win32Backend::get_runtime_search_dirs() { return PackedStringArray(); }
 Dictionary Win32Backend::get_runtime_info() { return Dictionary(); }

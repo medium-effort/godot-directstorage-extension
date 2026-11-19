@@ -321,10 +321,10 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 	}
 
 	if (release_dstorage_module) {
-		// The settings lived in the module just dropped; a later load is a different
-		// instance and must be configured again.
-		Win32Backend::notify_runtime_modules_released();
-		FreeLibrary(dstorage_module);
+		// The settings live in the module instance. Dropping only this reference does not
+		// discard them while another owner still has the module loaded, so the release -
+		// not a marker reset - is what decides whether they survived.
+		Win32Backend::release_runtime_module(dstorage_module);
 	}
 	if (release_core_module) {
 		FreeLibrary(core_module);

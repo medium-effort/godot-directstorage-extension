@@ -400,10 +400,6 @@ public:
 	~Win32Backend() override { shutdown(); }
 
 	static void apply_dstorage_configuration();
-	// Called by the context's capability probe after it releases runtime modules it
-	// loaded itself: the configuration does not survive with the module, and the
-	// loader may hand the same base address out again for a different instance.
-	static void notify_runtime_modules_released();
 	static bool probe_system_support();
 	// Candidate directories that may hold dstorage.dll / dstoragecore.dll,
 	// in lookup order. The addon bin dir covers the editor and dev runs;
@@ -439,6 +435,10 @@ public:
 	// Returns null on failure. The caller owns the reference and must FreeLibrary
 	// it; nothing here changes the module's lifetime.
 	static HMODULE load_runtime_module(const String &p_dir, const char *p_dll_name);
+	// Releases a runtime DLL handle returned by load_runtime_module(). Serialised with the
+	// loader and with apply_dstorage_configuration(); it never changes which instance is
+	// considered configured - the load epoch does that.
+	static void release_runtime_module(HMODULE p_module);
 #endif
 
 	bool is_available() const override;
