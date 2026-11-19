@@ -2747,8 +2747,15 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 	// pacing keeps its 1-offload cap, and unbounded callers keep the fit-first
 	// path used by await_pending_texture's essential entry.
 	const bool parallel_first = !bg_pacing && p_max_usec > 0 && !p_gpu_only;
-	constexpr uint64_t kMaxInFlightBytesLoading = 192ULL * 1024ULL * 1024ULL;
+	constexpr uint64_t kInFlightBytesPerCpuWorker = 32ULL * 1024ULL * 1024ULL;
+	constexpr uint64_t kMaxInFlightBytesLoadingCeiling = 512ULL * 1024ULL * 1024ULL;
 	constexpr uint64_t kMaxInFlightBytesBackground = 16ULL * 1024ULL * 1024ULL;
+	// Loading screens scale the in-flight byte budget with the same CPU budget
+	// that sizes the offload fan-out. Background streaming stays at 16 MiB so
+	// large ImageTexture uploads cannot burst RenderingServer::command_queue.
+	const uint64_t kMaxInFlightBytesLoading = std::min<uint64_t>(
+			kMaxInFlightBytesLoadingCeiling,
+			kInFlightBytesPerCpuWorker * static_cast<uint64_t>(std::max(1, ds_get_max_cpu_threads())));
 	const uint64_t max_in_flight_bytes = bg_pacing ? kMaxInFlightBytesBackground : kMaxInFlightBytesLoading;
 	const int scan_limit = p_max_items > 0 ? p_max_items + (parallel_first ? max_offloads_per_slice : 0) : 0;
 	int offloads = 0;

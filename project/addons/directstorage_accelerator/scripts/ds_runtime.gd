@@ -763,6 +763,9 @@ func _process(delta: float) -> void:
 			var slice_items: int = 2
 			var slice_usec: int = 4000
 			var slice_label: String = "mild"
+			# Loading screens have no frame to protect: scale the slice width with
+			# the CPU count. Background pacing keeps its fixed 2-3 item slices.
+			var loading_items: int = clampi(OS.get_processor_count(), 6, 24)
 			if _slice_ema_ms > heavy_at:
 				slice_items = 1
 				slice_usec = 4000
@@ -781,14 +784,14 @@ func _process(delta: float) -> void:
 							slice_items = 3
 							slice_usec = 4000
 						else:
-							slice_items = 12
+							slice_items = loading_items
 							slice_usec = 8000
 					else:
 						if _background_pacing:
 							slice_items = 2
 							slice_usec = 4000
 						else:
-							slice_items = 6
+							slice_items = maxi(3, loading_items / 2)
 							slice_usec = 6000
 					slice_label = "warm"
 			if slice_label != _slice_label:
