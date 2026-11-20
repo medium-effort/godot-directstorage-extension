@@ -29,6 +29,7 @@ private:
 	mutable std::mutex cache_mutex;
 	bool enabled = false;
 	int max_entries = 512;
+	bool max_entries_user_overridden = false;
 	// Evicted prewarm-origin entries (guarded by cache_mutex). One-shot warning
 	// makes the otherwise silent "prewarm self-eviction" failure diagnosable.
 	int prewarm_evictions = 0;
@@ -164,6 +165,10 @@ public:
 
 	void set_max_entries(int p_max);
 	int get_max_entries() const;
+	// Reduction-only VRAM guard: called after RenderingServer is up (e.g. from
+	// DSContext::initialize_ds()) because DSTextureCache is constructed at
+	// MODULE_INITIALIZATION_LEVEL_SCENE before RenderingServer exists.
+	void apply_vram_budget_guard(const Dictionary &p_adapter = Dictionary());
 	int get_cached_count() const;
 };
 

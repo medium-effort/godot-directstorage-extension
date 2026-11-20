@@ -2,6 +2,7 @@
 #include "ds_error_handler.h"
 #include "ds_profiler.h"
 #include "ds_settings.h"
+#include "../integration/ds_texture_cache.h"
 #include "../platform/fallback/ds_fallback_backend.h"
 #ifdef _WIN32
 #include "../platform/win32/ds_win32_backend.h"
@@ -34,9 +35,20 @@ Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device();
 // bound applies to any reader queued behind the pending writer.
 static constexpr uint32_t COMPLETION_WAIT_SLICE_MS = 250;
 
+// In template_release (!DEBUG_ENABLED), godot-cpp's RenderingServer::get_singleton()
+// passes nullptr to object_get_instance_binding() when RenderingServer is not
+// registered yet (e.g. MODULE_INITIALIZATION_LEVEL_SCENE), crashing with 0xC0000005.
+static RenderingServer *safe_get_rendering_server() {
+	Engine *engine = Engine::get_singleton();
+	if (!engine || !engine->has_singleton("RenderingServer")) {
+		return nullptr;
+	}
+	return RenderingServer::get_singleton();
+}
+
 static bool validate_d3d12_rendering_device_active(const String &p_phase) {
 #ifdef _WIN32
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		UtilityFunctions::push_error("[DirectStorage] D3D12 RenderingDevice validation unavailable during " + p_phase + ": D3D12 is not active.");
 		return false;
@@ -206,7 +218,7 @@ bool DSContext::is_d3d12_backend() const {
 		return false;
 	}
 #ifdef _WIN32
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		return false;
 	}
@@ -249,7 +261,7 @@ static DSTORAGE_COMPRESSION_SUPPORT query_gpu_decompression_support(uint16_t p_q
 		}
 	}
 
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		return DSTORAGE_COMPRESSION_SUPPORT_NONE;
 	}
@@ -380,8 +392,13 @@ static void probe_d3d12_adapter_locked() {
 		return;
 	}
 
-	RenderingServer *rs = RenderingServer::get_singleton();
-	if (rs && rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
+	RenderingServer *rs = safe_get_rendering_server();
+	if (!rs) {
+		// RenderingServer not registered yet (e.g. MODULE_INITIALIZATION_LEVEL_SCENE).
+		// Do not cache finalized=true so subsequent calls re-probe once it is up.
+		return;
+	}
+	if (rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		// Permanently finalized: active driver is Vulkan/OpenGL, D3D12 device will never exist.
 		s_adapter_probe = DSD3D12AdapterProbe();
 		s_adapter_probe_finalized = true;
@@ -923,7 +940,7 @@ RID DSContext::create_destination_texture(const Ref<RDTextureFormat> &p_format, 
 		UtilityFunctions::push_error("[DirectStorage] create_destination_texture failed: format is null.");
 		return RID();
 	}
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
 	if (!rd) {
 		UtilityFunctions::push_error("[DirectStorage] create_destination_texture failed: RenderingDevice is not available.");
@@ -1139,6 +1156,9 @@ bool DSContext::initialize_ds_locked() {
 		queue_capacity.store(clamped_queue);
 	}
 #endif
+	if (DSTextureCache *cache = DSTextureCache::get_singleton()) {
+		cache->apply_vram_budget_guard();
+	}
 
 #ifdef _WIN32
 	bool bench_try_win32 = true;
@@ -1207,7 +1227,7 @@ bool DSContext::initialize_ds_locked() {
 	// visible, but only once, and never on headless/non-D3D12 runs where the
 	// fallback is the correct backend.
 	{
-		RenderingServer *warning_rs = RenderingServer::get_singleton();
+		RenderingServer *warning_rs = safe_get_rendering_server();
 		static std::atomic<bool> s_off_main_fallback_warned{false};
 		if (!Thread::is_main_thread() && warning_rs &&
 				warning_rs->get_current_rendering_driver_name().to_lower() == "d3d12" &&

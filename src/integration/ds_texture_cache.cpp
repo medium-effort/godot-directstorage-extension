@@ -3,6 +3,7 @@
 #include "ds_texture_owner.h"
 #include "../core/ds_context.h"
 #include "core/ds_settings.h"
+#include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
@@ -399,29 +400,46 @@ DSTextureCache::DSTextureCache() {
 			max_entries = 512;
 		}
 	}
-	// Reduction-only VRAM guard: the higher default must not turn a small-VRAM
-	// machine's prewarm into residency pressure. Read the settings directly:
-	// this singleton is built before DSContext::initialize_ds() reloads its
-	// auto-tune members, and a user who disabled them must still be honoured.
-	if (DSContext *ctx = DSContext::get_singleton()) {
-		const bool auto_integrated = static_cast<bool>(dsgd_settings::get_setting("auto_tune_for_integrated_gpu", "auto_tune_for_integrated_gpu", Variant(true)));
-		const bool auto_low_vram = static_cast<bool>(dsgd_settings::get_setting("auto_tune_for_low_vram_gpu", "auto_tune_for_low_vram_gpu", Variant(true)));
-		const Dictionary adapter = ctx->get_gpu_adapter_info();
-		const bool available = static_cast<bool>(adapter.get("available", false));
-		const bool integrated = static_cast<bool>(adapter.get("is_uma", false)) ||
-				static_cast<bool>(adapter.get("integrated_gpu_guess", false));
-		const int64_t dedicated_mb = static_cast<int64_t>(adapter.get("dedicated_vram_mb", static_cast<int64_t>(0)));
-		int cap = 0;
-		if (auto_integrated && integrated) {
-			cap = 128;
-		} else if (auto_low_vram && available && !integrated && dedicated_mb > 0) {
-			if (dedicated_mb < 4096) {
-				cap = 128;
-			} else if (dedicated_mb < 8192) {
-				cap = 256;
-			}
+	// DSTextureCache is constructed at MODULE_INITIALIZATION_LEVEL_SCENE before
+	// RenderingServer is registered; querying get_gpu_adapter_info() before
+	// RenderingServer exists logs a singleton error in debug and crashes in
+	// template_release. Defer the VRAM guard until RenderingServer is up
+	// (DSContext::initialize_ds() calls apply_vram_budget_guard() as well).
+	Engine *engine = Engine::get_singleton();
+	if (engine && engine->has_singleton("RenderingServer")) {
+		apply_vram_budget_guard();
+	}
+}
+
+void DSTextureCache::apply_vram_budget_guard(const Dictionary &p_adapter) {
+	Dictionary adapter = p_adapter;
+	if (adapter.is_empty()) {
+		DSContext *ctx = DSContext::get_singleton();
+		if (!ctx) {
+			return;
 		}
-		if (cap > 0) {
+		adapter = ctx->get_gpu_adapter_info();
+	}
+
+	const bool auto_integrated = static_cast<bool>(dsgd_settings::get_setting("auto_tune_for_integrated_gpu", "auto_tune_for_integrated_gpu", Variant(true)));
+	const bool auto_low_vram = static_cast<bool>(dsgd_settings::get_setting("auto_tune_for_low_vram_gpu", "auto_tune_for_low_vram_gpu", Variant(true)));
+	const bool available = static_cast<bool>(adapter.get("available", false));
+	const bool integrated = static_cast<bool>(adapter.get("is_uma", false)) ||
+			static_cast<bool>(adapter.get("integrated_gpu_guess", false));
+	const int64_t dedicated_mb = static_cast<int64_t>(adapter.get("dedicated_vram_mb", static_cast<int64_t>(0)));
+	int cap = 0;
+	if (auto_integrated && integrated) {
+		cap = 128;
+	} else if (auto_low_vram && available && !integrated && dedicated_mb > 0) {
+		if (dedicated_mb < 4096) {
+			cap = 128;
+		} else if (dedicated_mb < 8192) {
+			cap = 256;
+		}
+	}
+	if (cap > 0) {
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		if (!max_entries_user_overridden) {
 			max_entries = std::min(max_entries, cap);
 		}
 	}
@@ -1025,6 +1043,7 @@ void DSTextureCache::set_max_entries(int p_max) {
 	{
 		std::lock_guard<std::mutex> lock(cache_mutex);
 
+		max_entries_user_overridden = true;
 		max_entries = p_max < 1 ? 1 : p_max;
 		while (static_cast<int>(cache_map.size()) > max_entries) {
 			// Same single-call pattern as store(): pristine-count scan,

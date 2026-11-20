@@ -53,6 +53,17 @@
 
 namespace godot {
 
+// In template_release (!DEBUG_ENABLED), godot-cpp's RenderingServer::get_singleton()
+// passes nullptr to object_get_instance_binding() when RenderingServer is not
+// registered yet (e.g. MODULE_INITIALIZATION_LEVEL_SCENE), crashing with 0xC0000005.
+static RenderingServer *safe_get_rendering_server() {
+	Engine *engine = Engine::get_singleton();
+	if (!engine || !engine->has_singleton("RenderingServer")) {
+		return nullptr;
+	}
+	return RenderingServer::get_singleton();
+}
+
 // Queue-admission observability. Process-wide because a process has one
 // Win32Backend: rejected_admissions counts staging attempts refused for want of
 // operation budget, peak_staged_ops is the high-water mark of
@@ -1017,7 +1028,7 @@ void Win32Backend::release_all_resource_guards() {
 // the AddRef'd guard resource without stalling frames or risking deadlocks.
 static bool ds_win32_query_guard_resource_on_render_thread(bool p_is_buffer_request, const RID &p_destination_rid, ID3D12Resource *&r_resource) {
 	r_resource = nullptr;
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	if (!rs) {
 		return false;
 	}
@@ -1068,7 +1079,7 @@ static void ds_win32_fetch_destination_resource_on_render_thread() {
 	if (!ctx) {
 		return;
 	}
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
 	ID3D12Resource *resource = nullptr;
 	D3D12_RESOURCE_DESC desc = {};
@@ -1111,7 +1122,7 @@ static bool ds_win32_query_destination_resource_on_render_thread(
 	r_native_format = 0;
 	r_rd_available = false;
 
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		return false;
 	}
@@ -1174,7 +1185,7 @@ bool Win32Backend::validate_resource_guard(const Ref<DSRequest> &p_request, Stri
 		return false;
 	}
 
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12" || !rd) {
 		r_error = "DirectStorage GPU resource could not be validated after batch completion.";
@@ -2388,7 +2399,7 @@ static void ds_win32_log_d3d12_adapter_identity(ID3D12Device *p_device) {
 
 // Direct fetch; the caller must already be on the render thread.
 static Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_fetch_d3d12_device_direct() {
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		return nullptr;
 	}
@@ -2451,7 +2462,7 @@ Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device() {
 		}
 	}
 
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		return nullptr;
 	}
@@ -2741,7 +2752,7 @@ static bool ds_renderer_supports_dstorage(String &r_reason) {
 		}
 	}
 
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	const String driver_name = rs ? rs->get_current_rendering_driver_name().to_lower() : String();
 	if (driver_name != "d3d12") {
 		r_reason = ds_renderer_gate_reason(driver_name);
@@ -3571,7 +3582,7 @@ bool Win32Backend::execute_transitions(const Vector<GPUTargetTransition> &p_tran
 	if (p_transitions.is_empty()) {
 		return true;
 	}
-	RenderingServer *rs = RenderingServer::get_singleton();
+	RenderingServer *rs = safe_get_rendering_server();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 		return false;
 	}
@@ -3925,7 +3936,7 @@ bool Win32Backend::initialize(const String &p_path) {
 				err_handler->register_queue(queue.queue);
 			}
 		}
-		RenderingServer *rs = RenderingServer::get_singleton();
+		RenderingServer *rs = safe_get_rendering_server();
 		String driver_name = rs ? rs->get_current_rendering_driver_name().to_lower() : "unknown";
 		int gpu_tier = ctx ? ctx->get_gpu_decompression_support_tier() : 0;
 		// Human-readable GPU path: tier 2 = GPU-optimized GDeflate shaders,
@@ -4615,7 +4626,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	if (gpu_buffer_destination) {
 		String destination_error;
 		EnqueueOutcome destination_outcome = EnqueueOutcome::TERMINAL;
-		RenderingServer *rs = RenderingServer::get_singleton();
+		RenderingServer *rs = safe_get_rendering_server();
 		if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 			destination_error = "Win32Backend: GPU buffer destination requires the D3D12 rendering driver.";
 		} else if (!dest_rd_avail) {
@@ -4653,7 +4664,7 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	if (gpu_texture_destination) {
 		String destination_error;
 		EnqueueOutcome destination_outcome = EnqueueOutcome::TERMINAL;
-		RenderingServer *rs = RenderingServer::get_singleton();
+		RenderingServer *rs = safe_get_rendering_server();
 		if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
 			destination_error = "Win32Backend: GPU texture destination requires the D3D12 rendering driver.";
 		} else if (!dest_rd_avail) {

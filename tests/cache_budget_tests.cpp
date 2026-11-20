@@ -6,6 +6,7 @@
 #include "gdextest/registry.h"
 
 #include "integration/ds_texture_cache.h"
+#include "core/ds_context.h"
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
@@ -55,4 +56,150 @@ GDEX_TEST(cache_budget, prewarm_origin_eviction_is_counted_and_warned_once) {
 	GDEX_ASSERT_TRUE(cache->store("res://cache_budget_e", make_test_texture(0.5f), godot::DSTextureCache::CACHE_MODE_REUSE, "", false));
 	GDEX_ASSERT_TRUE(cache->store("res://cache_budget_f", make_test_texture(0.6f), godot::DSTextureCache::CACHE_MODE_REUSE, "", false));
 	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->_get_prewarm_eviction_count_for_testing()), static_cast<int64_t>(0));
+}
+
+GDEX_TEST(cache_budget, vram_guard_clamps_default_by_adapter_tier) {
+	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+	GDEX_ASSERT_TRUE(ps != nullptr);
+
+	auto save_setting = [&](const char *key) {
+		bool had = ps->has_setting(key);
+		godot::Variant prev = had ? ps->get_setting(key) : godot::Variant();
+		ctx.add_teardown([ps, key, had, prev]() {
+			if (had) {
+				ps->set_setting(key, prev);
+			} else {
+				ps->clear(key);
+			}
+		});
+	};
+	save_setting("dsgd_extension/texture_cache_max_entries");
+	save_setting("dsgd_extension/auto_tune_for_integrated_gpu");
+	save_setting("dsgd_extension/auto_tune_for_low_vram_gpu");
+
+	ps->set_setting("dsgd_extension/texture_cache_max_entries", 512);
+	ps->set_setting("dsgd_extension/auto_tune_for_integrated_gpu", true);
+	ps->set_setting("dsgd_extension/auto_tune_for_low_vram_gpu", true);
+
+	auto make_cache = [&](bool p_auto_low_vram = true) {
+		// Suppress the constructor's live-adapter VRAM guard so the synthetic
+		// adapter tests below start from the un-clamped 512 default on any GPU.
+		ps->set_setting("dsgd_extension/auto_tune_for_integrated_gpu", false);
+		ps->set_setting("dsgd_extension/auto_tune_for_low_vram_gpu", false);
+		godot::DSTextureCache *c = memnew(godot::DSTextureCache);
+		ps->set_setting("dsgd_extension/auto_tune_for_integrated_gpu", true);
+		ps->set_setting("dsgd_extension/auto_tune_for_low_vram_gpu", p_auto_low_vram);
+		ctx.add_teardown([c]() {
+			c->clear();
+			memdelete(c);
+		});
+		return c;
+	};
+
+	// Discrete <4 GiB -> clamped to 128.
+	{
+		godot::DSTextureCache *c = make_cache();
+		godot::Dictionary adapter;
+		adapter["available"] = true;
+		adapter["is_uma"] = false;
+		adapter["integrated_gpu_guess"] = false;
+		adapter["dedicated_vram_mb"] = static_cast<int64_t>(4095);
+		c->apply_vram_budget_guard(adapter);
+		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(128));
+	}
+
+	// Discrete 4-8 GiB -> clamped to 256.
+	{
+		godot::DSTextureCache *c = make_cache();
+		godot::Dictionary adapter;
+		adapter["available"] = true;
+		adapter["is_uma"] = false;
+		adapter["integrated_gpu_guess"] = false;
+		adapter["dedicated_vram_mb"] = static_cast<int64_t>(6144);
+		c->apply_vram_budget_guard(adapter);
+		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(256));
+	}
+
+	// Discrete >=8 GiB -> keeps 512.
+	{
+		godot::DSTextureCache *c = make_cache();
+		godot::Dictionary adapter;
+		adapter["available"] = true;
+		adapter["is_uma"] = false;
+		adapter["integrated_gpu_guess"] = false;
+		adapter["dedicated_vram_mb"] = static_cast<int64_t>(8192);
+		c->apply_vram_budget_guard(adapter);
+		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(512));
+	}
+
+	// Integrated/UMA -> clamped to 128.
+	{
+		godot::DSTextureCache *c = make_cache();
+		godot::Dictionary adapter;
+		adapter["available"] = true;
+		adapter["is_uma"] = true;
+		adapter["integrated_gpu_guess"] = true;
+		adapter["dedicated_vram_mb"] = static_cast<int64_t>(0);
+		c->apply_vram_budget_guard(adapter);
+		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(128));
+	}
+
+	// Explicit user override via set_max_entries() is preserved.
+	{
+		godot::DSTextureCache *c = make_cache();
+		c->set_max_entries(400);
+		godot::Dictionary adapter;
+		adapter["available"] = true;
+		adapter["is_uma"] = false;
+		adapter["integrated_gpu_guess"] = false;
+		adapter["dedicated_vram_mb"] = static_cast<int64_t>(2048);
+		c->apply_vram_budget_guard(adapter);
+		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(400));
+	}
+
+	// Disabling auto_tune_for_low_vram_gpu keeps 512.
+	{
+		godot::DSTextureCache *c = make_cache(false);
+		godot::Dictionary adapter;
+		adapter["available"] = true;
+		adapter["is_uma"] = false;
+		adapter["integrated_gpu_guess"] = false;
+		adapter["dedicated_vram_mb"] = static_cast<int64_t>(2048);
+		c->apply_vram_budget_guard(adapter);
+		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(512));
+	}
+}
+
+GDEX_TEST(cache_budget, initialize_ds_applies_vram_guard_on_live_d3d12) {
+	godot::DSContext *ds = godot::DSContext::get_singleton();
+	if (!ds || !ds->is_d3d12_backend()) {
+		GDEX_SKIP("D3D12 backend unavailable (headless or non-D3D12 driver)");
+	}
+
+	godot::DSTextureCache *prev_cache = godot::DSTextureCache::get_singleton();
+	godot::DSTextureCache *fresh_cache = memnew(godot::DSTextureCache);
+	ctx.add_teardown([ds, fresh_cache]() {
+		ds->shutdown_ds();
+		fresh_cache->clear();
+		memdelete(fresh_cache);
+	});
+	// Ensure singleton is restored if prev_cache was replaced; DSTextureCache
+	// destructor nulls singleton when fresh_cache is deleted, which matches
+	// gdextest's existing per-test DSTextureCache lifecycle.
+	(void)prev_cache;
+
+	GDEX_ASSERT_TRUE(ds->initialize_ds());
+	const godot::Dictionary adapter = ds->get_gpu_adapter_info();
+	GDEX_ASSERT_TRUE(static_cast<bool>(adapter.get("available", false)));
+
+	const bool integrated = static_cast<bool>(adapter.get("is_uma", false)) ||
+			static_cast<bool>(adapter.get("integrated_gpu_guess", false));
+	const int64_t dedicated_mb = static_cast<int64_t>(adapter.get("dedicated_vram_mb", static_cast<int64_t>(0)));
+	int64_t expected_cap = 512;
+	if (integrated || (dedicated_mb > 0 && dedicated_mb < 4096)) {
+		expected_cap = 128;
+	} else if (dedicated_mb >= 4096 && dedicated_mb < 8192) {
+		expected_cap = 256;
+	}
+	GDEX_EXPECT_LE(static_cast<int64_t>(fresh_cache->get_max_entries()), expected_cap);
 }
