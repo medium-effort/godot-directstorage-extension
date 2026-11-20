@@ -47,6 +47,17 @@ private:
 	uint32_t uncompressed_size = 0;
 	uint64_t cancellation_tag = 0;
 	CompressionFormat compression_format = COMPRESSION_NONE;
+	// C++-only record of a GDeflate tile-stream header that was already
+	// validated off-thread by DSPreloader. Not exposed to GDScript: only the
+	// preloader stamps it, and the backend honours it only when the request's
+	// path/offset/declared size still match the validated triple. A mismatch
+	// (or an unstamped request) falls back to the backend's own synchronous
+	// check, so direct enqueue_request callers and corruption tests stay
+	// fail-closed. Written under payload_mutex like every other payload field.
+	bool gdeflate_stream_prevalidated = false;
+	String gdeflate_validated_path;
+	uint64_t gdeflate_validated_offset = 0;
+	uint32_t gdeflate_validated_size = 0;
 	PackedByteArray destination_buffer;
 	DSDestinationType destination_type = DESTINATION_MEMORY;
 	RID destination_resource;
@@ -157,6 +168,13 @@ public:
 	// mutex the setters take. False when the request is already submitted, in flight or
 	// terminal - in that case the status is left alone.
 	bool claim_submission();
+
+	// C++-only (not bound to GDScript). Stamps the off-thread-validated
+	// GDeflate header record. The backend only skips its own validation when
+	// all three values still match, which makes a late mutation of the request
+	// fall back to the synchronous check instead of trusting a stale validation.
+	void set_gdeflate_stream_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_declared_size);
+	bool is_gdeflate_stream_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_declared_size) const;
 
 	uint64_t get_cancel_timestamp_usec() const { return cancel_timestamp_usec.load(std::memory_order_acquire); }
 	void set_cancel_timestamp_usec(uint64_t p_usec) { cancel_timestamp_usec.store(p_usec, std::memory_order_release); }

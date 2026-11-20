@@ -39,6 +39,7 @@
 //   pump_gpu_prewarm / poll_completed) and delegate here; tag
 //   progress/cancel stay on DSContext's existing bindings.
 
+#include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/templates/hash_map.hpp>
 #include <godot_cpp/templates/vector.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
@@ -103,6 +104,11 @@ public:
 		PackedInt64Array chunk_offsets;
 		PackedInt32Array chunk_compressed_sizes;
 		PackedInt32Array chunk_uncompressed_sizes;
+		// Set when every GDeflate stream header this payload will enqueue was
+		// already validated off-thread in collect_prewarm_payloads(). Requests
+		// expanded from this payload get a C++-only validation record so the
+		// Win32 backend can skip its own synchronous per-mip file probe.
+		bool gdeflate_prevalidated = false;
 	};
 
 	// Header cache entry for one .dstex file. Plain struct — no Dictionary,
@@ -399,6 +405,11 @@ private:
 	static bool fill_from_import_remap(const String &p_engine_path, Payload &r_out);
 	static bool fill_from_dstex_file(const String &p_engine_path, const String &p_dstex_path, Payload &r_out);
 	static bool validate_payload(const Payload &p_payload);
+	// Off-thread GDeflate tile-stream header validation for one resolved
+	// payload. Reuses the caller's FileAccess handle (one open per archive)
+	// and stamps p_payload.gdeflate_prevalidated only when every stream that
+	// expand_requests() will emit was checked at its exact offset/size.
+	static bool prevalidate_gdeflate_payload(const Payload &p_payload, Ref<FileAccess> &p_file);
 
 
 

@@ -4,6 +4,7 @@
 #include "../../core/ds_context.h"
 #include "../../core/ds_cpu_budget.h"
 #include "../../core/ds_error_handler.h"
+#include "../../core/ds_gdeflate_stream.h"
 #include "../../core/ds_profiler.h"
 #include "core/ds_settings.h"
 #include "../../formats/dstex_format.h"
@@ -337,44 +338,63 @@ bool Win32Backend::validate_dstex_chunk_range(uint64_t p_source_offset, uint64_t
 // and still reports success with no error record. The CPU fallback applies the
 // same rule in GDeflateDecompressor::validate_stream.
 #ifdef _WIN32
+namespace {
+	// FileAccess handles reused by the fallback GDeflate header check. Direct
+	// enqueue_request callers (and the corruption tests) are not pre-validated
+	// by DSPreloader, so they still come through here. Reusing one handle per
+	// path removes the per-mip CreateFileW/CloseHandle pair without weakening
+	// the check; a changed mtime reopens the file.
+	struct CachedValidationFile {
+		Ref<FileAccess> file;
+		uint64_t mtime = 0;
+	};
+	std::mutex g_gdeflate_validation_mutex;
+	std::unordered_map<std::string, CachedValidationFile> g_gdeflate_validation_files;
+	constexpr size_t kMaxCachedValidationFiles = 32;
+} // namespace
+
+void clear_gdeflate_validation_cache() {
+	std::lock_guard<std::mutex> lock(g_gdeflate_validation_mutex);
+	g_gdeflate_validation_files.clear();
+}
+
 static bool validate_gdeflate_stream_size(const String &p_path, uint64_t p_source_offset, uint64_t p_declared_size, String &r_error) {
-	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ);
-	if (file.is_null() || !file->is_open()) {
-		r_error = "Win32Backend: Failed to open '" + p_path + "' to validate its GDeflate stream header.";
-		return false;
+	const std::string key = p_path.utf8().get_data();
+	PackedByteArray raw_header;
+	{
+		std::lock_guard<std::mutex> lock(g_gdeflate_validation_mutex);
+		const uint64_t mtime = FileAccess::get_modified_time(p_path);
+		std::unordered_map<std::string, CachedValidationFile>::iterator it = g_gdeflate_validation_files.find(key);
+		Ref<FileAccess> file;
+		if (it != g_gdeflate_validation_files.end() && it->second.file.is_valid() &&
+				it->second.file->is_open() && it->second.mtime == mtime) {
+			file = it->second.file;
+		} else {
+			file = FileAccess::open(p_path, FileAccess::READ);
+			if (file.is_null() || !file->is_open()) {
+				r_error = "Win32Backend: Failed to open '" + p_path + "' to validate its GDeflate stream header.";
+				return false;
+			}
+			if (g_gdeflate_validation_files.size() >= kMaxCachedValidationFiles) {
+				g_gdeflate_validation_files.clear();
+			}
+			CachedValidationFile entry;
+			entry.file = file;
+			entry.mtime = mtime;
+			g_gdeflate_validation_files[key] = entry;
+		}
+		file->seek(static_cast<int64_t>(p_source_offset));
+		if (file->get_position() != p_source_offset) {
+			r_error = "Win32Backend: Cannot seek to GDeflate payload offset " + String::num_uint64(p_source_offset) + " in '" + p_path + "'.";
+			return false;
+		}
+		// Held under the same mutex as the cached handle: two threads must not
+		// seek the shared FileAccess concurrently. The buffer is our own copy.
+		raw_header = file->get_buffer(static_cast<int64_t>(sizeof(GDeflate::TileStream)));
 	}
-	file->seek(static_cast<int64_t>(p_source_offset));
-	if (file->get_position() != p_source_offset) {
-		r_error = "Win32Backend: Cannot seek to GDeflate payload offset " + String::num_uint64(p_source_offset) + " in '" + p_path + "'.";
-		return false;
-	}
-	PackedByteArray raw_header = file->get_buffer(static_cast<int64_t>(sizeof(GDeflate::TileStream)));
-	file->close();
-	if (raw_header.size() != static_cast<int64_t>(sizeof(GDeflate::TileStream))) {
-		r_error = "Win32Backend: GDeflate payload at offset " + String::num_uint64(p_source_offset) + " in '" + p_path + "' is shorter than a tile-stream header.";
-		return false;
-	}
-
-	// TileStream has no default constructor; copy the packed 8 bytes into an
-	// aligned buffer instead of constructing or reading through a potentially
-	// unaligned pointer.
-	alignas(8) uint8_t header_bytes[sizeof(GDeflate::TileStream)] = {};
-	std::memcpy(header_bytes, raw_header.ptr(), sizeof(GDeflate::TileStream));
-	const GDeflate::TileStream *header = reinterpret_cast<const GDeflate::TileStream *>(header_bytes);
-	if (!header->IsValid() || header->id != GDeflate::kGDeflateId || header->tileSizeIdx != 1 ||
-			header->numTiles == 0 || header->lastTileSize > GDeflate::kDefaultTileSize) {
-		r_error = "Win32Backend: Invalid GDeflate tile-stream header at offset " + String::num_uint64(p_source_offset) + " in '" + p_path + "'.";
-		return false;
-	}
-
-	const uint64_t stream_size = static_cast<uint64_t>(header->GetUncompressedSize());
-	if (stream_size != p_declared_size) {
-		r_error = "Win32Backend: GDeflate stream declares " + String::num_uint64(stream_size) +
-				" uncompressed bytes but the request declared " + String::num_uint64(p_declared_size) +
-				"; refusing to decompress into a destination sized by the declared value.";
-		return false;
-	}
-	return true;
+	return dsgd_gdeflate::validate_stream_header(
+			reinterpret_cast<const uint8_t *>(raw_header.ptr()), static_cast<size_t>(raw_header.size()),
+			p_source_offset, p_declared_size, "Win32Backend: ", p_path, r_error);
 }
 #endif // _WIN32
 
@@ -2095,6 +2115,7 @@ void Win32Backend::clear_persistent_files() {
 		}
 	}
 	persistent_file_cache.clear();
+	clear_gdeflate_validation_cache();
 }
 
 // Returns a handle for p_wpath with one caller reference. The caller must hand
@@ -4366,7 +4387,8 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	// here like any other declaration.
 	if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE &&
 			(has_row_region || p_request->get_destination_type() == DSRequest::DESTINATION_MEMORY ||
-					p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER)) {
+					p_request->get_destination_type() == DSRequest::DESTINATION_GPU_BUFFER) &&
+			!p_request->is_gdeflate_stream_prevalidated(p_request->get_file_path(), p_request->get_offset(), uncompressed_size)) {
 		String stream_error;
 		if (!validate_gdeflate_stream_size(p_request->get_file_path(), p_request->get_offset(), uncompressed_size, stream_error)) {
 			DSErrorHandler *err_handler = DSErrorHandler::get_singleton();
@@ -4440,6 +4462,12 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 		if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE) {
 			for (uint32_t mip_index = 0; mip_index < texture_subresource_count; mip_index++) {
 				const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource + mip_index];
+				// Preloader requests carry an off-thread validation record for
+				// their exact (path, offset, size); a whole-texture request with
+				// several mips cannot match it and falls back to this check.
+				if (p_request->is_gdeflate_stream_prevalidated(p_request->get_file_path(), mip_entry.offset, mip_entry.uncompressed_size)) {
+					continue;
+				}
 				String stream_error;
 				if (!validate_gdeflate_stream_size(p_request->get_file_path(), mip_entry.offset, mip_entry.uncompressed_size, stream_error)) {
 					DSErrorHandler *err_handler = DSErrorHandler::get_singleton();

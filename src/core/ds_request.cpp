@@ -99,6 +99,28 @@ DSRequest::CompressionFormat DSRequest::get_compression_format() const {
 	return compression_format;
 }
 
+void DSRequest::set_gdeflate_stream_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_declared_size) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot stamp a GDeflate validation record while request is in-flight or completed.");
+		return;
+	}
+	notify_mutation_window();
+	gdeflate_stream_prevalidated = true;
+	gdeflate_validated_path = p_path;
+	gdeflate_validated_offset = p_offset;
+	gdeflate_validated_size = p_declared_size;
+}
+
+bool DSRequest::is_gdeflate_stream_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_declared_size) const {
+	// Getters are unguarded by design: these fields are written only before
+	// claim_submission(), after which they are immutable for the submitter.
+	return gdeflate_stream_prevalidated &&
+			gdeflate_validated_path == p_path &&
+			gdeflate_validated_offset == p_offset &&
+			gdeflate_validated_size == p_declared_size;
+}
+
 void DSRequest::set_destination_buffer(const PackedByteArray &p_buffer) {
 	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {

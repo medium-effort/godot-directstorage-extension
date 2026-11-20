@@ -3,6 +3,7 @@
 #include "core/ds_settings.h"
 #include "../core/ds_context.h"
 #include "../core/ds_cpu_budget.h"
+#include "../core/ds_gdeflate_stream.h"
 #include "../core/ds_request.h"
 #include "../formats/dspkg_format.h"
 #include "../formats/dstex_format.h"
@@ -1052,8 +1053,86 @@ bool DSPreloader::validate_payload(const Payload &p_payload) {
 	return true;
 }
 
+// Off-thread counterpart of Win32Backend's GDeflate header gate. Mirrors
+// expand_requests()' stream splitting exactly so every header the backend
+// would have validated on the frame thread is checked here instead. One
+// FileAccess handle is reused across all payloads of the same archive (the
+// caller opens it once per file), replacing up to 187 open/seek/read/close
+// cycles per cold-purged prewarm.
+bool DSPreloader::prevalidate_gdeflate_payload(const Payload &p_payload, Ref<FileAccess> &p_file) {
+	if (p_payload.compression_format != static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
+		return true; // NONE payloads never enter the GDeflate compute shader.
+	}
+	if (p_file.is_null() || !p_file->is_open()) {
+		return false;
+	}
+
+	static constexpr int64_t kHeaderBytes = 8; // sizeof(GDeflate::TileStream)
+	struct Stream {
+		uint64_t offset;
+		uint64_t declared_size;
+	};
+	std::vector<Stream> streams;
+	streams.reserve(static_cast<size_t>(p_payload.mip_count) + 4);
+	if (!p_payload.is_v2) {
+		streams.push_back({ p_payload.data_offset, p_payload.original_size });
+	} else if (p_payload.chunked) {
+		int64_t chunk_cursor = 0;
+		for (uint32_t i = 0; i < p_payload.mip_count; ++i) {
+			const int32_t count = p_payload.mip_chunk_counts.size() > static_cast<int64_t>(i)
+					? p_payload.mip_chunk_counts[i]
+					: 1;
+			if (count <= 1) {
+				streams.push_back({ static_cast<uint64_t>(p_payload.mip_offsets[i]),
+						static_cast<uint64_t>(p_payload.mip_uncompressed_sizes[i]) });
+				continue;
+			}
+			for (int32_t c = 0; c < count; ++c, ++chunk_cursor) {
+				if (chunk_cursor >= p_payload.chunk_offsets.size() ||
+						chunk_cursor >= p_payload.chunk_uncompressed_sizes.size()) {
+					UtilityFunctions::push_warning("DSPreloader: Chunk table for '", p_payload.engine_path, "' is truncated; skipping prewarm.");
+					return false;
+				}
+				streams.push_back({ static_cast<uint64_t>(p_payload.chunk_offsets[chunk_cursor]),
+						static_cast<uint64_t>(p_payload.chunk_uncompressed_sizes[chunk_cursor]) });
+			}
+		}
+	} else {
+		for (uint32_t i = 0; i < p_payload.mip_count; ++i) {
+			streams.push_back({ static_cast<uint64_t>(p_payload.mip_offsets[i]),
+					static_cast<uint64_t>(p_payload.mip_uncompressed_sizes[i]) });
+		}
+	}
+
+	for (const Stream &s : streams) {
+		p_file->seek(static_cast<int64_t>(s.offset));
+		if (p_file->get_position() != static_cast<int64_t>(s.offset)) {
+			UtilityFunctions::push_warning("DSPreloader: Cannot seek to GDeflate payload offset ",
+					String::num_uint64(s.offset), " in '", p_payload.file_path, "'; skipping prewarm.");
+			return false;
+		}
+		const PackedByteArray raw_header = p_file->get_buffer(kHeaderBytes);
+		String error;
+		if (!dsgd_gdeflate::validate_stream_header(
+					reinterpret_cast<const uint8_t *>(raw_header.ptr()), static_cast<size_t>(raw_header.size()),
+					s.offset, s.declared_size, "DSPreloader: ", p_payload.file_path, error)) {
+			UtilityFunctions::push_warning("DSPreloader: ", error, "; skipping prewarm for '", p_payload.engine_path, "'.");
+			return false;
+		}
+	}
+	return true;
+}
+
 bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vector<Ref<DSRequest>> &r_out) {
 	r_out.clear();
+	// Carry the off-thread validation record onto every emitted request. The
+	// backend honours it only while path/offset/size still match, so a caller
+	// that mutates the request after this point falls back to its own check.
+	auto stamp_validation = [&p_payload](const Ref<DSRequest> &p_req) {
+		if (p_payload.gdeflate_prevalidated) {
+			p_req->set_gdeflate_stream_prevalidated(p_payload.file_path, p_req->get_offset(), p_req->get_uncompressed_size());
+		}
+	};
 	// Pre-size once: the per-mip push_back loop below must not pay one
 	// realloc per mip. The destination output buffer resize() per request
 	// is load-bearing (decompression target) and stays.
@@ -1068,6 +1147,7 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 		req->set_compression_format(p_payload.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
 				? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
 		req->set_cancellation_tag(p_tag);
+		stamp_validation(req);
 		r_out.push_back(req);
 		return true;
 	}
@@ -1092,6 +1172,7 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 								? DSRequest::COMPRESSION_GDEFLATE
 								: DSRequest::COMPRESSION_NONE);
 				req->set_cancellation_tag(p_tag);
+				stamp_validation(req);
 				r_out.push_back(req);
 				continue;
 			}
@@ -1112,6 +1193,7 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 								? DSRequest::COMPRESSION_GDEFLATE
 								: DSRequest::COMPRESSION_NONE);
 				req->set_cancellation_tag(p_tag);
+				stamp_validation(req);
 				r_out.push_back(req);
 			}
 		}
@@ -1143,6 +1225,7 @@ bool DSPreloader::expand_requests(const Payload &p_payload, uint64_t p_tag, Vect
 		req->set_compression_format(p_payload.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
 				? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
 		req->set_cancellation_tag(p_tag);
+		stamp_validation(req);
 		r_out.push_back(req);
 	}
 	return r_out.size() > 0;
@@ -1154,6 +1237,11 @@ void DSPreloader::collect_prewarm_payloads(const PackedStringArray &p_paths, std
 
 	HashMap<String, bool> seen;
 	r_payloads.reserve((size_t)p_paths.size());
+	// One handle per archive for off-thread GDeflate header validation. The
+	// prewarm prep task runs on WorkerThreadPool, so these cold 8-byte reads
+	// never stall a frame; reuse avoids one CreateFileW per mip.
+	Ref<FileAccess> validation_file;
+	String validation_path;
 	for (int i = 0; i < p_paths.size(); ++i) {
 		String path = p_paths[i].strip_edges();
 		if (path.is_empty() || seen.has(path)) {
@@ -1186,6 +1274,18 @@ void DSPreloader::collect_prewarm_payloads(const PackedStringArray &p_paths, std
 		if (!resolve_payload(path, payload) || !validate_payload(payload)) {
 			r_skipped_unresolvable++;
 			continue;
+		}
+		if (payload.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
+			if (validation_file.is_null() || !validation_file->is_open() || validation_path != payload.file_path) {
+				validation_file = FileAccess::open(payload.file_path, FileAccess::READ);
+				validation_path = payload.file_path;
+			}
+			if (validation_file.is_null() || !validation_file->is_open() ||
+					!prevalidate_gdeflate_payload(payload, validation_file)) {
+				r_skipped_unresolvable++;
+				continue;
+			}
+			payload.gdeflate_prevalidated = true;
 		}
 		// Payload bytes already cached under the remapped key (e.g. a sync
 		// _load stored the .dstex key but the engine path alias is missing):
