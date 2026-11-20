@@ -2300,6 +2300,20 @@ if (-not $SkipVerify) {
             Show-BuildFailure -Step "GDScript Verification" -Message "One or more addon GDScript files failed syntax validation. Aborting before sync." -Code 1
         }
     }
+
+    # 5c. Template Release Startup Smoke Test (opt-in via ENABLE_RELEASE_SMOKE_TEST)
+    $enableReleaseSmoke = if ($env:ENABLE_RELEASE_SMOKE_TEST) { $env:ENABLE_RELEASE_SMOKE_TEST.Trim().ToLower() } else { "0" }
+    $builtRelease = $Target -in @("template_release", "template_debug_and_release", "all")
+    if ($builtRelease -and ($enableReleaseSmoke -in @("1", "true", "yes", "on"))) {
+        Write-Status "[verify] Running template_release startup smoke test..." -ForegroundColor Cyan
+        $smokeScript = Join-Path $PSScriptRoot "check_release_smoke.ps1"
+        if (Test-Path -LiteralPath $smokeScript) {
+            & powershell -ExecutionPolicy Bypass -File $smokeScript
+            if ($LASTEXITCODE -ne 0) {
+                Show-BuildFailure -Step "Release Smoke Verification" -Message "template_release startup smoke test failed. Aborting before sync." -Code 1
+            }
+        }
+    }
 }
 
 # 6. Post-build synchronization (deployment stage).

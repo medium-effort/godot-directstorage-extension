@@ -78,6 +78,7 @@ project/test_assets/*.png
 # Test Frameworks & Static Analysis (gdextest, cppcheck, logs)
 # ==============================================================================
 build/gdextest/
+build/release_smoke/
 # gdextest test libraries. libdirectstorage_tests* = pre-dsgd leftovers, kept
 # ignored so a stale artifact never resurfaces as untracked.
 bin/libdsgd_tests*
