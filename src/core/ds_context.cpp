@@ -806,9 +806,8 @@ uint64_t DSContext::get_in_flight_async_batch_count() const {
 		const FallbackBackend *fallback = static_cast<const FallbackBackend *>(active_backend);
 		return static_cast<uint64_t>(fallback->get_in_flight_async_batch_count());
 	}
-	// Win32 exposes no per-slot counter; the completion gate is the only
-	// observable in-flight state (0 or 1 from the caller's viewpoint).
-	return active_backend->is_batch_complete() ? 0 : 1;
+	// Win32 exposes its per-slot counter: up to two batches can be in flight.
+	return static_cast<Win32Backend *>(active_backend)->get_in_flight_batch_count();
 }
 
 uint64_t DSContext::get_completion_fence() const {
@@ -1601,9 +1600,10 @@ Error DSContext::flush_stream_async() {
 		if (stream_queue.empty() && !has_staged_pending) {
 			return OK;
 		}
-		if (!active_backend->is_batch_complete()) {
-			// All batch slots occupied: keep the queue intact so the batch
-			// manager can retry next frame instead of losing requests.
+		if (!active_backend->has_free_batch_slot()) {
+			// No free staging slot: keep the queue intact so the batch manager
+			// can retry next frame instead of losing requests. A sibling slot may
+			// still be in flight - that is now the normal pipelined case.
 			return ERR_BUSY;
 		}
 		uint16_t cap = get_queue_capacity();
@@ -1909,6 +1909,22 @@ bool DSContext::has_pending_results() const {
 	return active_backend->is_batch_complete() && !pending_batch_request_counts.empty();
 }
 
+bool DSContext::has_harvestable_results() const {
+	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
+		return false;
+	}
+#ifdef _WIN32
+	if (active_backend->get_name() == "Win32DirectStorage") {
+		// Win32Backend checks both slots for completion_ready; a finished sibling
+		// can be harvested while the other slot is still in flight.
+		return static_cast<Win32Backend *>(active_backend)->has_pending_results();
+	}
+#endif
+	std::lock_guard<std::mutex> lock(context_mutex);
+	return active_backend->is_batch_complete() && !pending_batch_request_counts.empty();
+}
+
 void DSContext::collect_completed_results() {
 	std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
@@ -2184,6 +2200,7 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_tag_cancelled", "tag"), &DSContext::is_tag_cancelled);
 	ClassDB::bind_method(D_METHOD("is_batch_complete"), &DSContext::is_batch_complete);
 	ClassDB::bind_method(D_METHOD("has_pending_results"), &DSContext::has_pending_results);
+	ClassDB::bind_method(D_METHOD("has_harvestable_results"), &DSContext::has_harvestable_results);
 	ClassDB::bind_method(D_METHOD("collect_completed_results"), &DSContext::collect_completed_results);
 	ClassDB::bind_method(D_METHOD("get_completion_fence"), &DSContext::get_completion_fence);
 	ClassDB::bind_method(D_METHOD("wait_for_completion", "timeout_msec"), &DSContext::wait_for_completion);

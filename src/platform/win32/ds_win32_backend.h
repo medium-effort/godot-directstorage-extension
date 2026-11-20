@@ -339,7 +339,9 @@ private:
 	// True when any slot of the queue still holds the named request, i.e. the
 	// record belongs to a later completion. Caller holds batch_mutex.
 	bool queue_has_request_name_locked(const QueueState &p_queue, const String &p_failed_request_name) const;
-	void poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, int p_slot_index, uint64_t p_fence_value, BatchReport &r_report);
+	// Returns false when the slot's fence has not retired; the caller must not
+	// retire the slot or release its resources in that case.
+	bool poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, int p_slot_index, uint64_t p_fence_value, BatchReport &r_report);
 	void complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch, BatchReport &r_report);
 	bool has_in_flight_batches_locked() const;
 	void update_profiler_queue_depth_locked();
@@ -355,6 +357,10 @@ private:
 	int count_logical_requests(const Vector<Ref<DSRequest>> &p_requests) const;
 	void complete_chunked_requests();
 	void close_slot_files(BatchSlot &p_slot);
+	// Clears every staging container and per-batch metadata of a slot that has
+	// already been harvested/aborted. Caller holds batch_mutex and has already
+	// released resource guards and closed the slot's file handles.
+	static void clear_completed_slot_locked(BatchSlot &r_slot);
 	// Aborts an unsubmitted slot after pre-submit barrier failure: fails its
 	// requests, releases guards and handles, and clears all four staging
 	// containers so the slot is clean for reuse. Caller holds batch_mutex.
@@ -425,6 +431,16 @@ public:
 		return static_cast<uint64_t>(p_staged) + static_cast<uint64_t>(p_add) + 2ULL <= static_cast<uint64_t>(p_capacity);
 	}
 
+	// Two slots may be staged at once, but their combined requests and the two
+	// signal operations per submitted batch must never exceed the queue's
+	// capacity. Halving the admission budget gives each slot capacity/2 - 2
+	// requests, so two full slots consume exactly capacity. Tiny queues keep
+	// the single-slot path.
+	static uint32_t per_slot_admission_capacity(uint32_t p_capacity) {
+		return p_capacity >= 8 ? p_capacity / 2u : p_capacity;
+	}
+	static bool can_pipeline(uint32_t p_capacity) { return p_capacity >= 8; }
+
 #if defined(_WIN32)
 	// Loads one DirectStorage runtime DLL ("dstoragecore.dll" or "dstorage.dll")
 	// from p_dir. The only loader for the runtime: the backend and the context's
@@ -452,6 +468,8 @@ public:
 	bool enqueue_request(Ref<DSRequest> p_request, PlatformBackend::EnqueueOutcome *r_outcome = nullptr) override;
 	void submit_batch() override;
 	bool submit_async() override;
+	bool has_free_batch_slot() const override;
+	uint32_t get_in_flight_batch_count() const;
 	bool is_batch_complete() const override;
 	void collect_completed_results() override;
 	void poll_batch_status();
@@ -535,6 +553,11 @@ public:
 	// order. Lets a test inject a record that names a real staged request without
 	// reaching into the slot's containers. Never bound in _bind_methods().
 	PackedStringArray _debug_staged_request_names_for_testing(int p_queue_index, int p_slot_index) const;
+	// Test-only seam: marks both slots of one queue as submitted without real
+	// DMA, so has_free_batch_slot() can be tested against the same quantifier
+	// submit_async() uses. Caller must restore the flags via teardown/shutdown.
+	// Never bound in _bind_methods().
+	void _debug_mark_queue_slots_submitted_for_testing(int p_queue_index);
 	// Test-only seam: attributes a synthetic queue-error record against the given
 	// request twice and returns the rendered text. The queue-error event thread
 	// and the batch claim can both attribute one record, so attribution must be

@@ -1500,6 +1500,78 @@ void Win32Backend::handle_queue_error_event(int p_queue_index) {
 }
 #endif
 
+bool Win32Backend::has_free_batch_slot() const {
+#ifdef _WIN32
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	if (!accepting_requests.load() || sync_batch_in_flight.load()) {
+		return false;
+	}
+	DSContext *ctx = DSContext::get_singleton();
+	const uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
+	const bool pipelining = can_pipeline(queue_capacity);
+	if (!pipelining) {
+		// Single-slot serialization: every slot on every queue must be idle, and
+		// at least one slot index must have no unharvested results anywhere.
+		for (int queue_index = 0; queue_index < QUEUE_COUNT; ++queue_index) {
+			for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; ++slot_index) {
+				const BatchSlot &slot = priority_queues[queue_index].batch_slots[slot_index];
+				if (slot.submitted || slot.closing) {
+					return false;
+				}
+			}
+		}
+		for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; ++slot_index) {
+			bool any_completion_ready = false;
+			for (int queue_index = 0; queue_index < QUEUE_COUNT; ++queue_index) {
+				any_completion_ready = any_completion_ready || priority_queues[queue_index].batch_slots[slot_index].completion_ready;
+			}
+			if (!any_completion_ready) {
+				return true;
+			}
+		}
+		return false;
+	}
+	// submit_async() claims a slot index across ALL queues, so the caller gate
+	// must use the same quantifier: exists slot index that is free everywhere.
+	for (int slot_index = 0; slot_index < BATCH_SLOT_COUNT; ++slot_index) {
+		bool slot_free_on_every_queue = true;
+		bool any_completion_ready = false;
+		for (int queue_index = 0; queue_index < QUEUE_COUNT; ++queue_index) {
+			const BatchSlot &slot = priority_queues[queue_index].batch_slots[slot_index];
+			if (slot.submitted || slot.closing) {
+				slot_free_on_every_queue = false;
+			}
+			if (slot.completion_ready) {
+				any_completion_ready = true;
+			}
+		}
+		if (slot_free_on_every_queue && !any_completion_ready) {
+			return true;
+		}
+	}
+	return false;
+#else
+	return true;
+#endif
+}
+
+uint32_t Win32Backend::get_in_flight_batch_count() const {
+#ifdef _WIN32
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	uint32_t count = 0;
+	for (const QueueState &queue : priority_queues) {
+		for (const BatchSlot &slot : queue.batch_slots) {
+			if (slot.submitted || slot.closing) {
+				++count;
+			}
+		}
+	}
+	return count;
+#else
+	return 0;
+#endif
+}
+
 bool Win32Backend::is_batch_complete() const {
 #ifdef _WIN32
 	std::lock_guard<std::mutex> lock(batch_mutex);
@@ -1916,10 +1988,10 @@ bool Win32Backend::stage_single_mip_request(Ref<DSRequest> p_parent, Ref<DSReque
 #endif
 }
 
-void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, int p_slot_index, uint64_t p_fence_value, BatchReport &r_report) {
+bool Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, int p_slot_index, uint64_t p_fence_value, BatchReport &r_report) {
 	if (!p_queue.completion_fence || p_fence_value == 0 ||
 			p_queue.completion_fence->GetCompletedValue() < p_fence_value) {
-		return;
+		return false;
 	}
 
 	p_queue.completed_fence_value = std::max(p_queue.completed_fence_value, p_queue.completion_fence->GetCompletedValue());
@@ -2016,6 +2088,7 @@ void Win32Backend::poll_batch_status(QueueState &p_queue, BatchSlot &p_slot, int
 		}
 	}
 	complete_chunked_requests();
+	return true;
 }
 #endif
 
@@ -2036,7 +2109,14 @@ void Win32Backend::update_profiler_queue_depth_locked() {
 }
 
 void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, const BatchMetadata &p_batch, BatchReport &r_report) {
-	poll_batch_status(p_queue, p_slot, p_batch.slot_index, p_slot.fence_value, r_report);
+	if (!poll_batch_status(p_queue, p_slot, p_batch.slot_index, p_slot.fence_value, r_report)) {
+		// The batch's fence has not retired (e.g. a stale slot event matched it).
+		// Retiring here would release resource guards and close IDStorageFile
+		// handles while DMA is still active, and would strand requests at
+		// STATUS_SUBMITTED. Leave everything in place for the fence poll.
+		r_report.warnings.push_back("Win32Backend: refused to retire a batch whose completion fence has not retired.");
+		return;
+	}
 	p_slot.completed_count = count_completed_requests(p_slot.requests);
 	p_slot.error_code = 0;
 	p_slot.error_message = String();
@@ -2068,6 +2148,17 @@ void Win32Backend::complete_batch_slot(QueueState &p_queue, BatchSlot &p_slot, c
 // still needs it (see release_source_file), because the same file is shared by
 // every request in a batch and across queues. Sole closer for BatchSlot files;
 // all reset, completion, cancel, and shutdown paths go through here.
+void Win32Backend::clear_completed_slot_locked(BatchSlot &r_slot) {
+	r_slot.requests.clear();
+	r_slot.request_names.clear();
+	r_slot.request_name_map.clear();
+	r_slot.dstorage_requests.clear();
+	r_slot.fence_value = 0;
+	r_slot.completed_count = 0;
+	r_slot.error_code = 0;
+	r_slot.error_message = String();
+}
+
 void Win32Backend::close_slot_files(BatchSlot &p_slot) {
 	for (std::unordered_map<std::wstring, IDStorageFile *>::iterator it = p_slot.file_cache.begin(); it != p_slot.file_cache.end(); ++it) {
 		release_source_file(it->first, it->second);
@@ -2269,6 +2360,9 @@ void Win32Backend::completion_thread_func() {
 
 		DWORD wait_result = WaitForMultipleObjects(kSlotHandleCount + QUEUE_COUNT + 1, wait_handles, FALSE, 500);
 		if (wait_result == WAIT_TIMEOUT) {
+			// Auto-reset slot events can be missed when a stale signal belongs to a
+			// previous batch on the same slot. Poll the fences as a liveness backstop.
+			poll_batch_status();
 			continue;
 		}
 		if (wait_result == WAIT_OBJECT_0) {
@@ -2298,10 +2392,21 @@ void Win32Backend::completion_thread_func() {
 			std::lock_guard<std::mutex> lock(batch_mutex);
 			std::deque<BatchMetadata>::iterator batch_it = completion_queue.end();
 			for (std::deque<BatchMetadata>::iterator it = completion_queue.begin(); it != completion_queue.end(); ++it) {
-				if (it->queue_index == completed_queue_index && it->slot_index == completed_slot_index) {
-					batch_it = it;
-					break;
+				if (it->queue_index != completed_queue_index || it->slot_index != completed_slot_index) {
+					continue;
 				}
+				const QueueState &queue_state = priority_queues[it->queue_index];
+				const BatchSlot &slot_state = queue_state.batch_slots[it->slot_index];
+				// A stale slot event may outlive the batch that set it. Only retire a
+				// batch whose own fence has actually completed; otherwise leave it in
+				// completion_queue for the fence poll / a later signal.
+				if (!slot_state.submitted || slot_state.completion_ready || slot_state.fence_value != it->fence_value ||
+						!queue_state.completion_fence ||
+						queue_state.completion_fence->GetCompletedValue() < it->fence_value) {
+					continue;
+				}
+				batch_it = it;
+				break;
 			}
 			if (batch_it == completion_queue.end()) {
 				continue;
@@ -2309,6 +2414,7 @@ void Win32Backend::completion_thread_func() {
 			batch = *batch_it;
 			completion_queue.erase(batch_it);
 			BatchSlot &completed_slot = priority_queues[batch.queue_index].batch_slots[batch.slot_index];
+			ResetEvent(completed_slot.event);
 			post_transitions = completed_slot.gpu_transitions;
 			completed_slot.gpu_transitions.clear();
 		}
@@ -4507,28 +4613,14 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	BatchSlot *slot_ptr = &queue.batch_slots[current_slot];
 	if (!slot_ptr->submitted && !slot_ptr->closing && slot_ptr->completion_ready) {
 		close_slot_files(*slot_ptr);
-		slot_ptr->requests.clear();
-		slot_ptr->request_names.clear();
-		slot_ptr->request_name_map.clear();
-		slot_ptr->dstorage_requests.clear();
-		slot_ptr->fence_value = 0;
-		slot_ptr->completed_count = 0;
-		slot_ptr->error_code = 0;
-		slot_ptr->error_message = String();
+		clear_completed_slot_locked(*slot_ptr);
 		slot_ptr->completion_ready = false;
 	} else if (slot_ptr->submitted || slot_ptr->closing) {
 		int alternate_slot = 1 - current_slot;
 		BatchSlot &alt_slot = queue.batch_slots[alternate_slot];
 		if (!alt_slot.submitted && !alt_slot.closing && alt_slot.completion_ready) {
 			close_slot_files(alt_slot);
-			alt_slot.requests.clear();
-			alt_slot.request_names.clear();
-			alt_slot.request_name_map.clear();
-			alt_slot.dstorage_requests.clear();
-			alt_slot.fence_value = 0;
-			alt_slot.completed_count = 0;
-			alt_slot.error_code = 0;
-			alt_slot.error_message = String();
+			clear_completed_slot_locked(alt_slot);
 			alt_slot.completion_ready = false;
 		}
 		if (!alt_slot.submitted && !alt_slot.closing && !alt_slot.completion_ready) {
@@ -5006,9 +5098,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 		}
 
 		uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
-		if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), static_cast<uint32_t>(staged_children.size()), queue_capacity)) {
+		const uint32_t slot_budget = per_slot_admission_capacity(queue_capacity);
+		if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), static_cast<uint32_t>(staged_children.size()), slot_budget)) {
 			s_rejected_admission_count.fetch_add(1, std::memory_order_relaxed);
-			return reject(p_request, ds_capacity_reject_message(queue_capacity), EnqueueOutcome::TRANSIENT);
+			return reject(p_request, ds_capacity_reject_message(slot_budget), EnqueueOutcome::TRANSIENT);
 		}
 		ds_note_staged_ops(static_cast<uint32_t>(slot.requests.size() + staged_children.size()) + 2);
 
@@ -5051,9 +5144,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 		}
 
 		uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
-		if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), 1, queue_capacity)) {
+		const uint32_t slot_budget = per_slot_admission_capacity(queue_capacity);
+		if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), 1, slot_budget)) {
 			s_rejected_admission_count.fetch_add(1, std::memory_order_relaxed);
-			return reject(p_request, ds_capacity_reject_message(queue_capacity), EnqueueOutcome::TRANSIENT);
+			return reject(p_request, ds_capacity_reject_message(slot_budget), EnqueueOutcome::TRANSIENT);
 		}
 		ds_note_staged_ops(static_cast<uint32_t>(slot.requests.size()) + 3);
 
@@ -5169,9 +5263,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 		}
 
 		uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
-		if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), static_cast<uint32_t>(staged_children.size()), queue_capacity)) {
+		const uint32_t slot_budget = per_slot_admission_capacity(queue_capacity);
+		if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), static_cast<uint32_t>(staged_children.size()), slot_budget)) {
 			s_rejected_admission_count.fetch_add(1, std::memory_order_relaxed);
-			return reject(p_request, ds_capacity_reject_message(queue_capacity), EnqueueOutcome::TRANSIENT);
+			return reject(p_request, ds_capacity_reject_message(slot_budget), EnqueueOutcome::TRANSIENT);
 		}
 		ds_note_staged_ops(static_cast<uint32_t>(slot.requests.size() + staged_children.size()) + 2);
 
@@ -5203,9 +5298,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	}
 
 	uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
-	if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), 1, queue_capacity)) {
+	const uint32_t slot_budget = per_slot_admission_capacity(queue_capacity);
+	if (!admits_requests(static_cast<uint32_t>(slot.requests.size()), 1, slot_budget)) {
 		s_rejected_admission_count.fetch_add(1, std::memory_order_relaxed);
-		return reject(p_request, ds_capacity_reject_message(queue_capacity), EnqueueOutcome::TRANSIENT);
+		return reject(p_request, ds_capacity_reject_message(slot_budget), EnqueueOutcome::TRANSIENT);
 	}
 	ds_note_staged_ops(static_cast<uint32_t>(slot.requests.size()) + 3);
 	const EnqueueOutcome request_outcome = enqueue_one(p_request, 0);
@@ -5230,22 +5326,51 @@ bool Win32Backend::submit_async() {
 	if (!accepting_requests.load() || sync_batch_in_flight.load()) {
 		return false;
 	}
-	int submit_slot_index = active_batch_slot.load();
+	DSContext *ctx = DSContext::get_singleton();
+	const uint32_t queue_capacity = ctx ? ctx->get_queue_capacity() : 512;
+	const bool pipelining = can_pipeline(queue_capacity);
+	int submit_slot_index = 0;
 	Vector<GPUTargetTransition> pre_transitions;
 	// Enqueue payload staged under batch_mutex and consumed after it is released.
 	std::vector<DSTORAGE_REQUEST> local_dstorage[QUEUE_COUNT];
 	bool enqueue_queue[QUEUE_COUNT] = { false };
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
+		submit_slot_index = active_batch_slot.load();
+		if (pipelining) {
+			bool target_busy = false;
+			for (const QueueState &queue : priority_queues) {
+				const BatchSlot &target = queue.batch_slots[submit_slot_index];
+				target_busy = target_busy || target.submitted || target.closing || target.completion_ready;
+			}
+			if (target_busy) {
+				const int alternate = 1 - submit_slot_index;
+				bool alternate_free = true;
+				for (const QueueState &queue : priority_queues) {
+					const BatchSlot &slot = queue.batch_slots[alternate];
+					alternate_free = alternate_free && !slot.submitted && !slot.closing && !slot.completion_ready;
+				}
+				if (alternate_free) {
+					submit_slot_index = alternate;
+					active_batch_slot.store(alternate);
+				}
+			}
+		}
 		// Atomic claim gate: between this claim and the second lock below (which
 		// sets `submitted`) a claimed batch is only visible as `closing`, so both
-		// states must count. Checking the target slot alone let two threads each
-		// claim a different slot and put twice the queue's operation budget in
-		// flight, which is exactly the blocking enqueue the contract forbids.
+		// states must count on the target slot. Two slots may now be in flight at
+		// once because each one's admission budget is halved; tiny queues that
+		// cannot be split keep the old all-slot serialization.
 		for (const QueueState &queue : priority_queues) {
-			for (const BatchSlot &slot : queue.batch_slots) {
-				if (slot.submitted || slot.closing) {
-					return false;
+			const BatchSlot &target = queue.batch_slots[submit_slot_index];
+			if (target.submitted || target.closing || target.completion_ready) {
+				return false;
+			}
+			if (!pipelining) {
+				for (const BatchSlot &sibling : queue.batch_slots) {
+					if (sibling.submitted || sibling.closing) {
+						return false;
+					}
 				}
 			}
 		}
@@ -5464,11 +5589,7 @@ bool Win32Backend::collect_completed_batch(uint64_t &r_fence_value, int &r_compl
 			r_error_code = slot.error_code;
 			r_error_message = slot.error_message;
 			close_slot_files(slot);
-			slot.requests.clear();
-			slot.fence_value = 0;
-			slot.completed_count = 0;
-			slot.error_code = 0;
-			slot.error_message = String();
+			clear_completed_slot_locked(slot);
 			slot.completion_ready = false;
 			batch_in_flight.store(has_in_flight_batches_locked());
 			update_profiler_queue_depth_locked();
@@ -6224,6 +6345,18 @@ String Win32Backend::_debug_render_queue_error_attributed_twice_for_testing(cons
 	(void)p_request;
 	(void)p_failed_filename;
 	return String();
+#endif
+}
+
+void Win32Backend::_debug_mark_queue_slots_submitted_for_testing(int p_queue_index) {
+#ifdef _WIN32
+	if (p_queue_index < 0 || p_queue_index >= QUEUE_COUNT) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(batch_mutex);
+	for (int i = 0; i < BATCH_SLOT_COUNT; ++i) {
+		priority_queues[p_queue_index].batch_slots[i].submitted = true;
+	}
 #endif
 }
 

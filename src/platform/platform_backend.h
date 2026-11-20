@@ -35,6 +35,11 @@ public:
 	// Submits the staged batch. Returns false when another batch is already in
 	// flight and the caller should retry later (transient, requests stay staged).
 	virtual bool submit_async() = 0;
+	// True when a backend can accept another staged batch without waiting for a
+	// full drain. Backends that serialize batches keep the default. Used by
+	// callers that previously gated on is_batch_complete() and could not
+	// overlap two slots.
+	virtual bool has_free_batch_slot() const { return true; }
 	virtual bool is_batch_complete() const = 0;
 	virtual void collect_completed_results() = 0;
 	virtual void cancel_requests_with_tag(uint64_t p_tag) = 0;

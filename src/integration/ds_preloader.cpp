@@ -2923,7 +2923,7 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 		bool inline_runner_reserved = false;
 		for (size_t si = 0; si < terminal_ids.size() && offloads + 1 < max_offloads_per_slice; ++si) {
 			const int64_t candidate_id = terminal_ids[si];
-			bool should_offload = false;
+			bool offloaded = false;
 			{
 				std::lock_guard<std::mutex> lock(state().mutex);
 				State &s = state();
@@ -2939,13 +2939,19 @@ int DSPreloader::poll_completed(uint64_t p_tag, int p_max_items, uint32_t p_max_
 							inline_runner_reserved = true;
 						} else {
 							const uint64_t est_bytes = estimate_payload_bytes(cand.meta);
-							should_offload = (s.in_flight_builds == 0) ||
+							const bool should_offload = (s.in_flight_builds == 0) ||
 									(s.in_flight_build_bytes + est_bytes <= max_in_flight_bytes);
+							// offload_cpu_build_locked mutates s.pending, s.build_jobs and the
+							// in-flight counters; it must run under the same mutex as the
+							// poll_completed() loop that iterates/erases s.build_jobs.
+							if (should_offload) {
+								offloaded = offload_cpu_build_locked(candidate_id);
+							}
 						}
 					}
 				}
 			}
-			if (should_offload && offload_cpu_build_locked(candidate_id)) {
+			if (offloaded) {
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 				s_last_poll_offloads.fetch_add(1);
 #endif

@@ -334,6 +334,10 @@ public:
 	bool is_resource_in_flight(const RID &p_rid) const;
 	bool is_batch_complete() const;
 	bool has_pending_results() const;
+	// True when a completed batch is waiting to be harvested, independent of
+	// whether a sibling batch is still in flight. Lets callers reclaim a finished
+	// slot without waiting for the whole backend to drain.
+	bool has_harvestable_results() const;
 	void collect_completed_results();
 	uint64_t get_completion_fence() const;
 	bool wait_for_completion(int p_timeout_msec);

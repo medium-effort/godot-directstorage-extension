@@ -1,16 +1,16 @@
-// The atomic claim gate (queue-capacity contract, G2).
+// The atomic claim gate (queue-capacity contract, G2) after finding 1.1.
 //
 // submit_async() claims the batch while holding batch_mutex, but the claim is
 // only visible to other submitters as `closing` until the second lock sets
-// `submitted`. is_batch_complete() reports "complete" during that window, so a
-// second submitter used to pass the caller-side check and claim the other slot,
-// putting two batches (twice the operation budget) in flight. The window is a
-// few hundred instructions wide and is not reachable by a stress loop; the
-// DEBUG/DEV enqueue hook parks the first submitter inside it instead, the same
-// way win32_remediation.dstorage_requests_not_shared_during_enqueue_window does.
+// `submitted`. is_batch_complete() reports "complete" during that window. The
+// window is a few hundred instructions wide and is not reachable by a stress
+// loop; the DEBUG/DEV enqueue hook parks the first submitter inside it instead.
 //
-// Discriminator: the second submit_async() must return false while the first
-// claim is parked; pre-fix it returns true and submits the diverted slot.
+// With two-slot pipelining, a second submitter MAY claim the diverted slot: each
+// slot now stages at most capacity/2 - 2 requests, so two batches in flight
+// consume exactly the queue's operation budget. The invariant to protect is no
+// longer "only one submitter wins" but "both claims land in distinct slots and
+// both batches complete without losing a request".
 
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
@@ -84,7 +84,7 @@ bool wait_for_flag(const std::atomic<bool> &p_flag, int p_timeout_ms) {
 
 } // namespace
 
-GDEX_TEST_T(queue_capacity_concurrency, claim_gate_refuses_second_submitter, TAG_INTEGRATION) {
+GDEX_TEST_T(queue_capacity_concurrency, claim_gate_allows_two_budgeted_submitters, TAG_INTEGRATION) {
 	const godot::String fixture = "user://queue_capacity_claim_fixture.bin";
 	remove_temp_file(fixture);
 	// Registered before the backend teardown below so LIFO deletes the backend
@@ -134,39 +134,39 @@ GDEX_TEST_T(queue_capacity_concurrency, claim_gate_refuses_second_submitter, TAG
 		return;
 	}
 
-	// The hole the gate closes: the claim is parked as `closing`, and
-	// is_batch_complete() only looks at `submitted`, so it still says "complete".
+	// The claim is parked as `closing`, and is_batch_complete() only looks at
+	// `submitted`, so it still says "complete" during the window.
 	GDEX_EXPECT_TRUE(backend->is_batch_complete());
 
-	// Stage into the diverted slot (slot 0 is closing) and try to claim it.
+	// Stage into the diverted slot (slot 0 is closing) and claim it. Unlike the
+	// old single-batch contract, this must now succeed: the halved admission
+	// budget keeps two in-flight batches within the queue's operation budget.
 	godot::Ref<godot::DSRequest> second = make_memory_request(fixture);
 	GDEX_EXPECT_TRUE(backend->enqueue_request(second));
-	GDEX_EXPECT_FALSE(backend->submit_async());
+	GDEX_EXPECT_TRUE(backend->submit_async());
 
 	release_window.store(true);
 	submitter.join();
 	backend->_debug_set_enqueue_window_hook_for_testing({});
 	GDEX_EXPECT_TRUE(first_result.load());
 
-	// First batch completes; the refused second batch must still be staged and
-	// must submit and complete afterwards, so the refusal loses nothing.
+	// Both batches are in flight; both must complete without losing a request.
 	const uint64_t first_fence = backend->get_completion_fence();
 	GDEX_EXPECT_TRUE(backend->wait_for_completion(first_fence, 5000));
-	backend->poll_batch_status();
-	backend->collect_completed_results();
+	for (int i = 0; i < 100 &&
+			(first->get_status() != godot::DSRequest::STATUS_COMPLETED ||
+					second->get_status() != godot::DSRequest::STATUS_COMPLETED); ++i) {
+		backend->poll_batch_status();
+		backend->collect_completed_results();
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	}
 	GDEX_EXPECT_EQ(static_cast<int64_t>(first->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
-
-	GDEX_EXPECT_TRUE(backend->submit_async());
-	const uint64_t second_fence = backend->get_completion_fence();
-	GDEX_EXPECT_TRUE(backend->wait_for_completion(second_fence, 5000));
-	backend->poll_batch_status();
-	backend->collect_completed_results();
 	GDEX_EXPECT_EQ(static_cast<int64_t>(second->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
 }
 
 #else
 
-GDEX_TEST_T(queue_capacity_concurrency, claim_gate_refuses_second_submitter, TAG_INTEGRATION) {
+GDEX_TEST_T(queue_capacity_concurrency, claim_gate_allows_two_budgeted_submitters, TAG_INTEGRATION) {
 	(void)ctx;
 	GDEX_SKIP("The enqueue-window seam is compiled out of release builds.");
 }
@@ -174,7 +174,7 @@ GDEX_TEST_T(queue_capacity_concurrency, claim_gate_refuses_second_submitter, TAG
 #endif
 #else
 
-GDEX_TEST_T(queue_capacity_concurrency, claim_gate_refuses_second_submitter, TAG_INTEGRATION) {
+GDEX_TEST_T(queue_capacity_concurrency, claim_gate_allows_two_budgeted_submitters, TAG_INTEGRATION) {
 	(void)ctx;
 	GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 }

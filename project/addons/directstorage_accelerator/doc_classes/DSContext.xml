@@ -186,6 +186,10 @@
 			<return type="bool" />
 			<description>Returns [code]true[/code] if there are pending asynchronous batch results waiting to be collected via [method collect_completed_results].</description>
 		</method>
+		<method name="has_harvestable_results" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] when a completed batch is waiting to be harvested, even if a sibling batch is still in flight. Use this instead of [method is_batch_complete] to decide whether to call [method collect_completed_results].</description>
+		</method>
 		<method name="has_stream_pending" qualifiers="const">
 			<return type="bool" />
 			<description>Returns [code]true[/code] if the async stream (prewarm) queue holds requests awaiting [method flush_stream_async].</description>

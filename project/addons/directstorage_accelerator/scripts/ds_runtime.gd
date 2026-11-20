@@ -682,8 +682,12 @@ func _process(delta: float) -> void:
 		return
 	# 1. Harvest already-finished batches first (non-blocking). This frees
 	#    batch slots so the stream flush below can submit in the same frame
-	#    instead of hitting ERR_BUSY and waiting a frame.
-	if ctx.is_batch_complete() and ctx.has_pending_results():
+	#    instead of hitting ERR_BUSY and waiting a frame. A finished sibling must
+	#    be reclaimed even while its sibling slot is still in flight (finding 1.1).
+	if ctx.has_method("has_harvestable_results"):
+		if ctx.has_harvestable_results():
+			ctx.collect_completed_results()
+	elif ctx.is_batch_complete() and ctx.has_pending_results():
 		ctx.collect_completed_results()
 	# 2. Stream-only flush (non-blocking; ERR_BUSY keeps the queue intact for
 	#    retry next frame). Never routes through the sync flush path.

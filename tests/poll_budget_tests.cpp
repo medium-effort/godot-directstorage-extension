@@ -674,3 +674,47 @@ GDEX_TEST_T(poll_budget, negative_budget_does_not_become_unbounded, TAG_UNIT) {
 		GDEX_EXPECT_TRUE(cache->get_cached(godot::String(paths[i])).is_valid());
 	}
 }
+
+// Regression for the parallel-first offload lock race introduced in da2a7fb:
+// offload_cpu_build_locked() mutates s.pending, s.build_jobs and the in-flight
+// counters, so the seeding path must call it while holding state().mutex. The
+// unlocked call raced the main-thread poll_completed() loop that iterates and
+// erases s.build_jobs, producing a 0xC0000005 in real D3D12 runs. This stress
+// test pins the invariant by hammering both paths concurrently. Kept last so
+// its worker-pool load cannot perturb the timing assertions above.
+GDEX_TEST_T(poll_budget, parallel_first_offload_lock_safety, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF0143ULL;
+	constexpr int kCount = 16;
+
+	godot::PackedByteArray data;
+	data.resize(static_cast<int64_t>(kUnboundedEntryBytes));
+	uint8_t *w = data.ptrw();
+	for (int64_t i = 0; i < data.size(); i += 4093) {
+		w[i] = static_cast<uint8_t>(i & 0xFF);
+	}
+	for (int i = 0; i < kCount; ++i) {
+		godot::String p = godot::String("user://gdextest_poll_offload_lock_") + godot::String::num_int64(i) + ".png";
+		godot::DSPreloader::Payload meta = make_payload(p.utf8().get_data(), 4096);
+		meta.height = 1536;
+		meta.original_size = kUnboundedEntryBytes;
+		meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(kUnboundedEntryBytes));
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	}
+	warm_worker_pool();
+
+	std::atomic<bool> stop_worker{ false };
+	std::thread worker([&]() {
+		while (!stop_worker.load()) {
+			godot::DSPreloader::poll_completed(tag, 8, 8000, "", false);
+			std::this_thread::yield();
+		}
+	});
+	for (int i = 0; i < 200; ++i) {
+		cache->poll_completed(tag, 8, 8000, false);
+	}
+	stop_worker.store(true);
+	worker.join();
+
+	GDEX_EXPECT_TRUE(pump_until_unbuilt(cache, tag, 64));
+}
