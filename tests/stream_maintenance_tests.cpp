@@ -507,3 +507,90 @@ GDEX_TEST_T(stream_maintenance, concurrent_flush_stream_async_drains_all_request
                 static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
     }
 }
+
+// Finding 1.3 Phase A RED: a loading-mode flush at queue_capacity=1024 must
+// drain 256 requests (cap/4), splitting a 407-request scene across the two
+// 1.1 slots. At HEAD it drains the old hard-clamped 128.
+GDEX_TEST_T(stream_maintenance, stream_flush_loading_scales_while_preserving_pipelining, TAG_INTEGRATION) {
+    godot::DSContext *ds = require_initialized_context(ctx);
+    const uint16_t previous_capacity = ds->get_queue_capacity();
+    ds->set_queue_capacity(1024);
+    godot::DSPreloader::set_background_pacing(false);
+    // The backend reads queue_capacity from the global singleton while this
+    // test drives a local DSContext; align both so admission accepts 256.
+    godot::DSContext *singleton = godot::DSContext::get_singleton();
+    GDEX_ASSERT_TRUE(singleton != nullptr);
+    const uint16_t previous_singleton_capacity = singleton->get_queue_capacity();
+    if (singleton != ds) {
+        singleton->set_queue_capacity(1024);
+    }
+    ctx.add_teardown([ds, singleton, previous_capacity, previous_singleton_capacity]() {
+        ds->set_queue_capacity(previous_capacity);
+        if (singleton != ds) {
+            singleton->set_queue_capacity(previous_singleton_capacity);
+        }
+        godot::DSPreloader::set_background_pacing(false);
+    });
+
+    constexpr const char *kPath = "user://gdextest_loading_flush_scale.bin";
+    GDEX_ASSERT_TRUE(write_probe_file(kPath));
+    ctx.add_teardown([]() { remove_probe_file(kPath); });
+
+    std::vector<godot::Ref<godot::DSRequest>> reqs;
+    reqs.reserve(300);
+    for (int i = 0; i < 300; ++i) {
+        godot::Ref<godot::DSRequest> req = make_memory_request(kPath);
+        GDEX_ASSERT_TRUE(ds->enqueue_request(req, true));
+        reqs.push_back(req);
+    }
+    const int before = ds->get_stream_pending_count();
+    ds->flush_stream_async();
+    const int staged_by_first_flush = before - ds->get_stream_pending_count();
+    // 256 keeps 44 requests for the second slot; 128 (HEAD) is too small and
+    // 510 (v1) would collapse the scene into one monolithic batch.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(staged_by_first_flush), static_cast<int64_t>(256));
+}
+
+// Background pacing must keep the strict 128-request cap even at high queue
+// capacity, so large scenes cannot produce 256+ request bursts during 60 FPS
+// gameplay. Proves DSPreloader -> DSContext mode propagation as well.
+GDEX_TEST_T(stream_maintenance, stream_flush_background_pacing_caps_at_128, TAG_INTEGRATION) {
+    godot::DSContext *ds = require_initialized_context(ctx);
+    const uint16_t previous_capacity = ds->get_queue_capacity();
+    ds->set_queue_capacity(1024);
+    godot::DSPreloader::set_background_pacing(true);
+    // DSPreloader forwards to the module singleton; this test drives a local
+    // DSContext, so assert the forwarding separately and set the local flag.
+    godot::DSContext *singleton = godot::DSContext::get_singleton();
+    GDEX_ASSERT_TRUE(singleton != nullptr);
+    GDEX_EXPECT_TRUE(singleton->is_stream_background_pacing());
+    ds->set_stream_background_pacing(true);
+    const uint16_t previous_singleton_capacity = singleton->get_queue_capacity();
+    if (singleton != ds) {
+        singleton->set_queue_capacity(1024);
+    }
+    ctx.add_teardown([ds, singleton, previous_capacity, previous_singleton_capacity]() {
+        ds->set_queue_capacity(previous_capacity);
+        if (singleton != ds) {
+            singleton->set_queue_capacity(previous_singleton_capacity);
+        }
+        ds->set_stream_background_pacing(false);
+        godot::DSPreloader::set_background_pacing(false);
+    });
+
+    constexpr const char *kPath = "user://gdextest_background_flush_cap.bin";
+    GDEX_ASSERT_TRUE(write_probe_file(kPath));
+    ctx.add_teardown([]() { remove_probe_file(kPath); });
+
+    std::vector<godot::Ref<godot::DSRequest>> reqs;
+    reqs.reserve(300);
+    for (int i = 0; i < 300; ++i) {
+        godot::Ref<godot::DSRequest> req = make_memory_request(kPath);
+        GDEX_ASSERT_TRUE(ds->enqueue_request(req, true));
+        reqs.push_back(req);
+    }
+    const int before = ds->get_stream_pending_count();
+    ds->flush_stream_async();
+    const int staged_by_first_flush = before - ds->get_stream_pending_count();
+    GDEX_EXPECT_EQ(static_cast<int64_t>(staged_by_first_flush), static_cast<int64_t>(128));
+}

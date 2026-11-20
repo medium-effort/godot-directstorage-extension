@@ -5,6 +5,7 @@
 #include "../core/ds_cpu_budget.h"
 #include "../core/ds_gdeflate_stream.h"
 #include "../core/ds_request.h"
+#include "../core/ds_request_budget.h"
 #include "../formats/dspkg_format.h"
 #include "../formats/dstex_format.h"
 
@@ -47,13 +48,10 @@ static std::atomic<int> s_last_poll_offloads{ 0 };
 // header claiming gigabytes must be rejected before resize() runs.
 static constexpr uint64_t MAX_PREWARM_REQUEST_BYTES = 512ULL * 1024ULL * 1024ULL;
 
-// Per-callback request cap: one render-thread callback allocates, enqueues and
-// flush-attempts every request of its textures, so an 8K chunked texture (tens
-// of chunk requests) must not share a callback with dozens of siblings. 64
-// keeps the worst case near one queue-budget slice (queue_capacity / 2 = 256 at
-// the 512 default) while packing small textures efficiently. The effective cap
-// is additionally lowered to half the queue capacity by prewarm_gpu_async().
-static constexpr size_t kGpuPrewarmRequestsPerCallback = 64;
+// The per-callback request cap now lives in core/ds_request_budget.h and is
+// mode-aware: 64 in background pacing, scaled with queue_capacity in loading
+// mode. A callback allocates, enqueues and flush-attempts all its textures, so
+// an 8K chunked texture must not share a callback with dozens of siblings.
 
 // Per-callback VRAM byte cap: bound how much texture_create() + GPU GDeflate
 // decompression work a single render-thread callback stages. Whole textures
@@ -1950,12 +1948,11 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 		// textures are never split: an item that would overflow the request
 		// cap starts the next chunk (an oversized single texture rides alone
 		// and the render-side queue-budget guard diverts it if needed).
-		// The cap is the smaller of the fixed per-callback constant and half the
-		// queue capacity, so a caller that lowers queue_capacity cannot get a
-		// callback that stages the entire queue in one go.
-		const size_t callback_request_cap = std::min<size_t>(
-				kGpuPrewarmRequestsPerCallback,
-				static_cast<size_t>(std::max<uint32_t>(1, ctx->get_queue_capacity() / 2)));
+		// Mode-aware: background pacing keeps the strict 64-request cap; loading
+		// mode scales conservatively with queue_capacity but never past one slot.
+		const bool callback_background_pacing = s.background_pacing.load(std::memory_order_relaxed);
+		const size_t callback_request_cap = dsgd_budget::gpu_callback_request_budget(
+				ctx->get_queue_capacity(), callback_background_pacing);
 		{
 			// Per-item budget inputs first, then the shared planner decides the
 			// boundaries (the same function the test seam asserts).
@@ -2188,7 +2185,8 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 	// memory path shape by dropping the GPU entry; sync load stays available.
 	if (p_ctx != nullptr) {
 		const uint32_t queue_capacity = p_ctx->get_queue_capacity();
-		if (uploads.size() > static_cast<int>(std::max<uint32_t>(1, queue_capacity / 2))) {
+		const size_t slot_ceiling = dsgd_budget::per_slot_request_ceiling(queue_capacity);
+		if (uploads.size() > static_cast<int>(slot_ceiling)) {
 			UtilityFunctions::push_warning("DSPreloader: ", uploads.size(), " GPU prewarm requests exceed the queue budget (", queue_capacity, ") for '", m.engine_path, "'; sync load remains available.");
 			p_rd->free_rid(tex_rid);
 			mark_gpu_item_failed(p_item.pending_id);
@@ -3172,6 +3170,9 @@ bool DSPreloader::has_gpu_requests_in_flight(uint64_t p_tag) {
 
 void DSPreloader::set_background_pacing(bool p_enabled) {
 	state().background_pacing.store(p_enabled, std::memory_order_relaxed);
+	if (DSContext *ctx = DSContext::get_singleton()) {
+		ctx->set_stream_background_pacing(p_enabled);
+	}
 }
 
 bool DSPreloader::is_background_pacing() {

@@ -2,6 +2,7 @@
 #define DS_WIN32_BACKEND_H
 
 #include "../platform_backend.h"
+#include "../../core/ds_request_budget.h"
 #include "../../formats/dspkg_format.h"
 #include <godot_cpp/templates/vector.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
@@ -437,7 +438,7 @@ public:
 	// requests, so two full slots consume exactly capacity. Tiny queues keep
 	// the single-slot path.
 	static uint32_t per_slot_admission_capacity(uint32_t p_capacity) {
-		return p_capacity >= 8 ? p_capacity / 2u : p_capacity;
+		return static_cast<uint32_t>(dsgd_budget::per_slot_admission_capacity(p_capacity));
 	}
 	static bool can_pipeline(uint32_t p_capacity) { return p_capacity >= 8; }
 

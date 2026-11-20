@@ -1,6 +1,7 @@
 #include "ds_context.h"
 #include "ds_error_handler.h"
 #include "ds_profiler.h"
+#include "ds_request_budget.h"
 #include "ds_settings.h"
 #include "../integration/ds_texture_cache.h"
 #include "../platform/fallback/ds_fallback_backend.h"
@@ -1607,11 +1608,9 @@ Error DSContext::flush_stream_async() {
 			return ERR_BUSY;
 		}
 		uint16_t cap = get_queue_capacity();
-		size_t subresource_budget = (cap > 64) ? (cap / 2) : 64;
-		if (subresource_budget > 1024) {
-			subresource_budget = 1024;
-		}
-		size_t max_logical_requests = std::min<size_t>(subresource_budget, 128);
+		const bool background_pacing = stream_background_pacing.load(std::memory_order_relaxed);
+		const size_t subresource_budget = dsgd_budget::per_flush_subresource_budget(cap);
+		const size_t max_logical_requests = dsgd_budget::per_flush_request_budget(cap, background_pacing);
 		size_t accumulated_subresources = 0;
 		while (!stream_queue.empty() && to_submit.size() < max_logical_requests) {
 			Ref<DSRequest> next_req = stream_queue.front();
@@ -1878,6 +1877,14 @@ bool DSContext::is_resource_in_flight(const RID &p_rid) const {
 		return false;
 	}
 	return active_backend->is_resource_in_flight(p_rid);
+}
+
+void DSContext::set_stream_background_pacing(bool p_enabled) {
+	stream_background_pacing.store(p_enabled, std::memory_order_relaxed);
+}
+
+bool DSContext::is_stream_background_pacing() const {
+	return stream_background_pacing.load(std::memory_order_relaxed);
 }
 
 bool DSContext::is_batch_complete() const {

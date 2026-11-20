@@ -183,6 +183,9 @@ private:
 	// empty stream queue, so the final chunk of a prewarm cannot sit staged
 	// forever waiting for an enqueue that will never come.
 	std::atomic<int> stream_pending_submit_requests{ 0 };
+	// C++-only: mirrors DSPreloader's background-pacing mode so the stream
+	// flush can choose the tight (gameplay) or scaled (loading) request budget.
+	std::atomic<bool> stream_background_pacing{ false };
 	std::unordered_map<uint64_t, StreamTagInfo> stream_tags;
 	uint64_t next_stream_tag = 1;
 
@@ -333,6 +336,8 @@ public:
 	bool is_tag_cancelled(uint64_t p_tag) const;
 	bool is_resource_in_flight(const RID &p_rid) const;
 	bool is_batch_complete() const;
+	void set_stream_background_pacing(bool p_enabled);
+	bool is_stream_background_pacing() const;
 	bool has_pending_results() const;
 	// True when a completed batch is waiting to be harvested, independent of
 	// whether a sibling batch is still in flight. Lets callers reclaim a finished
