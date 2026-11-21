@@ -290,6 +290,11 @@ private:
 	// be running; readers must not release device resources in that case.
 	// Atomic like the neighbouring flags: the accessor takes no lock.
 	std::atomic<bool> last_shutdown_drained{ true };
+	// Set when the last shutdown drain could not arm a completion event. Only
+	// written by drain_all_queues() and read immediately afterwards by shutdown(),
+	// both on the shutdown thread; plain bool for that reason. Not a lock-free
+	// reader: nothing else reads it.
+	bool last_drain_arm_failed = false;
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	// Test-only seam: called immediately after submit_async()/submit_batch()
 	// release batch_mutex and before anything is handed to DirectStorage. It
@@ -301,6 +306,15 @@ private:
 	// completion counters. A test parks there and asks another thread whether
 	// batch_mutex is held at that instant. Never bound in _bind_methods().
 	std::function<void()> drain_counter_access_hook;
+#ifdef _WIN32
+	// Test-only seam: substitutes the per-target event-arm call in
+	// drain_all_queues(). Returns the HRESULT the real
+	// ID3D12Fence::SetEventOnCompletion() would have returned; an empty hook calls
+	// the fence directly. It exists because an arm failure needs a device removed
+	// between the GetCompletedValue() query and the arm, which cannot be produced on
+	// demand. Never bound in _bind_methods().
+	std::function<HRESULT(int p_queue_index, ID3D12Fence *p_fence, uint64_t p_value, HANDLE p_event)> drain_arm_hook;
+#endif
 	// Test-only seam: forces the pre-submit transition gate in submit_async() and
 	// submit_batch() to abort even when pre_transitions is empty, so transition-abort
 	// slot cleanup can be tested without a live D3D12 device removal. Never bound in _bind_methods().
@@ -628,6 +642,10 @@ public:
 	// which is the point: the retry decision must not depend on the text.
 	// Never bound in _bind_methods().
 	static void _set_capacity_reject_text_for_testing(const String &p_text);
+	// Test-only seam: installs (or, with an empty callback, clears) the hook that
+	// substitutes drain_all_queues()'s per-target SetEventOnCompletion() call, so a
+	// test can make an arm fail on a live device. Never bound in _bind_methods().
+	void _debug_set_drain_arm_hook_for_testing(const std::function<HRESULT(int, ID3D12Fence *, uint64_t, HANDLE)> &p_hook);
 #endif
 #endif
 

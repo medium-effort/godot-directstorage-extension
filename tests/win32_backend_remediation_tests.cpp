@@ -4477,3 +4477,222 @@ GDEX_TEST_T(win32_remediation, transition_abort_clears_staged_request_names, ::g
 #endif
 }
 
+GDEX_TEST_T(win32_remediation, drain_arm_failure_is_not_clean, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps == nullptr) {
+        (void)ctx;
+        GDEX_SKIP("ProjectSettings unavailable in this fixture.");
+        return;
+    }
+    const bool had_timeout = ps->has_setting("dsgd_extension/shutdown_drain_timeout_ms");
+    const godot::Variant prev_timeout = had_timeout
+            ? ps->get_setting("dsgd_extension/shutdown_drain_timeout_ms")
+            : godot::Variant();
+    ctx.add_teardown([ps, had_timeout, prev_timeout]() {
+        if (had_timeout) {
+            ps->set_setting("dsgd_extension/shutdown_drain_timeout_ms", prev_timeout);
+        } else {
+            ps->clear("dsgd_extension/shutdown_drain_timeout_ms");
+        }
+    });
+    // The wait path's floor is now 10 s, so a false returned in a few milliseconds
+    // can only have come from the arm-failure gate, not from a timeout.
+    ps->set_setting("dsgd_extension/shutdown_drain_timeout_ms", 10000);
+
+    // Leg A - control: the same pinned target and the same seam call site, but the
+    // hook performs the real arm. The drain must wait, then report clean.
+    {
+        godot::Win32Backend *backend = memnew(godot::Win32Backend);
+        bool *clean_holder = new bool(true);
+        ctx.add_teardown([backend, clean_holder]() {
+            const bool clean = *clean_holder;
+            delete clean_holder;
+            backend->_debug_set_drain_arm_hook_for_testing({});
+            if (clean) {
+                backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 0, 0);
+                memdelete(backend);
+            }
+            // A non-clean drain detached completion_thread: park the backend.
+        });
+        if (!backend->is_available() || !backend->initialize()) {
+            GDEX_SKIP("DirectStorage runtime absent or backend init failed on this machine.");
+            return;
+        }
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence(static_cast<ID3D12Fence *>(
+                backend->_debug_get_queue_completion_fence_for_testing(godot::DSRequest::PRIORITY_HIGH)));
+        GDEX_EXPECT_TRUE(fence != nullptr);
+        if (fence == nullptr) {
+            return;
+        }
+        const uint64_t target = fence->GetCompletedValue() + 1;
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, target, 0);
+        backend->_debug_set_drain_arm_hook_for_testing([](int, ID3D12Fence *p_fence, uint64_t p_value, HANDLE p_event) {
+            return p_fence->SetEventOnCompletion(p_value, p_event);
+        });
+
+        std::atomic<bool> drain_done{ false };
+        std::thread drainer([backend, &drain_done]() {
+            backend->shutdown();
+            drain_done.store(true, std::memory_order_release);
+        });
+        godot::OS::get_singleton()->delay_msec(50);
+        const bool still_waiting = !drain_done.load(std::memory_order_acquire);
+        GDEX_EXPECT_TRUE(fence->Signal(target) == S_OK);
+        drainer.join();
+
+        const bool clean = backend->was_drain_clean();
+        *clean_holder = clean;
+        uint64_t recorded_completion = 0;
+        uint64_t recorded_completed = 0;
+        backend->_debug_get_last_drain_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, recorded_completion, recorded_completed);
+        GDEX_EXPECT_TRUE(still_waiting);
+        GDEX_EXPECT_TRUE(clean);
+        GDEX_EXPECT_EQ(recorded_completion, target);
+        GDEX_EXPECT_TRUE(recorded_completed >= target);
+    }
+
+    // Leg B - failing input: identical shape, but the arm reports E_FAIL. The
+    // unsatisfied target is dropped from the wait set, so a drain that claims to
+    // be clean would licence teardown while DMA may still be resident.
+    {
+        godot::Win32Backend *backend = memnew(godot::Win32Backend);
+        bool *clean_holder = new bool(true);
+        ctx.add_teardown([backend, clean_holder]() {
+            const bool clean = *clean_holder;
+            delete clean_holder;
+            backend->_debug_set_drain_arm_hook_for_testing({});
+            if (clean) {
+                backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 0, 0);
+                memdelete(backend);
+            }
+        });
+        if (!backend->is_available() || !backend->initialize()) {
+            GDEX_SKIP("DirectStorage runtime absent or backend init failed on this machine.");
+            return;
+        }
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence(static_cast<ID3D12Fence *>(
+                backend->_debug_get_queue_completion_fence_for_testing(godot::DSRequest::PRIORITY_HIGH)));
+        GDEX_EXPECT_TRUE(fence != nullptr);
+        if (fence == nullptr) {
+            return;
+        }
+        const uint64_t target = fence->GetCompletedValue() + 1;
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, target, 0);
+        backend->_debug_set_drain_arm_hook_for_testing([](int, ID3D12Fence *, uint64_t, HANDLE) {
+            return E_FAIL;
+        });
+
+        const int64_t t0 = godot::Time::get_singleton()->get_ticks_msec();
+        backend->shutdown();
+        const int64_t elapsed = godot::Time::get_singleton()->get_ticks_msec() - t0;
+        const bool clean = backend->was_drain_clean();
+        *clean_holder = clean;
+        uint64_t recorded_completion = 0;
+        uint64_t recorded_completed = 0;
+        backend->_debug_get_last_drain_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, recorded_completion, recorded_completed);
+
+        GDEX_EXPECT_FALSE(clean);
+        GDEX_EXPECT_EQ(recorded_completion, 0ULL);
+        GDEX_EXPECT_EQ(recorded_completed, 0ULL);
+        GDEX_EXPECT_TRUE(elapsed < 2000);
+    }
+#else
+    (void)ctx;
+    GDEX_SKIP("The drain arm hook is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
+GDEX_TEST_T(win32_remediation, drain_partial_arm_failure_is_not_clean, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    if (ps == nullptr) {
+        (void)ctx;
+        GDEX_SKIP("ProjectSettings unavailable in this fixture.");
+        return;
+    }
+    const bool had_timeout = ps->has_setting("dsgd_extension/shutdown_drain_timeout_ms");
+    const godot::Variant prev_timeout = had_timeout
+            ? ps->get_setting("dsgd_extension/shutdown_drain_timeout_ms")
+            : godot::Variant();
+    ctx.add_teardown([ps, had_timeout, prev_timeout]() {
+        if (had_timeout) {
+            ps->set_setting("dsgd_extension/shutdown_drain_timeout_ms", prev_timeout);
+        } else {
+            ps->clear("dsgd_extension/shutdown_drain_timeout_ms");
+        }
+    });
+    ps->set_setting("dsgd_extension/shutdown_drain_timeout_ms", 10000);
+
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    bool *clean_holder = new bool(true);
+    ctx.add_teardown([backend, clean_holder]() {
+        const bool clean = *clean_holder;
+        delete clean_holder;
+        backend->_debug_set_drain_arm_hook_for_testing({});
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, 0, 0);
+        backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_NORMAL, 0, 0);
+        if (clean) {
+            memdelete(backend);
+        }
+    });
+    if (!backend->is_available() || !backend->initialize()) {
+        GDEX_SKIP("DirectStorage runtime absent or backend init failed on this machine.");
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence_high(static_cast<ID3D12Fence *>(
+            backend->_debug_get_queue_completion_fence_for_testing(godot::DSRequest::PRIORITY_HIGH)));
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence_normal(static_cast<ID3D12Fence *>(
+            backend->_debug_get_queue_completion_fence_for_testing(godot::DSRequest::PRIORITY_NORMAL)));
+    GDEX_EXPECT_TRUE(fence_high != nullptr);
+    GDEX_EXPECT_TRUE(fence_normal != nullptr);
+    if (fence_high == nullptr || fence_normal == nullptr) {
+        return;
+    }
+    const uint64_t target_high = fence_high->GetCompletedValue() + 1;
+    const uint64_t target_normal = fence_normal->GetCompletedValue() + 1;
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_HIGH, target_high, 0);
+    backend->_debug_set_queue_fence_counters_for_testing(godot::DSRequest::PRIORITY_NORMAL, target_normal, 0);
+    // HIGH is armed for real and satisfied below; NORMAL cannot be armed at all.
+    // Waiting on the armed subset alone must not be reported as a clean drain.
+    backend->_debug_set_drain_arm_hook_for_testing([](int p_queue_index, ID3D12Fence *p_fence, uint64_t p_value, HANDLE p_event) {
+        return p_queue_index == godot::DSRequest::PRIORITY_HIGH
+                ? p_fence->SetEventOnCompletion(p_value, p_event)
+                : E_FAIL;
+    });
+
+    const int64_t t0 = godot::Time::get_singleton()->get_ticks_msec();
+    std::atomic<bool> drain_done{ false };
+    std::thread drainer([backend, &drain_done]() {
+        backend->shutdown();
+        drain_done.store(true, std::memory_order_release);
+    });
+    godot::OS::get_singleton()->delay_msec(50);
+    GDEX_EXPECT_TRUE(fence_high->Signal(target_high) == S_OK);
+    drainer.join();
+    const int64_t elapsed = godot::Time::get_singleton()->get_ticks_msec() - t0;
+
+    const bool clean = backend->was_drain_clean();
+    *clean_holder = clean;
+    uint64_t recorded_normal_completion = 0;
+    uint64_t recorded_normal_completed = 0;
+    backend->_debug_get_last_drain_counters_for_testing(godot::DSRequest::PRIORITY_NORMAL, recorded_normal_completion, recorded_normal_completed);
+    GDEX_EXPECT_FALSE(clean);
+    GDEX_EXPECT_EQ(recorded_normal_completion, 0ULL);
+    GDEX_EXPECT_TRUE(elapsed < 2000);
+#else
+    (void)ctx;
+    GDEX_SKIP("The drain arm hook is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+

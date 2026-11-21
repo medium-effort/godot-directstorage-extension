@@ -4140,12 +4140,14 @@ void Win32Backend::record_drain_watermarks(ID3D12Fence *const *p_fences) {
 }
 
 bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
+	last_drain_arm_failed = false;
 	// Snapshot the per-queue wait targets under batch_mutex. Every QueueState
 	// counter belongs to that mutex: submit_async()/submit_batch() advance
 	// completion_fence_value under it, and the completion thread records
 	// completed_fence_value under it (complete_batch_slot()). Reading or writing
 	// either counter here without the lock raced those writers.
 	struct DrainTarget {
+		int queue_index = 0;
 		ID3D12Fence *fence = nullptr;
 		uint64_t target_value = 0;
 		HANDLE event = nullptr;
@@ -4168,7 +4170,7 @@ bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 			const QueueState &queue = priority_queues[i];
 			fences[i] = queue.completion_fence;
 			if (queue.completion_fence && queue.completion_fence_value != 0 && queue.completion_event) {
-				targets[target_count++] = { queue.completion_fence, queue.completion_fence_value, queue.completion_event };
+				targets[target_count++] = { i, queue.completion_fence, queue.completion_fence_value, queue.completion_event };
 			}
 		}
 	}
@@ -4178,13 +4180,41 @@ bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 	// lock across it would stall every enqueue, submit and batch completion.
 	HANDLE wait_events[QUEUE_COUNT];
 	int event_count = 0;
+	bool arm_failed = false;
 	for (int i = 0; i < target_count; i++) {
 		uint64_t completed = targets[i].fence->GetCompletedValue();
-		if (completed != UINT64_MAX && completed < targets[i].target_value) {
-			if (SUCCEEDED(targets[i].fence->SetEventOnCompletion(targets[i].target_value, targets[i].event))) {
-				wait_events[event_count++] = targets[i].event;
-			}
+		if (completed == UINT64_MAX || completed >= targets[i].target_value) {
+			continue;
 		}
+		HRESULT arm_result = S_OK;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		if (drain_arm_hook) {
+			arm_result = drain_arm_hook(targets[i].queue_index, targets[i].fence, targets[i].target_value, targets[i].event);
+		} else
+#endif
+		{
+			arm_result = targets[i].fence->SetEventOnCompletion(targets[i].target_value, targets[i].event);
+		}
+		if (FAILED(arm_result)) {
+			// A target that could not be armed can never be proven complete. It must
+			// not be dropped from the wait set silently: the drain's answer is "every
+			// unsatisfied target was waited on", and a subset cannot establish that.
+			arm_failed = true;
+			UtilityFunctions::push_error("[DirectStorage] Shutdown drain could not arm a completion event on priority queue " +
+					String::num_int64(targets[i].queue_index) + " (HRESULT 0x" +
+					String::num_uint64(static_cast<uint32_t>(arm_result), 16) +
+					"); that queue's target cannot be proven complete.");
+			continue;
+		}
+		wait_events[event_count++] = targets[i].event;
+	}
+
+	if (arm_failed) {
+		// Fail before either success exit. Waiting on the armed subset cannot prove
+		// the failed target, and the only caller takes the deliberate-leak path for a
+		// false answer either way, so spending the drain budget buys nothing.
+		last_drain_arm_failed = true;
+		return false;
 	}
 
 	if (event_count == 0) {
@@ -4261,13 +4291,18 @@ void Win32Backend::shutdown() {
 	}
 
 	if (!drained) {
-		// Drain timed out (GPU hardware hang, TDR, or driver deadlock).
+		// Two causes reach this branch: the wait timed out (GPU hardware hang, TDR,
+		// driver deadlock) or a queue's completion event could not be armed, in which
+		// case the drain failed immediately and never waited at all.
 		// Releasing guards, closing in-flight files, or unloading DirectStorage DLLs
 		// while hardware or driver DMA is active causes an immediate unhandled Access Violation.
 		// Instead: signal stop, detach completion_thread to avoid std::terminate(), leak handles,
 		// and skip unloading runtime modules. The OS kernel process teardown reclaims all resources cleanly.
-		UtilityFunctions::push_error("[DirectStorage] Shutdown drain timed out after " + String::num_uint64(timeout_ms) +
-				" ms (GPU/DMA hung); leaking handles and skipping DLL unload to avoid use-after-free.");
+		const String cause = last_drain_arm_failed
+				? String("could not arm a queue completion event (device removed or out of resources)")
+				: String("timed out after ") + String::num_uint64(timeout_ms) + " ms (GPU/DMA hung)";
+		UtilityFunctions::push_error("[DirectStorage] Shutdown drain " + cause +
+				"; leaking handles and skipping DLL unload to avoid use-after-free.");
 		{
 			// Publish the stop flag under batch_mutex: the completion thread
 			// checks it in its wait predicate under the same mutex, so a store
@@ -6432,6 +6467,16 @@ void Win32Backend::_debug_set_force_transition_failure_for_testing(bool p_force)
 	(void)p_force;
 #endif
 }
+
+#ifdef _WIN32
+void Win32Backend::_debug_set_drain_arm_hook_for_testing(const std::function<HRESULT(int, ID3D12Fence *, uint64_t, HANDLE)> &p_hook) {
+	// Test-only seam. Installs the callback that substitutes the per-target
+	// SetEventOnCompletion() call inside drain_all_queues(), or clears it when
+	// p_hook is empty. Callers must clear it before the captured state dies and
+	// before deleting the backend. Never bound in _bind_methods().
+	drain_arm_hook = p_hook;
+}
+#endif
 #endif
 
 } // namespace godot
