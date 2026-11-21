@@ -21,7 +21,7 @@
 //   int GDeflateCompressor::compress_bound(input_size) const
 //   void/int GDeflateCompressor::set/get_compression_level() (clamp 1..12, default 1)
 //   PackedByteArray GDeflateDecompressor::decompress(compressed, original_size)
-//   void/int GDeflateDecompressor::set/get_worker_count() (clamp 1..8)
+//   void/int GDeflateDecompressor::set/get_worker_count() (clamp 1..ds_get_max_cpu_threads())
 
 namespace {
 
@@ -156,18 +156,20 @@ GDEX_TEST(gdeflate, compression_level_clamps_1_to_12) {
     GDEX_EXPECT_EQ(compressor->get_compression_level(), 6);
 }
 
-GDEX_TEST(gdeflate, worker_count_clamps_1_to_8) {
+GDEX_TEST(gdeflate, worker_count_clamps_to_cpu_budget) {
+    const int ceiling = godot::ds_get_max_cpu_threads();
+    GDEX_ASSERT_TRUE(ceiling >= 1);
     godot::Ref<godot::GDeflateDecompressor> decompressor;
     decompressor.instantiate();
-    // Default is CPU-dependent (fallback 4); only the clamped range is asserted.
+    // Default is the resolved CPU budget (fallback 4); assert the clamped range.
     GDEX_EXPECT_GE(decompressor->get_worker_count(), 1);
-    GDEX_EXPECT_LE(decompressor->get_worker_count(), 8);
+    GDEX_EXPECT_LE(decompressor->get_worker_count(), ceiling);
     decompressor->set_worker_count(0);
     GDEX_EXPECT_EQ(decompressor->get_worker_count(), 1);
     decompressor->set_worker_count(99);
-    GDEX_EXPECT_EQ(decompressor->get_worker_count(), 8);
+    GDEX_EXPECT_EQ(decompressor->get_worker_count(), ceiling);
     decompressor->set_worker_count(2);
-    GDEX_EXPECT_EQ(decompressor->get_worker_count(), 2);
+    GDEX_EXPECT_EQ(decompressor->get_worker_count(), 2 <= ceiling ? 2 : ceiling);
 }
 
 GDEX_TEST(gdeflate, empty_input_yields_empty) {

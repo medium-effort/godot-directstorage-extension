@@ -22,12 +22,12 @@
 		<method name="set_worker_count">
 			<return type="void" />
 			<param index="0" name="count" type="int" />
-			<description>Sets the worker count, clamped to the range [code]1[/code] through [code]8[/code].</description>
+			<description>Sets the worker count, clamped to the range [code]1[/code] through the resolved [code]dsgd_extension/max_cpu_threads[/code] budget (auto: processors capped by the engine worker pool, up to 16; explicitly configurable up to 32). The constructor and this setter both use that budget.</description>
 		</method>
 	</methods>
 	<members>
 		<member name="worker_count" type="int" setter="set_worker_count" getter="get_worker_count" default="4">
-			Number of worker threads used for software decompression. The constructor selects a value from [code]1[/code] through [code]8[/code] based on available processors.
+			Number of worker threads used for software decompression. The constructor selects a value from [code]1[/code] through the resolved [code]dsgd_extension/max_cpu_threads[/code] budget, based on available processors.
 		</member>
 	</members>
 </class>
