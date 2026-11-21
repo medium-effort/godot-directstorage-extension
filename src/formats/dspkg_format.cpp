@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -78,6 +79,17 @@ static std::mutex s_unauth_log_mutex;
 static uint64_t s_last_unauth_path_hash = 0;
 static bool s_has_unauth_path = false;
 
+// A scoped global-key install snapshots the previous resolution state so a
+// short-lived tooling operation (the exporter's writer round trip) can use an
+// override without discarding a developer's preview key. Tokens are LIFO and
+// must be ended under the same s_key_mutex that guards the globals.
+struct KeyScopeRecord {
+	KeyResolutionState state = KEY_STATE_DEFAULT;
+	std::array<uint8_t, 32> key_bytes = {};
+};
+static std::unordered_map<int, KeyScopeRecord> s_key_scopes;
+static int s_next_key_scope_token = 1;
+
 static String key_id_to_hex(const uint8_t id_buf[8]) {
 	String result;
 	for (int i = 0; i < 8; ++i) {
@@ -125,6 +137,17 @@ static void compute_key_id_from_bytes(const uint8_t *p_key_bytes, uint64_t &r_ke
 
 static void wipe_key_bytes(std::array<uint8_t, 32> &r_key_bytes) {
 	crypto_wipe(r_key_bytes.data(), r_key_bytes.size());
+}
+
+// Copies exactly 32 bytes out of a caller-supplied PackedByteArray. The caller
+// can wipe its own buffer after this returns; the native copy owns the key.
+static bool copy_key_bytes_32(const PackedByteArray &p_bytes, std::array<uint8_t, 32> &r_out) {
+	if (p_bytes.size() != 32) {
+		wipe_key_bytes(r_out);
+		return false;
+	}
+	memcpy(r_out.data(), p_bytes.ptr(), 32);
+	return true;
 }
 
 // Acquires a decryption-key candidate without installing it. Installation is the
@@ -545,11 +568,14 @@ void DSPkg::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_repack_uncompressed"), &DSPkg::is_repack_uncompressed);
 	ClassDB::bind_method(D_METHOD("add_texture", "resource_path", "dstex_path", "mip_metadata"), &DSPkg::add_texture, DEFVAL(Dictionary()));
 	ClassDB::bind_method(D_METHOD("set_encryption_key", "key_hex"), &DSPkg::set_encryption_key);
+	ClassDB::bind_method(D_METHOD("set_encryption_key_bytes", "key_bytes"), &DSPkg::set_encryption_key_bytes);
 	ClassDB::bind_method(D_METHOD("finalize"), &DSPkg::finalize);
 
 	ClassDB::bind_static_method("DSPkg", D_METHOD("set_global_encryption_key", "key_hex"), &DSPkg::set_global_encryption_key);
 	ClassDB::bind_static_method("DSPkg", D_METHOD("get_global_encryption_key_id"), &DSPkg::get_global_encryption_key_id);
 	ClassDB::bind_static_method("DSPkg", D_METHOD("compute_key_id", "key_hex"), &DSPkg::compute_key_id);
+	ClassDB::bind_static_method("DSPkg", D_METHOD("begin_global_key_scope", "key_bytes"), &DSPkg::begin_global_key_scope);
+	ClassDB::bind_static_method("DSPkg", D_METHOD("end_global_key_scope", "token"), &DSPkg::end_global_key_scope);
 
 	ClassDB::bind_method(D_METHOD("open", "path", "expected_fingerprint"), &DSPkg::open, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("get_archive_fingerprint"), &DSPkg::get_archive_fingerprint);
@@ -638,6 +664,68 @@ Error DSPkg::set_global_encryption_key(const String &p_key_hex) {
 	}
 	s_key_resolution_state = KEY_STATE_OVERRIDE;
 	return OK;
+}
+
+Error DSPkg::set_encryption_key_bytes(const PackedByteArray &p_key_bytes) {
+	if (!is_building) return ERR_UNCONFIGURED;
+	std::array<uint8_t, 32> bytes = {};
+	if (!copy_key_bytes_32(p_key_bytes, bytes)) {
+		return ERR_INVALID_PARAMETER;
+	}
+	m_encryption_key = bytes;
+	wipe_key_bytes(bytes);
+	m_encryption_enabled = true;
+	return OK;
+}
+
+int DSPkg::begin_global_key_scope(const PackedByteArray &p_key_bytes) {
+	std::array<uint8_t, 32> new_bytes = {};
+	if (!copy_key_bytes_32(p_key_bytes, new_bytes)) {
+		return 0;
+	}
+	std::lock_guard<std::mutex> lock(s_key_mutex);
+	{
+		std::lock_guard<std::mutex> unauth_lock(s_unauth_log_mutex);
+		s_has_unauth_path = false;
+		s_last_unauth_path_hash = 0;
+	}
+	KeyScopeRecord record;
+	record.state = s_key_resolution_state;
+	if (record.state == KEY_STATE_OVERRIDE) {
+		record.key_bytes = s_global_encryption_key_bytes;
+	}
+	int token = s_next_key_scope_token++;
+	if (token <= 0) {
+		s_next_key_scope_token = 1;
+		token = s_next_key_scope_token++;
+	}
+	while (s_key_scopes.find(token) != s_key_scopes.end()) {
+		token = s_next_key_scope_token++;
+	}
+	s_key_scopes.emplace(token, record);
+	wipe_key_bytes(record.key_bytes);
+	s_global_encryption_key_bytes = new_bytes;
+	wipe_key_bytes(new_bytes);
+	s_key_resolution_state = KEY_STATE_OVERRIDE;
+	return token;
+}
+
+bool DSPkg::end_global_key_scope(int p_token) {
+	std::lock_guard<std::mutex> lock(s_key_mutex);
+	auto it = s_key_scopes.find(p_token);
+	if (it == s_key_scopes.end()) {
+		return false;
+	}
+	KeyScopeRecord record = it->second;
+	s_key_scopes.erase(it);
+	s_key_resolution_state = record.state;
+	if (record.state == KEY_STATE_OVERRIDE) {
+		s_global_encryption_key_bytes = record.key_bytes;
+	} else {
+		crypto_wipe(s_global_encryption_key_bytes.data(), 32);
+	}
+	wipe_key_bytes(record.key_bytes);
+	return true;
 }
 
 String DSPkg::get_global_encryption_key_id() {

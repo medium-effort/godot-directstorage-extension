@@ -1311,6 +1311,48 @@ GDEX_TEST_T(dspkg, protected_build_rejects_plaintext_archive, TAG_INTEGRATION) {
 	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), godot::DSPkg::compute_key_id(key_hex));
 }
 
+// Scoped global key installs back the exporter's writer round trip: a short
+// override must restore exactly the previous resolution state (including a
+// developer preview key), and its token must retire after one use.
+GDEX_TEST_T(dspkg, global_key_scope_restores_state, TAG_UNIT) {
+	const godot::String key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+	const godot::String preview_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+	godot::PackedByteArray key_bytes = key_hex.hex_decode();
+	godot::PackedByteArray preview_bytes = preview_hex.hex_decode();
+	GDEX_ASSERT_EQ(static_cast<int64_t>(key_bytes.size()), static_cast<int64_t>(32));
+	GDEX_ASSERT_EQ(static_cast<int64_t>(preview_bytes.size()), static_cast<int64_t>(32));
+
+	GlobalKeyResetGuard guard;
+	const godot::String baseline_id = godot::DSPkg::get_global_encryption_key_id();
+
+	// 1-3. Scoped override, restored to the baseline, token retired.
+	const int token = godot::DSPkg::begin_global_key_scope(key_bytes);
+	GDEX_ASSERT_TRUE(token > 0);
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), godot::DSPkg::compute_key_id(key_hex));
+	GDEX_EXPECT_TRUE(godot::DSPkg::end_global_key_scope(token));
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), baseline_id);
+	GDEX_EXPECT_FALSE(godot::DSPkg::end_global_key_scope(token));
+
+	// 4-5. A preview key installed before the scope survives it. Clearing with
+	//      an empty string here would reset to DEFAULT and discard the preview.
+	GDEX_ASSERT_TRUE(godot::DSPkg::set_global_encryption_key(preview_hex) == godot::OK);
+	const godot::String preview_id = godot::DSPkg::get_global_encryption_key_id();
+	const int preview_token = godot::DSPkg::begin_global_key_scope(key_bytes);
+	GDEX_ASSERT_TRUE(preview_token > 0);
+	GDEX_EXPECT_TRUE(godot::DSPkg::end_global_key_scope(preview_token));
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), preview_id);
+
+	// 6. Nested scopes unwind LIFO to the same preview key.
+	const int outer = godot::DSPkg::begin_global_key_scope(key_bytes);
+	const int inner = godot::DSPkg::begin_global_key_scope(preview_bytes);
+	GDEX_ASSERT_TRUE(outer > 0 && inner > 0 && outer != inner);
+	GDEX_EXPECT_TRUE(godot::DSPkg::end_global_key_scope(inner));
+	GDEX_EXPECT_TRUE(godot::DSPkg::end_global_key_scope(outer));
+	GDEX_EXPECT_STR_EQ(godot::DSPkg::get_global_encryption_key_id(), preview_id);
+
+	GDEX_EXPECT_TRUE(godot::DSPkg::set_global_encryption_key("") == godot::OK);
+}
+
 // The requirement must survive a project-settings override. `dsgd_extension/protected`
 // is published in project.binary, and a file beside the executable (`override.cfg`)
 // can displace it at startup. The carrier that no file beside the executable can add

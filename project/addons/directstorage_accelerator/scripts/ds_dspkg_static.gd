@@ -18,3 +18,13 @@ static func set_global_key(key_hex: String) -> bool:
 ## no key is installed.
 static func get_global_key_id() -> String:
 	return DSPkg.get_global_encryption_key_id()
+
+
+## Installs a scoped override key and returns its restore token (0 on bad key).
+static func begin_key_scope(key_bytes: PackedByteArray) -> int:
+	return int(DSPkg.begin_global_key_scope(key_bytes))
+
+
+## Restores the key state saved by begin_key_scope(). False for a stale token.
+static func end_key_scope(token: int) -> bool:
+	return bool(DSPkg.end_global_key_scope(token))

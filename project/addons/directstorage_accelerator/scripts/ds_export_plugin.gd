@@ -492,12 +492,12 @@ func _build_key_file(key: PackedByteArray) -> PackedByteArray:
 
 ## Installs the generated key on the writer so the archive is built encrypted.
 func _apply_archive_key() -> bool:
-	if not _dspkg.has_method("set_encryption_key"):
-		push_error("[DirectStorage Exporter] The loaded DSPkg binary does not support TOC encryption. Rebuild the extension.")
+	if not _dspkg.has_method("set_encryption_key_bytes"):
+		push_error("[DirectStorage Exporter] The loaded DSPkg binary does not support byte-based TOC encryption keys. Rebuild the extension.")
 		_dspkg = null
 		_archive_failed = true
 		return false
-	var err: Error = _dspkg.set_encryption_key(_archive_key.hex_encode())
+	var err: Error = _dspkg.set_encryption_key_bytes(_archive_key)
 	if err != OK:
 		push_error("[DirectStorage Exporter] Failed to configure the archive encryption key: " + error_string(err))
 		_dspkg = null
@@ -741,6 +741,7 @@ func _export_end() -> void:
 	_dspkg = null
 	_cleanup_staging()
 	_cleanup_legacy_user_temp()
+	_clear_archive_key()
 	if not dspkg_ok:
 		var detail := ""
 		if _outcome == _policy.OUTCOME_FAILED and not _protection_failure_reason.is_empty():
@@ -1000,24 +1001,45 @@ func _option_bool(option: StringName, default_value: bool) -> bool:
 	return bool(value)
 
 
-## Writer round-trip: install the key this export generated, then open the
-## archive that was just deployed with it and the published archive id.
+## Wipes the per-export key buffer. Safe to call more than once: the native key
+## scope has already copied the bytes by the time verification ends.
+func _clear_archive_key() -> void:
+	_archive_key.fill(0)
+
+
+## Writer round-trip: install the key this export generated as a scoped global
+## override, then open the archive that was just deployed with it and the
+## published archive id.
 ##
 ## `open()` compares the header key id and authenticates the TOC, so an OK here
 ## proves the archive and the key belong to the same export. A failure marks the
-## export failed but keeps the structurally valid archive. The key is left
-## installed: clearing it with an empty string resets the key state and would
-## discard a developer's preview key.
+## export failed but keeps the structurally valid archive. The scope restores
+## the previous key state on every exit, so a developer's preview key survives;
+## clearing with an empty string would have discarded it.
 func _verify_written_archive() -> bool:
 	var bridge: GDScript = _get_dspkg_static()
 	if bridge == null:
 		return false
-
-	var installed: bool = bool(bridge.call("set_global_key", _archive_key.hex_encode()))
-	if not installed:
-		push_error("[DirectStorage Exporter] Failed to install the generated archive key; the written archive cannot be verified.")
+	if not ClassDB.class_has_method("DSPkg", "begin_global_key_scope", true) or not ClassDB.class_has_method("DSPkg", "end_global_key_scope", true):
+		push_error("[DirectStorage Exporter] The loaded DSPkg binary does not support scoped archive keys. Rebuild the extension.")
 		return false
 
+	var token: int = int(bridge.call("begin_key_scope", _archive_key))
+	if token == 0:
+		push_error("[DirectStorage Exporter] Failed to scope the generated archive key; the written archive cannot be verified.")
+		return false
+
+	var result: bool = _verify_written_archive_inner(bridge)
+	if not bool(bridge.call("end_key_scope", token)):
+		push_error("[DirectStorage Exporter] Failed to restore the previous archive key state.")
+		return false
+	_clear_archive_key()
+	return result
+
+
+## The body of the round trip, with no key lifetime responsibilities: the caller
+## owns the scope token and restores it on both success and failure.
+func _verify_written_archive_inner(bridge: GDScript) -> bool:
 	var key_id: String = String(bridge.call("get_global_key_id"))
 	if key_id.is_empty():
 		push_error("[DirectStorage Exporter] The generated archive key is not active; the written archive cannot be verified.")

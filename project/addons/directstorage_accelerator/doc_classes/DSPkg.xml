@@ -107,10 +107,25 @@
 			<param index="0" name="key_hex" type="String" />
 			<description>Configures the 64-hex-character symmetric encryption key for the archive currently being built (builder-only; returns [constant ERR_UNCONFIGURED] otherwise). Passing an empty string or "disabled"/"none" disables encryption. Returns [constant OK] on success or [constant ERR_INVALID_PARAMETER] on invalid input (previous key state is preserved). Warning: Storing plaintext keys in export preset configuration files risks exposing secrets if committed to source control.</description>
 		</method>
+		<method name="set_encryption_key_bytes">
+			<return type="Error" />
+			<param index="0" name="key_bytes" type="PackedByteArray" />
+			<description>Configures the archive builder key from exactly 32 raw bytes, avoiding the temporary hex string created by [method set_encryption_key]. Builder-only; returns [constant ERR_UNCONFIGURED] outside a build and [constant ERR_INVALID_PARAMETER] when the byte count is not 32. The caller should wipe its own buffer after a successful call.</description>
+		</method>
 		<method name="set_global_encryption_key" qualifiers="static">
 			<return type="Error" />
 			<param index="0" name="key_hex" type="String" />
 			<description>Installs a process-wide override key for tooling: editor previews, probes, and test harnesses that open an archive they just produced. This is not part of the shipped runtime path — [method open] already reads the key from [code]res://.dspkg/toc.key[/code]. Passing an empty string clears the override and returns to the default resolution (PCK entry, or the compile-time baked key in a source build that has one); "disabled"/"none" explicitly disables decryption. Returns [constant OK] or [constant ERR_INVALID_PARAMETER]. Warning: Storing plaintext keys in export preset configuration files risks exposing secrets if committed to source control.</description>
+		</method>
+		<method name="begin_global_key_scope" qualifiers="static">
+			<return type="int" />
+			<param index="0" name="key_bytes" type="PackedByteArray" />
+			<description>Snapshots the current global key resolution state, then installs [code]key_bytes[/code] as a process-wide override. Returns a positive token, or 0 if the input is not exactly 32 bytes. The token must be passed exactly once to [method end_global_key_scope], in LIFO order for nested scopes. Intended for short-lived tooling operations such as the exporter's writer round trip; unlike [method set_global_encryption_key], the previous key state - including a developer preview key - is preserved and restored.</description>
+		</method>
+		<method name="end_global_key_scope" qualifiers="static">
+			<return type="bool" />
+			<param index="0" name="token" type="int" />
+			<description>Restores the global key resolution state saved by [method begin_global_key_scope] and wipes the saved bytes. Returns [code]true[/code] on success and [code]false[/code] for an unknown or already-ended token. Never call [method set_global_encryption_key] with an empty string to end a scope: that would reset to the default state and discard a preview key.</description>
 		</method>
 		<method name="set_payload_alignment">
 			<return type="void" />

@@ -287,12 +287,18 @@ public:
 	bool is_repack_uncompressed() const;
 	Error add_texture(const String &p_resource_path, const String &p_dstex_path, const Dictionary &p_mip_metadata = Dictionary());
 	Error set_encryption_key(const String &p_key_hex);
+	Error set_encryption_key_bytes(const PackedByteArray &p_key_bytes);
 	Error finalize();
 
 	// Runtime static key API
 	static Error set_global_encryption_key(const String &p_key_hex);
 	static String get_global_encryption_key_id();
 	static String compute_key_id(const String &p_key_hex);
+	// Snapshots the current global key state and installs p_key_bytes as an
+	// override. Returns a token that must be passed to end_global_key_scope()
+	// exactly once, in LIFO order; 0 means the key bytes were not exactly 32.
+	static int begin_global_key_scope(const PackedByteArray &p_key_bytes);
+	static bool end_global_key_scope(int p_token);
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 public:
