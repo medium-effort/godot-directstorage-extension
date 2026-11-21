@@ -280,6 +280,9 @@ public:
 	// Hardware/heuristic verdict: true when D3D12 reports UMA (unified memory
 	// architecture) or the adapter reports <1 GiB dedicated VRAM.
 	bool is_integrated_gpu() const;
+	// C++-only: dedicated VRAM in MiB from the cached D3D12 adapter probe
+	// (0 when unavailable/non-Windows). Used by the GPU callback byte budget.
+	int64_t get_dedicated_vram_mb() const;
 	// Direct D3D12 hardware query: true when D3D12_FEATURE_ARCHITECTURE1
 	// reports UMA == TRUE (shared system memory architecture).
 	bool is_uma() const;

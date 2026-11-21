@@ -55,6 +55,27 @@ inline size_t gpu_callback_request_budget(uint16_t p_capacity, bool p_background
 	return std::min(slot_ceiling, target);
 }
 
+// Bytes one render-thread GPU prewarm callback may stage.
+// - Background pacing is always 2 MiB on every device (60 FPS frame protection).
+// - Loading mode stays at the conservative 16 MiB on integrated GPUs, when the
+//   adapter query is unavailable, and on discrete GPUs below 7168 MiB. The
+//   7168 MiB bound is DXGI-safe: real 8 GiB cards report ~7900 MiB, so the old
+//   "< 8192" test would have wrongly throttled them.
+// - Only discrete >= 7168 MiB cards scale with half the configured staging
+//   buffer, clamped to [16, 64] MiB.
+inline uint64_t gpu_callback_byte_budget(uint32_t p_staging_mb, int64_t p_dedicated_vram_mb,
+		bool p_integrated, bool p_background_pacing) {
+	constexpr uint64_t mib = 1024ULL * 1024ULL;
+	if (p_background_pacing) {
+		return 2ULL * mib;
+	}
+	if (p_integrated || p_dedicated_vram_mb < 7168) {
+		return 16ULL * mib;
+	}
+	const uint32_t mb = std::clamp<uint32_t>(p_staging_mb / 2u, 16u, 64u);
+	return static_cast<uint64_t>(mb) * mib;
+}
+
 } // namespace dsgd_budget
 
 #endif // DS_REQUEST_BUDGET_H

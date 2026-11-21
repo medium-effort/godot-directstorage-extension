@@ -590,6 +590,18 @@ bool DSContext::is_uma() const {
 #endif
 }
 
+int64_t DSContext::get_dedicated_vram_mb() const {
+#ifdef _WIN32
+	const DSD3D12AdapterProbe &probe = query_d3d12_adapter();
+	if (!probe.available) {
+		return 0;
+	}
+	return static_cast<int64_t>(probe.dedicated_bytes / (1024ULL * 1024ULL));
+#else
+	return 0; // Conservative tier: falls back to the 16 MiB byte cap.
+#endif
+}
+
 // Stable keys for get_capability_report()["loader_cpu_fallbacks"]. Keep in the
 // same order as DSContext::LoaderFallback; a reason added to the enum without a
 // name here reports as "unknown".

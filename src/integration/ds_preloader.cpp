@@ -53,10 +53,11 @@ static constexpr uint64_t MAX_PREWARM_REQUEST_BYTES = 512ULL * 1024ULL * 1024ULL
 // mode. A callback allocates, enqueues and flush-attempts all its textures, so
 // an 8K chunked texture must not share a callback with dozens of siblings.
 
-// Per-callback VRAM byte cap: bound how much texture_create() + GPU GDeflate
-// decompression work a single render-thread callback stages. Whole textures
-// are never split: a single oversized texture rides alone in its own chunk.
-static constexpr uint64_t kGpuPrewarmBytesPerCallback = 16ULL * 1024ULL * 1024ULL;
+// The per-callback VRAM byte cap now lives in core/ds_request_budget.h as
+// gpu_callback_byte_budget() and is hardware/mode gated: 2 MiB during
+// background pacing, 16 MiB on integrated/< 8 GiB discrete GPUs in loading
+// mode, and staging-scaled only on >= 8 GiB discrete cards. Whole textures are
+// never split: a single oversized texture rides alone in its own chunk.
 
 static uint64_t estimate_payload_bytes(const DSPreloader::Payload &p_meta);
 
@@ -1964,8 +1965,12 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 				item_requests.push_back(static_cast<uint64_t>(count_gpu_requests_for_payload(chunk.items[i].meta)));
 				item_bytes.push_back(estimate_payload_bytes(chunk.items[i].meta));
 			}
-			const uint64_t bg_chunk_cap = 2ULL * 1024ULL * 1024ULL;
-			const uint64_t default_chunk_cap = s.background_pacing.load(std::memory_order_relaxed) ? bg_chunk_cap : kGpuPrewarmBytesPerCallback;
+			// Phase B: hardware-gated byte cap. This resolves to the unchanged
+			// 2 MiB (background) / 16 MiB (loading) on integrated and < 7168 MiB
+			// discrete GPUs; only >= 8 GiB discrete cards scale with staging.
+			const uint64_t default_chunk_cap = dsgd_budget::gpu_callback_byte_budget(
+					ctx->get_staging_buffer_size_mb(), ctx->get_dedicated_vram_mb(),
+					ctx->is_integrated_gpu(), callback_background_pacing);
 			const uint64_t chunk_byte_cap = p_max_chunk_bytes > 0 ? static_cast<uint64_t>(p_max_chunk_bytes) : default_chunk_cap;
 			const std::vector<GpuChunkSlice> slices = plan_gpu_chunk_slices(item_requests, item_bytes,
 					static_cast<size_t>(std::max(1, chunk_size)), callback_request_cap, chunk_byte_cap);
