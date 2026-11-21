@@ -11,7 +11,13 @@ param(
     # Fail the run when a case was skipped for a real reason (missing template, fixture or
     # prerequisite stage). Contract limitations are reported separately and do not trip it.
     [switch]$RequireFullCoverage,
-    # Remove the work root after a passing run; a failing run keeps its artefacts for diagnosis.
+    # Keep every case directory for diagnosis. Per-case disposal and the work-root
+    # removal below are skipped when set.
+    [switch]$KeepArtifacts,
+    # A passing run removes its work root; a failing run always keeps it for diagnosis.
+    # Pass this to inspect a green run's artefacts.
+    [switch]$KeepWorkRoot,
+    # Accepted for compatibility: removing the work root after a passing run is the default.
     [switch]$Cleanup
 )
 
@@ -147,6 +153,10 @@ $script:ProtectedStage = $null
 $script:ProtectedArchive = $null
 $script:PlainArchiveStage = $null
 $script:BootSeq = 0
+# Stages consumed by a later case. Everything else is disposable after its own body.
+$script:RetainedStages = @{ 'protected_success' = $true; 'unprotected_success' = $true }
+$script:SharedDir = Join-Path $WorkRoot '_shared'
+$script:KeptArtifacts = New-Object System.Collections.Generic.List[string]
 $MasterProject = ''
 
 # ---------------------------------------------------------------- reporting
@@ -176,14 +186,45 @@ function Add-KnownLimitation {
     Write-Output ('[LIMIT] ' + $Name + ' :: ' + $Reason)
 }
 
+function Remove-CaseScratch {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([string]$Name)
+    # A retained stage is a later case's input; its case project is still disposable.
+    if (-not $script:RetainedStages.ContainsKey($Name)) {
+        $stage = Join-Path $WorkRoot ('stage-' + $Name)
+        if ((Test-Path -LiteralPath $stage) -and $PSCmdlet.ShouldProcess($stage, 'Remove case stage')) {
+            try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop }
+            catch { Write-Output ('[gate] artifact cleanup skipped: ' + $stage + ' :: ' + $_.Exception.Message) }
+        }
+    }
+    $caseDir = Join-Path $WorkRoot ('case-' + $Name)
+    if ((Test-Path -LiteralPath $caseDir) -and $PSCmdlet.ShouldProcess($caseDir, 'Remove case project')) {
+        try { Remove-Item -LiteralPath $caseDir -Recurse -Force -ErrorAction Stop }
+        catch { Write-Output ('[gate] artifact cleanup skipped: ' + $caseDir + ' :: ' + $_.Exception.Message) }
+    }
+}
+
 function Invoke-Case {
     param([string]$Name, [scriptblock]$Body)
     if ($script:Only.Count -gt 0 -and -not ($script:Only -contains $Name)) { return }
     $script:CurrentCase = $Name
     $script:Covered.Add($Name)
+    $checksBefore = $script:Results.Count
     Write-Output ''
     Write-Output ('[case] ' + $Name)
     & $Body
+    # Disposal is decided from the checks this body added, so an earlier failure does
+    # not freeze the rest of the run and a failing case always survives on disk.
+    if (-not $KeepArtifacts) {
+        $added = @($script:Results | Select-Object -Skip $checksBefore)
+        $caseFailed = @($added | Where-Object { -not $_.Pass }).Count -gt 0
+        if ($caseFailed) {
+            Write-Output ('[gate] artifacts kept for failing case: ' + $Name)
+            $script:KeptArtifacts.Add($Name)
+        } else {
+            Remove-CaseScratch $Name
+        }
+    }
 }
 
 function Save-Log {
@@ -325,12 +366,37 @@ function Write-CredentialFile {
 
 # ---------------------------------------------------------------- export
 
+# One copy of the keyed template for the whole run. Write-Preset pins
+# binary_format/embed_pck=false, so every exported game.exe is a byte-identical copy of
+# the template and each case's executable can be a hardlink instead of a private 51.6 MB
+# copy. The shared file is copied from the template, never from an export, and cases are
+# never hardlinked straight to the template, so no case can modify the user's template.
+function Get-SharedReleaseExe {
+    param([string]$TemplatePath)
+    if (-not (Test-Path -LiteralPath $script:SharedDir)) { New-Item -ItemType Directory -Path $script:SharedDir -Force | Out-Null }
+    $shared = Join-Path $script:SharedDir 'game.exe'
+    if (-not (Test-Path -LiteralPath $shared)) { Copy-Item -LiteralPath $TemplatePath -Destination $shared -Force }
+    return $shared
+}
+
 function Export-Release {
     param([string]$ProjectDir, [string]$Preset, [string]$OutputDir, [hashtable]$Environment = @{})
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
     $exe = Join-Path $OutputDir 'game.exe'
     $arguments = '--headless --path "' + $ProjectDir + '" --export-release "' + $Preset + '" "' + $exe + '"'
-    return Invoke-Tool -Exe $Godot -Arguments $arguments -WorkingDirectory $ProjectDir -TimeoutSec $ExportTimeoutSec -Environment $Environment
+    $run = Invoke-Tool -Exe $Godot -Arguments $arguments -WorkingDirectory $ProjectDir -TimeoutSec $ExportTimeoutSec -Environment $Environment
+    # Size guard: if embed_pck ever becomes true the export stops matching the template
+    # and dedupe disables itself instead of pairing a stale executable with a fresh pck.
+    if (($run.ExitCode -eq 0) -and (-not $run.TimedOut) -and (Test-Path -LiteralPath $exe) -and -not [string]::IsNullOrEmpty($TemplatePath)) {
+        $templateLength = (Get-Item -LiteralPath $TemplatePath).Length
+        if ((Get-Item -LiteralPath $exe).Length -eq $templateLength) {
+            $shared = Get-SharedReleaseExe $TemplatePath
+            Remove-Item -LiteralPath $exe -Force
+            try { New-Item -ItemType HardLink -Path $exe -Target $shared -ErrorAction Stop | Out-Null }
+            catch { Copy-Item -LiteralPath $shared -Destination $exe -Force }
+        }
+    }
+    return $run
 }
 
 function Export-Pack {
@@ -1375,6 +1441,9 @@ if ($script:KnownLimits.Count -gt 0) { $knownLimitsText = ($script:KnownLimits -
 
 Write-Output ''
 Write-Output ('[gate] checks=' + $script:Results.Count + ' failed=' + $failed.Count)
+if ($script:KeptArtifacts.Count -gt 0) {
+    Write-Output ('[gate] artifacts kept for failing cases: ' + ($script:KeptArtifacts -join '; '))
+}
 foreach ($failure in $failed) {
     Write-Output ('[gate] FAILED: ' + $failure.Name + ' :: ' + (($failure.Detail -replace "`r?`n", ' | ')))
 }
@@ -1392,7 +1461,11 @@ if ($RequireFullCoverage -and $script:NotCovered.Count -gt 0) {
     exit 1
 }
 Write-Output ('[gate] RESULT PASS checks=' + $script:Results.Count)
-if ($Cleanup) {
+# Storage policy: a passing run removes its work root (peak scratch is what remains).
+# A failing run exited above, so its artefacts - and any -KeepArtifacts/-KeepWorkRoot
+# run - stay on disk. Removal is permanent on purpose: the Recycle Bin would retain the
+# bytes this gate exists to free, and the whole work root is disposable by contract.
+if (-not $KeepArtifacts -and -not $KeepWorkRoot -and -not $Cleanup) {
     Write-Output ('[gate] cleanup: removing ' + $WorkRoot)
     try {
         Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction Stop

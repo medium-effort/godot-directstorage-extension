@@ -337,11 +337,14 @@ Run these after touching the exporter, the runtime, or the archive reader.
 | Harness | Command | Proves |
 |---|---|---|
 | Policy unit test | `godot --headless --path project --script headless_tests/test_export_policy.gd` | the whole decision table above, in seconds, with no extension or export (17 checks) |
-| Export-contract gate | `powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1 -RequireFullCoverage` (2.5 min, ~0.9 GB of scratch) | protected/unprotected/bundling-off exports, the three fail-closed presets, subset modes, stale-archive deletion, partial salvage, corrupted TOC, the boot grammar, the pack scan and the key-scan positive control |
+| Export-contract gate | `powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1 -RequireFullCoverage` (2.5 min, measured peak ~230 MB of scratch, nothing left after a pass) | protected/unprotected/bundling-off exports, the three fail-closed presets, subset modes, stale-archive deletion, partial salvage, corrupted TOC, the boot grammar, the pack scan and the key-scan positive control |
 | Pack scan | `godot --headless --path project --script res://addons/directstorage_accelerator/tools/dspkg_pack_scan.gd -- --pack <pck>` | pack validity and key-magic absence for one file |
 
 The gate is run manually before exporting a release; nothing runs it automatically, so a change to the
-exporter, the runtime or the archive reader is only checked if someone runs it. It ends with `covers=`,
+exporter, the runtime or the archive reader is only checked if someone runs it. It disposes of each
+case's project tree and stage after the case has recorded its checks - only the two stages a later case
+reads survive - and a passing run removes its whole work root (`-KeepArtifacts` / `-KeepWorkRoot` retain
+them for diagnosis; a failing run always keeps them). It ends with `covers=`,
 `not_covered=` and `known_limits=`:
 
 - `covers=` and `checks=` state what actually ran (a full run is 162 checks over 20 cases).

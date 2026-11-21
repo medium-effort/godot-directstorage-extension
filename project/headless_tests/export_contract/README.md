@@ -12,9 +12,11 @@ exactly one `DSPKG_BOOT status=ok` line in stdout and in the
 powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1 -RequireFullCoverage
 ```
 
-Run it before exporting a release, not on every build: it takes about 2.5 minutes
-and needs roughly 0.9 GB of scratch space. Nothing runs it automatically - there
-is no CI job for it - so a release is only checked if a person checks it.
+Run it before exporting a release, not on every build: it takes about 2.5 minutes.
+Scratch is disposed of as the run proceeds: a measured full 24-case sweep peaks at
+about 230 MB (down from about 1.05 GB before case disposal existed) and leaves
+nothing behind after a pass. Nothing runs it automatically - there is no CI job for
+it - so a release is only checked if a person checks it.
 
 Options:
 
@@ -27,7 +29,9 @@ Options:
 | `-ExportTimeoutSec`, `-BootTimeoutSec` | process timeouts |
 | `-NegativeControl` | self-test: leaves the archive in place during `alert_bypass`; the gate must then fail |
 | `-RequireFullCoverage` | fail the run when any case was skipped for a real reason (missing template, fixture or prerequisite stage) |
-| `-Cleanup` | delete the work root after a **passing** run; a failing run keeps it for diagnosis |
+| `-KeepArtifacts` | keep every case directory and the work root; disables per-case disposal and the work-root removal |
+| `-KeepWorkRoot` | keep the work root after a **passing** run (default: removed) |
+| `-Cleanup` | accepted for compatibility; removing the work root after a passing run is now the default |
 
 The key is read from the template directory at run time. This script and the
 fixture never store a key.
@@ -39,8 +43,21 @@ DLLs. The keyed template is needed for the protected cases; without it they are
 reported under `not_covered` and `-RequireFullCoverage` fails the run rather than
 passing silently.
 
-The work root is disposable. `-Cleanup` removes it after a pass; without it,
-delete old `out/run-*` directories yourself (keeping the newest few is enough):
+The work root is disposable, so the gate disposes of it as it goes. A case's project
+tree and its disposable release stage are removed as soon as the case has recorded its
+checks; only the two stages a later case reads (`stage-protected_success`,
+`stage-unprotected_success`) survive; and a **passing** run removes the whole work root.
+A failing run keeps everything and names the pinned cases, so there is always something
+to inspect. `-KeepArtifacts` and `-KeepWorkRoot` opt out, and `-Cleanup` is accepted for
+compatibility.
+
+Removal is permanent on purpose: sending the run's scratch to the Recycle Bin would hold
+the bytes this policy exists to free, and the whole work root is generated output. A
+locked file (an antivirus scan or a Godot process that has not released a handle) can
+leave one stage behind mid-run; the `[gate] artifact cleanup skipped: ...` line reports
+it and never affects the verdict, and the end-of-run removal clears the whole root. Old
+`out/run-*` directories therefore only accumulate from failing runs and from
+`-KeepWorkRoot` runs; the prune command is:
 
 ```powershell
 Get-ChildItem out | Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 | Remove-Item -Recurse -Force
