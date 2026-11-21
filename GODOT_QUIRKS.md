@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 18 November 2026
+Last updated: 21 November 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1964,4 +1964,26 @@ Scenario C in `benchmark/benchmark_runner.gd` waited 2 `process_frame`s + `Rende
 Never assert or measure VRAM reclamation after `free_rid()` / `clear_unused()` with only a 2-frame drain; wait at least 10 frames (past the D3D12 GPU fence ring) before sampling `RENDER_VIDEO_MEM_USED` or `RENDERING_INFO_TEXTURE_MEM_USED`.
 
 Implemented as a 10-frame + `RenderingServer.frame_post_draw` drain in `benchmark/benchmark_runner.gd` (`_run_scenario_c()`). Related: Q27 (`Texture2DRD` RID ownership), Q78 (`RENDER_VIDEO_MEM_USED` refresh timing).
-
+
+---
+
+## 81. Sub-25 ms frame spikes are invisible to _process(delta)
+
+### The Engine Reality
+`MainTimerSync::advance_checked()` (`godot/main/main_timer_sync.cpp:449-464`) clamps the `process_step` that becomes `delta` to at most one 60 Hz physics step (16.667 ms) as long as `abs(time_deficit) <= physics_jitter_fix * p_physics_step` (default jitter fix 0.5 -> 8.333 ms). An isolated wall-clock spike below roughly 25 ms therefore never reaches `_process(delta)` as a long frame: it is absorbed into `time_deficit` and delivered as an ordinary 16.667 ms step. This is the small-spike counterpart of Q77's >133 ms truncation — both make `delta` unusable as a frame-duration measurement, but this regime silently disables the 17-18 ms backoff thresholds a frame-budgeted streamer would naturally choose.
+
+### The Trap / Symptom
+An A/B experiment on the GTX 1050 Ti tightened the frame-capped `warm_at` / `mild_at` thresholds in `ds_runtime.gd` from 17.67 / 18.33 ms to 17.17 / 17.67 ms, believing backoff was engaging too late at the 18.3 ms drop mark. Across all 264 archived B2 iteration JSONs (`dsgd-benchmark/benchmark/results/ab_runs/r{1,2}_{baseline,fixed}/`), `slice_stats.mild == 0` and `slice_stats.heavy == 0` — including runs with 26 dropped frames at up to 24.5 ms measured by `benchmark_runner.gd` via `Time.get_ticks_usec()`. The thresholds were dead code. The mistaken diagnosis cost a full fix commit and two 11-iteration A/B rounds (~40 minutes of benchmarking) before the change was reverted; the real residual was 6-SM GDeflate compute contention, not a late backoff.
+
+### The Rule
+Never build frame-time backoff on `_process(delta)` alone under a frame cap; Godot's `MainTimerSync` absorbs spikes up to about 25 ms into `time_deficit` and delivers `delta * 1000.0 == 16.67 ms`, so thresholds below roughly 25 ms never fire — measure with `Time.get_ticks_usec()`.
+
+```gdscript
+func _process(delta: float) -> void:
+    var now: int = Time.get_ticks_usec()
+    var wall_ms: float = float(now - _last_frame_usec) / 1000.0
+    _last_frame_usec = now
+    # Use wall_ms for pacing/backoff; keep delta only for physics-like stepping.
+```
+
+Re-arm the sampler when it restarts (a frame with no previous sample is meaningless). Godot still applies its own frame pacing and `OS::add_frame_delay()` jitter to the wall-clock interval, so a 17 ms "threshold" sits inside normal jitter even with the correct clock source; use sustained multi-frame evidence, not a single spike, to trigger backoff. Related: Q77 (long frames are cut above 133 ms), Q13 (budget by usec, not frames), Q41 (poll by usec budget). Diagnosed during the November 2026 review of the `ds_runtime.gd` pacing fix.
