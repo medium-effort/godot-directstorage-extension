@@ -64,7 +64,19 @@ private:
 	mutable std::mutex batch_mutex;
 	std::condition_variable batch_cv;
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only observations of the per-worker input-handle cache. Workers own
+	// their scratch, so both are atomics; relaxed ordering is enough because no
+	// decision in the engine depends on them. Never bound in _bind_methods().
+	std::atomic<size_t> worker_file_cache_entries{0};
+	std::atomic<uint64_t> worker_file_cache_inserts{0};
+#endif
+
 	void worker_thread_func();
+	// Drops every FileAccess cached in one worker's scratch. Closing a handle is a
+	// kernel call, so callers must not hold batch_mutex. Also keeps the debug-only
+	// handle count honest.
+	void clear_worker_file_cache(WorkerScratch &r_scratch);
 	void finish_batch_request_locked(uint64_t p_batch_id);
 	// True when the worker must drop the request without touching buffers:
 	// null, already terminal (cancelled while queued), or tag cancelled
@@ -93,6 +105,14 @@ public:
 	// Progress-ready observability for the async path (lock-protected).
 	uint64_t get_async_batches_submitted() const;
 	size_t get_in_flight_async_batch_count() const;
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Test-only, non-binding: handles cached across all workers right now, and a
+	// monotonic count of insertions so a zero reading cannot be mistaken for
+	// "caching never ran". Debug/editor builds only.
+	size_t _get_cached_file_handle_count_for_testing() const;
+	uint64_t _get_cached_file_handle_inserts_for_testing() const;
+#endif
 
 private:
 	bool process_request(Ref<DSRequest> p_request, WorkerScratch *p_scratch = nullptr);

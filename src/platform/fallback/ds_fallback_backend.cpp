@@ -82,6 +82,17 @@ void FallbackBackend::finish_batch_request_locked(uint64_t p_batch_id) {
 	}
 }
 
+void FallbackBackend::clear_worker_file_cache(WorkerScratch &r_scratch) {
+	if (r_scratch.open_files.empty()) {
+		return;
+	}
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	const size_t dropped = r_scratch.open_files.size();
+	worker_file_cache_entries.fetch_sub(dropped, std::memory_order_relaxed);
+#endif
+	r_scratch.open_files.clear();
+}
+
 void FallbackBackend::worker_thread_func() {
 	WorkerScratch scratch;
 	while (true) {
@@ -143,6 +154,10 @@ bool FallbackBackend::initialize() {
 		cancelled_tags.clear();
 		next_async_batch_id = 1;
 		async_batches_submitted = 0;
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		worker_file_cache_entries.store(0, std::memory_order_relaxed);
+		worker_file_cache_inserts.store(0, std::memory_order_relaxed);
+#endif
 	}
 	worker_threads.clear();
 	worker_threads.reserve(num_workers);
@@ -242,9 +257,14 @@ bool FallbackBackend::process_request(Ref<DSRequest> p_request, WorkerScratch *p
 		}
 		if (p_scratch != nullptr) {
 			if (p_scratch->open_files.size() >= WorkerScratch::MAX_OPEN_FILES) {
-				p_scratch->open_files.clear();
+				clear_worker_file_cache(*p_scratch);
 			}
-			p_scratch->open_files.emplace(std::move(path_key), file);
+			if (p_scratch->open_files.emplace(std::move(path_key), file).second) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+				worker_file_cache_entries.fetch_add(1, std::memory_order_relaxed);
+				worker_file_cache_inserts.fetch_add(1, std::memory_order_relaxed);
+#endif
+			}
 		}
 	}
 
@@ -467,5 +487,15 @@ void FallbackBackend::cancel_requests_with_tag(uint64_t p_tag) {
 	batch_in_flight.store(!request_queue.empty() || active_workers > 0);
 	batch_cv.notify_all();
 }
+
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+size_t FallbackBackend::_get_cached_file_handle_count_for_testing() const {
+	return worker_file_cache_entries.load(std::memory_order_relaxed);
+}
+
+uint64_t FallbackBackend::_get_cached_file_handle_inserts_for_testing() const {
+	return worker_file_cache_inserts.load(std::memory_order_relaxed);
+}
+#endif
 
 } // namespace godot

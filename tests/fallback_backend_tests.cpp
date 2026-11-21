@@ -4,22 +4,27 @@
 #include "compression/gdeflate_compressor.h"
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/ref.hpp>
+#include <godot_cpp/classes/time.hpp>
 
-// Pre-allocation guards in FallbackBackend::process_request.
+// FallbackBackend: pre-allocation guards in process_request(), plus the lifetime
+// of the per-worker input handle cache.
 //
 // The soft-decompress path sizes its destination from the request's declared
 // uncompressed_size. Nothing bounded that value or checked the payload's
 // TileStream header first, so a hostile size allocated before any validation
-// and a truncated tile table was only rejected after the allocation. Each case
-// asserts on the destination buffer's size because the return status alone
+// and a truncated tile table was only rejected after the allocation. Each guard
+// case asserts on the destination buffer's size because the return status alone
 // cannot distinguish "rejected up front" from "allocated, then failed in the
-// codec".
+// codec". Those cases are driven through the public entry points: enqueue_request()
+// moves the request to SUBMITTED and submit_batch() processes it inline on this
+// thread, so no thread, device or DSContext singleton is involved.
 //
-// Driven through the public entry points: enqueue_request() moves the request to
-// SUBMITTED and submit_batch() processes it inline on this thread (batch_in_flight
-// is false until submit_async/initialize), so no thread, device or DSContext
-// singleton is involved and the suite runs on every platform.
+// fallback_file_cache uses submit_async() and a real worker pool instead. A
+// worker that keeps an input handle after its batch drains locks the archive
+// against replacement and can serve a stale handle to a later batch; the case
+// asserts both that no handle survives a drain and that the archive stays usable.
 
 namespace {
 
@@ -65,6 +70,36 @@ godot::Ref<godot::DSRequest> make_gdeflate_request(const char *p_path, uint32_t 
     req->set_uncompressed_size(static_cast<int64_t>(p_uncompressed_size));
     req->set_compression_format(godot::DSRequest::COMPRESSION_GDEFLATE);
     return req;
+}
+
+godot::Error remove_file_result(const char *p_path) {
+    godot::Ref<godot::DirAccess> dir = godot::DirAccess::open("user://");
+    if (dir.is_null()) {
+        return godot::ERR_CANT_OPEN;
+    }
+    return dir->remove(godot::String(p_path));
+}
+
+godot::Ref<godot::DSRequest> make_raw_request(const char *p_path, int64_t p_offset, int64_t p_size) {
+    godot::Ref<godot::DSRequest> req;
+    req.instantiate();
+    req->set_file_path(godot::String(p_path));
+    req->set_offset(static_cast<uint64_t>(p_offset));
+    req->set_size(p_size);
+    req->set_compression_format(godot::DSRequest::COMPRESSION_NONE);
+    return req;
+}
+
+bool wait_for_fallback_drain(godot::FallbackBackend &p_backend, int64_t p_timeout_ms) {
+    const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() +
+            static_cast<uint64_t>(p_timeout_ms);
+    while (!p_backend.is_batch_complete()) {
+        if (godot::Time::get_singleton()->get_ticks_msec() >= deadline) {
+            return false;
+        }
+        godot::OS::get_singleton()->delay_msec(2);
+    }
+    return true;
 }
 
 } // namespace
@@ -163,4 +198,76 @@ GDEX_TEST_T(fallback_gdeflate_guard, legal_stream_still_decompresses, TAG_UNIT) 
             static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
     GDEX_EXPECT_EQ(req->get_destination_buffer_ref().size(), kTileSize);
     GDEX_EXPECT_TRUE(req->get_destination_buffer_ref() == original);
+}
+
+// A cached input handle must not outlive the batch that opened it. The control
+// leg proves the delete probe succeeds with no cache outstanding; the batch leg
+// populates the cache, then asserts the count settles to zero, the file is
+// replaceable while the backend is alive, and a later batch reads the
+// replacement bytes.
+GDEX_TEST_T(fallback_file_cache, input_handle_released_when_batch_drains, TAG_INTEGRATION) {
+    const char *kPath = "user://gdextest_fallback_cache.bin";
+    godot::PackedByteArray first;
+    first.resize(4096);
+    for (int64_t i = 0; i < first.size(); i++) {
+        first[i] = static_cast<uint8_t>((i * 31 + 7) % 251);
+    }
+    godot::PackedByteArray second = first;
+    for (int64_t i = 0; i < second.size(); i++) {
+        second[i] = static_cast<uint8_t>(255 - first[i]);
+    }
+
+    ctx.add_teardown([kPath]() { remove_file(kPath); });
+
+    // Control: the probe works before any handle is cached.
+    GDEX_ASSERT_TRUE(write_bytes(kPath, first));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(remove_file_result(kPath)),
+            static_cast<int64_t>(godot::OK));
+    GDEX_ASSERT_TRUE(write_bytes(kPath, first));
+
+    godot::FallbackBackend backend;
+    GDEX_ASSERT_TRUE(backend.initialize());
+    GDEX_EXPECT_EQ(static_cast<int64_t>(backend._get_cached_file_handle_count_for_testing()),
+            static_cast<int64_t>(0));
+
+    // Exercise the cache: two requests for the same path in one async batch.
+    godot::Ref<godot::DSRequest> r1 = make_raw_request(kPath, 0, 4096);
+    godot::Ref<godot::DSRequest> r2 = make_raw_request(kPath, 0, 4096);
+    GDEX_ASSERT_TRUE(backend.enqueue_request(r1));
+    GDEX_ASSERT_TRUE(backend.enqueue_request(r2));
+    GDEX_ASSERT_TRUE(backend.submit_async());
+    GDEX_ASSERT_TRUE(wait_for_fallback_drain(backend, 5000));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(r1->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+    GDEX_EXPECT_TRUE(r1->get_destination_buffer_ref() == first);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(r2->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+    GDEX_EXPECT_TRUE(r2->get_destination_buffer_ref() == first);
+    GDEX_EXPECT_TRUE(backend._get_cached_file_handle_inserts_for_testing() > 0);
+
+    // The clear runs outside batch_mutex, so allow a scheduling window after
+    // completion before asserting that an idle worker holds nothing.
+    const uint64_t settle_deadline = godot::Time::get_singleton()->get_ticks_msec() + 2000;
+    while (backend._get_cached_file_handle_count_for_testing() != 0 &&
+            godot::Time::get_singleton()->get_ticks_msec() < settle_deadline) {
+        godot::OS::get_singleton()->delay_msec(2);
+    }
+    GDEX_EXPECT_EQ(static_cast<int64_t>(backend._get_cached_file_handle_count_for_testing()),
+            static_cast<int64_t>(0));
+
+    // The archive must be replaceable while the backend stays alive.
+    GDEX_EXPECT_EQ(static_cast<int64_t>(remove_file_result(kPath)),
+            static_cast<int64_t>(godot::OK));
+    GDEX_ASSERT_TRUE(write_bytes(kPath, second));
+
+    // A later batch must open the path as it is on disk now, not reuse the
+    // handle the previous batch held.
+    godot::Ref<godot::DSRequest> r3 = make_raw_request(kPath, 0, 4096);
+    GDEX_ASSERT_TRUE(backend.enqueue_request(r3));
+    GDEX_ASSERT_TRUE(backend.submit_async());
+    GDEX_ASSERT_TRUE(wait_for_fallback_drain(backend, 5000));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(r3->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+    GDEX_EXPECT_TRUE(r3->get_destination_buffer_ref() == second);
+    GDEX_EXPECT_TRUE(r3->get_destination_buffer_ref() != first);
 }
