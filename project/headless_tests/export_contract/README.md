@@ -32,7 +32,7 @@ Options:
 | `-RequireFullCoverage` | fail the run when any case was skipped for a real reason (missing template, fixture or prerequisite stage) |
 | `-KeepArtifacts` | keep every case directory and the work root; disables per-case disposal and the work-root removal |
 | `-KeepWorkRoot` | keep the work root after a **passing** run (default: removed) |
-| `-Cleanup` | accepted for compatibility; removing the work root after a passing run is now the default |
+| `-Cleanup` | accepted for compatibility and ignored: removing the work root after a passing run is the default, so this switch changes nothing |
 
 The key is read from the template directory at run time. This script and the
 fixture never store a key.

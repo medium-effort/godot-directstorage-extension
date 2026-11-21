@@ -190,6 +190,18 @@ Add-TestCheck 'run6.exit_zero' ($run6.ExitCode -eq 0) ('exit=' + $run6.ExitCode)
 Add-TestCheck 'run6.cleanup_announced' ($run6Out -match '(?m)^\[gate\] cleanup: removing ') 'the cleanup line must name the work root'
 Add-TestCheck 'run6.work_root_removed' (-not (Test-Path -LiteralPath $run6Root)) ('root_exists=' + (Test-Path -LiteralPath $run6Root))
 
+# ---- run 7: -Cleanup is a compatibility no-op and must not prevent the removal.
+$run7Root = Join-Path $OutRoot 'run7'
+Write-Output ''
+Write-Output '[test] run 7: -Only protected_success -Cleanup (the switch must not keep the work root)'
+$run7 = Invoke-Gate (@('-Only', 'protected_success', '-WorkRoot', $run7Root, '-Cleanup') + $CommonArguments)
+$run7Out = $run7.Output
+
+Add-TestCheck 'run7.exit_zero' ($run7.ExitCode -eq 0) ('exit=' + $run7.ExitCode)
+Add-TestCheck 'run7.noop_announced' ($run7Out -match '(?m)^\[gate\] note: -Cleanup is a no-op') 'the run must say the switch is ignored'
+Add-TestCheck 'run7.cleanup_announced' ($run7Out -match '(?m)^\[gate\] cleanup: removing ') 'the cleanup line must still be printed with -Cleanup'
+Add-TestCheck 'run7.work_root_removed' (-not (Test-Path -LiteralPath $run7Root)) ('root_exists=' + (Test-Path -LiteralPath $run7Root))
+
 # ---- assertion 8: disposal changed no check result.
 $run1Text = Get-GateCheckText -Text $run1Out -PathsToMask @($run1Root)
 $run4Text = Get-GateCheckText -Text $run4Out -PathsToMask @($run4Root)

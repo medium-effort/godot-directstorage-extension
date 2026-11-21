@@ -21,7 +21,9 @@ param(
     # A passing run removes its work root; a failing run always keeps it for diagnosis.
     # Pass this to inspect a green run's artefacts.
     [switch]$KeepWorkRoot,
-    # Accepted for compatibility: removing the work root after a passing run is the default.
+    # Accepted for compatibility and deliberately ignored: removing the work root after a
+    # passing run is the default. Never put this switch in the removal condition - doing so
+    # inverted it once, so a documented -Cleanup run silently kept its whole scratch tree.
     [switch]$Cleanup
 )
 
@@ -194,6 +196,11 @@ if ($ProtectedAvailable) {
     Write-Output ('[gate] keyed_template=' + $TemplatePath + ' (source=' + $TemplateSource + ')')
 } else {
     Write-Output ('[gate] keyed_template=unavailable (' + $TemplateReason + ')')
+}
+if ($Cleanup) {
+    # Compatibility shim: the switch is accepted and consumed here so it is not dead, but it
+    # must not influence the removal decision (see the storage-policy block at the footer).
+    Write-Output '[gate] note: -Cleanup is a no-op; a passing run removes its work root unless -KeepWorkRoot or -KeepArtifacts is passed'
 }
 
 $script:Results = New-Object System.Collections.Generic.List[object]
@@ -1519,7 +1526,9 @@ Write-Output ('[gate] RESULT PASS checks=' + $script:Results.Count)
 # A failing run exited above, so its artefacts - and any -KeepArtifacts/-KeepWorkRoot
 # run - stay on disk. Removal is permanent on purpose: the Recycle Bin would retain the
 # bytes this gate exists to free, and the whole work root is disposable by contract.
-if (-not $KeepArtifacts -and -not $KeepWorkRoot -and -not $Cleanup) {
+# -Cleanup is deliberately absent: it is a compatibility no-op, and including it here
+# inverted its meaning (a documented -Cleanup run kept its whole scratch tree).
+if (-not $KeepArtifacts -and -not $KeepWorkRoot) {
     Write-Output ('[gate] cleanup: removing ' + $WorkRoot)
     try {
         Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction Stop
