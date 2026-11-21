@@ -386,11 +386,16 @@ switch ($Action) {
         [System.IO.Directory]::CreateDirectory($cacheDir) | Out-Null
 
         # Preserve the cache's identity/metadata so SCons finds the same layout and
-        # the build-signature delta diagnostics keep their baseline.
+        # the build-signature delta diagnostics keep their baseline. Move (not
+        # Copy) so cleaning works even when the volume has zero free space.
         foreach ($name in @('config', 'CACHEDIR.TAG', 'build-signature.json')) {
             $source = Join-Path $trash $name
             if (Test-Path -LiteralPath $source -PathType Leaf) {
-                [System.IO.File]::Copy($source, (Join-Path $cacheDir $name), $true)
+                $dest = Join-Path $cacheDir $name
+                if (Test-Path -LiteralPath $dest -PathType Leaf) {
+                    [System.IO.File]::Delete($dest)
+                }
+                [System.IO.File]::Move($source, $dest)
             }
         }
 
