@@ -1800,9 +1800,14 @@ void Win32Backend::poll_batch_status() {
 					continue;
 				}
 				for (std::deque<BatchMetadata>::iterator it = completion_queue.begin(); it != completion_queue.end(); ++it) {
-					if (it->queue_index == queue_index && it->slot_index == slot_index) {
+					if (it->queue_index == queue_index && it->slot_index == slot_index && it->fence_value == slot.fence_value) {
 						completed_batches.push_back(*it);
 						completion_queue.erase(it);
+						// Match completion_thread_func(): consume the slot event so a
+						// stale signal cannot wake the completion thread needlessly.
+						if (slot.event) {
+							ResetEvent(slot.event);
+						}
 						for (int t = 0; t < slot.gpu_transitions.size(); t++) {
 							post_transitions.push_back(slot.gpu_transitions[t]);
 						}

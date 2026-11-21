@@ -433,7 +433,9 @@ void DSTextureCache::apply_vram_budget_guard(const Dictionary &p_adapter) {
 	} else if (auto_low_vram && available && !integrated && dedicated_mb > 0) {
 		if (dedicated_mb < 4096) {
 			cap = 128;
-		} else if (dedicated_mb < 8192) {
+		} else if (dedicated_mb < 7168) {
+			// DXGI-safe 8 GiB boundary: real 8 GiB cards report ~7900-8060 MiB,
+			// so 7168 keeps them at the full 512 default.
 			cap = 256;
 		}
 	}
@@ -665,6 +667,9 @@ Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode
 				lru_list.move_to_front(entry.lru_element);
 			}
 
+			// The prewarm batch has been consumed by the scene; a later LRU
+			// eviction is ordinary turnover, not "evicted before batch finished".
+			entry.prewarm_origin = false;
 			result = entry.texture;
 		}
 

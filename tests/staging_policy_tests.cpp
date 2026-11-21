@@ -37,7 +37,10 @@ GDEX_TEST(staging_policy, discrete_tiers) {
 	GDEX_EXPECT_EQ(cap(2048), static_cast<int64_t>(64));
 	GDEX_EXPECT_EQ(cap(4096), static_cast<int64_t>(64));
 	GDEX_EXPECT_EQ(cap(6144), static_cast<int64_t>(64));
-	GDEX_EXPECT_EQ(cap(8191), static_cast<int64_t>(64));
+	GDEX_EXPECT_EQ(cap(7167), static_cast<int64_t>(64));
+	// DXGI-safe 8 GiB boundary: real 8 GiB cards report ~7900-8060 MiB.
+	GDEX_EXPECT_EQ(cap(7900), static_cast<int64_t>(0));
+	GDEX_EXPECT_EQ(cap(8191), static_cast<int64_t>(0));
 	GDEX_EXPECT_EQ(cap(8192), static_cast<int64_t>(0));
 	GDEX_EXPECT_EQ(cap(24576), static_cast<int64_t>(0));
 }

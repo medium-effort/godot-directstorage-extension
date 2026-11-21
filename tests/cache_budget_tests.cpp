@@ -58,6 +58,28 @@ GDEX_TEST(cache_budget, prewarm_origin_eviction_is_counted_and_warned_once) {
 	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->_get_prewarm_eviction_count_for_testing()), static_cast<int64_t>(0));
 }
 
+// Audit gap 5: a prewarmed entry consumed via get_cached() is no longer "waiting
+// for its batch"; a later LRU eviction is ordinary turnover and must not warn.
+GDEX_TEST(cache_budget, consumed_prewarm_entry_evicts_without_warning) {
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	cache->set_max_entries(2);
+	cache->_reset_prewarm_eviction_stats_for_testing();
+	ctx.add_teardown([cache]() {
+		cache->clear();
+		memdelete(cache);
+	});
+
+	GDEX_ASSERT_TRUE(cache->store("res://cache_consumed_a", make_test_texture(0.1f), godot::DSTextureCache::CACHE_MODE_REUSE, "", true));
+	// Consuming the entry clears its prewarm origin.
+	GDEX_ASSERT_TRUE(cache->get_cached("res://cache_consumed_a").is_valid());
+	// Two more stores push the consumed entry out of the 2-entry cache.
+	GDEX_ASSERT_TRUE(cache->store("res://cache_consumed_b", make_test_texture(0.2f), godot::DSTextureCache::CACHE_MODE_REUSE, "", false));
+	GDEX_ASSERT_TRUE(cache->store("res://cache_consumed_c", make_test_texture(0.3f), godot::DSTextureCache::CACHE_MODE_REUSE, "", false));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->_get_prewarm_eviction_count_for_testing()), static_cast<int64_t>(0));
+}
+
 GDEX_TEST(cache_budget, vram_guard_clamps_default_by_adapter_tier) {
 	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
 	GDEX_ASSERT_TRUE(ps != nullptr);
@@ -118,6 +140,18 @@ GDEX_TEST(cache_budget, vram_guard_clamps_default_by_adapter_tier) {
 		adapter["dedicated_vram_mb"] = static_cast<int64_t>(6144);
 		c->apply_vram_budget_guard(adapter);
 		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(256));
+	}
+
+	// Discrete 4-8 GiB DXGI report (real 8 GiB card ~7900 MiB) -> keeps 512.
+	{
+		godot::DSTextureCache *c = make_cache();
+		godot::Dictionary adapter;
+		adapter["available"] = true;
+		adapter["is_uma"] = false;
+		adapter["integrated_gpu_guess"] = false;
+		adapter["dedicated_vram_mb"] = static_cast<int64_t>(7900);
+		c->apply_vram_budget_guard(adapter);
+		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(512));
 	}
 
 	// Discrete >=8 GiB -> keeps 512.
@@ -198,7 +232,7 @@ GDEX_TEST(cache_budget, initialize_ds_applies_vram_guard_on_live_d3d12) {
 	int64_t expected_cap = 512;
 	if (integrated || (dedicated_mb > 0 && dedicated_mb < 4096)) {
 		expected_cap = 128;
-	} else if (dedicated_mb >= 4096 && dedicated_mb < 8192) {
+	} else if (dedicated_mb >= 4096 && dedicated_mb < 7168) {
 		expected_cap = 256;
 	}
 	GDEX_EXPECT_LE(static_cast<int64_t>(fresh_cache->get_max_entries()), expected_cap);

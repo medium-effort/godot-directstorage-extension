@@ -297,11 +297,16 @@ namespace GDeflate
                 ? hardwareWorkers
                 : std::min(hardwareWorkers, p_max_workers);
 
-        // The old expression counted extra threads next to the inline one, so the total
-        // is one more; a single-thread request stays at one runner.
+        // The parallel-for executor posts ALL p_workers as pool tasks (no inline
+        // runner), so the total must stay within the CPU budget and the tile
+        // count: 1 tile -> 1 worker, not upstream's "1 + 1 = 2"; large inputs
+        // request at most maxWorkers, not maxWorkers + 1.
         const uint32_t workers = (flags & COMPRESS_SINGLE_THREAD)
             ? 1u
-            : 1u + std::min(maxWorkers, (context.numItems + kMinTilesPerWorker - 1) / kMinTilesPerWorker);
+            : std::clamp(
+                (context.numItems + kMinTilesPerWorker - 1) / kMinTilesPerWorker,
+                1u,
+                std::min(std::max(1u, context.numItems), maxWorkers));
 
         CompressJob job{ &context, level };
         if (workers > 1 && p_parallelFor != nullptr)

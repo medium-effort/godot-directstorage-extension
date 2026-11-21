@@ -250,7 +250,9 @@ public:
 		if (p_dedicated_vram_mb < 2048) {
 			return 32;
 		}
-		if (p_dedicated_vram_mb < 8192) {
+		// DXGI-safe 8 GiB boundary: real 8 GiB cards report ~7900-8060 MiB
+		// (just like a 4 GiB card reports 4004), so 7168 keeps them uncapped.
+		if (p_dedicated_vram_mb < 7168) {
 			return 64;
 		}
 		return 0;

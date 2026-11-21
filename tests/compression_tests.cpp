@@ -365,6 +365,31 @@ GDEX_TEST(gdeflate, borderline_incompressible_full_tile_round_trip) {
 // Audit 3.2: the old 64-tiles-per-worker floor let a 4 MiB (64-tile) mip fan out
 // to only 2 workers even on a many-core CPU. Assert the dispatched worker count
 // scales with the shared budget, then prove the finer tiling still round-trips.
+// Audit gap 4: ds_gdeflate_parallel_for posts all p_workers as pool tasks (no
+// inline runner), so upstream's "1u + ceil(tiles/kMinTilesPerWorker)" dispatched
+// one worker too many (2 for a single 64 KiB tile, budget+1 for large inputs).
+GDEX_TEST(gdeflate, compress_worker_count_never_exceeds_tiles_or_budget) {
+    const uint32_t budget = static_cast<uint32_t>(godot::ds_get_max_cpu_threads());
+    // One tile: the fix must dispatch at most 1 worker (RED: old code used 2).
+    {
+        godot::PackedByteArray original = make_pattern(kTileSize);
+        godot::Ref<godot::GDeflateCompressor> compressor;
+        compressor.instantiate();
+        godot::ds_reset_parallel_for_workers_for_testing();
+        GDEX_EXPECT_GT(compressor->compress(original, 1).size(), 0);
+        GDEX_EXPECT_LE(godot::ds_get_last_parallel_for_workers_for_testing(), 1u);
+    }
+    // Large input: workers must not exceed the resolved CPU budget.
+    {
+        godot::PackedByteArray original = make_pattern(kTileSize * 256);
+        godot::Ref<godot::GDeflateCompressor> compressor;
+        compressor.instantiate();
+        godot::ds_reset_parallel_for_workers_for_testing();
+        GDEX_EXPECT_GT(compressor->compress(original, 1).size(), 0);
+        GDEX_EXPECT_LE(godot::ds_get_last_parallel_for_workers_for_testing(), budget);
+    }
+}
+
 GDEX_TEST(gdeflate, compress_small_mip_fans_out_across_cpu_budget) {
     if (godot::ds_get_max_cpu_threads() < 4) {
         GDEX_SKIP("Shared CPU budget too small to prove multi-worker fan-out");
