@@ -21,6 +21,9 @@ namespace godot {
 struct FallbackBackend::WorkerScratch {
 	static constexpr size_t MAX_OPEN_FILES = 16;
 	std::unordered_map<std::string, Ref<FileAccess>> open_files;
+	// Batch whose handles are cached here; 0 means none yet. Async batch ids
+	// start at 1 (submit_async, next_async_batch_id), so 0 is a safe sentinel.
+	uint64_t batch_id = 0;
 };
 
 FallbackBackend::FallbackBackend() {
@@ -97,18 +100,43 @@ void FallbackBackend::worker_thread_func() {
 	WorkerScratch scratch;
 	while (true) {
 		QueuedRequest item;
+		bool stopping = false;
 		{
 			std::unique_lock<std::mutex> lock(batch_mutex);
+			// Nothing is queued and this worker is about to block. Release its
+			// cached input handles: one held while idle keeps the archive locked
+			// against replacement on Windows and keeps serving the unlinked
+			// inode on POSIX. Closed outside batch_mutex - closing is a syscall.
+			if (request_queue.empty() && !scratch.open_files.empty()) {
+				lock.unlock();
+				clear_worker_file_cache(scratch);
+				lock.lock();
+			}
 			batch_cv.wait(lock, [this]() {
 				return completion_thread_stop.load() || !request_queue.empty();
 			});
 			if (request_queue.empty() && completion_thread_stop.load()) {
-				return;
+				stopping = true;
+			} else {
+				item = request_queue.front();
+				request_queue.pop_front();
+				active_workers++;
+				batch_in_flight.store(true);
 			}
-			item = request_queue.front();
-			request_queue.pop_front();
-			active_workers++;
-			batch_in_flight.store(true);
+		}
+		if (stopping) {
+			clear_worker_file_cache(scratch);
+			return;
+		}
+
+		// A cached handle belongs to the batch that opened it. Between two batches
+		// the archive may have been replaced or rewritten in place, so reusing it
+		// would serve stale bytes - the same reason Win32Backend resolves a source
+		// file per batch and drops it on completion. This also closes the window
+		// where a submit lands before a worker reaches its idle clear.
+		if (scratch.batch_id != item.batch_id) {
+			clear_worker_file_cache(scratch);
+			scratch.batch_id = item.batch_id;
 		}
 
 		// CPU file I/O + GDeflate decompression stay on this worker thread,
