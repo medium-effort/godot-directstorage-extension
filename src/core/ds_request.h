@@ -58,6 +58,15 @@ private:
 	String gdeflate_validated_path;
 	uint64_t gdeflate_validated_offset = 0;
 	uint32_t gdeflate_validated_size = 0;
+	// Whole-texture GPU prewarm requests validate ALL target mips in one request,
+	// so a single (offset, size) record cannot match the backend's per-mip check.
+	// This record covers a whole subresource range validated off-thread; the
+	// backend honours it only for an exact (path, offset, first, count) match.
+	bool gdeflate_streams_prevalidated = false;
+	String gdeflate_streams_validated_path;
+	uint64_t gdeflate_streams_validated_offset = 0;
+	uint32_t gdeflate_streams_validated_first_subresource = 0;
+	uint32_t gdeflate_streams_validated_subresource_count = 0;
 	PackedByteArray destination_buffer;
 	DSDestinationType destination_type = DESTINATION_MEMORY;
 	RID destination_resource;
@@ -175,6 +184,8 @@ public:
 	// fall back to the synchronous check instead of trusting a stale validation.
 	void set_gdeflate_stream_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_declared_size);
 	bool is_gdeflate_stream_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_declared_size) const;
+	void set_gdeflate_streams_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_first_subresource, uint32_t p_subresource_count);
+	bool is_gdeflate_streams_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_first_subresource, uint32_t p_subresource_count) const;
 
 	uint64_t get_cancel_timestamp_usec() const { return cancel_timestamp_usec.load(std::memory_order_acquire); }
 	void set_cancel_timestamp_usec(uint64_t p_usec) { cancel_timestamp_usec.store(p_usec, std::memory_order_release); }

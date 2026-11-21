@@ -121,6 +121,28 @@ bool DSRequest::is_gdeflate_stream_prevalidated(const String &p_path, uint64_t p
 			gdeflate_validated_size == p_declared_size;
 }
 
+void DSRequest::set_gdeflate_streams_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_first_subresource, uint32_t p_subresource_count) {
+	std::lock_guard<std::mutex> lock(payload_mutex);
+	if (!is_mutable()) {
+		UtilityFunctions::push_error("DSRequest: Cannot stamp a GDeflate validation record while request is in-flight or completed.");
+		return;
+	}
+	notify_mutation_window();
+	gdeflate_streams_prevalidated = true;
+	gdeflate_streams_validated_path = p_path;
+	gdeflate_streams_validated_offset = p_offset;
+	gdeflate_streams_validated_first_subresource = p_first_subresource;
+	gdeflate_streams_validated_subresource_count = p_subresource_count;
+}
+
+bool DSRequest::is_gdeflate_streams_prevalidated(const String &p_path, uint64_t p_offset, uint32_t p_first_subresource, uint32_t p_subresource_count) const {
+	return gdeflate_streams_prevalidated &&
+			gdeflate_streams_validated_path == p_path &&
+			gdeflate_streams_validated_offset == p_offset &&
+			gdeflate_streams_validated_first_subresource == p_first_subresource &&
+			gdeflate_streams_validated_subresource_count == p_subresource_count;
+}
+
 void DSRequest::set_destination_buffer(const PackedByteArray &p_buffer) {
 	std::lock_guard<std::mutex> lock(payload_mutex);
 	if (!is_mutable()) {

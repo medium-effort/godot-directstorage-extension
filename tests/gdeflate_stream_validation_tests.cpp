@@ -85,3 +85,50 @@ GDEX_TEST(gdeflate_header, unstamped_request_falls_back) {
 	req->set_uncompressed_size(64 * 1024);
 	GDEX_EXPECT_FALSE(req->is_gdeflate_stream_prevalidated("res://textures.dspkg", 8192, 64 * 1024));
 }
+
+// Whole-texture GPU prewarm requests cover all mips in one DSRequest, so a
+// single (offset, size) record cannot match each mip the backend validates.
+// The range record must match the exact (path, offset, first, count) identity.
+GDEX_TEST(gdeflate_header, whole_texture_record_honours_exact_range) {
+	godot::Ref<godot::DSRequest> req;
+	req.instantiate();
+	req->set_file_path("res://textures.dspkg");
+	req->set_offset(8192);
+	req->set_first_subresource(0);
+	req->set_subresource_count(11);
+	req->set_gdeflate_streams_prevalidated("res://textures.dspkg", 8192, 0, 11);
+
+	GDEX_EXPECT_TRUE(req->is_gdeflate_streams_prevalidated("res://textures.dspkg", 8192, 0, 11));
+	// Any mismatch must fall back to the backend's synchronous per-mip check.
+	GDEX_EXPECT_FALSE(req->is_gdeflate_streams_prevalidated("res://other.dspkg", 8192, 0, 11));
+	GDEX_EXPECT_FALSE(req->is_gdeflate_streams_prevalidated("res://textures.dspkg", 4096, 0, 11));
+	GDEX_EXPECT_FALSE(req->is_gdeflate_streams_prevalidated("res://textures.dspkg", 8192, 1, 11));
+	GDEX_EXPECT_FALSE(req->is_gdeflate_streams_prevalidated("res://textures.dspkg", 8192, 0, 10));
+}
+
+// A single-stream stamp (used for chunked/single-mip requests) must NOT be
+// mistaken for a whole-range stamp: a multi-mip request still has every mip
+// validated by the backend unless the full range was prevalidated off-thread.
+GDEX_TEST(gdeflate_header, single_stream_stamp_does_not_imply_whole_range) {
+	godot::Ref<godot::DSRequest> req;
+	req.instantiate();
+	req->set_file_path("res://textures.dspkg");
+	req->set_offset(8192);
+	req->set_uncompressed_size(64 * 1024);
+	req->set_first_subresource(0);
+	req->set_subresource_count(11);
+	req->set_gdeflate_stream_prevalidated("res://textures.dspkg", 8192, 64 * 1024);
+
+	GDEX_EXPECT_TRUE(req->is_gdeflate_stream_prevalidated("res://textures.dspkg", 8192, 64 * 1024));
+	GDEX_EXPECT_FALSE(req->is_gdeflate_streams_prevalidated("res://textures.dspkg", 8192, 0, 11));
+}
+
+GDEX_TEST(gdeflate_header, unstamped_whole_range_falls_back) {
+	godot::Ref<godot::DSRequest> req;
+	req.instantiate();
+	req->set_file_path("res://textures.dspkg");
+	req->set_offset(8192);
+	req->set_first_subresource(0);
+	req->set_subresource_count(11);
+	GDEX_EXPECT_FALSE(req->is_gdeflate_streams_prevalidated("res://textures.dspkg", 8192, 0, 11));
+}

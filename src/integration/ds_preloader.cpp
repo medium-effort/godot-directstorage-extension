@@ -2134,6 +2134,16 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 		req->set_subresource_count(p_subresource_count);
 		req->set_texture_format(static_cast<uint32_t>(native));
 		req->set_debug_label(m.engine_path);
+		// Finding 1.2 off-thread validation covered this payload's streams; stamp
+		// the request so Win32Backend skips its synchronous per-mip file probe.
+		// Single-stream stamp covers row-region chunks and single-mip requests;
+		// the range stamp covers whole-texture (multi-mip) requests.
+		if (m.gdeflate_prevalidated && m.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
+			req->set_gdeflate_stream_prevalidated(m.file_path, p_upload_offset, p_uncompressed);
+			if (p_subresource_count > 1) {
+				req->set_gdeflate_streams_prevalidated(m.file_path, p_upload_offset, p_first_subresource, p_subresource_count);
+			}
+		}
 		uploads.push_back(req);
 		return req;
 	};

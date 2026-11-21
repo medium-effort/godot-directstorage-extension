@@ -4566,11 +4566,17 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 			return reject(p_request, codec_error, EnqueueOutcome::TERMINAL);
 		}
 		if (p_request->get_compression_format() == DSRequest::COMPRESSION_GDEFLATE) {
+			// A whole-texture prewarm request validated all target mips off-thread
+			// and carries a range stamp matching its exact request identity.
+			const bool whole_range_prevalidated = p_request->is_gdeflate_streams_prevalidated(
+					p_request->get_file_path(), p_request->get_offset(), texture_first_subresource, texture_subresource_count);
 			for (uint32_t mip_index = 0; mip_index < texture_subresource_count; mip_index++) {
+				if (whole_range_prevalidated) {
+					continue;
+				}
 				const DSTexMipEntryV2 &mip_entry = texture_mip_entries[texture_first_subresource + mip_index];
-				// Preloader requests carry an off-thread validation record for
-				// their exact (path, offset, size); a whole-texture request with
-				// several mips cannot match it and falls back to this check.
+				// A single-stream record (row-range chunk or single-mip request)
+				// validates exactly this mip; any other request falls back.
 				if (p_request->is_gdeflate_stream_prevalidated(p_request->get_file_path(), mip_entry.offset, mip_entry.uncompressed_size)) {
 					continue;
 				}
