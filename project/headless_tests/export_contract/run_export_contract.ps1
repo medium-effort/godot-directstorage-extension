@@ -4,6 +4,10 @@ param(
     [string]$WorkRoot = '',
     [string]$KeyedTemplate = '',
     [string]$KeyFile = '',
+    # Optional .env to read DSPKG_KEYED_TEMPLATE / DSPKG_KEYED_TEMPLATE_KEY_FILE from.
+    # Default: <workspace>\.env. A parameter so a test can point at a fixture file.
+    # Deliberately not $EnvFile: the Godot console reader owns that local above.
+    [string]$EnvFilePath = '',
     [string[]]$Only = @(),
     [int]$ExportTimeoutSec = 420,
     [int]$BootTimeoutSec = 90,
@@ -52,10 +56,15 @@ param(
 # Requirements: the Godot console binary named by .env or by the environment
 # (GODOT_CONSOLE_PATH), a 4.7.2 keyed release template plus its key file
 # (protected cases), and the extension DLLs in
-# project/addons/directstorage_accelerator/bin/. The positive-control fixture is
+# project/addons/directstorage_accelerator/bin/. The template and key file can be supplied
+# without editing this script: -KeyedTemplate/-KeyFile first, then DSPKG_KEYED_TEMPLATE /
+# DSPKG_KEYED_TEMPLATE_KEY_FILE from the process environment or .env, then the gitignored
+# default below. A value supplied by the environment or .env must exist or the run stops
+# before any case; a missing argument still degrades to not_covered. Both are paths, never
+# key bytes: the key stays in a file beside the template, so no child process inherits it.
+# The positive-control fixture is
 # in this directory; the old .agents/scratch copy is still accepted as a fallback.
-# The key is read from the template directory at run time and never written into
-# this script or the fixture.
+# The key is read at run time and never written into this script or the fixture.
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -109,12 +118,57 @@ if ($Godot -notmatch 'console') {
 }
 if (-not (Test-Path -LiteralPath $ScannerScript)) { throw ('Pack scanner missing: ' + $ScannerScript) }
 
-if ([string]::IsNullOrEmpty($KeyedTemplate)) {
-    $KeyedTemplate = Join-Path $WorkspaceRoot '.agents\scratch\test_keyed_template_release\godot.windows.template_release.x86_64.exe'
+# The keyed template and its key file are inputs, not discoveries: a parameter wins, then
+# the process environment, then the workspace .env, then the historical default under the
+# gitignored scratch directory. A value supplied by the environment or by .env must exist
+# or the run stops before any case; a parameter keeps its old degrade-to-not_covered
+# behaviour, because an existing harness passes a deliberately missing path and expects a
+# coverage gap rather than a hard failure.
+function Get-GateConfigValue {
+    param([string]$Name, [string]$Path)
+    $value = [string][Environment]::GetEnvironmentVariable($Name)
+    if (-not [string]::IsNullOrWhiteSpace($value)) {
+        return @{ Value = $value.Trim().Trim('"').Trim("'"); Source = 'environment' }
+    }
+    if (-not [string]::IsNullOrEmpty($Path) -and (Test-Path -LiteralPath $Path)) {
+        $line = Get-Content -LiteralPath $Path | Where-Object { $_ -match ('^\s*' + [regex]::Escape($Name) + '\s*=') } | Select-Object -First 1
+        if ($null -ne $line) {
+            $raw = ($line -split '=', 2)[1].Trim().Trim('"').Trim("'")
+            if (-not [string]::IsNullOrWhiteSpace($raw)) { return @{ Value = $raw; Source = '.env' } }
+        }
+    }
+    return @{ Value = ''; Source = 'none' }
 }
-if ([string]::IsNullOrEmpty($KeyFile)) {
-    $KeyFile = Join-Path $WorkspaceRoot '.agents\scratch\test_keyed_template_release\key.txt'
+
+if ([string]::IsNullOrEmpty($EnvFilePath)) { $EnvFilePath = Join-Path $WorkspaceRoot '.env' }
+$templateInput = Get-GateConfigValue 'DSPKG_KEYED_TEMPLATE' $EnvFilePath
+$keyInput = Get-GateConfigValue 'DSPKG_KEYED_TEMPLATE_KEY_FILE' $EnvFilePath
+if (-not [string]::IsNullOrEmpty($KeyedTemplate)) { $templateInput = @{ Value = $KeyedTemplate; Source = 'parameter' } }
+if (-not [string]::IsNullOrEmpty($KeyFile)) { $keyInput = @{ Value = $KeyFile; Source = 'parameter' } }
+if ($templateInput['Source'] -eq 'none') {
+    $templateInput = @{ Value = (Join-Path $WorkspaceRoot '.agents\scratch\test_keyed_template_release\godot.windows.template_release.x86_64.exe'); Source = 'default' }
 }
+if ($keyInput['Source'] -eq 'none') {
+    if ($templateInput['Source'] -eq 'default') {
+        $keyInput = @{ Value = (Join-Path $WorkspaceRoot '.agents\scratch\test_keyed_template_release\key.txt'); Source = 'default' }
+    } else {
+        # A caller-supplied template defines the directory; the key sits beside it unless named.
+        $templateDir = Split-Path -Parent $templateInput['Value']
+        if ([string]::IsNullOrEmpty($templateDir)) { $templateDir = '.' }
+        $keyInput = @{ Value = (Join-Path $templateDir 'key.txt'); Source = 'derived' }
+    }
+}
+if (($templateInput['Source'] -eq 'environment' -or $templateInput['Source'] -eq '.env') -and -not (Test-Path -LiteralPath $templateInput['Value'] -PathType Leaf)) {
+    Write-Output ('[gate] RESULT FAIL input DSPKG_KEYED_TEMPLATE=' + $templateInput['Value'])
+    exit 1
+}
+if (($keyInput['Source'] -eq 'environment' -or $keyInput['Source'] -eq '.env') -and -not (Test-Path -LiteralPath $keyInput['Value'] -PathType Leaf)) {
+    Write-Output ('[gate] RESULT FAIL input DSPKG_KEYED_TEMPLATE_KEY_FILE=' + $keyInput['Value'])
+    exit 1
+}
+$KeyedTemplate = $templateInput['Value']
+$KeyFile = $keyInput['Value']
+$TemplateSource = $templateInput['Source']
 $TemplatePath = ''
 $TemplateKey = ''
 $TemplateReason = ''
@@ -137,7 +191,7 @@ Write-Output ('[gate] workspace=' + $WorkspaceRoot)
 Write-Output ('[gate] godot=' + $Godot)
 Write-Output ('[gate] work=' + $WorkRoot)
 if ($ProtectedAvailable) {
-    Write-Output ('[gate] keyed_template=' + $TemplatePath)
+    Write-Output ('[gate] keyed_template=' + $TemplatePath + ' (source=' + $TemplateSource + ')')
 } else {
     Write-Output ('[gate] keyed_template=unavailable (' + $TemplateReason + ')')
 }

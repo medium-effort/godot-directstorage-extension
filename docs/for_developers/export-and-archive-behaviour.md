@@ -355,6 +355,11 @@ them for diagnosis; a failing run always keeps them). It ends with `covers=`,
   case asks for) and `skip_on_create_failure` (the builder never opens a file in `create()`, so that failure
   branch is unreachable; the contract consequence is asserted in the same case).
 
+The keyed template and its key file can be supplied without editing the script, through
+`DSPKG_KEYED_TEMPLATE` / `DSPKG_KEYED_TEMPLATE_KEY_FILE` in the environment or `.env` (arguments still
+win). A value supplied that way must exist, or the gate stops with `RESULT FAIL input` instead of skipping
+the protected cases; a missing argument keeps the `not_covered` behaviour below.
+
 Without a keyed template the protected cases land in `not_covered`, and with `-RequireFullCoverage` the run
 fails rather than reporting a pass it did not earn.
 

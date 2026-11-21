@@ -23,8 +23,9 @@ Options:
 | Option | Meaning |
 |---|---|
 | `-Only name1,name2` | run a subset (dependency cases such as `corrupted_toc` need `protected_success` in the same run) |
-| `-KeyedTemplate <path>` | 4.7.2 keyed release template (default: `.agents/scratch/test_keyed_template_release/godot.windows.template_release.x86_64.exe`) |
+| `-KeyedTemplate <path>` | 4.7.2 keyed release template (default: `.agents/scratch/test_keyed_template_release/godot.windows.template_release.x86_64.exe`); the environment variables below override the default, and this argument overrides both |
 | `-KeyFile <path>` | key file next to the template (default: `key.txt` in the same folder) |
+| `-EnvFilePath <path>` | `.env` to read `DSPKG_KEYED_TEMPLATE` / `DSPKG_KEYED_TEMPLATE_KEY_FILE` from (default: `<workspace>/.env`) |
 | `-WorkRoot <path>` | artifact directory (default: `out/run-<timestamp>`) |
 | `-ExportTimeoutSec`, `-BootTimeoutSec` | process timeouts |
 | `-NegativeControl` | self-test: leaves the archive in place during `alert_bypass`; the gate must then fail |
@@ -42,6 +43,14 @@ Requirements: `GODOT_CONSOLE_PATH` must point at a **console** build of Godot
 DLLs. The keyed template is needed for the protected cases; without it they are
 reported under `not_covered` and `-RequireFullCoverage` fails the run rather than
 passing silently.
+
+The template and key file resolve in this order: `-KeyedTemplate`/`-KeyFile`, then
+`DSPKG_KEYED_TEMPLATE` / `DSPKG_KEYED_TEMPLATE_KEY_FILE` in the process environment, then
+the same names in `.env`, then the built-in default above. A value supplied by the
+environment or `.env` must exist, or the run stops before any case with
+`RESULT FAIL input <VARIABLE>=<value>`; a missing argument keeps the older behaviour (a
+`not_covered` gap). Both are paths, never key bytes: the key stays in a file beside the
+template, so it is never inherited by the Godot processes and exports this script spawns.
 
 The work root is disposable, so the gate disposes of it as it goes. A case's project
 tree and its disposable release stage are removed as soon as the case has recorded its
