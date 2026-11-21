@@ -9,7 +9,7 @@ exactly one `DSPKG_BOOT status=ok` line in stdout and in the
 ## Run
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1 -RequireFullCoverage
+powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1
 ```
 
 Run it before exporting a release, not on every build: it takes about 2.5 minutes.
@@ -22,14 +22,15 @@ Options:
 
 | Option | Meaning |
 |---|---|
-| `-Only name1,name2` | run a subset (dependency cases such as `corrupted_toc` need `protected_success` in the same run) |
+| `-Only name1,name2` | run a subset; a subset is partial by definition and exits 1 unless `-AllowPartial` is also passed (dependency cases such as `corrupted_toc` need `protected_success` in the same run) |
 | `-KeyedTemplate <path>` | 4.7.2 keyed release template (default: `.agents/scratch/test_keyed_template_release/godot.windows.template_release.x86_64.exe`); the environment variables below override the default, and this argument overrides both |
 | `-KeyFile <path>` | key file next to the template (default: `key.txt` in the same folder) |
 | `-EnvFilePath <path>` | `.env` to read `DSPKG_KEYED_TEMPLATE` / `DSPKG_KEYED_TEMPLATE_KEY_FILE` from (default: `<workspace>/.env`) |
 | `-WorkRoot <path>` | artifact directory (default: `out/run-<timestamp>`) |
 | `-ExportTimeoutSec`, `-BootTimeoutSec` | process timeouts |
 | `-NegativeControl` | self-test: leaves the archive in place during `alert_bypass`; the gate must then fail |
-| `-RequireFullCoverage` | fail the run when any case was skipped for a real reason (missing template, fixture or prerequisite stage) |
+| `-RequireFullCoverage` | accepted for compatibility and ignored: full coverage is the default, so this switch changes nothing |
+| `-AllowPartial` | opt out of the coverage requirement for a debugging run: recorded gaps print `RESULT PARTIAL` and exit 0. A run that selected no case still fails |
 | `-KeepArtifacts` | keep every case directory and the work root; disables per-case disposal and the work-root removal |
 | `-KeepWorkRoot` | keep the work root after a **passing** run (default: removed) |
 | `-Cleanup` | accepted for compatibility and ignored: removing the work root after a passing run is the default, so this switch changes nothing |
@@ -41,8 +42,8 @@ Requirements: `GODOT_CONSOLE_PATH` must point at a **console** build of Godot
 4.7.2, in `.env` or in the environment, and
 `project/addons/directstorage_accelerator/bin/` must hold the built extension
 DLLs. The keyed template is needed for the protected cases; without it they are
-reported under `not_covered` and `-RequireFullCoverage` fails the run rather than
-passing silently.
+reported under `not_covered` and **the run fails** (`RESULT FAIL coverage_incomplete`)
+rather than passing silently. `-AllowPartial` reports `RESULT PARTIAL` instead.
 
 The template and key file resolve in this order: `-KeyedTemplate`/`-KeyFile`, then
 `DSPKG_KEYED_TEMPLATE` / `DSPKG_KEYED_TEMPLATE_KEY_FILE` in the process environment, then
@@ -92,19 +93,25 @@ Get-ChildItem out | Sort-Object LastWriteTime -Descending | Select-Object -Skip 
 | Pack scan | every case; `key_scan_control` proves a plaintext key is found |
 | Magic parity | `magic_parity` (C++, exporter and scanner labels and digests agree) |
 
-The runner ends with three lines that are read together:
+The runner ends with a counter line and four summary lines that are read together:
 
 ```text
-covers=<case names that ran>
-not_covered=<cases skipped for a real reason, with the reason>
+[gate] cases=<started>/<declared> checks=<recorded> failed=<failed>
+covers=<case names exercised without a coverage gap>
+not_covered=<cases that ran but skipped a sub-check, with the reason>
+not_run=<declared cases the filter never started>
 known_limits=<sub-checks that cannot pass on any machine, with the reason>
 ```
 
-`covers=` is the surface actually exercised and `checks=` (printed just above)
-is its size - a full run is 162 checks over 20 cases. `not_covered=` is a gap: a
-case did not run because something was missing, and `-RequireFullCoverage` turns
-any entry there into a failing exit code. `known_limits=` is not a gap: two
-sub-checks are limited by the engine or by the builder and cannot pass anywhere -
+`cases=` and `covers=` state the surface actually exercised, and `checks=` is its size - a
+full run reports `cases=24/24` and 194 checks today, but read the line rather than trusting
+that number. `not_covered=` and `not_run=` are gaps: a prerequisite was missing, or the
+`-Only` filter did not match a declared case (a mistyped name matches none of them). The
+gate fails when either is non-empty - `RESULT FAIL coverage_incomplete`, and a run that
+selected no case at all reports `RESULT FAIL no_checks`. `-AllowPartial` is the only
+opt-out: it keeps the gaps visible, prints `RESULT PARTIAL` and exits 0. `known_limits=`
+is not a gap: two sub-checks are limited by the engine or by the builder and cannot pass
+anywhere -
 
 - `protected_empty_key.pack_truncation`, because this Godot writes a complete PCK
   instead of the truncated one the case asks for (the fail-closed payload removal

@@ -337,19 +337,23 @@ Run these after touching the exporter, the runtime, or the archive reader.
 | Harness | Command | Proves |
 |---|---|---|
 | Policy unit test | `godot --headless --path project --script headless_tests/test_export_policy.gd` | the whole decision table above, in seconds, with no extension or export (17 checks) |
-| Export-contract gate | `powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1 -RequireFullCoverage` (2.5 min, measured peak ~230 MB of scratch, nothing left after a pass) | protected/unprotected/bundling-off exports, the three fail-closed presets, subset modes, stale-archive deletion, partial salvage, corrupted TOC, the boot grammar, the pack scan and the key-scan positive control |
+| Export-contract gate | `powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1` (2.5 min, measured peak ~230 MB of scratch, nothing left after a pass) | protected/unprotected/bundling-off exports, the three fail-closed presets, subset modes, stale-archive deletion, partial salvage, corrupted TOC, the boot grammar, the pack scan and the key-scan positive control |
+| Gate self-test | `powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/self_test.ps1` (about 1.5 min; needs no keyed template) | the gate's own verdicts: a skipped or unstarted case fails instead of reporting PASS, `-AllowPartial` labels such a run PARTIAL, and an empty selection always fails |
 | Pack scan | `godot --headless --path project --script res://addons/directstorage_accelerator/tools/dspkg_pack_scan.gd -- --pack <pck>` | pack validity and key-magic absence for one file |
 
 The gate is run manually before exporting a release; nothing runs it automatically, so a change to the
 exporter, the runtime or the archive reader is only checked if someone runs it. It disposes of each
 case's project tree and stage after the case has recorded its checks - only the two stages a later case
 reads survive - and a passing run removes its whole work root (`-KeepArtifacts` / `-KeepWorkRoot` retain
-them for diagnosis; a failing run always keeps them). It ends with `covers=`,
-`not_covered=` and `known_limits=`:
+them for diagnosis; a failing run always keeps them). It ends with `[gate] cases=`, `covers=`,
+`not_covered=`, `not_run=` and `known_limits=`:
 
-- `covers=` and `checks=` state what actually ran (a full run is 162 checks over 20 cases).
-- `not_covered=` is a gap - a case that did not run for want of a prerequisite. `-RequireFullCoverage`
-  turns any entry there into a failing exit code, which is why the documented command passes it.
+- `cases=` and `covers=` state what actually ran and `checks=` is its size - a full run reports
+  `cases=24/24` and 194 checks today; read the line instead of trusting a number in prose.
+- `not_covered=` and `not_run=` are gaps: a prerequisite was missing, or the `-Only` filter did not
+  match a declared case. The run fails (`RESULT FAIL coverage_incomplete`) instead of printing PASS;
+  a run that selected no case reports `RESULT FAIL no_checks`, which `-AllowPartial` cannot bless.
+  `-AllowPartial` is the only opt-out and prints `RESULT PARTIAL` with the gaps still listed.
 - `known_limits=` lists the two sub-checks that cannot pass on any machine:
   `protected_empty_key.pack_truncation` (this engine writes a complete PCK instead of the truncated one the
   case asks for) and `skip_on_create_failure` (the builder never opens a file in `create()`, so that failure
@@ -360,8 +364,8 @@ The keyed template and its key file can be supplied without editing the script, 
 win). A value supplied that way must exist, or the gate stops with `RESULT FAIL input` instead of skipping
 the protected cases; a missing argument keeps the `not_covered` behaviour below.
 
-Without a keyed template the protected cases land in `not_covered`, and with `-RequireFullCoverage` the run
-fails rather than reporting a pass it did not earn.
+Without a keyed template the protected cases land in `not_covered`, and the run fails rather than
+reporting a pass it did not earn; `-AllowPartial` reports `RESULT PARTIAL` for a debugging run.
 
 Gotchas learned while building these tests, useful for the next harness:
 

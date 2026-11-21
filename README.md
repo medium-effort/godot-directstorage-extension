@@ -175,9 +175,10 @@ The editor dialog also reports `Directory encrypted: yes/no`. `status=ok` does n
 ### 7.5 Deployment checklist
 
 - [ ] Templates built with the same PCK key as the preset (and rebuilt after any key change).
-- [ ] The export-contract gate passes on this machine: `project/headless_tests/export_contract/run_export_contract.ps1 -RequireFullCoverage`
-      ends with `RESULT PASS`, `not_covered=none` and only the two `known_limits=`. It is manual - no CI job
-      runs it - so this step is only done if you do it.
+- [ ] The export-contract gate passes on this machine: `project/headless_tests/export_contract/run_export_contract.ps1`
+      ends with `RESULT PASS`, `cases=24/24`, `not_covered=none`, `not_run=none` and only the two `known_limits=`.
+      It is manual - no CI job runs it - so this step is only done if you do it. A run that did not execute every
+      case now fails instead of reporting PASS; `-AllowPartial` is the deliberate opt-out for debugging one case.
 - [ ] `encrypt_pck` on, key set, include filter covering `res://.dspkg/toc.key`.
 - [ ] Export log shows the protected outcome, not plaintext and not a fail-closed error.
 - [ ] Exactly one `DSPKG_BOOT status=ok mode=protected … key_id=<16 hex>` line from the exported player.

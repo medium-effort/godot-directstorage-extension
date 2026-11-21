@@ -12,9 +12,13 @@ param(
     [int]$ExportTimeoutSec = 420,
     [int]$BootTimeoutSec = 90,
     [switch]$NegativeControl,
-    # Fail the run when a case was skipped for a real reason (missing template, fixture or
-    # prerequisite stage). Contract limitations are reported separately and do not trip it.
+    # Accepted for compatibility: full coverage is now the default, so this switch changes
+    # nothing. Use -AllowPartial to opt out.
     [switch]$RequireFullCoverage,
+    # Opt out of the default full-coverage requirement: a run that recorded a coverage gap
+    # reports RESULT PARTIAL and exits 0 instead of failing. A run that executed no check
+    # still fails. For debugging one case, never for a release check.
+    [switch]$AllowPartial,
     # Keep every case directory for diagnosis. Per-case disposal and the work-root
     # removal below are skipped when set.
     [switch]$KeepArtifacts,
@@ -54,6 +58,12 @@ param(
 # (stdout and the DSPKG_VALIDATE_OUT sink). Absence, a timeout or a duplicate is
 # a failure. A deliberately broken export fails the gate: the fail-closed cases
 # assert that no `status=ok` line exists and that the scanner rejects the pack.
+#
+# Coverage is enforced: a declared case that was skipped for a missing prerequisite, or
+# that the -Only filter never started, is a gap, and gaps fail the run - `RESULT FAIL
+# coverage_incomplete`. A run that selected no case at all reports `RESULT FAIL no_checks`.
+# -AllowPartial is the explicit opt-out for debugging one case: it keeps the gaps visible,
+# prints `RESULT PARTIAL` and exits 0. `-RequireFullCoverage` is accepted and ignored.
 #
 # Requirements: the Godot console binary named by .env or by the environment
 # (GODOT_CONSOLE_PATH), a 4.7.2 keyed release template plus its key file
@@ -202,11 +212,23 @@ if ($Cleanup) {
     # must not influence the removal decision (see the storage-policy block at the footer).
     Write-Output '[gate] note: -Cleanup is a no-op; a passing run removes its work root unless -KeepWorkRoot or -KeepArtifacts is passed'
 }
+if ($RequireFullCoverage) {
+    # Compatibility shim: full coverage is the default now, so the old opt-in changes nothing.
+    Write-Output '[gate] note: -RequireFullCoverage is a no-op; full coverage is the default and -AllowPartial is the opt-out'
+}
+if ($NegativeControl -and -not $ProtectedAvailable) {
+    # The self-test's premise is the protected stage; without it alert_bypass would be
+    # reported as not covered and the "must fail" assertion would never be constructed.
+    Write-Output ('[gate] RESULT FAIL negative_control_prerequisite :: ' + $TemplateReason)
+    exit 1
+}
 
 $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Covered = New-Object System.Collections.Generic.List[string]
 $script:NotCovered = New-Object System.Collections.Generic.List[string]
 $script:KnownLimits = New-Object System.Collections.Generic.List[string]
+$script:DeclaredCases = New-Object System.Collections.Generic.List[string]
+$script:StartedCases = New-Object System.Collections.Generic.List[string]
 $script:CurrentCase = ''
 $script:Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrEmpty($_) })
 $script:LastBoot = $null
@@ -240,7 +262,7 @@ function Add-NotCovered {
 
 # A contract limitation is a sub-check that cannot pass on any machine (an engine behaviour or
 # an unreachable branch), so it is reported separately from a real coverage gap and the case it
-# belongs to stays in `covers=`. -RequireFullCoverage only trips on real gaps.
+# belongs to stays in `covers=`. Only real gaps (`not_covered=` / `not_run=`) fail the run.
 function Add-KnownLimitation {
     param([string]$Name, [string]$Reason)
     $script:KnownLimits.Add($Name + ' (' + $Reason + ')')
@@ -267,7 +289,12 @@ function Remove-CaseScratch {
 
 function Invoke-Case {
     param([string]$Name, [scriptblock]$Body)
+    # Declared records what the gate claims to prove even when the filter skips the case;
+    # started records what this invocation attempted. $script:Covered cannot answer either
+    # question because Add-NotCovered removes a started-but-gapped case from it.
+    $script:DeclaredCases.Add($Name)
     if ($script:Only.Count -gt 0 -and -not ($script:Only -contains $Name)) { return }
+    $script:StartedCases.Add($Name)
     $script:CurrentCase = $Name
     $script:Covered.Add($Name)
     $checksBefore = $script:Results.Count
@@ -1494,14 +1521,20 @@ Invoke-Case 'key_scan_control' {
 # ---------------------------------------------------------------- footer
 
 $failed = @($script:Results | Where-Object { -not $_.Pass })
+# A case that the filter never started is a coverage gap too: `-Only corrupted_toc` runs one
+# of twenty-four cases, and a mistyped name runs none of them.
+$notRun = @($script:DeclaredCases | Where-Object { -not ($script:StartedCases -contains $_) })
+$coverageGaps = $script:NotCovered.Count + $notRun.Count
 $coversList = @($script:Covered | Sort-Object -Unique)
 $notCoveredText = 'none'
 if ($script:NotCovered.Count -gt 0) { $notCoveredText = ($script:NotCovered -join '; ') }
+$notRunText = 'none'
+if ($notRun.Count -gt 0) { $notRunText = ($notRun -join ',') }
 $knownLimitsText = 'none'
 if ($script:KnownLimits.Count -gt 0) { $knownLimitsText = ($script:KnownLimits -join '; ') }
 
 Write-Output ''
-Write-Output ('[gate] checks=' + $script:Results.Count + ' failed=' + $failed.Count)
+Write-Output ('[gate] cases=' + $script:StartedCases.Count + '/' + $script:DeclaredCases.Count + ' checks=' + $script:Results.Count + ' failed=' + $failed.Count)
 if ($script:KeptArtifacts.Count -gt 0) {
     Write-Output ('[gate] artifacts kept for failing cases: ' + ($script:KeptArtifacts -join '; '))
 }
@@ -1511,14 +1544,34 @@ foreach ($failure in $failed) {
 Write-Output ''
 Write-Output ('covers=' + ($coversList -join ','))
 Write-Output ('not_covered=' + $notCoveredText)
+Write-Output ('not_run=' + $notRunText)
 Write-Output ('known_limits=' + $knownLimitsText)
 Write-Output ''
 if ($failed.Count -gt 0) {
     Write-Output ('[gate] RESULT FAIL checks=' + $script:Results.Count + ' failed=' + $failed.Count)
     exit 1
 }
-if ($RequireFullCoverage -and $script:NotCovered.Count -gt 0) {
-    Write-Output ('[gate] RESULT FAIL coverage_required checks=' + $script:Results.Count + ' not_covered=' + $script:NotCovered.Count)
+# An invocation that selected no case at all is broken, not partial coverage, and the
+# opt-out cannot bless it.
+if ($script:StartedCases.Count -eq 0) {
+    Write-Output ('[gate] RESULT FAIL no_checks cases=0/' + $script:DeclaredCases.Count)
+    exit 1
+}
+if ($coverageGaps -gt 0) {
+    if (-not $AllowPartial) {
+        Write-Output ('[gate] RESULT FAIL coverage_incomplete checks=' + $script:Results.Count + ' not_covered=' + $script:NotCovered.Count + ' not_run=' + $notRun.Count)
+        exit 1
+    }
+    # The opt-out is the only path that exits 0 with gaps, and it keeps its artefacts: a
+    # partial run is the one whose leftovers explain the gap.
+    Write-Output ('[gate] RESULT PARTIAL checks=' + $script:Results.Count + ' not_covered=' + $script:NotCovered.Count + ' not_run=' + $notRun.Count)
+    exit 0
+}
+# Defensive: a started case that recorded neither a check nor a coverage gap must never
+# pass silently. No current case can reach this, but a future body that returns early
+# without calling Add-NotCovered would.
+if ($script:Results.Count -eq 0) {
+    Write-Output ('[gate] RESULT FAIL no_checks cases=' + $script:StartedCases.Count + '/' + $script:DeclaredCases.Count)
     exit 1
 }
 Write-Output ('[gate] RESULT PASS checks=' + $script:Results.Count)
