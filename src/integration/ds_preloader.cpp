@@ -35,6 +35,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 namespace godot {
 
@@ -42,6 +43,13 @@ namespace godot {
 static std::atomic<int> s_last_poll_inline_builds{ 0 };
 static std::atomic<int> s_last_poll_offloads{ 0 };
 #endif
+
+// Unauthorized-archive log dedup state. Native, trivially destructible types only:
+// a godot::String here would destruct at DLL unload, after Godot's allocator is
+// gone (GODOT_QUIRKS.md Section 6). Mirrors DSPkg's own dedup state.
+static std::mutex s_unauth_report_mutex;
+static uint64_t s_last_reported_preloader_unauth_hash = 0;
+static bool s_has_reported_preloader_unauth = false;
 
 // Upper bound per prewarm request output buffer. The sync loader imposes no
 // cap, but prewarm fans out to dozens of speculative buffers, so a corrupt
@@ -364,13 +372,14 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 		Error open_err = fresh->open(archive_path, expected_fingerprint);
 		if (open_err != OK) {
 			if (open_err == ERR_UNAUTHORIZED) {
-				// Function-local state, so it needs its own guard: two callers may
-				// open concurrently now that archive_mutex does not cover the parse.
-				static std::mutex s_unauth_report_mutex;
-				static String s_last_reported_preloader_unauth;
+				// The guard stays: two callers may open concurrently now that
+				// archive_mutex does not cover the parse. The dedup state itself must
+				// be native so it cannot destruct at DLL unload (Section 6).
 				std::lock_guard<std::mutex> report_lock(s_unauth_report_mutex);
-				if (s_last_reported_preloader_unauth != archive_path) {
-					s_last_reported_preloader_unauth = archive_path;
+				const uint64_t path_hash = archive_path.hash();
+				if (!s_has_reported_preloader_unauth || s_last_reported_preloader_unauth_hash != path_hash) {
+					s_has_reported_preloader_unauth = true;
+					s_last_reported_preloader_unauth_hash = path_hash;
 					UtilityFunctions::push_error("DirectStorage Preloader: Decryption unauthorized or key mismatch for package '" + archive_path + "'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.");
 				}
 			} else {

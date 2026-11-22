@@ -36,6 +36,13 @@ namespace godot {
 
 namespace {
 
+// Unauthorized-archive log dedup state. Native, trivially destructible types only:
+// a godot::String here would destruct at DLL unload, after Godot's allocator is
+// gone (GODOT_QUIRKS.md Section 6). Mirrors DSPkg's own dedup state.
+std::mutex s_unauth_report_mutex;
+uint64_t s_last_reported_unauth_hash = 0;
+bool s_has_reported_unauth = false;
+
 // Bounded wait for a threaded ResourceLoader worker that hits a texture already
 // in-flight in DSPreloader. Finite so a stalled prewarm cannot pin a worker
 // indefinitely; on timeout the worker falls through to the duplicate CPU decode
@@ -362,14 +369,14 @@ Ref<DSPkg> DSResourceFormatLoader::_open_archive_instance(const String &p_archiv
 	Error open_err = archive->open(p_archive_path, expected_fingerprint);
 	if (open_err != OK) {
 		if (open_err == ERR_UNAUTHORIZED) {
-			// Function-local state, so it needs its own guard: two callers may open
-			// concurrently now that archive_mutex does not cover the parse. DSPkg's
-			// own unauthorized log is guarded the same way.
-			static std::mutex s_unauth_report_mutex;
-			static String s_last_reported_unauth_path;
+			// The guard stays: two callers may open concurrently now that
+			// archive_mutex does not cover the parse. The dedup state itself must
+			// be native so it cannot destruct at DLL unload (Section 6).
 			std::lock_guard<std::mutex> report_lock(s_unauth_report_mutex);
-			if (s_last_reported_unauth_path != p_archive_path) {
-				s_last_reported_unauth_path = p_archive_path;
+			const uint64_t path_hash = p_archive_path.hash();
+			if (!s_has_reported_unauth || s_last_reported_unauth_hash != path_hash) {
+				s_has_reported_unauth = true;
+				s_last_reported_unauth_hash = path_hash;
 				UtilityFunctions::push_error("DirectStorage: Decryption unauthorized or key mismatch for package '" + p_archive_path + "'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.");
 			}
 		}

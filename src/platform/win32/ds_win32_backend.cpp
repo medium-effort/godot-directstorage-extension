@@ -527,6 +527,13 @@ Dictionary Win32Backend::_debug_get_queue_admission_stats_for_testing() {
 }
 #endif
 
+// Unauthorized-archive log dedup state. Native, trivially destructible types only:
+// a godot::String here would destruct at DLL unload, after Godot's allocator is
+// gone (GODOT_QUIRKS.md Section 6). Mirrors DSPkg's own dedup state.
+static std::mutex s_backend_unauth_log_mutex;
+static uint64_t s_last_backend_unauth_hash = 0;
+static bool s_has_backend_unauth_path = false;
+
 bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offset, Vector<DSTexMipEntryV2> &r_entries, DSCompressionFormat *r_container_format, int64_t p_single_mip_index) {
 	r_entries.clear();
 	String resolved_path = p_path;
@@ -799,9 +806,11 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 				dspkg_cache.package.unref();
 				dspkg_cache.path = String();
 				if (open_err == ERR_UNAUTHORIZED) {
-					static String s_last_backend_unauth_path;
-					if (s_last_backend_unauth_path != resolved_path) {
-						s_last_backend_unauth_path = resolved_path;
+					std::lock_guard<std::mutex> report_lock(s_backend_unauth_log_mutex);
+					const uint64_t path_hash = resolved_path.hash();
+					if (!s_has_backend_unauth_path || s_last_backend_unauth_hash != path_hash) {
+						s_has_backend_unauth_path = true;
+						s_last_backend_unauth_hash = path_hash;
 						UtilityFunctions::push_error(vformat("DirectStorage Win32 Backend: Decryption unauthorized or key mismatch for archive '%s'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.", resolved_path));
 					}
 				}
