@@ -90,6 +90,10 @@ private:
 	// metacommand, so the two can be compared on the same machine.
 	std::atomic<bool> disable_gpu_decompression_metacommand{ false };
 	std::atomic<bool> force_disable_bypass_io{ false };
+	// Forces FallbackBackend (SoftwareFallback) even when DirectStorage and a
+	// D3D12 RenderingDevice are available. Read from ProjectSettings on every
+	// initialize_ds(), so it takes effect on the next initialization.
+	std::atomic<bool> force_software_fallback{ false };
 	// Reduction-only UMA auto-tune (see initialize_ds_locked): when true and
 	// the active adapter is an integrated/UMA GPU, effective staging/queue
 	// are clamped down to the UMA caps. Explicit low values pass through
@@ -371,6 +375,9 @@ public:
 
 	void set_force_disable_bypass_io(bool p_disable);
 	bool get_force_disable_bypass_io() const;
+
+	void set_force_software_fallback(bool p_force);
+	bool get_force_software_fallback() const;
 
 	void set_auto_tune_for_integrated_gpu(bool p_enable);
 	bool get_auto_tune_for_integrated_gpu() const;

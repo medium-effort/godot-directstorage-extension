@@ -1105,6 +1105,9 @@ bool DSContext::initialize_ds_locked() {
 		if (dsgd_settings::has_setting("force_disable_bypass_io", "force_disable_bypass_io")) {
 			force_disable_bypass_io.store(static_cast<bool>(dsgd_settings::get_setting("force_disable_bypass_io", "force_disable_bypass_io")));
 		}
+		if (dsgd_settings::has_setting("force_software_fallback", "force_software_fallback")) {
+			force_software_fallback.store(static_cast<bool>(dsgd_settings::get_setting("force_software_fallback", "force_software_fallback")));
+		}
 		if (dsgd_settings::has_setting("queue_capacity", "queue_capacity")) {
 			Variant v = dsgd_settings::get_setting("queue_capacity", "queue_capacity");
 			uint32_t configured_cap = static_cast<uint32_t>(v);
@@ -1177,7 +1180,10 @@ bool DSContext::initialize_ds_locked() {
 	}
 
 #ifdef _WIN32
-	bool bench_try_win32 = true;
+	// Release-available override (dsgd_extension/force_software_fallback) plus the
+	// debug/dev-only env seam below both suppress the Win32 attempt; the setting is
+	// read from ProjectSettings earlier in this function, so it applies on this init.
+	bool bench_try_win32 = !force_software_fallback.load(std::memory_order_acquire);
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	// Benchmark seam (never bound, debug/dev only): lets the I/O-mode probe
 	// compare the software fallback against DirectStorage on the same volume.
@@ -1216,6 +1222,8 @@ bool DSContext::initialize_ds_locked() {
 			memdelete(backend);
 			UtilityFunctions::print("[DirectStorage] Win32DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
 		}
+	} else if (force_software_fallback.load(std::memory_order_acquire)) {
+		UtilityFunctions::print("[DirectStorage] force_software_fallback=true: skipping Win32Backend (SoftwareFallback selected).");
 	}
 #endif
 
@@ -2109,6 +2117,14 @@ bool DSContext::get_force_disable_bypass_io() const {
 	return force_disable_bypass_io.load();
 }
 
+void DSContext::set_force_software_fallback(bool p_force) {
+	force_software_fallback.store(p_force, std::memory_order_release);
+}
+
+bool DSContext::get_force_software_fallback() const {
+	return force_software_fallback.load(std::memory_order_acquire);
+}
+
 void DSContext::set_auto_tune_for_integrated_gpu(bool p_enable) {
 	auto_tune_for_integrated_gpu.store(p_enable);
 }
@@ -2153,6 +2169,7 @@ bool DSContext::_debug_config_fields_are_atomic_for_testing() const {
 			ds_is_atomic_type<decltype(disable_gpu_decompression)>::value &&
 			ds_is_atomic_type<decltype(disable_gpu_decompression_metacommand)>::value &&
 			ds_is_atomic_type<decltype(force_disable_bypass_io)>::value &&
+			ds_is_atomic_type<decltype(force_software_fallback)>::value &&
 			ds_is_atomic_type<decltype(auto_tune_for_integrated_gpu)>::value &&
 			ds_is_atomic_type<decltype(auto_tune_for_low_vram_gpu)>::value &&
 			ds_is_atomic_type<decltype(queue_capacity)>::value;
@@ -2249,6 +2266,9 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_force_disable_bypass_io", "disable"), &DSContext::set_force_disable_bypass_io);
 	ClassDB::bind_method(D_METHOD("get_force_disable_bypass_io"), &DSContext::get_force_disable_bypass_io);
 
+	ClassDB::bind_method(D_METHOD("set_force_software_fallback", "force"), &DSContext::set_force_software_fallback);
+	ClassDB::bind_method(D_METHOD("get_force_software_fallback"), &DSContext::get_force_software_fallback);
+
 	ClassDB::bind_method(D_METHOD("set_auto_tune_for_integrated_gpu", "enable"), &DSContext::set_auto_tune_for_integrated_gpu);
 	ClassDB::bind_method(D_METHOD("get_auto_tune_for_integrated_gpu"), &DSContext::get_auto_tune_for_integrated_gpu);
 
@@ -2262,6 +2282,7 @@ void DSContext::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disable_gpu_decompression"), "set_disable_gpu_decompression", "get_disable_gpu_decompression");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disable_gpu_decompression_metacommand"), "set_disable_gpu_decompression_metacommand", "get_disable_gpu_decompression_metacommand");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "force_disable_bypass_io"), "set_force_disable_bypass_io", "get_force_disable_bypass_io");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "force_software_fallback"), "set_force_software_fallback", "get_force_software_fallback");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_tune_for_integrated_gpu"), "set_auto_tune_for_integrated_gpu", "get_auto_tune_for_integrated_gpu");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_tune_for_low_vram_gpu"), "set_auto_tune_for_low_vram_gpu", "get_auto_tune_for_low_vram_gpu");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "queue_capacity"), "set_queue_capacity", "get_queue_capacity");

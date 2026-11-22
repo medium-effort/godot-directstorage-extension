@@ -132,6 +132,10 @@
 			<return type="bool" />
 			<description>Returns whether the configuration override to force-disable Windows BypassIO is enabled (see [member force_disable_bypass_io]). This reflects only the configured override; use [method get_drive_info] to inspect the live OS/volume BypassIO state.</description>
 		</method>
+		<method name="get_force_software_fallback" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether [member force_software_fallback] is enabled. On every [method initialize_ds] the value stored here is replaced by the [code]dsgd_extension/force_software_fallback[/code] project setting, so the setting is authoritative when it is present.</description>
+		</method>
 		<method name="get_gpu_decompression_support_tier" qualifiers="const">
 			<return type="int" />
 			<description>Returns the GPU decompression path reported by DirectStorage: [code]0[/code] unsupported (CPU decode only), [code]1[/code] GPU fallback via compute shaders (works, slower), [code]2[/code] GPU-optimized GDeflate path.</description>
@@ -298,6 +302,11 @@
 			<param index="0" name="disable" type="bool" />
 			<description>Sets the configuration override to force-disable Windows BypassIO while keeping unbuffered I/O active (unless rotational media enables [code]ForceFileBuffering[/code]). Must be set before the DirectStorage runtime is initialized.</description>
 		</method>
+		<method name="set_force_software_fallback">
+			<return type="void" />
+			<param index="0" name="force" type="bool" />
+			<description>Sets whether [method initialize_ds] skips Win32Backend and uses SoftwareFallback (CPU GDeflate via libdeflate) even on a DirectStorage-capable Windows D3D12 host. Available in release builds. The [code]dsgd_extension/force_software_fallback[/code] project setting is re-read on every initialization and wins over this method when present, so set it as well when driving initialization from code.</description>
+		</method>
 		<method name="set_prewarm_total">
 			<return type="void" />
 			<param index="0" name="tag" type="int" />
@@ -354,6 +363,9 @@
 		</member>
 		<member name="force_disable_bypass_io" type="bool" setter="set_force_disable_bypass_io" getter="get_force_disable_bypass_io" default="false">
 			If [code]true[/code], forces DirectStorage to disable Windows BypassIO ([code]DSTORAGE_CONFIGURATION1.DisableBypassIO[/code]) while keeping unbuffered I/O active, for A/B testing or working around incompatible filter drivers. Applied once when the DirectStorage runtime is initialized.
+		</member>
+		<member name="force_software_fallback" type="bool" setter="set_force_software_fallback" getter="get_force_software_fallback" default="false">
+			If [code]true[/code], skips Win32Backend and uses SoftwareFallback (CPU GDeflate via libdeflate, [code]ImageTexture[/code] upload) even when DirectStorage and a D3D12 RenderingDevice are available. Useful for troubleshooting buggy Windows storage drivers, reproducing fallback behavior in exported builds, and benchmarking both CPU GDeflate paths under the same rendering driver. Discards all DirectStorage acceleration, so it is an Advanced project setting. Applied on the next [method initialize_ds]; the [code]dsgd_extension/force_software_fallback[/code] project setting is authoritative over the setter.
 		</member>
 		<member name="queue_capacity" type="int" setter="set_queue_capacity" getter="get_queue_capacity" default="512">
 			The operation budget of each DirectStorage priority queue. Every request, plus the one signal and one set-event a submitted batch appends, occupies a queue slot until it completes, so one batch may stage at most this value minus two requests. Size it to about twice the requests expected in flight: enqueueing into a full queue blocks the calling thread, while a request refused for budget is transient and retried on the next flush. Values are clamped to [code]128[/code]..[code]8192[/code]. The default is [code]512[/code].

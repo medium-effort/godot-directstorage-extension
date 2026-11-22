@@ -79,6 +79,12 @@ static void register_directstorage_project_settings() {
 	register_setting(dsgd_settings::key("disable_gpu_decompression"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("disable_gpu_decompression_metacommand"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("force_disable_bypass_io"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
+	// Advanced (diagnostic) setting: forces SoftwareFallback even on a
+	// DirectStorage-capable Windows D3D12 host. Kept out of the basic page
+	// because enabling it discards all DirectStorage acceleration, but still
+	// discoverable for driver troubleshooting and benchmark reproduction.
+	register_setting(dsgd_settings::key("force_software_fallback"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
+	ps->set_as_basic(dsgd_settings::key("force_software_fallback"), false);
 	register_setting(dsgd_settings::key("max_cpu_threads"), Variant::INT, 0, PROPERTY_HINT_RANGE, "0,32,1");
 	register_setting(dsgd_settings::key("debug_break_on_error"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("queue_capacity"), Variant::INT, 512, PROPERTY_HINT_RANGE, "128,8192,64");

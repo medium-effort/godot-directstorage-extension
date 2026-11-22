@@ -29,6 +29,23 @@ public:
 		size_t total_requests = 0;
 		size_t remaining_requests = 0;
 		std::unordered_map<uint64_t, size_t> per_tag_counts;
+		// Profiler parity with Win32Backend::BatchMetadata. Plain data only:
+		// these live under batch_mutex and are copied out before any Godot call.
+		uint64_t compressed_bytes = 0;
+		uint64_t uncompressed_bytes = 0;
+		uint64_t start_time_us = 0;
+		int request_count = 0;
+		bool had_failure = false;
+	};
+
+	// Snapshot taken under batch_mutex at the instant a batch finishes and
+	// handed to report_batch_metrics() after the lock is released (Q46).
+	struct BatchMetrics {
+		uint64_t compressed_bytes = 0;
+		uint64_t uncompressed_bytes = 0;
+		uint64_t start_time_us = 0;
+		int request_count = 0;
+		int error_state = 0;
 	};
 
 private:
@@ -77,7 +94,13 @@ private:
 	// kernel call, so callers must not hold batch_mutex. Also keeps the debug-only
 	// handle count honest.
 	void clear_worker_file_cache(WorkerScratch &r_scratch);
-	void finish_batch_request_locked(uint64_t p_batch_id);
+	// Returns true when this request completed its batch; r_completed then holds
+	// the profiler snapshot. Caller must report it AFTER releasing batch_mutex.
+	bool finish_batch_request_locked(uint64_t p_batch_id, const Ref<DSRequest> &p_request, BatchMetrics &r_completed);
+	// Pairs ds_profiler_set_batch_metrics() with DSProfiler::record_workload().
+	// The metrics bridge uses a thread_local pending slot, so both calls must
+	// run on the same thread (the one that observed the batch completion).
+	void report_batch_metrics(const BatchMetrics &p_metrics);
 	// True when the worker must drop the request without touching buffers:
 	// null, already terminal (cancelled while queued), or tag cancelled
 	// after the request was popped. When p_mark is true and the request is

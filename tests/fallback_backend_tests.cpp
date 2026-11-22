@@ -1,5 +1,6 @@
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
+#include "core/ds_profiler.h"
 #include "platform/fallback/ds_fallback_backend.h"
 #include "compression/gdeflate_compressor.h"
 #include <godot_cpp/classes/dir_access.hpp>
@@ -270,4 +271,53 @@ GDEX_TEST_T(fallback_file_cache, input_handle_released_when_batch_drains, TAG_IN
             static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
     GDEX_EXPECT_TRUE(r3->get_destination_buffer_ref() == second);
     GDEX_EXPECT_TRUE(r3->get_destination_buffer_ref() != first);
+}
+
+// FallbackBackend must feed DSProfiler the same completed-batch fields the
+// Win32Backend feeds it, so the benchmark's "DS Batch (MiB/s)" column is not
+// blank for Mode 3. The batch is async because that is the path the paced
+// gameplay streaming benchmark exercises.
+GDEX_TEST_T(fallback_profiler, batch_metrics_reported_on_async_completion, TAG_INTEGRATION) {
+    const char *kPath = "user://gdextest_fallback_profiler.bin";
+    godot::PackedByteArray payload;
+    payload.resize(4096);
+    for (int64_t i = 0; i < payload.size(); i++) {
+        payload[i] = static_cast<uint8_t>((i * 13 + 29) % 251);
+    }
+    ctx.add_teardown([kPath]() { remove_file(kPath); });
+    GDEX_ASSERT_TRUE(write_bytes(kPath, payload));
+
+    godot::DSProfiler *profiler = godot::DSProfiler::get_singleton();
+    GDEX_ASSERT_TRUE(profiler != nullptr);
+    // get_last_result() builds a fresh Ref on every call, so the history length
+    // (not object identity) is the reliable "a new sample was published" signal.
+    const int64_t history_before = profiler->get_result_history().size();
+
+    godot::FallbackBackend backend;
+    GDEX_ASSERT_TRUE(backend.initialize());
+    godot::Ref<godot::DSRequest> r1 = make_raw_request(kPath, 0, 4096);
+    godot::Ref<godot::DSRequest> r2 = make_raw_request(kPath, 0, 4096);
+    GDEX_ASSERT_TRUE(backend.enqueue_request(r1));
+    GDEX_ASSERT_TRUE(backend.enqueue_request(r2));
+    GDEX_ASSERT_TRUE(backend.submit_async());
+    GDEX_ASSERT_TRUE(wait_for_fallback_drain(backend, 5000));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(r1->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(r2->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+
+    // Allow the reporting worker to publish its sample after the drain flips.
+    const uint64_t deadline = godot::Time::get_singleton()->get_ticks_msec() + 2000;
+    while (profiler->get_result_history().size() == history_before &&
+            godot::Time::get_singleton()->get_ticks_msec() < deadline) {
+        godot::OS::get_singleton()->delay_msec(2);
+    }
+    GDEX_ASSERT_TRUE(profiler->get_result_history().size() > history_before);
+    const godot::Ref<godot::DSProfilerResult> after = profiler->get_last_result();
+    GDEX_ASSERT_TRUE(after.is_valid());
+    GDEX_EXPECT_EQ(after->get_compressed_bytes_read(), static_cast<int64_t>(8192));
+    GDEX_EXPECT_EQ(after->get_uncompressed_bytes_produced(), static_cast<int64_t>(8192));
+    GDEX_EXPECT_EQ(after->get_request_count(), 2);
+    GDEX_EXPECT_TRUE(after->get_physical_read_duration_usec() > 0);
+    GDEX_EXPECT_EQ(after->get_error_state(), 0);
 }

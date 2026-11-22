@@ -1,5 +1,6 @@
 #include "ds_fallback_backend.h"
 #include "core/ds_cpu_budget.h"
+#include "core/ds_profiler.h"
 #include "core/ds_settings.h"
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/os.hpp>
@@ -17,6 +18,18 @@
 #include "../../formats/dstex_format.h"
 
 namespace godot {
+
+// Declared next to DSProfiler's implementation, not in its public header
+// (the Win32 backend carries the same forward declaration).
+void ds_profiler_set_batch_metrics(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes,
+		int p_request_count, int64_t p_decompression_duration_us, int p_error_state);
+
+namespace {
+uint64_t fallback_now_us() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+} // namespace
 
 struct FallbackBackend::WorkerScratch {
 	static constexpr size_t MAX_OPEN_FILES = 16;
@@ -64,25 +77,55 @@ bool FallbackBackend::should_drop_request(const Ref<DSRequest> &p_request, bool 
 	return true;
 }
 
-void FallbackBackend::finish_batch_request_locked(uint64_t p_batch_id) {
+bool FallbackBackend::finish_batch_request_locked(uint64_t p_batch_id, const Ref<DSRequest> &p_request, BatchMetrics &r_completed) {
 	if (p_batch_id == 0) {
-		return;
+		return false;
 	}
 	for (auto it = in_flight_batch_infos.begin(); it != in_flight_batch_infos.end(); ++it) {
 		if (it->batch_id == p_batch_id) {
+			if (p_request.is_valid() && p_request->get_status() == DSRequest::STATUS_FAILED) {
+				it->had_failure = true;
+			}
 			if (it->remaining_requests > 1) {
 				it->remaining_requests--;
 			} else {
 				it->remaining_requests = 0;
+				r_completed.compressed_bytes = it->compressed_bytes;
+				r_completed.uncompressed_bytes = it->uncompressed_bytes;
+				r_completed.start_time_us = it->start_time_us;
+				r_completed.request_count = it->request_count;
+				r_completed.error_state = it->had_failure ? 1 : 0;
 				completed_batch_infos.push_back(*it);
 				if (completed_batch_infos.size() > MAX_COMPLETED_BATCHES) {
 					completed_batch_infos.pop_front();
 				}
 				in_flight_batch_infos.erase(it);
+				return true;
 			}
 			break;
 		}
 	}
+	return false;
+}
+
+void FallbackBackend::report_batch_metrics(const BatchMetrics &p_metrics) {
+	const uint64_t end_us = fallback_now_us();
+	const uint64_t duration_us = (end_us > p_metrics.start_time_us) ? (end_us - p_metrics.start_time_us) : 1;
+	DSProfiler *profiler = DSProfiler::get_singleton();
+	if (!profiler) {
+		return;
+	}
+	// The metrics bridge stores a thread_local pending slot that record_workload()
+	// consumes, so this pair must stay on the thread that observed completion.
+	// Neither call touches a Godot allocator and record_workload() takes only
+	// profiler_mutex (never batch_mutex), so the Q46 lock order is preserved.
+	ds_profiler_set_batch_metrics(
+			p_metrics.compressed_bytes,
+			p_metrics.uncompressed_bytes,
+			p_metrics.request_count,
+			-1,
+			p_metrics.error_state);
+	profiler->record_workload(p_metrics.compressed_bytes, duration_us);
 }
 
 void FallbackBackend::clear_worker_file_cache(WorkerScratch &r_scratch) {
@@ -146,9 +189,11 @@ void FallbackBackend::worker_thread_func() {
 			process_request(item.request, &scratch);
 		}
 
+		BatchMetrics completed_metrics;
+		bool batch_completed = false;
 		{
 			std::lock_guard<std::mutex> lock(batch_mutex);
-			finish_batch_request_locked(item.batch_id);
+			batch_completed = finish_batch_request_locked(item.batch_id, item.request, completed_metrics);
 			if (active_workers > 0) {
 				active_workers--;
 			}
@@ -157,6 +202,11 @@ void FallbackBackend::worker_thread_func() {
 			if (!still_busy) {
 				batch_cv.notify_all();
 			}
+		}
+		// Outside batch_mutex: DSProfiler takes its own mutex and may call into
+		// the engine, so it must never be reached while the batch lock is held.
+		if (batch_completed) {
+			report_batch_metrics(completed_metrics);
 		}
 	}
 }
@@ -436,12 +486,23 @@ bool FallbackBackend::submit_async() {
 		info.batch_id = next_async_batch_id++;
 		info.total_requests = static_cast<size_t>(batch.size());
 		info.remaining_requests = static_cast<size_t>(batch.size());
+		info.start_time_us = fallback_now_us();
+		// Same byte accounting Win32Backend::submit_async() uses for BatchMetadata:
+		// compressed bytes actually read, logical bytes produced after GDeflate.
 		for (int i = 0; i < batch.size(); i++) {
 			if (batch[i].is_valid()) {
 				info.per_tag_counts[batch[i]->get_cancellation_tag()]++;
+				const uint32_t compressed = batch[i]->get_size();
+				const uint32_t uncompressed = batch[i]->get_uncompressed_size();
+				info.compressed_bytes += compressed;
+				info.uncompressed_bytes += (uncompressed > 0 ? uncompressed : compressed);
 			}
 			request_queue.push_back(QueuedRequest{batch[i], info.batch_id});
 		}
+		// Physical queued requests. Win32 counts logical requests (which collapse
+		// chunk children); FallbackBackend has no chunk children here, so the two
+		// counts coincide for the paths the benchmark exercises.
+		info.request_count = static_cast<int>(batch.size());
 		in_flight_batch_infos.push_back(info);
 		async_batches_submitted++;
 		batch_in_flight.store(true);
@@ -473,7 +534,7 @@ void FallbackBackend::cancel_requests_with_tag(uint64_t p_tag) {
 	if (p_tag == 0) {
 		return;
 	}
-	std::lock_guard<std::mutex> lock(batch_mutex);
+	std::unique_lock<std::mutex> lock(batch_mutex);
 	// Remember the tag so workers drop a request that was already popped
 	// from the queue (mid-processing race) before buffer writes.
 	// Bounded: tags are never reused, eviction only weakens the race guard
@@ -500,13 +561,17 @@ void FallbackBackend::cancel_requests_with_tag(uint64_t p_tag) {
 	// mark terminal FAILED (progress-ready) and erase so workers never
 	// touch their buffers. Decrement remaining_requests so in_flight_batch_infos
 	// stays accurate.
+	std::vector<BatchMetrics> completed_metrics;
 	for (auto it = request_queue.begin(); it != request_queue.end();) {
 		Ref<DSRequest> req = it->request;
 		if (req.is_valid() && req->get_cancellation_tag() == p_tag &&
 				req->get_status() == DSRequest::STATUS_SUBMITTED) {
 			req->set_status(DSRequest::STATUS_FAILED);
 			req->set_error_message("Request cancelled by tag.");
-			finish_batch_request_locked(it->batch_id);
+			BatchMetrics metrics;
+			if (finish_batch_request_locked(it->batch_id, req, metrics)) {
+				completed_metrics.push_back(metrics);
+			}
 			it = request_queue.erase(it);
 		} else {
 			++it;
@@ -514,6 +579,12 @@ void FallbackBackend::cancel_requests_with_tag(uint64_t p_tag) {
 	}
 	batch_in_flight.store(!request_queue.empty() || active_workers > 0);
 	batch_cv.notify_all();
+	lock.unlock();
+	// Report only after batch_mutex is released; a cancelled batch is a failed
+	// workload, which the profiler records with error_state = 1.
+	for (const BatchMetrics &metrics : completed_metrics) {
+		report_batch_metrics(metrics);
+	}
 }
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
