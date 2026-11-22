@@ -362,11 +362,49 @@ jobs:
       - name: Publish test report (GitHub Annotations)
         uses: dorny/test-reporter@v1
         if: always() && hashFiles('test-results.xml') != ''
+        env:
+          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/test-reporter-summary.md
         with:
           name: gdextest (${{ matrix.os }})
           path: test-results.xml
           reporter: java-junit
           fail-on-error: false
+
+      - name: Wrap test report summary in collapsible details
+        if: always() && hashFiles('test-results.xml') != ''
+        shell: bash
+        run: |
+          TMP_SUMMARY="${{ runner.temp }}/test-reporter-summary.md"
+          if [ ! -s "$TMP_SUMMARY" ]; then
+            exit 0
+          fi
+          python - "$TMP_SUMMARY" "$GITHUB_STEP_SUMMARY" << 'PY'
+          import re, sys
+          tmp_path, out_path = sys.argv[1], sys.argv[2]
+          text = open(tmp_path, "r", encoding="utf-8", errors="replace").read()
+          if "<details" in text:
+              out = text
+          else:
+              lines = text.splitlines()
+              badge = lines[0] if lines and lines[0].startswith("![") else ""
+              body = "\n".join(lines[1:] if badge else lines).strip()
+              m = re.search(r"(\d+)\s+failed", text)
+              n = int(m.group(1)) if m else 0
+              label = f"Expand for details ({n} test{'s' if n != 1 else ''} failed)" if n > 0 else "Expand for details"
+              parts = []
+              if badge:
+                  parts.append(badge)
+                  parts.append("")
+              parts.append(f"<details><summary>{label}</summary>")
+              parts.append("")
+              parts.append(body)
+              parts.append("")
+              parts.append("</details>")
+              parts.append("")
+              out = "\n".join(parts)
+          with open(out_path, "a", encoding="utf-8") as f:
+              f.write(out)
+          PY
 
       - name: Summarize SCons cache
         # Last on purpose: step summaries are concatenated in step order, so the
