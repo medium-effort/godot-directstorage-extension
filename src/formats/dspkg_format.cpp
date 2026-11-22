@@ -534,7 +534,7 @@ bool staged_source_is_unchanged(const DSPkgStagedEntry &p_entry, const Dictionar
 	}
 	if (p_entry.gpu_metadata) {
 		PackedInt32Array uncompressed_sizes = p_header.get("mip_uncompressed_sizes", PackedInt32Array());
-		if (!(uncompressed_sizes == p_entry.mip_uncompressed_sizes)) {
+		if (!(uncompressed_sizes == p_entry.source_mip_uncompressed_sizes)) {
 			r_reason = "GPU footprint metadata changed";
 			return false;
 		}
@@ -545,7 +545,7 @@ bool staged_source_is_unchanged(const DSPkgStagedEntry &p_entry, const Dictionar
 				return false;
 			}
 		}
-		if (footprint != p_entry.gpu_footprint) {
+		if (footprint != p_entry.source_gpu_footprint) {
 			r_reason = "GPU footprint size changed";
 			return false;
 		}
@@ -962,6 +962,20 @@ Error DSPkg::add_texture(const String &p_resource_path, const String &p_dstex_pa
 		entry.mip_sizes = source_metadata.get("mip_sizes", PackedInt32Array());
 		entry.mip_uncompressed_sizes = source_metadata.get("mip_uncompressed_sizes", PackedInt32Array());
 		entry.mip_row_pitches = source_metadata.get("mip_row_pitches", PackedInt32Array());
+		// Keep the on-disk footprint as the baseline for finalize()'s staged-source
+		// check. source_metadata may be a caller override; dstex_header is what a
+		// fresh read_header() at finalize() will report, so using it here is what
+		// separates a real source mutation from a legitimate override.
+		entry.source_mip_uncompressed_sizes = dstex_header.get("mip_uncompressed_sizes", PackedInt32Array());
+		uint64_t source_footprint = 0;
+		for (int64_t mip = 0; mip < entry.source_mip_uncompressed_sizes.size(); ++mip) {
+			if (!checked_add(source_footprint,
+					static_cast<uint32_t>(entry.source_mip_uncompressed_sizes[mip]), source_footprint)) {
+				UtilityFunctions::push_error("DSPkg: On-disk GPU footprint size overflow: ", p_dstex_path);
+				return ERR_INVALID_DATA;
+			}
+		}
+		entry.source_gpu_footprint = source_footprint;
 		// The payload is streamed mip by mip straight from the source table, so
 		// the metadata that describes the TOC must match those slices exactly.
 		if (!(entry.mip_sizes == source_mip_sizes)) {

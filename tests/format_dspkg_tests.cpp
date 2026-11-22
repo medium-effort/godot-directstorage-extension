@@ -1,5 +1,6 @@
 #include "gdextest/assert.h"
 #include "gdextest/registry.h"
+#include "gdextest/strings.h"
 
 #include "compression/gdeflate_decompressor.h"
 #include "formats/dspkg_format.h"
@@ -20,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 // Suite covering the same area as project/headless_tests/test_dspkg_alignment.gd
 // (+ test_formats.gd package sections): DSPkg create/finalize/open cycle,
@@ -2886,6 +2888,198 @@ GDEX_TEST_T(dspkg, repack_uncompressed_rejects_texture_without_gpu_mip_metadata,
 
 	remove_temp_file(dstex_path);
 	remove_temp_file(pkg_path);
+}
+
+// A caller-supplied p_mip_metadata may legitimately replace the v2/v3 GPU
+// footprint arrays. finalize() must compare a fresh read_header() against the
+// on-disk baseline captured by add_texture(), not against the override that was
+// written into the TOC. The v1 leg is the report's own upgrade scenario: a v1
+// .dstex has no footprint metadata, so the recorded baseline is all zeros while
+// the override is non-zero.
+GDEX_TEST_T(dspkg, add_texture_mip_metadata_override_survives_finalize, TAG_INTEGRATION) {
+	const char *v2_dstex = "user://gdextest_mip_override_v2.dstex";
+	const char *v1_dstex = "user://gdextest_mip_override_v1.dstex";
+	const char *control_pkg = "user://gdextest_mip_override_control.dspkg";
+	const char *applied_pkg = "user://gdextest_mip_override_applied.dspkg";
+	const char *v1_pkg = "user://gdextest_mip_override_v1.dspkg";
+	const char *control_res = "res://gdextest_mip_override_control.dstex";
+	const char *applied_res = "res://gdextest_mip_override_applied.dstex";
+	const char *v1_res = "res://gdextest_mip_override_v1.dstex";
+	for (const char *path : {v2_dstex, v1_dstex, control_pkg, applied_pkg, v1_pkg}) {
+		remove_temp_file(path);
+	}
+
+	// 1-3. v2 fixture and the on-disk baseline the fix must record.
+	GDEX_ASSERT_TRUE(write_temp_dstex(v2_dstex, 64, 4, 2, 1536));
+	godot::Ref<godot::DSTex> tex_reader;
+	tex_reader.instantiate();
+	godot::Dictionary header = tex_reader->read_header(godot::String(v2_dstex));
+	GDEX_ASSERT_FALSE(header.is_empty());
+	GDEX_ASSERT_EQ(static_cast<int>(header["version"]), 2);
+	GDEX_ASSERT_EQ(static_cast<int>(header["mip_count"]), 2);
+	godot::PackedInt32Array disk_sizes = header.get("mip_sizes", godot::PackedInt32Array());
+	godot::PackedInt32Array disk_unc = header.get("mip_uncompressed_sizes", godot::PackedInt32Array());
+	godot::PackedInt32Array disk_pitch = header.get("mip_row_pitches", godot::PackedInt32Array());
+	GDEX_ASSERT_EQ(disk_sizes.size(), 2);
+	GDEX_ASSERT_EQ(disk_unc.size(), 2);
+	GDEX_ASSERT_EQ(disk_pitch.size(), 2);
+	GDEX_ASSERT_EQ(static_cast<int>(disk_unc[0]), 1024);
+	GDEX_ASSERT_EQ(static_cast<int>(disk_unc[1]), 512);
+
+	// 2. Control: identical fixture and call, no override. Green at HEAD.
+	{
+		godot::Ref<godot::DSPkg> control;
+		control.instantiate();
+		GDEX_ASSERT_EQ(static_cast<int64_t>(control->create(godot::String(control_pkg), 0ULL)),
+				static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_EQ(static_cast<int64_t>(control->add_texture(godot::String(control_res), godot::String(v2_dstex))),
+				static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_EQ(static_cast<int64_t>(control->finalize()), static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_TRUE(godot::FileAccess::file_exists(godot::String(control_pkg)));
+	}
+
+	// 3-7. Valid override: only mip_uncompressed_sizes differs. The sum must
+	// stay equal to original_size (1536), which open() requires, so swap the
+	// per-mip split instead of inflating it. add_texture() accepts it at HEAD;
+	// finalize() is the red assert.
+	godot::PackedInt32Array override_unc;
+	override_unc.resize(2);
+	override_unc[0] = 512;
+	override_unc[1] = 1024;
+	GDEX_ASSERT_FALSE(override_unc == disk_unc);
+	godot::Dictionary override_md;
+	override_md["version"] = header["version"];
+	override_md["mip_sizes"] = disk_sizes;
+	override_md["mip_uncompressed_sizes"] = override_unc;
+	override_md["mip_row_pitches"] = disk_pitch;
+	{
+		godot::Ref<godot::DSPkg> applied;
+		applied.instantiate();
+		GDEX_ASSERT_EQ(static_cast<int64_t>(applied->create(godot::String(applied_pkg), 0ULL)),
+				static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_EQ(static_cast<int64_t>(applied->add_texture(godot::String(applied_res), godot::String(v2_dstex), override_md)),
+				static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_EQ(static_cast<int64_t>(applied->finalize()), static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_TRUE(godot::FileAccess::file_exists(godot::String(applied_pkg)));
+
+		godot::Ref<godot::DSPkg> opened;
+		opened.instantiate();
+		GDEX_ASSERT_EQ(static_cast<int64_t>(opened->open(godot::String(applied_pkg))), static_cast<int64_t>(godot::OK));
+		godot::Dictionary info = opened->get_entry_info(godot::String(applied_res));
+		GDEX_EXPECT_TRUE(static_cast<bool>(info.get("has_gpu_metadata", false)));
+		godot::PackedInt32Array written_unc = info.get("mip_uncompressed_sizes", godot::PackedInt32Array());
+		GDEX_ASSERT_EQ(written_unc.size(), 2);
+		GDEX_EXPECT_EQ(static_cast<int>(written_unc[0]), 512);
+		GDEX_EXPECT_EQ(static_cast<int>(written_unc[1]), 1024);
+		godot::PackedInt32Array written_pitch = info.get("mip_row_pitches", godot::PackedInt32Array());
+		GDEX_EXPECT_TRUE(written_pitch == disk_pitch);
+	}
+
+	// 8. v1 upgrade leg: a v1 .dstex has no on-disk footprint, so the baseline
+	// is zero. A version-2 override dictionary is required to enable gpu metadata.
+	const uint32_t v1_payload_bytes = 64u * 64u * 4u;
+	godot::DSTexHeader v1{};
+	v1.magic = 0x58455444;
+	v1.version = 1;
+	v1.flags = 0;
+	v1.width = 64;
+	v1.height = 64;
+	v1.pixel_format = static_cast<uint32_t>(godot::RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM);
+	v1.mip_count = 1;
+	v1.original_size = v1_payload_bytes;
+	v1.compressed_size = v1_payload_bytes;
+	v1.reserved = 0;
+	godot::DSTexMipEntry v1_mip{};
+	v1_mip.offset = sizeof(godot::DSTexHeader) + sizeof(godot::DSTexMipEntry);
+	v1_mip.size = v1_payload_bytes;
+	{
+		godot::Ref<godot::FileAccess> dstex_file = godot::FileAccess::open(godot::String(v1_dstex), godot::FileAccess::WRITE);
+		GDEX_ASSERT_TRUE(dstex_file.is_valid() && dstex_file->is_open());
+		dstex_file->store_buffer(reinterpret_cast<const uint8_t *>(&v1), sizeof(v1));
+		dstex_file->store_buffer(reinterpret_cast<const uint8_t *>(&v1_mip), sizeof(v1_mip));
+		godot::PackedByteArray payload;
+		payload.resize(v1_payload_bytes);
+		for (uint32_t i = 0; i < v1_payload_bytes; ++i) {
+			payload.ptrw()[i] = static_cast<uint8_t>(i);
+		}
+		dstex_file->store_buffer(payload);
+		dstex_file->close();
+	}
+	godot::Ref<godot::DSTex> v1_reader;
+	v1_reader.instantiate();
+	godot::Dictionary v1_header = v1_reader->read_header(godot::String(v1_dstex));
+	GDEX_ASSERT_FALSE(v1_header.is_empty());
+	GDEX_ASSERT_EQ(static_cast<int>(v1_header["version"]), 1);
+	godot::PackedInt32Array v1_unc = v1_header.get("mip_uncompressed_sizes", godot::PackedInt32Array());
+	GDEX_ASSERT_EQ(v1_unc.size(), 1);
+	GDEX_EXPECT_EQ(static_cast<int>(v1_unc[0]), 0);
+	godot::PackedInt32Array v1_sizes;
+	v1_sizes.resize(1);
+	v1_sizes[0] = static_cast<int32_t>(v1_payload_bytes);
+	godot::PackedInt32Array v1_override_unc;
+	v1_override_unc.resize(1);
+	v1_override_unc[0] = static_cast<int32_t>(v1_payload_bytes); // == original_size
+	godot::PackedInt32Array v1_pitch;
+	v1_pitch.resize(1);
+	v1_pitch[0] = 256;
+	godot::Dictionary v1_md;
+	v1_md["version"] = 2;
+	v1_md["mip_sizes"] = v1_sizes;
+	v1_md["mip_uncompressed_sizes"] = v1_override_unc;
+	v1_md["mip_row_pitches"] = v1_pitch;
+	{
+		godot::Ref<godot::DSPkg> v1_builder;
+		v1_builder.instantiate();
+		GDEX_ASSERT_EQ(static_cast<int64_t>(v1_builder->create(godot::String(v1_pkg), 0ULL)),
+				static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_EQ(static_cast<int64_t>(v1_builder->add_texture(godot::String(v1_res), godot::String(v1_dstex), v1_md)),
+				static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_EQ(static_cast<int64_t>(v1_builder->finalize()), static_cast<int64_t>(godot::OK));
+		GDEX_ASSERT_TRUE(godot::FileAccess::file_exists(godot::String(v1_pkg)));
+	}
+
+	// 9. Structural guard. A behavioral "mutate the on-disk footprint" leg is
+	// not usable: read_header() rejects an edited footprint before the staged-
+	// source predicate runs. Assert the two baseline comparisons are present.
+	auto read_workspace_source = []() -> std::string {
+		godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+		if (!ps) {
+			return std::string();
+		}
+		godot::String dir = ps->globalize_path("res://");
+		for (int i = 0; i < 6; ++i) {
+			if (dir.is_empty()) {
+				break;
+			}
+			const godot::String probe = dir.path_join("src/formats/dspkg_format.cpp");
+			if (godot::FileAccess::file_exists(probe)) {
+				godot::Ref<godot::FileAccess> file = godot::FileAccess::open(probe, godot::FileAccess::READ);
+				if (file.is_null()) {
+					return std::string();
+				}
+				const std::string text = ::gdextest::to_std_string(file->get_as_text());
+				file->close();
+				return text;
+			}
+			const godot::String parent = dir.get_base_dir();
+			if (parent == dir) {
+				break;
+			}
+			dir = parent;
+		}
+		return std::string();
+	};
+	const std::string source_text = read_workspace_source();
+	GDEX_ASSERT_FALSE(source_text.empty());
+	GDEX_ASSERT_TRUE(source_text.find("p_entry.source_mip_uncompressed_sizes") != std::string::npos);
+	GDEX_ASSERT_TRUE(source_text.find("p_entry.source_gpu_footprint") != std::string::npos);
+	GDEX_ASSERT_TRUE(source_text.find("uncompressed_sizes == p_entry.mip_uncompressed_sizes") == std::string::npos);
+	GDEX_ASSERT_TRUE(source_text.find("footprint != p_entry.gpu_footprint") == std::string::npos);
+
+	// 10. Teardown.
+	for (const char *path : {v2_dstex, v1_dstex, control_pkg, applied_pkg, v1_pkg}) {
+		remove_temp_file(path);
+	}
 }
 
 

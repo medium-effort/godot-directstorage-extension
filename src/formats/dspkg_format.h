@@ -207,6 +207,11 @@ struct DSPkgStagedEntry {
 	PackedInt32Array mip_sizes;           // TOC compressed mip sizes
 	PackedInt32Array mip_uncompressed_sizes;
 	PackedInt32Array mip_row_pitches;
+	// On-disk footprint metadata captured by add_texture(), kept separate from
+	// the effective TOC arrays above. p_mip_metadata may override those, but the
+	// staged-source check at finalize() must compare against what was on disk.
+	PackedInt32Array source_mip_uncompressed_sizes;
+	uint64_t source_gpu_footprint = 0; // sum of the on-disk baseline above
 	// Chunked v3 sources: per-mip chunk counts plus the flat chunk table, all
 	// offsets absolute inside the .dstex (rebased into the archive on write).
 	bool chunked = false;
