@@ -241,7 +241,8 @@ GDEX_TEST_T(poll_budget, offload_scans_beyond_item_budget, TAG_UNIT) {
 GDEX_TEST_T(poll_budget, loading_poll_seeds_parallel_builds_first, TAG_UNIT) {
 	godot::DSTextureCache *cache = make_budget_cache(ctx);
 	const uint64_t tag = 0x7FFF0152ULL;
-	for (int i = 0; i < 8; ++i) {
+	const int budget = std::max(2, godot::ds_get_max_cpu_threads());
+	for (int i = 0; i < budget; ++i) {
 		godot::DSPreloader::Payload meta = make_payload("user://gdextest_poll_parallel.png", 1024);
 		meta.original_size = 4ULL * 1024ULL * 1024ULL;
 		meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(meta.original_size));
@@ -251,9 +252,9 @@ GDEX_TEST_T(poll_budget, loading_poll_seeds_parallel_builds_first, TAG_UNIT) {
 	}
 	warm_worker_pool();
 
-	cache->poll_completed(tag, 8, 8000);
+	cache->poll_completed(tag, budget, 8000);
 	GDEX_EXPECT_LE(godot::DSPreloader::_get_last_poll_inline_builds_for_testing(), 1);
-	GDEX_EXPECT_GE(godot::DSPreloader::_get_last_poll_offloads_for_testing(), 6);
+	GDEX_EXPECT_GE(godot::DSPreloader::_get_last_poll_offloads_for_testing(), budget - 1);
 	GDEX_EXPECT_TRUE(pump_until_unbuilt(cache, tag, 16));
 }
 

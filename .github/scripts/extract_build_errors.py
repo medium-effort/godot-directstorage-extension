@@ -17,7 +17,9 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # Failing-test marker emitted by gdextest; the indented lines below it carry
 # the file:line assertions that failed. Self-contained: never backtrack into
 # the preceding suite output for compiler-style context.
-TEST_FAILURE_PATTERN = re.compile(r"^\s*❌")
+TEST_FAILURE_PATTERN = re.compile(r"^\s*(?:❌|\[\s*FAILED\s*\])")
+TEST_FAILURE_SUMMARY_HEADER = re.compile(r"^\s*\[\s*FAILED\s*\]\s+\d+\s+tests?,\s+listed below:")
+TEST_RESULT_LINE = re.compile(r"^\s*\[(?:\s*(?:RUN|OK|FAILED|PASSED|SKIPPED)\s*|[-=]{4,})\]")
 
 # Patterns that indicate an actual error line
 ERROR_PATTERNS = [
@@ -90,17 +92,39 @@ def is_continuation_line(line: str) -> bool:
     return False
 
 
-def extract_error_blocks(log_content: str, max_blocks: int = 20) -> Tuple[List[str], int]:
+def extract_error_blocks(log_content: str, max_blocks: int = 20, kind: str = "build") -> Tuple[List[str], int]:
     """
     Parses compiler error blocks preserving surrounding context (function header, code snippet, caret, notes).
     Returns (list of formatted blocks, total error count).
     """
     lines = log_content.splitlines(keepends=True)
-    # Exclude the generic SCons exit line from individual error spans
-    error_indices = [
-        i for i, line in enumerate(lines)
-        if is_error_line(line) and not line.strip().startswith("scons:")
-    ]
+
+    # For test runs, prefer explicit test-failure markers over Godot engine ERROR:
+    # lines in the trailing raw-log dump (tests intentionally trigger push_error).
+    # Deduplicate summary repeats ("... listed below:") by keeping only the
+    # run-site marker when indented details follow, or the first occurrence.
+    if kind == "test":
+        raw_test_indices = [
+            i for i, line in enumerate(lines)
+            if TEST_FAILURE_PATTERN.search(line) and not TEST_FAILURE_SUMMARY_HEADER.search(line)
+        ]
+        if raw_test_indices:
+            with_details = [
+                i for i in raw_test_indices
+                if i + 1 < len(lines) and lines[i + 1].startswith(("    ", "\t"))
+            ]
+            error_indices = with_details if with_details else raw_test_indices
+        else:
+            error_indices = [
+                i for i, line in enumerate(lines)
+                if is_error_line(line) and not line.strip().startswith("scons:")
+            ]
+    else:
+        # Exclude the generic SCons exit line from individual error spans
+        error_indices = [
+            i for i, line in enumerate(lines)
+            if is_error_line(line) and not line.strip().startswith("scons:")
+        ]
 
     total_errors = len(error_indices)
     if total_errors == 0:
@@ -112,13 +136,13 @@ def extract_error_blocks(log_content: str, max_blocks: int = 20) -> Tuple[List[s
     spans: List[Tuple[int, int]] = []
 
     for idx in error_indices[:max_blocks]:
-        # Test-failure markers are self-contained: their detail lines follow,
-        # so never pull in the preceding suite output as compiler context.
+        # Test-failure markers are self-contained: their detail lines follow
+        # (4-space or tab indented), so never pull in preceding suite output.
         if TEST_FAILURE_PATTERN.search(lines[idx]):
             end = idx + 1
-            while end < len(lines) and (end - idx) < 15:
+            while end < len(lines) and (end - idx) < 30:
                 nxt = lines[end]
-                if is_error_line(nxt) or not is_continuation_line(nxt):
+                if TEST_RESULT_LINE.search(nxt) or not nxt.startswith(("    ", "\t")):
                     break
                 end += 1
             spans.append((idx, end))
@@ -174,7 +198,7 @@ def extract_error_blocks(log_content: str, max_blocks: int = 20) -> Tuple[List[s
 
 def format_markdown(log_content: str, os_name: str, kind: str = "build") -> str:
     labels = FAILURE_KINDS.get(kind, FAILURE_KINDS["build"])
-    blocks, total_errors = extract_error_blocks(log_content)
+    blocks, total_errors = extract_error_blocks(log_content, kind=kind)
     lines = log_content.splitlines()
     tail_lines = lines[-40:] if len(lines) > 40 else lines
     tail_text = "\n".join(tail_lines)
