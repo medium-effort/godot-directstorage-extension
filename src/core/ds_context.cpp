@@ -819,8 +819,12 @@ uint64_t DSContext::get_in_flight_async_batch_count() const {
 		const FallbackBackend *fallback = static_cast<const FallbackBackend *>(active_backend);
 		return static_cast<uint64_t>(fallback->get_in_flight_async_batch_count());
 	}
+#ifdef _WIN32
 	// Win32 exposes its per-slot counter: up to two batches can be in flight.
 	return static_cast<Win32Backend *>(active_backend)->get_in_flight_batch_count();
+#else
+	return 0;
+#endif
 }
 
 uint64_t DSContext::get_completion_fence() const {
