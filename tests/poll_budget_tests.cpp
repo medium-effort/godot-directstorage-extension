@@ -656,14 +656,17 @@ GDEX_TEST_T(poll_budget, negative_budget_does_not_become_unbounded, TAG_UNIT) {
 	GDEX_ASSERT_EQ(cache->get_unbuilt_prewarm_count(tag), 3);
 	warm_worker_pool();
 
-	const uint64_t t0 = godot::Time::get_singleton()->get_ticks_usec();
 	const int stored = cache->poll_completed(tag, 0, -1);
-	const uint64_t elapsed = godot::Time::get_singleton()->get_ticks_usec() - t0;
 
-	// With p_max_usec == 1, 24 MiB entries (est_usec == 12600 > 1) offload instead
-	// of building 48 MiB inline (which p_max_usec == 0 would do, returning stored == 2).
+	// With p_max_usec == 1, the loop-top time check admits nothing, so no 24 MiB
+	// entry is built inline (which p_max_usec == 0 would do, returning stored == 2).
+	// Assert that dispatch split with counters instead of a wall-clock ceiling:
+	// the negative-budget warning emitted inside poll_completed costs a variable
+	// 8-22 ms in the editor-hosted runner and swamped the old 3.5 ms bound.
+	// Offload count is deliberately not asserted - a 1 us slice legitimately
+	// processes no entries at all before the drain loop below takes over.
 	GDEX_EXPECT_EQ(stored, 0);
-	GDEX_EXPECT_LT(elapsed, static_cast<uint64_t>(3500));
+	GDEX_EXPECT_EQ(godot::DSPreloader::_get_last_poll_inline_builds_for_testing(), 0);
 
 	// Drain any remaining entries with subsequent bounded slices.
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
