@@ -264,8 +264,10 @@ private:
 	// I/O plus full entry-table validation. A path switch drops the old package and
 	// opens the new one; an open failure clears the cache. Empty path + null package
 	// is the "nothing cached" state (the predecessor was a lazily memnew'd pointer).
-	// All access happens under batch_mutex (enqueue_request holds it across the
-	// get_texture_mip_entries call).
+	// All access happens under dspkg_cache_mutex: callers do not hold batch_mutex
+	// when get_texture_mip_entries() runs, and the archive open stays outside the
+	// short critical section so it never re-serializes enqueue disk I/O.
+	mutable std::mutex dspkg_cache_mutex;
 	struct DSPkgCache {
 		String path;
 		Ref<DSPkg> package;

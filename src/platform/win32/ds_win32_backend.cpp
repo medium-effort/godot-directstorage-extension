@@ -792,7 +792,14 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 		// Reuse the cached package for the active archive path instead of
 		// reopening/reparsing the .dspkg on every enqueue. Path switch drops
 		// the old package; open failure clears the cache and returns false.
-		if (dspkg_cache.package.is_null() || dspkg_cache.path != resolved_path) {
+		Ref<DSPkg> cached_package;
+		String cached_path;
+		{
+			std::lock_guard<std::mutex> cache_lock(dspkg_cache_mutex);
+			cached_package = dspkg_cache.package;
+			cached_path = dspkg_cache.path;
+		}
+		if (cached_package.is_null() || cached_path != resolved_path) {
 			Ref<DSPkg> fresh;
 			fresh.instantiate();
 			// 0 means the archive is unpaired; pairing is the random archive id,
@@ -803,8 +810,11 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 			}
 			Error open_err = (fresh.is_valid()) ? fresh->open(resolved_path, expected_fingerprint) : ERR_CANT_CREATE;
 			if (open_err != OK) {
-				dspkg_cache.package.unref();
-				dspkg_cache.path = String();
+				{
+					std::lock_guard<std::mutex> cache_lock(dspkg_cache_mutex);
+					dspkg_cache.package.unref();
+					dspkg_cache.path = String();
+				}
 				if (open_err == ERR_UNAUTHORIZED) {
 					std::lock_guard<std::mutex> report_lock(s_backend_unauth_log_mutex);
 					const uint64_t path_hash = resolved_path.hash();
@@ -816,8 +826,12 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 				}
 				return false;
 			}
-			dspkg_cache.package = fresh;
-			dspkg_cache.path = resolved_path;
+			{
+				std::lock_guard<std::mutex> cache_lock(dspkg_cache_mutex);
+				dspkg_cache.package = fresh;
+				dspkg_cache.path = resolved_path;
+			}
+			cached_package = fresh;
 		}
 		// O(1) direct lookup by absolute payload offset
 		// (header.data_offset + entry.data_offset). Miss (false) means a
@@ -828,7 +842,7 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 		uint8_t entry_gacl = 0;
 		bool entry_chunked = false;
 		if (p_single_mip_index >= 0) {
-			if (!dspkg_cache.package->get_gpu_entry_for_mip_offset(p_offset, static_cast<uint32_t>(p_single_mip_index),
+			if (!cached_package->get_gpu_entry_for_mip_offset(p_offset, static_cast<uint32_t>(p_single_mip_index),
 						package_entries, entry_format, entry_gacl, entry_chunked) ||
 					package_entries.is_empty() ||
 					p_single_mip_index >= package_entries.size() ||
@@ -836,10 +850,10 @@ bool Win32Backend::get_texture_mip_entries(const String &p_path, uint64_t p_offs
 				return false;
 			}
 		} else {
-			if (!dspkg_cache.package->get_mip_entries_for_offset(p_offset, package_entries) || package_entries.is_empty()) {
+			if (!cached_package->get_mip_entries_for_offset(p_offset, package_entries) || package_entries.is_empty()) {
 				return false;
 			}
-			if (!dspkg_cache.package->get_entry_features_for_offset(p_offset, entry_format, entry_gacl, entry_chunked) ||
+			if (!cached_package->get_entry_features_for_offset(p_offset, entry_format, entry_gacl, entry_chunked) ||
 					entry_chunked) {
 				return false;
 			}
