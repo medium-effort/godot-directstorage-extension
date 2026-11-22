@@ -3052,8 +3052,16 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 		res["bus_type"] = "Network";
 		res["file_system"] = "SMB";
 		res["bypassio_state"] = "Unsupported";
-		res["directstorage_supported"] = false;
-		res["reason"] = "DirectStorage and BypassIO are not supported on UNC network shares.";
+
+		DSDriveSupportInput unc_input;
+		unc_input.bus_type = "Network";
+		unc_input.file_system = "SMB";
+		unc_input.is_unc = true;
+		const DSDriveSupport support = resolve_drive_support(unc_input);
+		res["directstorage_supported"] = support.directstorage_supported;
+		res["bypassio_supported"] = support.bypassio_supported;
+		res["force_file_buffering"] = support.force_file_buffering;
+		res["reason"] = support.reason;
 		return res;
 	}
 

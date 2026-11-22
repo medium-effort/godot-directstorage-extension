@@ -429,6 +429,10 @@ GDEX_TEST_T(win32_remediation, drive_info_reports_bypassio_state, TAG_UNIT) {
     const godot::Dictionary unc_info = godot::Win32Backend::get_drive_info_for_path("\\\\localhost\\share\\file");
     GDEX_EXPECT_TRUE(godot::String(unc_info["bus_type"]) == "Network");
     GDEX_EXPECT_TRUE(godot::String(unc_info["bypassio_state"]) == "Unsupported");
+    GDEX_EXPECT_TRUE(unc_info.has("bypassio_supported"));
+    GDEX_EXPECT_TRUE(unc_info.has("force_file_buffering"));
+    GDEX_EXPECT_TRUE(godot::String(unc_info["reason"]) ==
+            "DirectStorage and BypassIO are not supported on UNC network shares.");
 #else
     (void)ctx;
     GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
