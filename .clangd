@@ -4,33 +4,37 @@
 # warnings originating inside external headers when included by src/ files.
 CompileFlags:
   Add:
-    - -isystem
+    - -imsvc
     - godot-cpp/include
-    - -isystem
+    - -imsvc
     - godot-cpp/gen/include
-    - -isystem
+    - -imsvc
     - thirdparty/directstorage/include
-    - -isystem
+    - -imsvc
     - thirdparty/gdeflate
-    - -isystem
+    - -imsvc
     - thirdparty/libdeflate
 
 ---
-# Suppress all diagnostics and warnings for files inside godot-cpp/
+# Suppress diagnostics and skip background indexing for files inside godot-cpp/
 If:
   PathMatch: .*/godot-cpp/.*
 Diagnostics:
   Suppress: "*"
+Index:
+  Background: Skip
 CompileFlags:
   Add:
     - -w
 
 ---
-# Suppress all diagnostics and warnings for files inside thirdparty/
+# Suppress diagnostics and skip background indexing for files inside thirdparty/
 If:
   PathMatch: .*/thirdparty/.*
 Diagnostics:
   Suppress: "*"
+Index:
+  Background: Skip
 CompileFlags:
   Add:
     - -w
