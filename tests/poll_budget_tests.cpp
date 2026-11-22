@@ -157,30 +157,31 @@ godot::DSPreloader::Payload make_payload(const char *p_path, int p_dim) {
 // the offload in place the worker erases the entry when its build finishes, so
 // this is the "the work still happened" guard; at HEAD the entry is already gone.
 bool wait_until_unbuilt(godot::DSTextureCache *p_cache, uint64_t p_tag, int p_timeout_ms) {
-	godot::OS *os = godot::OS::get_singleton();
-	for (int elapsed = 0; elapsed <= p_timeout_ms; elapsed += 2) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(p_timeout_ms);
+	while (std::chrono::steady_clock::now() < deadline) {
 		if (p_cache->get_unbuilt_prewarm_count(p_tag) == 0) {
 			return true;
 		}
-		if (os != nullptr) {
-			os->delay_msec(2);
-		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
 	}
 	return p_cache->get_unbuilt_prewarm_count(p_tag) == 0;
 }
 
 // Additional polls let entries the first (item-bounded) slice deliberately
 // left behind drain, so tests can assert the FIRST poll's dispatch split and
-// still finish cleanly.
+// still finish cleanly. Uses steady_clock + sleep_for so waves under low-core
+// max_in_flight_bytes caps always get polled to completion.
 bool pump_until_unbuilt(godot::DSTextureCache *p_cache, uint64_t p_tag, int p_rounds) {
-	godot::OS *os = godot::OS::get_singleton();
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 	for (int round = 0; round < p_rounds && p_cache->get_unbuilt_prewarm_count(p_tag) > 0; ++round) {
 		p_cache->poll_completed(p_tag, 32, 8000);
-		if (os != nullptr) {
-			os->delay_msec(2);
-		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
 	}
-	return wait_until_unbuilt(p_cache, p_tag, 5000);
+	while (p_cache->get_unbuilt_prewarm_count(p_tag) > 0 && std::chrono::steady_clock::now() < deadline) {
+		p_cache->poll_completed(p_tag, 32, 8000);
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	return p_cache->get_unbuilt_prewarm_count(p_tag) == 0;
 }
 
 } // namespace
