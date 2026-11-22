@@ -414,6 +414,12 @@ GDEX_TEST_T(win32_remediation, drive_info_reports_bypassio_state, TAG_UNIT) {
     const godot::String bus = info["bus_type"];
     const godot::String fs = info["file_system"];
     GDEX_EXPECT_FALSE(bus.is_empty());
+    GDEX_EXPECT_TRUE(info.has("bypassio_supported"));
+    GDEX_EXPECT_TRUE(info.has("force_file_buffering"));
+    if (bus == "NVMe" && fs == "NTFS") {
+        GDEX_EXPECT_TRUE(static_cast<bool>(info["bypassio_supported"]));
+        GDEX_EXPECT_FALSE(static_cast<bool>(info["force_file_buffering"]));
+    }
     // Windows 11+ NVMe/NTFS volumes should resolve BypassIO state via FSCTL_MANAGE_BYPASS_IO
     // (Enabled or Disabled if a filter vetoes it), rather than unconditionally failing with Unsupported.
     if (bus == "NVMe" && fs == "NTFS" && godot::OS::get_singleton() && godot::OS::get_singleton()->get_version().contains("226")) {

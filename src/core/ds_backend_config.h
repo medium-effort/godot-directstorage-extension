@@ -14,6 +14,9 @@ struct DSBackendConfigOptions {
 	bool disable_gpu_decompression = false;
 	bool disable_gpu_decompression_metacommand = false;
 	bool force_disable_bypass_io = false;
+	// Derived from the asset volume: true when the bus/filesystem cannot provide
+	// BypassIO (e.g. USB, SD, exFAT, virtual disks). Never set by user settings.
+	bool bypassio_unavailable = false;
 	bool force_file_buffering = false;
 	bool disable_telemetry = true;
 	// Maximum threads the runtime may use to decompress built-in formats on the
@@ -41,8 +44,10 @@ inline DSResolvedBackendConfig resolve_backend_config(const DSBackendConfigOptio
 	resolved.disable_gpu_decompression = p_options.disable_gpu_decompression;
 	resolved.disable_gpu_decompression_metacommand = p_options.disable_gpu_decompression_metacommand;
 	resolved.force_file_buffering = p_options.force_file_buffering;
-	// ForceFileBuffering is only honoured with BypassIO off.
-	resolved.disable_bypass_io = p_options.force_disable_bypass_io || p_options.force_file_buffering;
+	// ForceFileBuffering is only honoured with BypassIO off, and a volume that
+	// cannot provide BypassIO must be configured for standard I/O explicitly.
+	resolved.disable_bypass_io = p_options.force_disable_bypass_io ||
+			p_options.bypassio_unavailable || p_options.force_file_buffering;
 	// 0 means "runtime default"; a negative or absurd project setting must not
 	// reach DSTORAGE_CONFIGURATION. 256 is far above any consumer core count and
 	// still below the runtime's INT32 range.

@@ -85,6 +85,10 @@ static void register_directstorage_project_settings() {
 	// discoverable for driver troubleshooting and benchmark reproduction.
 	register_setting(dsgd_settings::key("force_software_fallback"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	ps->set_as_basic(dsgd_settings::key("force_software_fallback"), false);
+	// Advanced rollback / A/B switch for the relaxed volume gate: when false,
+	// only the legacy NVMe/SATA/ATA + NTFS volumes initialize Win32Backend.
+	register_setting(dsgd_settings::key("allow_directstorage_without_bypassio"), Variant::BOOL, true, PROPERTY_HINT_NONE, "");
+	ps->set_as_basic(dsgd_settings::key("allow_directstorage_without_bypassio"), false);
 	register_setting(dsgd_settings::key("max_cpu_threads"), Variant::INT, 0, PROPERTY_HINT_RANGE, "0,32,1");
 	register_setting(dsgd_settings::key("debug_break_on_error"), Variant::BOOL, false, PROPERTY_HINT_NONE, "");
 	register_setting(dsgd_settings::key("queue_capacity"), Variant::INT, 512, PROPERTY_HINT_RANGE, "128,8192,64");

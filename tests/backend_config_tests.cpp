@@ -64,6 +64,27 @@ GDEX_TEST(backend_config, force_disable_bypass_io_keeps_unbuffered) {
 	GDEX_EXPECT_FALSE(resolved.disable_gpu_decompression_metacommand);
 }
 
+GDEX_TEST(backend_config, bypassio_unavailable_disables_bypassio_without_touching_codecs) {
+	godot::DSBackendConfigOptions options;
+	options.bypassio_unavailable = true;
+	options.disable_gpu_decompression_metacommand = true;
+	const godot::DSResolvedBackendConfig resolved = godot::resolve_backend_config(options);
+	GDEX_EXPECT_TRUE(resolved.disable_bypass_io);
+	GDEX_EXPECT_FALSE(resolved.force_file_buffering); // flash volume keeps unbuffered I/O
+	GDEX_EXPECT_FALSE(resolved.disable_gpu_decompression);
+	GDEX_EXPECT_TRUE(resolved.disable_gpu_decompression_metacommand);
+}
+
+GDEX_TEST(backend_config, bypassio_unavailable_and_buffering_together) {
+	godot::DSBackendConfigOptions options;
+	options.bypassio_unavailable = true;
+	options.force_file_buffering = true;
+	const godot::DSResolvedBackendConfig resolved = godot::resolve_backend_config(options);
+	GDEX_EXPECT_TRUE(resolved.disable_bypass_io);
+	GDEX_EXPECT_TRUE(resolved.force_file_buffering);
+	GDEX_EXPECT_FALSE(resolved.disable_gpu_decompression);
+}
+
 GDEX_TEST(backend_config, telemetry_flag_is_carried_through) {
 	godot::DSBackendConfigOptions options;
 	options.disable_telemetry = false;

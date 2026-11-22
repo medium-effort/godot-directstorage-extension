@@ -3,6 +3,7 @@
 #include "../../core/ds_backend_config.h"
 #include "../../core/ds_context.h"
 #include "../../core/ds_cpu_budget.h"
+#include "../../core/ds_drive_support.h"
 #include "../../core/ds_error_handler.h"
 #include "../../core/ds_gdeflate_stream.h"
 #include "../../core/ds_profiler.h"
@@ -189,6 +190,10 @@ static std::atomic<int64_t> s_last_applied_staging_bytes{ 0 };
 // so a rotational volume can request ForceFileBuffering while flash keeps the
 // default unbuffered path.
 static std::atomic<bool> s_desired_file_buffering{ false };
+// True when the asset volume cannot provide BypassIO (non-NVMe bus or non-NTFS
+// filesystem). Fed into DSBackendConfigOptions before the one-shot runtime
+// configuration, exactly like s_desired_file_buffering.
+static std::atomic<bool> s_bypassio_unavailable{ false };
 // Mode actually applied to s_dstorage_configured_module, for mismatch warnings.
 static std::atomic<bool> s_applied_file_buffering{ false };
 
@@ -3000,11 +3005,17 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	res["seek_penalty"] = "Unknown";
 	res["trim"] = "Unknown";
 	res["directstorage_supported"] = false;
+	res["bypassio_supported"] = false;
+	res["force_file_buffering"] = false;
 	res["reason"] = "";
 
 #ifdef _WIN32
 	String global_path = p_path;
 	ProjectSettings *ps = ProjectSettings::get_singleton();
+	bool allow_relaxed_gate = true;
+	if (ps && ps->has_setting("dsgd_extension/allow_directstorage_without_bypassio")) {
+		allow_relaxed_gate = static_cast<bool>(ps->get_setting("dsgd_extension/allow_directstorage_without_bypassio"));
+	}
 	if (ps && (p_path.begins_with("res://") || p_path.begins_with("user://"))) {
 		global_path = ps->globalize_path(p_path);
 	}
@@ -3208,20 +3219,20 @@ Dictionary Win32Backend::get_drive_info_for_path(const String &p_path) {
 	res["seek_penalty"] = !seek_penalty_known ? "Unknown" : (incurs_seek_penalty ? "True" : "False");
 	res["trim"] = !trim_known ? "Unknown" : (trim_enabled ? "Enabled" : "Disabled");
 
-	if (!is_nvme && !is_sata_family) {
-		res["directstorage_supported"] = false;
-		res["reason"] = "Drive bus is " + String(res["bus_type"]) + ". DirectStorage support requires NVMe, SATA, or ATA.";
-	} else if (!is_ntfs) {
-		res["directstorage_supported"] = false;
-		res["reason"] = "File system is " + String(res["file_system"]) + ". DirectStorage requires NTFS.";
-	} else {
-		res["directstorage_supported"] = true;
-		if (media == StorageMediaClass::Rotational) {
-			res["reason"] = "Rotational NTFS media: DirectStorage uses buffered file I/O (ForceFileBuffering).";
-		} else {
-			res["reason"] = "NTFS flash media: DirectStorage uses the default unbuffered path (BypassIO when available).";
-		}
-	}
+	DSDriveSupportInput support_input;
+	support_input.bus_type = String(res["bus_type"]);
+	support_input.file_system = String(res["file_system"]);
+	support_input.is_nvme = is_nvme;
+	support_input.is_legacy_bus = is_nvme || is_sata_family;
+	support_input.is_ntfs = is_ntfs;
+	support_input.media = media == StorageMediaClass::Rotational ? DSDriveMedia::Rotational :
+			(media == StorageMediaClass::Flash ? DSDriveMedia::Flash : DSDriveMedia::Unknown);
+	support_input.allow_relaxed_gate = allow_relaxed_gate;
+	const DSDriveSupport support = resolve_drive_support(support_input);
+	res["directstorage_supported"] = support.directstorage_supported;
+	res["bypassio_supported"] = support.bypassio_supported;
+	res["force_file_buffering"] = support.force_file_buffering;
+	res["reason"] = support.reason;
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	// Benchmark seam (never bound, debug/dev only): lets the I/O-mode probe
@@ -3248,6 +3259,7 @@ void Win32Backend::apply_dstorage_configuration() {
 	options.disable_gpu_decompression = ctx ? ctx->get_disable_gpu_decompression() : false;
 	options.disable_gpu_decompression_metacommand = ctx ? ctx->get_disable_gpu_decompression_metacommand() : false;
 	options.force_disable_bypass_io = ctx ? ctx->get_force_disable_bypass_io() : false;
+	options.bypassio_unavailable = s_bypassio_unavailable.load();
 	options.force_file_buffering = s_desired_file_buffering.load();
 	// Raw setting, not the resolved budget: 0 must stay 0 so DirectStorage
 	// keeps its own best-guess CPU pool size.
@@ -3299,6 +3311,8 @@ void Win32Backend::apply_dstorage_configuration() {
 		if (SUCCEEDED(hr)) {
 			if (resolved.force_file_buffering) {
 				UtilityFunctions::print("[DirectStorage] File buffering enabled: rotational media uses ForceFileBuffering (BypassIO disabled).");
+			} else if (options.bypassio_unavailable) {
+				UtilityFunctions::print("[DirectStorage] BypassIO unavailable on this volume (non-NVMe bus or non-NTFS filesystem); using standard unbuffered I/O with GPU decompression.");
 			} else {
 				UtilityFunctions::print("[DirectStorage] BypassIO force-disabled via configuration; using standard unbuffered I/O.");
 			}
@@ -3502,6 +3516,7 @@ bool Win32Backend::probe_system_support() {
 		// names the loaded instance is not a live configuration.
 		if (!has_live_dstorage_configuration_locked()) {
 			s_desired_file_buffering.store(static_cast<bool>(drive_info.get("rotational", false)));
+			s_bypassio_unavailable.store(!static_cast<bool>(drive_info.get("bypassio_supported", true)));
 		}
 	}
 	if (!drive_info.get("directstorage_supported", false)) {
@@ -3906,6 +3921,7 @@ bool Win32Backend::initialize(const String &p_path) {
 	// one-shot and must precede DStorageGetFactory). The probe path does the
 	// same from res://; this covers a direct initialize_ds_for_path() call.
 	s_desired_file_buffering.store(static_cast<bool>(drive_info.get("rotational", false)));
+	s_bypassio_unavailable.store(!static_cast<bool>(drive_info.get("bypassio_supported", true)));
 
 	ProjectSettings *ps = ProjectSettings::get_singleton();
 	if (!ps) {
