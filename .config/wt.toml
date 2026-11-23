@@ -59,3 +59,8 @@ directstorage = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ worktree
 
 [[pre-start]]
 env = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_bootstrap_env.ps1 {{ primary_worktree_path }} -DestinationPath {{ worktree_path }}/.env -GodotCppPrebuilt"
+
+# Selectively trim cache entries exclusive to the removed worktree (skipping
+# safely if another build is active, and handing over landed commits to primary).
+[[post-remove]]
+scons_cache_trim = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/scons_cache.ps1 -Action TrimWorktree -WorktreePath {{ worktree_path }} -QuietIfBusy"

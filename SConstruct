@@ -68,6 +68,10 @@ if not os.environ.get("SCONS_CACHE"):
     _scons_cache_setting = _dotenv_or_env_value("SCONS_CACHE")
     if _scons_cache_setting:
         os.environ["SCONS_CACHE"] = _scons_cache_setting
+if not os.environ.get("SCONS_CACHE_HARDLINK"):
+    _scons_hardlink_setting = _dotenv_or_env_value("SCONS_CACHE_HARDLINK")
+    if _scons_hardlink_setting:
+        os.environ["SCONS_CACHE_HARDLINK"] = _scons_hardlink_setting
 
 
 # --- Optional prebuilt godot-cpp ---------------------------------------------
@@ -247,6 +251,11 @@ EnsurePythonVersion(3, 8)
 
 # Delegate environment initialization to godot-cpp/SConstruct
 env = SConscript("godot-cpp/SConstruct")
+
+_scons_cache_dir = os.environ.get("SCONS_CACHE", "").strip()
+if _scons_cache_dir and not _non_build:
+    env.Tool("worktree_cache")
+    env.EnableWorktreeCache(_scons_cache_dir, skip=_non_build)
 
 if _godot_cpp_prebuilt:
     # godot-cpp appends its library to LIBS even with build_library=no, so the
@@ -673,7 +682,11 @@ def _report_build_signature():
     cache_dir = os.environ.get("SCONS_CACHE", "").strip()
     fields = _build_signature_fields()
     signature = hashlib.sha1(json.dumps(fields, sort_keys=True).encode("utf-8")).hexdigest()
-    signature_path = os.path.join(cache_dir, "build-signature.json") if cache_dir else ""
+    _sig_variant = f"{fields['platform']}-{fields['target']}" + (
+        "-dev" if fields["dev_build"] in ("True", "true", "1", "yes") else ""
+    )
+    _sig_filename = "build-signature.json" if os.environ.get("CI") else f"build-signature-{_sig_variant}.json"
+    signature_path = os.path.join(cache_dir, _sig_filename) if cache_dir else ""
 
     previous = None
     if signature_path and os.path.isfile(signature_path):
@@ -888,6 +901,7 @@ library = env.SharedLibrary(
     source=sources,
 )
 env.Depends(library, gen_header_file)
+env.NoCache(library)
 
 targets = [library]
 
@@ -904,6 +918,7 @@ if env["platform"] == "windows":
     ]
     if ds_dlls:
         installed_dlls = env.Install(output_dir, ds_dlls)
+        env.NoCache(installed_dlls)
         targets.append(installed_dlls)
     else:
         print("[SCons] NOTE: DirectStorage runtime DLLs are not fetched; skipping the bin/ copy.")
@@ -916,11 +931,13 @@ install_notice = env.InstallAs(
     "project/addons/directstorage_accelerator/THIRD_PARTY_NOTICES.txt",
     "THIRD_PARTY_NOTICES.txt",
 )
+env.NoCache(install_notice)
 targets.append(install_notice)
 install_license = env.InstallAs(
     "project/addons/directstorage_accelerator/LICENSE",
     "LICENSE",
 )
+env.NoCache(install_license)
 targets.append(install_license)
 
 # --- gdextest integration (test-only build target) ---
@@ -949,6 +966,16 @@ if env["tests"]:
         # future source set stops importing dstorage.dll (spike defect #3).
         _gdex_env = env.Clone()
         _gdex_env.Depends("src/formats/dspkg_format.cpp", gen_header_file)
+        # Anchor relative CPPPATH/LIBPATH strings as SCons Dir('#...') nodes so
+        # extern/gdextest/SConscript does not turn them into worktree-absolute
+        # paths, which would break SCons CacheDir sharing across worktrees.
+        for _path_var in ("CPPPATH", "LIBPATH"):
+            _gdex_env[_path_var] = [
+                _gdex_env.Dir("#" + _entry)
+                if (isinstance(_entry, str) and _entry and not _entry.startswith("#") and not os.path.isabs(_entry))
+                else _entry
+                for _entry in _gdex_env.get(_path_var, [])
+            ]
         if "msvc" in _gdex_env.get("TOOLS", []):
             _gdex_env.Append(LINKFLAGS=["/ignore:4199"])
             _gdex_env.Append(CFLAGS=["/std:c11"])
@@ -967,6 +994,7 @@ if env["tests"]:
                 _filtered = [p for p in _all if "src/platform/win32/" not in p.replace("\\", "/")]
                 if len(_filtered) != len(_all):
                     _gdex_exports["gdextest"] = {"suites": _filtered}
+        _before_gdex_defaults = len(SCons.Script.DEFAULT_TARGETS)
         gdextest_lib = _gdex_env.SConscript(
             "extern/gdextest/SConscript",
             variant_dir="build/gdextest", duplicate=0,
@@ -982,7 +1010,65 @@ if env["tests"]:
             # src/platform/win32, which is equivalent to full discovery.)
             exports=_gdex_exports,
         )
+        # extern/gdextest/SConscript calls str(include) on godot-cpp Dir nodes
+        # while fs.getcwd() is build/gdextest, which freezes worktree-absolute
+        # paths into test_env["CCFLAGS"] (e.g. "/external:I D:\...\.worktrees\<wt>\godot-cpp\...").
+        # Rewrite any repo-root-prefixed flag strings back to root-relative paths
+        # so gdextest object cache keys stay identical across worktrees.
+        _repo_root_abs = os.path.abspath(".")
+        _repo_root_norm = os.path.normcase(os.path.normpath(_repo_root_abs)).rstrip("\\/") + os.sep
+        _gdex_envs = []
+        _seen_env_ids = set()
+        for _node in list(gdextest_lib or []):
+            for _candidate in [_node] + list(getattr(_node, "sources", []) or []):
+                _nenv = getattr(_candidate, "env", None)
+                if _nenv is not None and id(_nenv) not in _seen_env_ids:
+                    _seen_env_ids.add(id(_nenv))
+                    _gdex_envs.append(_nenv)
+        for _nenv in _gdex_envs:
+            for _flag_var in ("CCFLAGS", "CXXFLAGS", "CFLAGS", "SHCCFLAGS", "SHCXXFLAGS"):
+                if _flag_var not in _nenv:
+                    continue
+                _old_flags = list(_nenv[_flag_var])
+                _new_flags = []
+                _changed = False
+                for _fl in _old_flags:
+                    if isinstance(_fl, str):
+                        _fl_norm = os.path.normcase(os.path.normpath(_fl))
+                        if _fl_norm.startswith(_repo_root_norm):
+                            _new_flags.append(os.path.relpath(os.path.normpath(_fl), _repo_root_abs))
+                            _changed = True
+                            continue
+                    _new_flags.append(_fl)
+                if _changed:
+                    _nenv[_flag_var] = _new_flags
+            _ccflags_now = list(_nenv.get("CCFLAGS", []))
+            if any(str(_f).lower() == "/external:i" for _f in _ccflags_now) and not any(
+                str(_f).lower().startswith("/external:w") for _f in _ccflags_now
+            ):
+                _nenv.Append(CCFLAGS=["/external:W0"])
+            for _path_var in ("CPPPATH", "LIBPATH"):
+                if _path_var not in _nenv:
+                    continue
+                _old_paths = list(_nenv[_path_var])
+                _new_paths = []
+                _changed = False
+                for _entry in _old_paths:
+                    if isinstance(_entry, str):
+                        _entry_norm = os.path.normcase(os.path.normpath(_entry))
+                        if _entry_norm.startswith(_repo_root_norm):
+                            _rel = os.path.relpath(os.path.normpath(_entry), _repo_root_abs)
+                            _new_paths.append(_nenv.Dir("#" + _rel.replace("\\", "/")))
+                            _changed = True
+                            continue
+                    _new_paths.append(_entry)
+                if _changed:
+                    _nenv[_path_var] = _new_paths
+        _gdex_fixture_targets = list(SCons.Script.DEFAULT_TARGETS[_before_gdex_defaults:])
+        if _gdex_fixture_targets:
+            _gdex_env.NoCache(_gdex_fixture_targets)
         if gdextest_lib:
+            _gdex_env.NoCache(gdextest_lib)
             Default(targets, gdextest_lib)
     else:
         print("[SCons] Warning: tests=true requested but extern/gdextest/SConscript is missing; skipping test target.")
