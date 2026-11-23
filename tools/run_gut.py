@@ -56,11 +56,17 @@ def resolve_godot_bin(repo_root: Path, explicit: str | None) -> str:
 
 
 def ensure_imported(godot_bin: str, project_dir: Path) -> None:
-    """Run --headless --import if .godot/extension_list.cfg is not yet present."""
+    """Run --headless --import if extension_list.cfg or GUT class_names are missing."""
     ext_cfg = project_dir / ".godot" / "extension_list.cfg"
-    if ext_cfg.is_file():
+    class_cache = project_dir / ".godot" / "global_script_class_cache.cfg"
+    has_ext = ext_cfg.is_file()
+    has_gut_classes = False
+    if class_cache.is_file():
+        cache_text = class_cache.read_text(encoding="utf-8", errors="replace")
+        has_gut_classes = '"GutTest"' in cache_text and "res://addons/gut/" in cache_text
+    if has_ext and has_gut_classes:
         return
-    print("[gut] Importing project to register GDExtension classes...")
+    print("[gut] Importing project to register GDExtension and GUT classes...")
     subprocess.run(
         [godot_bin, "--headless", "--path", str(project_dir), "--import"],
         check=False,
@@ -102,8 +108,19 @@ def main(argv: list[str] | None = None) -> int:
         cmd.append(f"-gselect={args.select}")
     cmd.extend(extra_gut_args)
 
+    results_xml = project_dir / "gut-results.xml"
+    check_junit = not any(a.startswith("-gjunit_xml_file") for a in extra_gut_args)
+    if check_junit and results_xml.is_file():
+        results_xml.unlink()
+
     print(f"[gut] Running: {' '.join(cmd)}")
     completed = subprocess.run(cmd)
+    if completed.returncode == 0 and check_junit and not results_xml.is_file():
+        print(
+            "[gut] ERROR: GUT exited 0 without producing gut-results.xml (aborted during init?).",
+            file=sys.stderr,
+        )
+        return 1
     return completed.returncode
 
 
