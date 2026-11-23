@@ -251,7 +251,7 @@ jobs:
           rm -f project/dspkg_probe.gd
 
           echo "Validating addon GDScript files with Godot..."
-          for script in project/addons/directstorage_accelerator/scripts/*.gd; do
+          for script in project/addons/directstorage_accelerator/scripts/*.gd project/addons/directstorage_accelerator/tools/*.gd; do
             rel_script="${script#project/}"
             echo "Checking $rel_script..."
             if "$GODOT" --path project --headless --check-only --script "$rel_script"; then
@@ -267,6 +267,21 @@ jobs:
             exit 1
           fi
           echo "All addon GDScript files passed syntax validation."
+        env:
+          GODOT: ${{ env.GODOT }}
+
+      - name: Cache GUT addon
+        uses: actions/cache@v4
+        with:
+          path: .cache/gut
+          key: gut-${{ hashFiles('tools/fetch_gut.py') }}
+
+      - name: Run GUT (GDScript unit tests)
+        id: gut
+        shell: bash
+        run: |
+          set -o pipefail
+          python tools/run_gut.py --godot "$GODOT" 2>&1 | tee gut.log
         env:
           GODOT: ${{ env.GODOT }}
 
@@ -356,8 +371,19 @@ jobs:
             godot-raw.log
             scons-build.log
             gdscript-check.log
+            gut.log
+            project/gut-results.xml
             gdextest.log
           if-no-files-found: ignore
+
+      - name: Publish GUT report (GitHub Annotations)
+        uses: dorny/test-reporter@v1
+        if: always() && hashFiles('project/gut-results.xml') != ''
+        with:
+          name: gut (${{ matrix.os }})
+          path: project/gut-results.xml
+          reporter: java-junit
+          fail-on-error: false
             
       - name: Publish test report (GitHub Annotations)
         uses: dorny/test-reporter@v1

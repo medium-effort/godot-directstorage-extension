@@ -7,6 +7,7 @@ param(
     [switch]$Verbose,
     [string]$Filter = "",
     [switch]$SkipVerify,
+    [switch]$SkipGut,
     [switch]$Local,
     [switch]$Remote
 )
@@ -100,12 +101,36 @@ $testSw = [System.Diagnostics.Stopwatch]::StartNew()
 & powershell @testArgs
 $testExit = $LASTEXITCODE
 $testSw.Stop()
-$MasterStopwatch.Stop()
-
 if ($testExit -ne 0) {
+    $MasterStopwatch.Stop()
     Show-FullBuildBanner -Success $false -StageFailed "Test Suite Execution" -BuildDuration $buildSw.Elapsed -TestDuration $testSw.Elapsed -TotalDuration $MasterStopwatch.Elapsed
     exit $testExit
 }
 
-Show-FullBuildBanner -Success $true -BuildDuration $buildSw.Elapsed -TestDuration $testSw.Elapsed -TotalDuration $MasterStopwatch.Elapsed
+# --- Stage 3: Run GDScript GUT Unit Tests ---
+if (-not $SkipGut) {
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $gutRunner = Join-Path $repoRoot "tools\run_gut.py"
+    if (-not (Test-Path -LiteralPath $gutRunner)) {
+        $MasterStopwatch.Stop()
+        Write-Host "Error: GUT runner script not found at $gutRunner" -ForegroundColor Red
+        Show-FullBuildBanner -Success $false -StageFailed "GDScript GUT Suite" -BuildDuration $buildSw.Elapsed -TestDuration $testSw.Elapsed -TotalDuration $MasterStopwatch.Elapsed
+        exit 1
+    }
+    $gutSw = [System.Diagnostics.Stopwatch]::StartNew()
+    & python $gutRunner
+    $gutExit = $LASTEXITCODE
+    $gutSw.Stop()
+    if ($gutExit -ne 0) {
+        $MasterStopwatch.Stop()
+        Show-FullBuildBanner -Success $false -StageFailed "GDScript GUT Suite" -BuildDuration $buildSw.Elapsed -TestDuration ($testSw.Elapsed + $gutSw.Elapsed) -TotalDuration $MasterStopwatch.Elapsed
+        exit $gutExit
+    }
+    $testSwDuration = $testSw.Elapsed + $gutSw.Elapsed
+} else {
+    $testSwDuration = $testSw.Elapsed
+}
+
+$MasterStopwatch.Stop()
+Show-FullBuildBanner -Success $true -BuildDuration $buildSw.Elapsed -TestDuration $testSwDuration -TotalDuration $MasterStopwatch.Elapsed
 exit 0

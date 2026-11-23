@@ -1783,7 +1783,7 @@ $tarExcludesList = @(
     # Root-anchored with ./ like ./build/* above; a bare "out" pattern would strip
     # every directory component named out.
     "--exclude=./project/exports/*",
-    "--exclude=./project/headless_tests/export_contract/out/*"
+    "--exclude=./project/tests/gates/export_contract/out/*"
 )
 if ($KeyFileRelWin) {
     $tarExcludesList += ("--exclude=" + $KeyFileRelWin.Replace('\', '/'))

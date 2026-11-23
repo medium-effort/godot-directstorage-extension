@@ -85,6 +85,7 @@ bin/libdsgd_tests*
 bin/libdirectstorage_tests*
 gdextest_matrix.json
 test-results.xml
+project/gut-results.xml
 src/cppcheck_result.xml
 /logs
 
