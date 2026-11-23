@@ -20,7 +20,6 @@
 #include "GDeflate.h"
 #include "TileStream.h"
 #include "Utils.h"
-#include "gdeflate_cpu_dispatch.h"
 
 #include <libdeflate.h>
 
@@ -28,43 +27,11 @@
 #include <atomic>
 #include <memory>
 
-#if defined(_MSC_VER) && defined(_M_X64)
-#include <intrin.h>
-
-extern "C" {
-struct libdeflate_gdeflate_decompressor* LIBDEFLATEAPI
-libdeflate_alloc_gdeflate_decompressor_bmi2_msvc(void);
-
-void LIBDEFLATEAPI
-libdeflate_free_gdeflate_decompressor_bmi2_msvc(struct libdeflate_gdeflate_decompressor* d);
-
-enum libdeflate_result LIBDEFLATEAPI
-libdeflate_gdeflate_decompress_bmi2_msvc(struct libdeflate_gdeflate_decompressor* d,
-                                         struct libdeflate_gdeflate_in_page* in_pages,
-                                         size_t in_npages, void* out,
-                                         size_t out_nbytes_avail,
-                                         size_t* actual_out_nbytes_ret);
-}
-
-static bool use_bmi2_msvc_decoder()
-{
-    static const bool s_supported = GDeflate::has_avx2_bmi2_support();
-    return s_supported;
-}
-#endif
-
 template<>
 struct std::default_delete<libdeflate_gdeflate_decompressor>
 {
     void operator()(libdeflate_gdeflate_decompressor* p) const
     {
-#if defined(_MSC_VER) && defined(_M_X64)
-        if (use_bmi2_msvc_decoder())
-        {
-            libdeflate_free_gdeflate_decompressor_bmi2_msvc(p);
-            return;
-        }
-#endif
         libdeflate_free_gdeflate_decompressor(p);
     }
 };
@@ -109,14 +76,7 @@ namespace GDeflate
 
     static void TileDecompressionJob(DecompressionContext& context, uint32_t compressorId)
     {
-#if defined(_MSC_VER) && defined(_M_X64)
-        const bool use_bmi2 = use_bmi2_msvc_decoder();
-        std::unique_ptr<libdeflate_gdeflate_decompressor> decompressor(
-            use_bmi2 ? libdeflate_alloc_gdeflate_decompressor_bmi2_msvc()
-                     : libdeflate_alloc_gdeflate_decompressor());
-#else
         std::unique_ptr<libdeflate_gdeflate_decompressor> decompressor(libdeflate_alloc_gdeflate_decompressor());
-#endif
         if (!decompressor)
         {
             // Allocation failure is a clean failure, not a null decompressor handed to
@@ -166,23 +126,6 @@ namespace GDeflate
             const size_t outputAvail = std::min(static_cast<size_t>(kDefaultTileSize),
                     context.outputSize - outputOffset);
 
-#if defined(_MSC_VER) && defined(_M_X64)
-            decompressResult = use_bmi2
-                ? libdeflate_gdeflate_decompress_bmi2_msvc(
-                    decompressor.get(),
-                    &compressedPage,
-                    1,
-                    context.outputPtr + outputOffset,
-                    outputAvail,
-                    nullptr)
-                : libdeflate_gdeflate_decompress(
-                    decompressor.get(),
-                    &compressedPage,
-                    1,
-                    context.outputPtr + outputOffset,
-                    outputAvail,
-                    nullptr);
-#else
             decompressResult = libdeflate_gdeflate_decompress(
                 decompressor.get(),
                 &compressedPage,
@@ -190,7 +133,6 @@ namespace GDeflate
                 context.outputPtr + outputOffset,
                 outputAvail,
                 nullptr);
-#endif
 
             if ( decompressResult != LIBDEFLATE_SUCCESS)
             {

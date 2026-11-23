@@ -769,7 +769,6 @@ if env["platform"] == "windows":
 # builds and broke the link with undefined crypto_aead_lock/crypto_aead_unlock/
 # crypto_blake2b/crypto_wipe.
 thirdparty_objects = thirdparty_sources + monocypher_sources
-bmi2_objects = []
 avx2_objects = []
 if env["platform"] == "windows" and "msvc" in env["TOOLS"]:
     thirdparty_env = env.Clone()
@@ -779,12 +778,8 @@ if env["platform"] == "windows" and "msvc" in env["TOOLS"]:
     monocypher_objects = monocypher_env.SharedObject(monocypher_sources)
     thirdparty_objects = thirdparty_env.SharedObject(thirdparty_sources) + monocypher_objects
     if env["arch"] == "x86_64":
-        bmi2_env = thirdparty_env.Clone()
-        bmi2_env.Append(CCFLAGS=["/arch:AVX2"])
-        bmi2_objects = bmi2_env.SharedObject("src/compression/gdeflate_decompress_bmi2_msvc.c")
-        thirdparty_objects += bmi2_objects
-        # Same isolation for the compressor: second copy of the GDeflate/deflate
-        # hot path with /arch:AVX2, dispatched at runtime by GDeflateCompress.cpp.
+        # Isolate the compressor: second copy of the GDeflate/deflate hot path
+        # with /arch:AVX2, dispatched at runtime by GDeflateCompress.cpp.
         avx2_env = thirdparty_env.Clone()
         avx2_env.Append(CCFLAGS=["/arch:AVX2"])
         avx2_objects = avx2_env.SharedObject("src/compression/gdeflate_compress_avx2_msvc.c")
@@ -957,8 +952,6 @@ if env["tests"]:
         if "msvc" in _gdex_env.get("TOOLS", []):
             _gdex_env.Append(LINKFLAGS=["/ignore:4199"])
             _gdex_env.Append(CFLAGS=["/std:c11"])
-            if bmi2_objects:
-                _gdex_env.Append(LIBS=bmi2_objects)
             if avx2_objects:
                 _gdex_env.Append(LIBS=avx2_objects)
         _gdex_exports = {"env": _gdex_env, "gdextest": {}}
