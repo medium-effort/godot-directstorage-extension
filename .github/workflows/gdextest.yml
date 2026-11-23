@@ -377,61 +377,33 @@ jobs:
             gdextest.log
           if-no-files-found: ignore
 
+      - name: Add gdextest summary heading
+        if: always() && hashFiles('test-results.xml') != ''
+        shell: bash
+        run: echo "### gdextest (C++ Native Tests)" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish gdextest report (GitHub Annotations)
         uses: dorny/test-reporter@v1
         if: always() && hashFiles('test-results.xml') != ''
-        env:
-          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gdextest-reporter-summary.md
         with:
           name: gdextest (${{ matrix.os }})
           path: test-results.xml
           reporter: java-junit
           fail-on-error: false
 
+      - name: Add GUT summary heading
+        if: always() && hashFiles('project/gut-results.xml') != ''
+        shell: bash
+        run: echo "### GUT (GDScript Unit Tests)" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish GUT report (GitHub Annotations)
         uses: dorny/test-reporter@v1
         if: always() && hashFiles('project/gut-results.xml') != ''
-        env:
-          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gut-reporter-summary.md
         with:
           name: GUT (${{ matrix.os }})
           path: project/gut-results.xml
           reporter: java-junit
           fail-on-error: false
-
-      - name: Publish separated test report summaries
-        if: always() && (hashFiles('test-results.xml') != '' || hashFiles('project/gut-results.xml') != '')
-        shell: bash
-        run: |
-          python - "${{ runner.temp }}" "$GITHUB_STEP_SUMMARY" << 'PY'
-          import os, re, sys
-          tmp_dir, out_path = sys.argv[1], sys.argv[2]
-          sections = [
-              ("gdextest (C++ Native Tests)", os.path.join(tmp_dir, "gdextest-reporter-summary.md")),
-              ("GUT (GDScript Unit Tests)", os.path.join(tmp_dir, "gut-reporter-summary.md")),
-          ]
-          chunks = []
-          for title, path in sections:
-              if not os.path.isfile(path) or os.path.getsize(path) == 0:
-                  continue
-              text = open(path, "r", encoding="utf-8", errors="replace").read().strip()
-              chunks.append(f"### {title}\n")
-              if "<details" in text:
-                  chunks.append(text + "\n")
-                  continue
-              lines = text.splitlines()
-              badge = lines[0] if lines and lines[0].startswith("![") else ""
-              body = "\n".join(lines[1:] if badge else lines).strip()
-              m = re.search(r"(\d+)\s+failed", text)
-              n = int(m.group(1)) if m else 0
-              label = f"Expand {title} details ({n} test{'s' if n != 1 else ''} failed)" if n > 0 else f"Expand {title} details"
-              if badge:
-                  chunks.append(badge + "\n")
-              chunks.append(f"<details><summary>{label}</summary>\n\n{body}\n\n</details>\n")
-          if chunks:
-              with open(out_path, "a", encoding="utf-8") as f:
-                  f.write("\n".join(chunks) + "\n")
-          PY
 
       - name: Summarize SCons cache
         # Last on purpose: step summaries are concatenated in step order, so the
