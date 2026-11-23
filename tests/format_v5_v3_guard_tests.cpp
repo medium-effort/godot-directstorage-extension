@@ -14,6 +14,8 @@
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/string.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -644,24 +646,42 @@ GDEX_TEST_T(dspkg_v5, header_tlv_cost_stays_linear_at_table_cap, TAG_INTEGRATION
 	GDEX_ASSERT_TRUE(write_bytes(big_path, big.bytes));
 	GDEX_ASSERT_TRUE(write_bytes(small_path, small_archive.bytes));
 
-	godot::Ref<godot::DSPkg> big_pkg;
-	big_pkg.instantiate();
-	const int64_t big_start = godot::Time::get_singleton()->get_ticks_usec();
-	const godot::Error big_err = big_pkg->open(big_path, 0);
-	const int64_t big_us = godot::Time::get_singleton()->get_ticks_usec() - big_start;
+	auto measure_open_us = [](const godot::String &p_path, godot::Error &r_err, int32_t &r_entry_count) -> int64_t {
+		godot::Ref<godot::DSPkg> pkg;
+		pkg.instantiate();
+		const int64_t start = godot::Time::get_singleton()->get_ticks_usec();
+		r_err = pkg->open(p_path, 0);
+		const int64_t elapsed = godot::Time::get_singleton()->get_ticks_usec() - start;
+		r_entry_count = (r_err == godot::OK) ? pkg->get_entry_count() : 0;
+		return elapsed;
+	};
 
-	godot::Ref<godot::DSPkg> small_pkg;
-	small_pkg.instantiate();
-	const int64_t small_start = godot::Time::get_singleton()->get_ticks_usec();
-	const godot::Error small_err = small_pkg->open(small_path, 0);
-	const int64_t small_us = godot::Time::get_singleton()->get_ticks_usec() - small_start;
+	// Warm OS file cache and take median of 5 runs so CI VM I/O jitter doesn't
+	// trip the linear-vs-quadratic ratio guard.
+	godot::Error big_err = godot::OK;
+	godot::Error small_err = godot::OK;
+	int32_t big_count = 0;
+	int32_t small_count = 0;
+	measure_open_us(big_path, big_err, big_count);
+	measure_open_us(small_path, small_err, small_count);
+
+	std::array<int64_t, 5> big_samples{};
+	std::array<int64_t, 5> small_samples{};
+	for (size_t i = 0; i < big_samples.size(); ++i) {
+		big_samples[i] = measure_open_us(big_path, big_err, big_count);
+		small_samples[i] = measure_open_us(small_path, small_err, small_count);
+	}
+	std::sort(big_samples.begin(), big_samples.end());
+	std::sort(small_samples.begin(), small_samples.end());
+	const int64_t big_us = big_samples[big_samples.size() / 2];
+	const int64_t small_us = small_samples[small_samples.size() / 2];
 
 	remove_file(big_path);
 	remove_file(small_path);
 
 	GDEX_ASSERT_EQ(static_cast<int64_t>(big_err), static_cast<int64_t>(godot::OK));
 	GDEX_ASSERT_EQ(static_cast<int64_t>(small_err), static_cast<int64_t>(godot::OK));
-	GDEX_EXPECT_EQ(big_pkg->get_entry_count(), 1);
+	GDEX_EXPECT_EQ(big_count, 1);
 	GDEX_EXPECT_LT(big_us, static_cast<int64_t>(HEADER_TLV_TABLE_BUDGET_US));
 	const int64_t small_floor_us = small_us > HEADER_TLV_TIMING_FLOOR_US ? small_us : HEADER_TLV_TIMING_FLOOR_US;
 	GDEX_EXPECT_LT(big_us, static_cast<int64_t>(HEADER_TLV_TABLE_RATIO) * small_floor_us);
