@@ -1,7 +1,7 @@
-# CI job for gdextest framework
-# Runs after native build on Linux/macOS runners (no Device A/B split needed)
+# CI job for gdextest (C++ native tests) and GUT (GDScript unit tests)
+# Runs after native build on Linux/macOS/Windows runners
 
-name: Run gdextest
+name: Run Tests
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   run-gdextest:
-    name: Run gdextest ${{ matrix.os }}
+    name: Run Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     env:
@@ -270,22 +270,7 @@ jobs:
         env:
           GODOT: ${{ env.GODOT }}
 
-      - name: Cache GUT addon
-        uses: actions/cache@v4
-        with:
-          path: .cache/gut
-          key: gut-${{ hashFiles('tools/fetch_gut.py') }}
-
-      - name: Run GUT (GDScript unit tests)
-        id: gut
-        shell: bash
-        run: |
-          set -o pipefail
-          python tools/run_gut.py --godot "$GODOT" 2>&1 | tee gut.log
-        env:
-          GODOT: ${{ env.GODOT }}
-
-      - name: Run gdextest
+      - name: Run gdextest (C++ native tests)
         id: gdextest
         shell: bash
         run: |
@@ -300,6 +285,23 @@ jobs:
         env:
           GODOT: ${{ env.GODOT }}
 
+      - name: Cache GUT addon
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.gdscript.outcome == 'success' }}
+        uses: actions/cache@v4
+        with:
+          path: .cache/gut
+          key: gut-${{ hashFiles('tools/fetch_gut.py') }}
+
+      - name: Run GUT (GDScript unit tests)
+        id: gut
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.gdscript.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python tools/run_gut.py --godot "$GODOT" 2>&1 | tee gut.log
+        env:
+          GODOT: ${{ env.GODOT }}
+
       - name: Publish failure summary
         # Runs for ANY failed step, not just a broken SCons build: a failure in
         # the GDScript validation step previously produced no job summary at
@@ -308,22 +310,21 @@ jobs:
         shell: bash
         run: |
           if [ "${{ steps.build.outcome }}" != "success" ]; then
-            LOG=scons-build.log
-            KIND=build
+            echo "Publishing build failure summary from scons-build.log"
+            python .github/scripts/extract_build_errors.py scons-build.log --kind build
           elif [ "${{ steps.gdscript.outcome }}" = "failure" ]; then
-            LOG=gdscript-check.log
-            KIND=validation
-          elif [ "${{ steps.gdextest.outcome }}" = "failure" ]; then
-            # A failed test run must not be reported as a build failure with
-            # the build log tail: the failure only exists in the test log.
-            LOG=gdextest.log
-            KIND=test
+            echo "Publishing validation failure summary from gdscript-check.log"
+            python .github/scripts/extract_build_errors.py gdscript-check.log --kind validation
           else
-            LOG=scons-build.log
-            KIND=build
+            if [ "${{ steps.gdextest.outcome }}" = "failure" ]; then
+              echo "Publishing gdextest failure summary from gdextest.log"
+              python .github/scripts/extract_build_errors.py gdextest.log --kind test
+            fi
+            if [ "${{ steps.gut.outcome }}" = "failure" ]; then
+              echo "Publishing GUT failure summary from gut.log"
+              python .github/scripts/extract_build_errors.py gut.log --kind test
+            fi
           fi
-          echo "Publishing $KIND failure summary from $LOG"
-          python .github/scripts/extract_build_errors.py "$LOG" --kind "$KIND"
 
       - name: Show godot raw log head (crash diagnosis)
         # The failure tail only shows the backtrace; the head shows which
@@ -376,60 +377,60 @@ jobs:
             gdextest.log
           if-no-files-found: ignore
 
-      - name: Publish GUT report (GitHub Annotations)
-        uses: dorny/test-reporter@v1
-        if: always() && hashFiles('project/gut-results.xml') != ''
-        with:
-          name: gut (${{ matrix.os }})
-          path: project/gut-results.xml
-          reporter: java-junit
-          fail-on-error: false
-            
-      - name: Publish test report (GitHub Annotations)
+      - name: Publish gdextest report (GitHub Annotations)
         uses: dorny/test-reporter@v1
         if: always() && hashFiles('test-results.xml') != ''
         env:
-          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/test-reporter-summary.md
+          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gdextest-reporter-summary.md
         with:
           name: gdextest (${{ matrix.os }})
           path: test-results.xml
           reporter: java-junit
           fail-on-error: false
 
-      - name: Wrap test report summary in collapsible details
-        if: always() && hashFiles('test-results.xml') != ''
+      - name: Publish GUT report (GitHub Annotations)
+        uses: dorny/test-reporter@v1
+        if: always() && hashFiles('project/gut-results.xml') != ''
+        env:
+          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gut-reporter-summary.md
+        with:
+          name: GUT (${{ matrix.os }})
+          path: project/gut-results.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Publish separated test report summaries
+        if: always() && (hashFiles('test-results.xml') != '' || hashFiles('project/gut-results.xml') != '')
         shell: bash
         run: |
-          TMP_SUMMARY="${{ runner.temp }}/test-reporter-summary.md"
-          if [ ! -s "$TMP_SUMMARY" ]; then
-            exit 0
-          fi
-          python - "$TMP_SUMMARY" "$GITHUB_STEP_SUMMARY" << 'PY'
-          import re, sys
-          tmp_path, out_path = sys.argv[1], sys.argv[2]
-          text = open(tmp_path, "r", encoding="utf-8", errors="replace").read()
-          if "<details" in text:
-              out = text
-          else:
+          python - "${{ runner.temp }}" "$GITHUB_STEP_SUMMARY" << 'PY'
+          import os, re, sys
+          tmp_dir, out_path = sys.argv[1], sys.argv[2]
+          sections = [
+              ("gdextest (C++ Native Tests)", os.path.join(tmp_dir, "gdextest-reporter-summary.md")),
+              ("GUT (GDScript Unit Tests)", os.path.join(tmp_dir, "gut-reporter-summary.md")),
+          ]
+          chunks = []
+          for title, path in sections:
+              if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                  continue
+              text = open(path, "r", encoding="utf-8", errors="replace").read().strip()
+              chunks.append(f"### {title}\n")
+              if "<details" in text:
+                  chunks.append(text + "\n")
+                  continue
               lines = text.splitlines()
               badge = lines[0] if lines and lines[0].startswith("![") else ""
               body = "\n".join(lines[1:] if badge else lines).strip()
               m = re.search(r"(\d+)\s+failed", text)
               n = int(m.group(1)) if m else 0
-              label = f"Expand for details ({n} test{'s' if n != 1 else ''} failed)" if n > 0 else "Expand for details"
-              parts = []
+              label = f"Expand {title} details ({n} test{'s' if n != 1 else ''} failed)" if n > 0 else f"Expand {title} details"
               if badge:
-                  parts.append(badge)
-                  parts.append("")
-              parts.append(f"<details><summary>{label}</summary>")
-              parts.append("")
-              parts.append(body)
-              parts.append("")
-              parts.append("</details>")
-              parts.append("")
-              out = "\n".join(parts)
-          with open(out_path, "a", encoding="utf-8") as f:
-              f.write(out)
+                  chunks.append(badge + "\n")
+              chunks.append(f"<details><summary>{label}</summary>\n\n{body}\n\n</details>\n")
+          if chunks:
+              with open(out_path, "a", encoding="utf-8") as f:
+                  f.write("\n".join(chunks) + "\n")
           PY
 
       - name: Summarize SCons cache
