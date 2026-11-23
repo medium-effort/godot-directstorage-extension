@@ -405,6 +405,45 @@ jobs:
           reporter: java-junit
           fail-on-error: false
 
+      - name: Collapse failed test report summaries
+        if: always() && (hashFiles('test-results.xml') != '' || hashFiles('project/gut-results.xml') != '')
+        shell: bash
+        run: |
+          python - "$GITHUB_STEP_SUMMARY" << 'PY'
+          import os, re, sys
+          path = sys.argv[1]
+          if not path or not os.path.isfile(path):
+              sys.exit(0)
+          text = open(path, "r", encoding="utf-8", errors="replace").read()
+          parts = re.split(r"(?m)(?=^### (?:gdextest|GUT) )", text)
+          out = []
+          for part in parts:
+              if not re.match(r"^### (?:gdextest|GUT) ", part) or "<details" in part:
+                  out.append(part)
+                  continue
+              lines = part.splitlines()
+              heading = lines[0]
+              rest = lines[1:]
+              badge_idx = next((i for i, l in enumerate(rest) if l.startswith("![")), None)
+              prefix = [heading, ""]
+              if badge_idx is not None:
+                  prefix.append(rest[badge_idx])
+                  prefix.append("")
+                  body_lines = rest[badge_idx + 1:]
+              else:
+                  body_lines = rest
+              body = "\n".join(body_lines).strip()
+              if not body:
+                  out.append(part)
+                  continue
+              m = re.search(r"(\d+)\s+failed", part)
+              n = int(m.group(1)) if m else 0
+              label = f"Expand for details ({n} test{'s' if n != 1 else ''} failed)" if n > 0 else "Expand for details"
+              out.append("\n".join(prefix) + f"<details><summary>{label}</summary>\n\n{body}\n\n</details>\n\n")
+          with open(path, "w", encoding="utf-8") as f:
+              f.write("".join(out))
+          PY
+
       - name: Summarize SCons cache
         # Last on purpose: step summaries are concatenated in step order, so the
         # verdict and the failure detail must be written first. This step is a
