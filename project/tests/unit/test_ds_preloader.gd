@@ -6,6 +6,7 @@ const Helpers = preload("res://tests/unit/_gut_helpers.gd")
 const PROBE_DIR := "res://gut_tmp_ds_preloader/"
 const DSPKG_PATH := "res://textures.dspkg"
 const FORCE_ARCHIVE_SETTING := "dsgd_extension/force_archive_resolution"
+const SKIP_IMPORT_SETTING := "dsgd_extension/skip_archive_import_check"
 const TEX_W := 64
 const TEX_H := 64
 const SET_N := 3
@@ -13,6 +14,8 @@ const MAX_PUMP_FRAMES := 600
 
 var _had_force_archive := false
 var _prev_force_archive: Variant = null
+var _had_skip_import := false
+var _prev_skip_import: Variant = null
 
 
 func before_each() -> void:
@@ -20,10 +23,14 @@ func before_each() -> void:
 	_had_force_archive = ProjectSettings.has_setting(FORCE_ARCHIVE_SETTING)
 	_prev_force_archive = ProjectSettings.get_setting(FORCE_ARCHIVE_SETTING) if _had_force_archive else null
 	ProjectSettings.set_setting(FORCE_ARCHIVE_SETTING, true)
+	_had_skip_import = ProjectSettings.has_setting(SKIP_IMPORT_SETTING)
+	_prev_skip_import = ProjectSettings.get_setting(SKIP_IMPORT_SETTING) if _had_skip_import else null
+	ProjectSettings.set_setting(SKIP_IMPORT_SETTING, false)
 
 
 func after_each() -> void:
 	Helpers.restore_setting(FORCE_ARCHIVE_SETTING, _had_force_archive, _prev_force_archive)
+	Helpers.restore_setting(SKIP_IMPORT_SETTING, _had_skip_import, _prev_skip_import)
 	if Engine.has_singleton("DSTextureCache"):
 		Engine.get_singleton("DSTextureCache").clear()
 	if Engine.has_singleton("DSContext"):
@@ -97,6 +104,39 @@ func test_async_prewarm_archive_import_and_cancel() -> void:
 	ctx.cancel_prewarm(tag_imp)
 	ctx.cancel_prewarm(999999999)
 	assert_true(ctx.is_prewarm_complete(999999999))
+
+
+func test_archive_discovery_uses_toc_as_image_texture_flag() -> void:
+	var payload := PackedByteArray()
+	payload.resize(TEX_W * TEX_H * 4)
+	payload.fill(180)
+
+	var normal_png := PROBE_DIR + "toc_normal.png"
+	var compat_png := PROBE_DIR + "toc_compat.png"
+	var normal_dstex := PROBE_DIR + "toc_normal.dstex"
+	var compat_dstex := PROBE_DIR + "toc_compat.dstex"
+	_write_dstex(normal_dstex, payload, false)
+	_write_dstex(compat_dstex, payload, true)
+
+	var dspkg := DSPkg.new()
+	assert_eq(dspkg.create(ProjectSettings.globalize_path(DSPKG_PATH)), OK)
+	assert_eq(dspkg.add_texture(normal_png, normal_dstex), OK)
+	assert_eq(dspkg.add_texture(compat_png, compat_dstex), OK)
+	assert_eq(dspkg.finalize(), OK)
+
+	var reader := DSPkg.new()
+	assert_eq(reader.open(ProjectSettings.globalize_path(DSPKG_PATH)), OK)
+	var normal_info: Dictionary = reader.call("get_entry_info", normal_png)
+	var compat_info: Dictionary = reader.call("get_entry_info", compat_png)
+	assert_false(bool(normal_info.get("as_image_texture", false)))
+	assert_true(bool(compat_info.get("as_image_texture", false)))
+	# No sidecars exist: a passing exclusion can only have come from the TOC.
+	assert_false(FileAccess.file_exists(normal_png + ".import"))
+	assert_false(FileAccess.file_exists(compat_png + ".import"))
+
+	var collected: PackedStringArray = PreloaderScript.collect_scene_textures("", PackedStringArray([PROBE_DIR]))
+	assert_true(normal_png in collected)
+	assert_false(compat_png in collected)
 
 
 func test_prewarm_scene_async_and_stage_cancels() -> void:
@@ -182,9 +222,9 @@ func _pump_until(ctx: Object, cache: Object, tag: int) -> bool:
 	return true
 
 
-func _write_dstex(dstex_res: String, payload: PackedByteArray) -> void:
+func _write_dstex(dstex_res: String, payload: PackedByteArray, as_image_texture: bool = false) -> void:
 	var dstex := DSTex.new()
-	assert_eq(dstex.write_to_file(dstex_res, payload, TEX_W, TEX_H, Image.FORMAT_RGBA8, 1, 1), OK)
+	assert_eq(dstex.write_to_file(dstex_res, payload, TEX_W, TEX_H, Image.FORMAT_RGBA8, 1, 1, false, as_image_texture), OK)
 
 
 func _write_import(png_res: String, dstex_res: String) -> void:

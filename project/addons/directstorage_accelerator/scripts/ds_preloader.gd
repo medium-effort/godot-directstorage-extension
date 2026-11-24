@@ -202,10 +202,15 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 				var pkg_entries: Array = dspkg.call("get_entries")
 				for entry in pkg_entries:
 					var entry_str := String(entry)
+					if not _is_prewarmable_texture(entry_str):
+						continue
+					var in_coverage := false
 					for dir in dirs.keys():
-						if entry_str.begins_with(dir) and _is_prewarmable_texture(entry_str) and (skip_import_check or not _is_excluded_import(entry_str)):
-							found[entry_str] = true
+						if entry_str.begins_with(dir):
+							in_coverage = true
 							break
+					if in_coverage and not _is_archive_entry_excluded(dspkg, entry_str, skip_import_check):
+						found[entry_str] = true
 				if not found.is_empty():
 					var out := PackedStringArray(found.keys())
 					out.sort()
@@ -243,10 +248,15 @@ static func collect_scene_textures(scene_path: String, extra_scan_dirs: PackedSt
 				var pkg_entries: Array = dspkg.call("get_entries")
 				for entry in pkg_entries:
 					var entry_str := String(entry)
+					if not _is_prewarmable_texture(entry_str):
+						continue
+					var in_coverage := false
 					for dir in dirs.keys():
-						if entry_str.begins_with(dir) and _is_prewarmable_texture(entry_str) and (skip_import_check or not _is_excluded_import(entry_str)):
-							found[entry_str] = true
+						if entry_str.begins_with(dir):
+							in_coverage = true
 							break
+					if in_coverage and not _is_archive_entry_excluded(dspkg, entry_str, skip_import_check):
+						found[entry_str] = true
 	for dir in dirs.keys():
 		_sweep_directory(dir, found)
 	var out := PackedStringArray(found.keys())
@@ -727,6 +737,24 @@ static func _is_excluded_import(path: String) -> bool:
 	if cfg.load(import_path) != OK:
 		return false
 	return bool(cfg.get_value("params", "compatibility/as_image_texture", false))
+
+
+## Archive-entry variant of [method _is_excluded_import]: reads the
+## [code]as_image_texture[/code] flag from the already-open DSPkg table of
+## contents (no [code].import[/code] disk reads). Archives older than v3 do
+## not store per-entry flags, so they fall back to the sidecar check. The
+## legacy [code]skip_archive_import_check[/code] setting still bypasses the
+## filter entirely for callers that need the old fast path.
+static func _is_archive_entry_excluded(dspkg: RefCounted, path: String, skip_import_check: bool) -> bool:
+	if skip_import_check:
+		return false
+	if dspkg != null and dspkg.has_method("get_entry_info"):
+		var info: Dictionary = dspkg.call("get_entry_info", path)
+		if not info.is_empty():
+			if int(info.get("format_version", 0)) < 3:
+				return _is_excluded_import(path)
+			return bool(info.get("as_image_texture", false))
+	return _is_excluded_import(path)
 
 
 ## Recursively sweeps [param directory] for prewarmable textures, applying
