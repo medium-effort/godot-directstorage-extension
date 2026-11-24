@@ -4548,6 +4548,16 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	if (src_size == 0 || uncompressed_size == 0) {
 		return reject(p_request, "Win32Backend: Invalid size parameters (src_size=" + String::num_uint64(src_size) + ", uncompressed_size=" + String::num_uint64(uncompressed_size) + ").", EnqueueOutcome::TERMINAL);
 	}
+	if (static_cast<uint64_t>(uncompressed_size) > DSTEX_MAX_TOTAL_BYTES) {
+		return reject(p_request, "Win32Backend: uncompressed size " + String::num_uint64(uncompressed_size) + " exceeds the 512 MiB limit.", EnqueueOutcome::TERMINAL);
+	}
+
+	// Hoisted above batch_mutex: the pre-lock destination pre-size below and the
+	// staging-split decision later in this function both need the same values.
+	// get_staging_buffer_size_mb() is an atomic load, so this is safe off-lock.
+	DSContext *ctx = DSContext::get_singleton();
+	const uint64_t staging_size = ctx ? static_cast<uint64_t>(ctx->get_staging_buffer_size_mb()) * 1024ULL * 1024ULL : 0;
+	const uint64_t request_size = MAX(static_cast<uint64_t>(src_size), static_cast<uint64_t>(uncompressed_size));
 
 	// A non-zero (top, bottom) pair is the caller opting into the sub-box
 	// destination. An empty or inverted band is a caller bug, not "whole
@@ -4697,6 +4707,20 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	// request transfers it to the slot (adopt_source_file below).
 	bool file_registered = false;
 	SourceRefGuard source_ref_guard(this, wpath, pre_opened_file, file_registered);
+
+	// Pre-size a plain memory destination BEFORE taking batch_mutex. In Godot
+	// 4.7 PackedByteArray::resize() zero-fills the whole allocation (~220 us/MiB
+	// on this host plus soft zero-page faults), so doing it under batch_mutex
+	// would make a main-thread has_pending_results()/poll_batch_status() block
+	// for the entire resize once flush_stream_async() is offloaded to a worker.
+	// Exclude GPU destinations (their resources are render-thread-owned) and
+	// staging-split payloads (their children own their own buffers); enqueue_one
+	// keeps the idempotent child-side resize as a fallback.
+	if (!is_gpu_buffer && !is_gpu_texture &&
+			(staging_size == 0 || request_size <= staging_size ||
+					p_request->get_compression_format() != DSRequest::COMPRESSION_GDEFLATE)) {
+		p_request->ensure_destination_buffer_capacity(uncompressed_size);
+	}
 
 	std::lock_guard<std::mutex> lock(batch_mutex);
 	if (sync_batch_in_flight.load()) {
@@ -5127,10 +5151,6 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 			file_registered = true;
 		}
 	};
-
-	DSContext *ctx = DSContext::get_singleton();
-	uint64_t staging_size = ctx ? static_cast<uint64_t>(ctx->get_staging_buffer_size_mb()) * 1024ULL * 1024ULL : 0;
-	uint64_t request_size = MAX(static_cast<uint64_t>(src_size), static_cast<uint64_t>(uncompressed_size));
 
 	if (gpu_texture_destination && has_texture_mip_entries && texture_subresource_count > 1) {
 		// Multi-mip .dstex files store each mip level as an independent GDeflate compressed stream.

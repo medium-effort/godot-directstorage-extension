@@ -3612,6 +3612,86 @@ GDEX_TEST_T(win32_remediation, terminal_refusals_report_terminal, TAG_INTEGRATIO
 }
 
 
+// Step 1 of the prewarm stutter plan: a plain memory destination is pre-sized
+// before batch_mutex is taken, but the guards that must run ahead of any
+// allocation still do. A rejected request must never own a large buffer.
+GDEX_TEST_T(win32_remediation, memory_destination_presize_respects_guards, TAG_INTEGRATION) {
+#ifdef _WIN32
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+    godot::Win32Backend *backend = memnew(godot::Win32Backend);
+    ctx.add_teardown([backend]() { memdelete(backend); });
+    if (!backend->is_available()) {
+        GDEX_SKIP("DirectStorage runtime absent on this machine.");
+    }
+    if (!backend->initialize()) {
+        GDEX_SKIP("Win32Backend initialize() failed on this machine.");
+    }
+
+    // A real GDeflate stream: the #0181 guard accepts only a matching declaration.
+    const int64_t payload_bytes = 4096;
+    godot::PackedByteArray source;
+    source.resize(payload_bytes);
+    for (int64_t i = 0; i < payload_bytes; ++i) {
+        source[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+    }
+    godot::Ref<godot::GDeflateCompressor> compressor;
+    compressor.instantiate();
+    const godot::PackedByteArray stream = compressor->compress(source, 1);
+    GDEX_ASSERT_TRUE(stream.size() > 0);
+
+    const char *path = "user://prelock_memory_stream.bin";
+    godot::Ref<godot::FileAccess> out = godot::FileAccess::open(godot::String(path), godot::FileAccess::WRITE);
+    GDEX_ASSERT_TRUE(out.is_valid());
+    out->store_buffer(stream);
+    out->close();
+    godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
+    const godot::String global_path = ps ? ps->globalize_path(path) : godot::String(path);
+    ctx.add_teardown([global_path]() { godot::DirAccess::remove_absolute(global_path); });
+
+    auto make_memory_request = [&](uint32_t p_declared_size) {
+        godot::Ref<godot::DSRequest> request;
+        request.instantiate();
+        request->set_file_path(godot::String(path));
+        request->set_offset(0);
+        request->set_size(static_cast<uint32_t>(stream.size()));
+        request->set_uncompressed_size(p_declared_size);
+        request->set_compression_format(godot::DSRequest::COMPRESSION_GDEFLATE);
+        request->set_destination_type(godot::DSRequest::DESTINATION_MEMORY);
+        return request;
+    };
+
+    // 512 MiB bound: rejected before anything is sized from the declaration.
+    godot::Ref<godot::DSRequest> huge = make_memory_request(
+            static_cast<uint32_t>(godot::DSTEX_MAX_TOTAL_BYTES + 1ULL));
+    godot::PlatformBackend::EnqueueOutcome outcome = godot::PlatformBackend::EnqueueOutcome::STAGED;
+    GDEX_EXPECT_FALSE(backend->enqueue_request(huge, &outcome));
+    GDEX_EXPECT_TRUE(outcome == godot::PlatformBackend::EnqueueOutcome::TERMINAL);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(huge->get_destination_buffer().size()), static_cast<int64_t>(0));
+    GDEX_EXPECT_TRUE(::gdextest::to_std_string(huge->get_error_message()).find("512 MiB limit") != std::string::npos);
+
+    // #0181 mismatch: the stream declares payload_bytes, the request declares half.
+    godot::Ref<godot::DSRequest> wrong = make_memory_request(static_cast<uint32_t>(payload_bytes / 2));
+    outcome = godot::PlatformBackend::EnqueueOutcome::STAGED;
+    GDEX_EXPECT_FALSE(backend->enqueue_request(wrong, &outcome));
+    GDEX_EXPECT_TRUE(outcome == godot::PlatformBackend::EnqueueOutcome::TERMINAL);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(wrong->get_destination_buffer().size()), static_cast<int64_t>(0));
+
+    // Control: a matching declaration is accepted and the destination is sized.
+    godot::Ref<godot::DSRequest> correct = make_memory_request(static_cast<uint32_t>(payload_bytes));
+    outcome = godot::PlatformBackend::EnqueueOutcome::STAGED;
+    GDEX_EXPECT_TRUE(backend->enqueue_request(correct, &outcome));
+    GDEX_EXPECT_TRUE(outcome == godot::PlatformBackend::EnqueueOutcome::STAGED);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(correct->get_destination_buffer().size()), payload_bytes);
+#else
+    (void)ctx;
+    GDEX_SKIP("The outcome seam is compiled out of release builds.");
+#endif
+#else
+    (void)ctx;
+    GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+#endif
+}
+
 // --- Row-band payload extent -------------------------------------------------
 //
 // The destination's row pitch is the 256-byte-aligned copyable pitch, not the
