@@ -38,8 +38,8 @@ if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
 }
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path.TrimEnd('\', '/')
 
-$manifestPath = Join-Path $RepoRoot 'project\addons\directstorage_accelerator\runtime_versions.json'
-$installerPath = Join-Path $RepoRoot 'project\addons\directstorage_accelerator\scripts\ds_runtime_installer.gd'
+$manifestPath = [System.IO.Path]::Combine($RepoRoot, 'project', 'addons', 'directstorage_accelerator', 'runtime_versions.json')
+$installerPath = [System.IO.Path]::Combine($RepoRoot, 'project', 'addons', 'directstorage_accelerator', 'scripts', 'ds_runtime_installer.gd')
 $baselineKey = '1.3.0'
 
 $problems = [System.Collections.Generic.List[string]]::new()

@@ -120,13 +120,13 @@ function Resolve-TemplateReleaseExecutable {
 $godotConsole = Resolve-GodotConsole -ExplicitPath $GodotConsolePath -Root $repoRoot
 $templateExe = Resolve-TemplateReleaseExecutable -ExplicitPath $TemplateReleasePath -GodotExe $godotConsole -Root $repoRoot
 
-$smokeDir = Join-Path $repoRoot "build\release_smoke"
-$smokeBinDir = Join-Path $smokeDir "addons\directstorage_accelerator\bin"
+$smokeDir = [System.IO.Path]::Combine($repoRoot, "build", "release_smoke")
+$smokeBinDir = [System.IO.Path]::Combine($smokeDir, "addons", "directstorage_accelerator", "bin")
 
 try {
 New-Item -ItemType Directory -Force -Path $smokeBinDir | Out-Null
 
-$addonDir = Join-Path $repoRoot "project\addons\directstorage_accelerator"
+$addonDir = [System.IO.Path]::Combine($repoRoot, "project", "addons", "directstorage_accelerator")
 $gdextSrc = Join-Path $addonDir "directstorage_accelerator.gdextension"
 $binSrcDir = Join-Path $addonDir "bin"
 
