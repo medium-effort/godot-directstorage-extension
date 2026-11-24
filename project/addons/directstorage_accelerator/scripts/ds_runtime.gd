@@ -107,6 +107,16 @@ var _prewarm_api_missing_warned: bool = false
 ## `poll_completed()` builds `ImageTexture` only (Quirks Sec25 worker-safe);
 ## evict-path RID frees defer via `call_on_render_thread` (Sec27).
 var _poll_task_id: int = -1
+## Single-flight WorkerThreadPool task IDs for the two main-thread stalls in
+## Mode 4 (Win32 DESTINATION_MEMORY) streaming; -1 = idle. Neither task ever
+## touches RenderingServer / call_on_render_thread(), so both are safe to join
+## from the main thread during teardown.
+var _stream_flush_task_id: int = -1
+var _cpu_pump_task_id: int = -1
+## Probed once: older extension binaries lack has_stream_gpu_pending(), in
+## which case stream flushes stay on the main thread.
+var _stream_gpu_api_probed: bool = false
+var _has_stream_gpu_pending: bool = false
 ## Cached DSTextureCache capability probe (avoids per-frame `has_method` /
 ## `call` reflection; probed once, compatible with older builds lacking
 ## `get_unbuilt_prewarm_count` / `poll_completed`).
@@ -680,6 +690,9 @@ func _process(delta: float) -> void:
 		_poll_legacy_completions(ctx)
 		_poll_scene_prewarms()
 		return
+	if not _stream_gpu_api_probed:
+		_stream_gpu_api_probed = true
+		_has_stream_gpu_pending = ctx.has_method("has_stream_gpu_pending")
 	# 1. Harvest already-finished batches first (non-blocking). This frees
 	#    batch slots so the stream flush below can submit in the same frame
 	#    instead of hitting ERR_BUSY and waiting a frame. A finished sibling must
@@ -691,8 +704,20 @@ func _process(delta: float) -> void:
 		ctx.collect_completed_results()
 	# 2. Stream-only flush (non-blocking; ERR_BUSY keeps the queue intact for
 	#    retry next frame). Never routes through the sync flush path.
+	#    Memory-only flushes go to one WorkerThreadPool task: Win32Backend
+	#    now sizes destination buffers outside batch_mutex, so the worker-side
+	#    resize cannot block main-thread result polling. GPU destinations stay
+	#    synchronous - their render-thread waits must not be joined from the
+	#    main thread at teardown.
+	if _stream_flush_task_id != -1 and WorkerThreadPool.is_task_completed(_stream_flush_task_id):
+		WorkerThreadPool.wait_for_task_completion(_stream_flush_task_id)
+		_stream_flush_task_id = -1
 	if ctx.has_stream_pending():
-		ctx.flush_stream_async()
+		if _stream_flush_task_id == -1:
+			if _has_stream_gpu_pending and not bool(ctx.has_stream_gpu_pending()):
+				_stream_flush_task_id = WorkerThreadPool.add_task(_background_stream_flush, false, "DS_StreamFlush")
+			else:
+				ctx.flush_stream_async()
 	# 3. Build textures for terminal prewarm requests (always ImageTexture,
 	#    pipeline-safe on worker threads per GODOT_QUIRKS Sec25). Ingestion
 	#    runs on WorkerThreadPool in one bounded slice per task (Q13/Q41:
@@ -845,6 +870,9 @@ func _process(delta: float) -> void:
 			if _has_pump_cpu and _has_get_queued_cpu:
 				var queued_cpu: int = int(cache.get_queued_cpu_prewarm_count(0))
 				if queued_cpu > 0:
+					if _cpu_pump_task_id != -1 and WorkerThreadPool.is_task_completed(_cpu_pump_task_id):
+						WorkerThreadPool.wait_for_task_completion(_cpu_pump_task_id)
+						_cpu_pump_task_id = -1
 					if _background_pacing:
 						var cores: int = maxi(2, OS.get_processor_count())
 						if not _cpu_window_init:
@@ -868,10 +896,11 @@ func _process(delta: float) -> void:
 							var in_flight_bytes: int = int(cache.get_in_flight_cpu_prewarm_bytes(0)) if _has_get_in_flight_cpu_bytes else 0
 							var avail_items: int = _cpu_window_items - in_flight_items
 							var avail_bytes: int = _cpu_window_bytes - in_flight_bytes
-							if avail_items > 0 and avail_bytes > 0:
-								cache.pump_cpu_prewarm(avail_items, avail_bytes)
+							if avail_items > 0 and avail_bytes > 0 and _cpu_pump_task_id == -1:
+								_cpu_pump_task_id = WorkerThreadPool.add_task(_background_cpu_pump.bind(avail_items, avail_bytes), false, "DS_CpuPrewarmPump")
 					else:
-						cache.pump_cpu_prewarm(queued_cpu, 0)
+						if _cpu_pump_task_id == -1:
+							_cpu_pump_task_id = WorkerThreadPool.add_task(_background_cpu_pump.bind(queued_cpu, 0), false, "DS_CpuPrewarmPump")
 			# Main-thread texture drain: Texture2DRD wrappers must be
 			# instantiated on the main or render thread (GODOT_QUIRKS Sec02 & Sec25).
 			# Fast (<2us per texture): drain completed GPU textures within budget.
@@ -1068,6 +1097,31 @@ func _background_poll_slice(p_items: int, p_usec: int) -> void:
 	cache.poll_completed(0, p_items, p_usec)
 
 
+## Background stream flush for memory-only batches. Deliberately touches no
+## RenderingServer / RenderingDevice API: GPU destinations stay on the main
+## thread, so joining this task during teardown cannot deadlock.
+func _background_stream_flush() -> void:
+	if not ClassDB.class_exists("DSContext"):
+		return
+	var ctx = Engine.get_singleton("DSContext")
+	if ctx == null or not ctx.is_initialized():
+		return
+	if not ctx.has_method("flush_stream_async"):
+		return
+	ctx.flush_stream_async()
+
+
+## Background CPU prewarm pump. Only stages requests; all texture building
+## and GPU/render-thread work stays on the main-thread ingestion path.
+func _background_cpu_pump(p_items: int, p_bytes: int) -> void:
+	if not ClassDB.class_exists("DSTextureCache"):
+		return
+	var cache = Engine.get_singleton("DSTextureCache")
+	if cache == null or not cache.has_method("pump_cpu_prewarm"):
+		return
+	cache.pump_cpu_prewarm(p_items, p_bytes)
+
+
 ## Collects finished batches without submitting anything new. Used when the
 ## stream API is unavailable so processes that poll for completion on their
 ## own still finish.
@@ -1094,6 +1148,14 @@ func _notification(what: int) -> void:
 		if _poll_task_id != -1:
 			WorkerThreadPool.wait_for_task_completion(_poll_task_id)
 			_poll_task_id = -1
+		# Both offload tasks are memory-only: no render-thread wait inside
+		# them, so joining here cannot deadlock single-threaded rendering.
+		if _cpu_pump_task_id != -1:
+			WorkerThreadPool.wait_for_task_completion(_cpu_pump_task_id)
+			_cpu_pump_task_id = -1
+		if _stream_flush_task_id != -1:
+			WorkerThreadPool.wait_for_task_completion(_stream_flush_task_id)
+			_stream_flush_task_id = -1
 		if ClassDB.class_exists("DSContext"):
 			var ctx = Engine.get_singleton("DSContext")
 			if ctx and ctx.is_initialized():
