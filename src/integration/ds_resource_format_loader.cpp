@@ -5,6 +5,7 @@
 #include "ds_texture_pipeline_common.h"
 #include "../compression/gdeflate_decompressor.h"
 #include "../core/ds_context.h"
+#include "../core/ds_log.h"
 #include "../core/ds_request.h"
 #include "core/ds_settings.h"
 #include "../formats/dspkg_format.h"
@@ -162,7 +163,7 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 		if (project_settings && p_logical_path.begins_with("res://")) {
 			String globalized_probe = project_settings->globalize_path(p_logical_path);
 			if (!FileAccess::file_exists(globalized_probe)) {
-				UtilityFunctions::push_error("[DirectStorage] CONFIGURATION ERROR: Archive '", p_logical_path,
+				UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "CONFIGURATION ERROR: Archive '", p_logical_path,
 						"' is embedded inside the Godot PCK pack! DirectStorage hardware DMA requires a standalone file on the physical disk. "
 						"DirectStorage DMA is disabled; degrading to CPU decompression.");
 			}
@@ -209,7 +210,7 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 			candidates_str += String(", 'res://textures.dspkg', '") + exe_dir.path_join("textures.dspkg") +
 					String("', '") + project_settings->globalize_path("res://textures.dspkg") + String("'");
 		}
-		UtilityFunctions::print("[DirectStorage] Archive '", archive_filename, "' not found. Searched candidates: ", candidates_str, ".");
+		UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "Archive '", archive_filename, "' not found. Searched candidates: ", candidates_str, ".");
 	}
 
 	return found;
@@ -354,7 +355,7 @@ bool DSResourceFormatLoader::_maybe_initialize_context(DSContext *p_ctx) const {
 		return true;
 	}
 	if (!s_loader_init_posted.exchange(true)) {
-		UtilityFunctions::print_verbose("[DirectStorage] Loader deferred context initialization to the main thread; this load uses the CPU path.");
+		UtilityFunctions::print_verbose(String(dsgd_log::EXTENSION_PREFIX) + "Loader deferred context initialization to the main thread; this load uses the CPU path.");
 		callable_mp_static(ds_loader_initialize_context_on_main_thread).call_deferred();
 	}
 	return true;

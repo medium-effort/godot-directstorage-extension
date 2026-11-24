@@ -16,14 +16,14 @@ const VERIFY_UID: String = "uid://bjyun30ppok5g"
 static func _load_policy() -> GDScript:
 	var script: GDScript = ResourceLoader.load(POLICY_UID, "GDScript") as GDScript
 	if script == null:
-		push_error("[DirectStorage] Export policy script not found (%s)." % POLICY_UID)
+		push_error("[dsgd Extension] Export policy script not found (%s)." % POLICY_UID)
 	return script
 
 
 static func _load_verifier() -> GDScript:
 	var script: GDScript = ResourceLoader.load(VERIFY_UID, "GDScript") as GDScript
 	if script == null:
-		push_error("[DirectStorage] Pack verifier script not found (%s)." % VERIFY_UID)
+		push_error("[dsgd Extension] Pack verifier script not found (%s)." % VERIFY_UID)
 	return script
 
 
@@ -39,6 +39,8 @@ var _policy: GDScript = _load_policy()
 ## on the export root automatically by Godot's built-in GDExtension exporter
 ## via the .gdextension [libraries] / [dependencies] mappings — no manual
 ## DLL relocation is performed by this plugin.
+
+const LOG_PREFIX: String = "[dsgd Exporter] "
 
 const OPTION_BUNDLE_DSPKG: StringName = &"dsgd_extension/bundle_textures_dspkg"
 const OPTION_VERIFY_PACK: StringName = &"dsgd_extension/verify_pack_on_export"
@@ -267,7 +269,7 @@ func _get_export_option_warning(platform: EditorExportPlatform, option: String) 
 
 ## Starts the archive for the current export and decides the protection outcome.
 func _export_begin(features: PackedStringArray, is_debug: bool, path: String, flags: int) -> void:
-	print("[DirectStorage Exporter] Export started for target: ", path)
+	print(LOG_PREFIX + "Export started for target: ", path)
 	# Snapshot the platform message count now: the engine's own failure
 	# messages (template copy, PCK write) are added to this list before
 	# _export_end runs, and only those must count as this run's errors.
@@ -277,7 +279,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	if resolved_export_path.is_empty():
 		_target_export_dir = ""
 		_target_export_path = ""
-		push_error("[DirectStorage Exporter] Export path is empty; archive bundling will be skipped.")
+		push_error(LOG_PREFIX + "Export path is empty; archive bundling will be skipped.")
 	else:
 		if resolved_export_path.begins_with("res://") or resolved_export_path.begins_with("user://"):
 			resolved_export_path = ProjectSettings.globalize_path(resolved_export_path)
@@ -285,17 +287,17 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 			resolved_export_path = ProjectSettings.globalize_path("res://" + resolved_export_path.trim_prefix("./"))
 		_target_export_dir = resolved_export_path.get_base_dir().simplify_path()
 		if not _target_export_dir.is_absolute_path():
-			push_error("[DirectStorage Exporter] Could not resolve an absolute export directory from: " + path)
+			push_error(LOG_PREFIX + "Could not resolve an absolute export directory from: " + path)
 			_target_export_dir = ""
 			_target_export_path = ""
 		else:
 			var target_dir_err := DirAccess.make_dir_recursive_absolute(_target_export_dir)
 			if target_dir_err != OK and not DirAccess.dir_exists_absolute(_target_export_dir):
-				push_error("[DirectStorage Exporter] Failed to prepare export directory '" + _target_export_dir + "': " + error_string(target_dir_err) + ". Verify the export path is writable.")
+				push_error(LOG_PREFIX + "Failed to prepare export directory '" + _target_export_dir + "': " + error_string(target_dir_err) + ". Verify the export path is writable.")
 				_target_export_path = ""
 			else:
 				_target_export_path = resolved_export_path
-				print("[DirectStorage Exporter] Resolved export directory: ", _target_export_dir)
+				print(LOG_PREFIX + "Resolved export directory: ", _target_export_dir)
 
 	_export_features = features
 	_is_debug_export = is_debug
@@ -342,10 +344,10 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_publish_contract()
 
 	if _outcome == _policy.OUTCOME_DISABLED:
-		print("[DirectStorage Exporter] Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK and loaded via CPU decompression at runtime.")
+		print(LOG_PREFIX + "Standalone DSPkg bundling is disabled. Textures (.dstex) will be packaged directly into the PCK and loaded via CPU decompression at runtime.")
 		return
 
-	print("[DirectStorage Exporter] Standalone DSPkg bundling is ENABLED. Target archive: ", _archive_name, " (archive id: ", String.num_uint64(_archive_id, 16), ", mode: ", _outcome, ")")
+	print(LOG_PREFIX + "Standalone DSPkg bundling is ENABLED. Target archive: ", _archive_name, " (archive id: ", String.num_uint64(_archive_id, 16), ", mode: ", _outcome, ")")
 
 	if not _target_export_dir.is_empty():
 		_target_dspkg_path = _target_export_dir.path_join(_archive_name)
@@ -355,19 +357,19 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		# Fail closed: no key file, no archive, and every texture payload stays
 		# out of the PCK so a protected build cannot ship plaintext textures.
 		_archive_failed = true
-		push_error("[DirectStorage Exporter] Protection was requested but cannot be delivered: " + _protection_failure_reason + ". No archive will be written and texture payloads are removed from the PCK.")
+		push_error(LOG_PREFIX + "Protection was requested but cannot be delivered: " + _protection_failure_reason + ". No archive will be written and texture payloads are removed from the PCK.")
 		if not _target_dspkg_path.is_empty():
 			_cleanup_staging()
 			_remove_file_silent(_target_dspkg_path)
 		return
 
 	if _target_export_dir.is_empty():
-		push_error("[DirectStorage Exporter] FATAL: no export directory resolved; " + _archive_name + " cannot be written. The export is incomplete.")
+		push_error(LOG_PREFIX + "FATAL: no export directory resolved; " + _archive_name + " cannot be written. The export is incomplete.")
 		_archive_failed = true
 		return
 
 	if not ClassDB.class_exists("DSPkg"):
-		push_error("[DirectStorage Exporter] The DSPkg class is not available; " + _archive_name + " cannot be written.")
+		push_error(LOG_PREFIX + "The DSPkg class is not available; " + _archive_name + " cannot be written.")
 		_archive_failed = true
 		return
 
@@ -380,13 +382,13 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	_cleanup_legacy_user_temp()
 	_dspkg = ClassDB.instantiate("DSPkg")
 	if _dspkg == null:
-		push_error("[DirectStorage Exporter] Failed to instantiate DSPkg; " + _archive_name + " cannot be written.")
+		push_error(LOG_PREFIX + "Failed to instantiate DSPkg; " + _archive_name + " cannot be written.")
 		_archive_failed = true
 		return
 
 	var err: Error = _dspkg.create(_staging_dspkg_path, _archive_id)
 	if err != OK:
-		push_error("[DirectStorage Exporter] Failed to create DSPkg staging archive at: " + _staging_dspkg_path + ": " + error_string(err))
+		push_error(LOG_PREFIX + "Failed to create DSPkg staging archive at: " + _staging_dspkg_path + ": " + error_string(err))
 		_dspkg = null
 		_archive_failed = true
 		_cleanup_staging()
@@ -396,9 +398,9 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 	if _dspkg.has_method("set_repack_uncompressed"):
 		_dspkg.set_repack_uncompressed(_store_uncompressed_textures)
 		if _store_uncompressed_textures:
-			print("[DirectStorage Exporter] Export-time uncompressed texture repack is ENABLED.")
+			print(LOG_PREFIX + "Export-time uncompressed texture repack is ENABLED.")
 	elif _store_uncompressed_textures:
-		push_warning("[DirectStorage Exporter] Active DSPkg binary does not support 'set_repack_uncompressed'; archive will keep source compression.")
+		push_warning(LOG_PREFIX + "Active DSPkg binary does not support 'set_repack_uncompressed'; archive will keep source compression.")
 	if _dspkg.has_method("set_payload_dedup_enabled"):
 		_dspkg.set_payload_dedup_enabled(true)
 
@@ -409,7 +411,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, fl
 		# The key file is a PCK entry only; res://.dspkg/ is never created on disk.
 		add_file(KEY_FILE_PATH, _build_key_file(_archive_key), false)
 
-	print("[DirectStorage Exporter] Initialized DSPkg staging archive at: ", _staging_dspkg_path)
+	print(LOG_PREFIX + "Initialized DSPkg staging archive at: ", _staging_dspkg_path)
 
 ## Decides the protection outcome once, from the active preset.
 ##
@@ -493,13 +495,13 @@ func _build_key_file(key: PackedByteArray) -> PackedByteArray:
 ## Installs the generated key on the writer so the archive is built encrypted.
 func _apply_archive_key() -> bool:
 	if not _dspkg.has_method("set_encryption_key_bytes"):
-		push_error("[DirectStorage Exporter] The loaded DSPkg binary does not support byte-based TOC encryption keys. Rebuild the extension.")
+		push_error(LOG_PREFIX + "The loaded DSPkg binary does not support byte-based TOC encryption keys. Rebuild the extension.")
 		_dspkg = null
 		_archive_failed = true
 		return false
 	var err: Error = _dspkg.set_encryption_key_bytes(_archive_key)
 	if err != OK:
-		push_error("[DirectStorage Exporter] Failed to configure the archive encryption key: " + error_string(err))
+		push_error(LOG_PREFIX + "Failed to configure the archive encryption key: " + error_string(err))
 		_dspkg = null
 		_archive_failed = true
 		return false
@@ -510,14 +512,14 @@ func _apply_steampipe_alignment() -> void:
 	if not _steampipe_1mb_alignment_enabled:
 		return
 	if not _dspkg.has_method("set_payload_alignment"):
-		push_warning("[DirectStorage Exporter] Active DSPkg binary does not support 'set_payload_alignment'; archive will use default 512-byte alignment.")
+		push_warning(LOG_PREFIX + "Active DSPkg binary does not support 'set_payload_alignment'; archive will use default 512-byte alignment.")
 		return
 	_dspkg.set_payload_alignment(1048576)
 	if _dspkg.has_method("set_bin_packing_enabled"):
 		_dspkg.set_bin_packing_enabled(true)
-		print("[DirectStorage Exporter] SteamPipe 1MB payload bin-packing is ENABLED.")
+		print(LOG_PREFIX + "SteamPipe 1MB payload bin-packing is ENABLED.")
 	else:
-		push_warning("[DirectStorage Exporter] Active DSPkg binary does not support 'set_bin_packing_enabled'; archive will fall back to strict 1MB alignment.")
+		push_warning(LOG_PREFIX + "Active DSPkg binary does not support 'set_bin_packing_enabled'; archive will fall back to strict 1MB alignment.")
 
 ## Reads v2/v3 per-mip footprint data so DSPkg can preserve GPU upload layouts.
 ## v3 GDeflate-inline files share the v2 footprint layout. Chunked v3 files are
@@ -537,14 +539,14 @@ func _read_v2_footprint_metadata(dstex_path: String) -> Dictionary:
 		# NONE (0) is a payload the v5 archive can stage, so only Zstd/GACL
 		# (and any future codec) lacks an archive representation here.
 		if int(metadata.get("compression_format", 1)) not in [0, 1] or int(metadata.get("gacl_transform", 0)) != 0:
-			push_warning("[DirectStorage Exporter] v3 payload in '" + dstex_path + "' needs Zstd/GACL support archives do not have; bundling without GPU mip metadata.")
+			push_warning(LOG_PREFIX + "v3 payload in '" + dstex_path + "' needs Zstd/GACL support archives do not have; bundling without GPU mip metadata.")
 			return {}
 	var mip_count := int(metadata.get("mip_count", 0))
 	var mip_sizes: PackedInt32Array = metadata.get("mip_sizes", PackedInt32Array())
 	var mip_uncompressed_sizes: PackedInt32Array = metadata.get("mip_uncompressed_sizes", PackedInt32Array())
 	var mip_row_pitches: PackedInt32Array = metadata.get("mip_row_pitches", PackedInt32Array())
 	if mip_count <= 0 or mip_sizes.size() != mip_count or mip_uncompressed_sizes.size() != mip_count or mip_row_pitches.size() != mip_count:
-		push_warning("[DirectStorage Exporter] Invalid v2 footprint metadata in: " + dstex_path)
+		push_warning(LOG_PREFIX + "Invalid v2 footprint metadata in: " + dstex_path)
 		return {}
 	return metadata
 
@@ -568,7 +570,7 @@ func _publish_contract() -> void:
 ## deployed path is cleaned up in `_export_end`.
 func _abort_archive(reason: String) -> void:
 	_archive_failed = true
-	push_error("[DirectStorage Exporter] " + reason)
+	push_error(LOG_PREFIX + reason)
 	if _archive_entries.is_empty():
 		_dspkg = null
 		_cleanup_staging()
@@ -590,13 +592,13 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 	# of the bundling option.
 	if path.ends_with(".dspkg"):
 		skip()
-		print("[DirectStorage Exporter] Excluded standalone archive from PCK: ", path)
+		print(LOG_PREFIX + "Excluded standalone archive from PCK: ", path)
 		return
 
 	# Never skip .import files: the remap table must reach the PCK so
 	# load("res://texture.png") can resolve to the archive entry.
 	if path.ends_with(".import"):
-		print("[DirectStorage Exporter] Preserving remap metadata in PCK: ", path)
+		print(LOG_PREFIX + "Preserving remap metadata in PCK: ", path)
 		return
 
 	var dstex_path := _resolve_dstex_path(path)
@@ -616,9 +618,9 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 					# payload with nothing pointing at it. Keep the mapping.
 					add_file(dstex_path, repacked, dstex_path != path)
 					skip()
-					print("[DirectStorage Exporter] Repacked uncompressed .dstex into PCK: ", dstex_path)
+					print(LOG_PREFIX + "Repacked uncompressed .dstex into PCK: ", dstex_path)
 					return
-				push_warning("[DirectStorage Exporter] Failed to repack '" + dstex_path + "' uncompressed; keeping original .dstex in PCK.")
+				push_warning(LOG_PREFIX + "Failed to repack '" + dstex_path + "' uncompressed; keeping original .dstex in PCK.")
 		# Intended CPU fallback: let Godot export .dstex directly into the PCK.
 		return
 	if action == _policy.ACTION_SKIP:
@@ -646,11 +648,11 @@ func _export_file(path: String, type: String, features: PackedStringArray) -> vo
 			# complete for the loader; only the remapped alias is missing.
 			_abort_archive("Failed to add remapped texture entry '" + dstex_path + "': " + error_string(remapped_add_err) + ". DSPkg bundling was aborted.")
 
-	print("[DirectStorage Exporter] Added texture to archive: ", path, " (from ", dstex_path, ")")
+	print(LOG_PREFIX + "Added texture to archive: ", path, " (from ", dstex_path, ")")
 	# Skip the payload as soon as the primary entry exists, so a later alias
 	# failure can never leave the same payload in both containers.
 	_skip_payload(path)
-	print("[DirectStorage Exporter] Skipped texture payload from PCK: ", path)
+	print(LOG_PREFIX + "Skipped texture payload from PCK: ", path)
 
 ## Resolves the .dstex file a resource path stands for, or an empty string when
 ## the path is not a DirectStorage texture payload.
@@ -687,14 +689,14 @@ func _export_end() -> void:
 			# Nothing can be salvaged: a protected build must fail loudly, and
 			# an unprotected build with no entries still has every texture in
 			# the PCK. Never leave a loadable archive behind either way.
-			push_error("[DirectStorage Exporter] FATAL: export finished without a usable " + _archive_name + " archive because bundling was aborted. No archive is deployed. See earlier errors for the cause (a likely candidate is out of disk space).")
+			push_error(LOG_PREFIX + "FATAL: export finished without a usable " + _archive_name + " archive because bundling was aborted. No archive is deployed. See earlier errors for the cause (a likely candidate is out of disk space).")
 			_dspkg = null
 			_cleanup_staging()
 			_remove_file_silent(_target_dspkg_path)
 		else:
 			# Textures were already skipped from the PCK, so those bytes exist
 			# only in the partial archive. Deploy it rather than deleting data.
-			push_warning("[DirectStorage Exporter] WARNING: bundling was aborted after " + str(_archive_entries.size()) + " texture(s) were added. Deploying a PARTIAL archive; the remaining textures stay in the PCK. Re-export to produce a complete archive.")
+			push_warning(LOG_PREFIX + "WARNING: bundling was aborted after " + str(_archive_entries.size()) + " texture(s) were added. Deploying a PARTIAL archive; the remaining textures stay in the PCK. Re-export to produce a complete archive.")
 
 	if _core_export_reports_error() and _dspkg != null and not _archive_entries.is_empty():
 		# The engine already recorded an export error, almost certainly in the
@@ -703,7 +705,7 @@ func _export_end() -> void:
 		# closed instead. The plugin cannot abort the engine's own steps; the
 		# error added at the end is what marks the export failed.
 		dspkg_ok = false
-		push_error("[DirectStorage Exporter] FATAL: the export failed before " + _archive_name + " could be deployed (see the engine export errors above); the archive was not written.")
+		push_error(LOG_PREFIX + "FATAL: the export failed before " + _archive_name + " could be deployed (see the engine export errors above); the archive was not written.")
 		_dspkg = null
 		_cleanup_staging()
 		_remove_file_silent(_target_dspkg_path)
@@ -716,15 +718,15 @@ func _export_end() -> void:
 			_remove_file_silent(_target_dspkg_path)
 		elif _staging_dspkg_path.is_empty() or _target_dspkg_path.is_empty():
 			dspkg_ok = false
-			push_error("[DirectStorage Exporter] FATAL: export directory was lost before finalize; " + _archive_name + " was not deployed.")
+			push_error(LOG_PREFIX + "FATAL: export directory was lost before finalize; " + _archive_name + " was not deployed.")
 		elif not FileAccess.file_exists(_staging_dspkg_path):
 			dspkg_ok = false
-			push_error("[DirectStorage Exporter] FATAL: finalized staging archive is missing at '" + _staging_dspkg_path + "'; " + _archive_name + " was not deployed.")
+			push_error(LOG_PREFIX + "FATAL: finalized staging archive is missing at '" + _staging_dspkg_path + "'; " + _archive_name + " was not deployed.")
 		else:
 			_remove_file_silent(_target_dspkg_path)
 			var rename_err := DirAccess.rename_absolute(_staging_dspkg_path, _target_dspkg_path)
 			if rename_err == OK:
-				print("[DirectStorage Exporter] Successfully deployed standalone textures archive to: ", _target_dspkg_path)
+				print(LOG_PREFIX + "Successfully deployed standalone textures archive to: ", _target_dspkg_path)
 				if _outcome == _policy.OUTCOME_PROTECTED:
 					dspkg_ok = _verify_written_archive()
 			else:
@@ -733,7 +735,7 @@ func _export_end() -> void:
 				_cleanup_staging()
 				_remove_file_silent(_target_dspkg_path)
 	elif not _archive_failed and _dspkg != null and _outcome != _policy.OUTCOME_DISABLED and _outcome != _policy.OUTCOME_FAILED:
-		print("[DirectStorage Exporter] Export finished. No DirectStorage (.dstex) textures were found to bundle.")
+		print(LOG_PREFIX + "Export finished. No DirectStorage (.dstex) textures were found to bundle.")
 
 	var pack_ok := true
 	if _outcome == _policy.OUTCOME_PROTECTED:
@@ -764,7 +766,7 @@ func _has_runtime_dlls() -> bool:
 func _notice_runtime_license(runtime_license_written: bool = false) -> void:
 	if not _is_windows_export or runtime_license_written or not _has_runtime_dlls():
 		return
-	print("[DirectStorage Exporter] NOTICE: dstorage.dll and dstoragecore.dll are Microsoft DirectStorage redistributables governed by Microsoft's license. Microsoft's own NuGet build targets copy only the DLLs; the license texts travel in the runtime package. You remain responsible for your distribution terms.")
+	print(LOG_PREFIX + "NOTICE: dstorage.dll and dstoragecore.dll are Microsoft DirectStorage redistributables governed by Microsoft's license. Microsoft's own NuGet build targets copy only the DLLs; the license texts travel in the runtime package. You remain responsible for your distribution terms.")
 
 
 ## Reconciles the notice files in the export directory with this preset.
@@ -776,7 +778,7 @@ func _notice_runtime_license(runtime_license_written: bool = false) -> void:
 func _sync_notice_files() -> void:
 	if _target_export_dir.is_empty():
 		if _include_dsgd_license_file or _include_directstorage_license_file:
-			push_warning("[DirectStorage Exporter] License files are enabled but the export directory is unknown; no license file was deployed.")
+			push_warning(LOG_PREFIX + "License files are enabled but the export directory is unknown; no license file was deployed.")
 		_notice_runtime_license(false)
 		return
 
@@ -804,12 +806,12 @@ func _sync_notice_files() -> void:
 			merged_runtime = merge_runtime
 			runtime_license_written = merged_runtime
 	elif _include_dsgd_license_file:
-		push_warning("[DirectStorage Exporter] The DSGD license file is enabled but neither '" + ADDON_LICENSE_SOURCE + "' nor '" + THIRD_PARTY_NOTICES_SOURCE + "' could be read. No file was written.")
+		push_warning(LOG_PREFIX + "The DSGD license file is enabled but neither '" + ADDON_LICENSE_SOURCE + "' nor '" + THIRD_PARTY_NOTICES_SOURCE + "' could be read. No file was written.")
 
 	if _include_directstorage_license_file and not merged_runtime:
 		if runtime_texts.is_empty():
 			var action := "Reinstall the runtime" if _has_runtime_dlls() else "Install a runtime"
-			push_warning("[DirectStorage Exporter] The DirectStorage license file is enabled but the runtime texts could not be resolved. " + action + " through Tools > DSGD Tools... > Manage DirectStorage Runtime, or disable dsgd_extension/include_directstorage_license_file.")
+			push_warning(LOG_PREFIX + "The DirectStorage license file is enabled but the runtime texts could not be resolved. " + action + " through Tools > DSGD Tools... > Manage DirectStorage Runtime, or disable dsgd_extension/include_directstorage_license_file.")
 		else:
 			var runtime_sections := _collect_directstorage_sections(runtime_texts)
 			var header := _notice_header("DirectStorage - license and notices", runtime_sections)
@@ -818,11 +820,11 @@ func _sync_notice_files() -> void:
 				runtime_license_written = true
 
 	if written.is_empty():
-		print("[DirectStorage Exporter] Notices: none (managed license files removed).")
+		print(LOG_PREFIX + "Notices: none (managed license files removed).")
 	elif merged_runtime:
-		print("[DirectStorage Exporter] Notices: ", DSGD_LICENSE_EXPORT_NAME, " (DirectStorage runtime texts merged).")
+		print(LOG_PREFIX + "Notices: ", DSGD_LICENSE_EXPORT_NAME, " (DirectStorage runtime texts merged).")
 	else:
-		print("[DirectStorage Exporter] Notices: ", ", ".join(written), ".")
+		print(LOG_PREFIX + "Notices: ", ", ".join(written), ".")
 
 	_notice_runtime_license(runtime_license_written)
 
@@ -833,12 +835,12 @@ func _collect_dsgd_license_sections() -> Array[Dictionary]:
 	var sections: Array[Dictionary] = []
 	var license_data := _read_notice_source(ADDON_LICENSE_SOURCE)
 	if license_data.is_empty():
-		push_warning("[DirectStorage Exporter] DSGD license text is missing at '" + ADDON_LICENSE_SOURCE + "'. Run a build to copy LICENSE from the repository root.")
+		push_warning(LOG_PREFIX + "DSGD license text is missing at '" + ADDON_LICENSE_SOURCE + "'. Run a build to copy LICENSE from the repository root.")
 	else:
 		sections.append({"title": "DSGD license", "data": license_data})
 	var notices_data := _read_notice_source(THIRD_PARTY_NOTICES_SOURCE)
 	if notices_data.is_empty():
-		push_warning("[DirectStorage Exporter] Third-party notices are missing at '" + THIRD_PARTY_NOTICES_SOURCE + "'. Run a build to copy it from the repository root.")
+		push_warning(LOG_PREFIX + "Third-party notices are missing at '" + THIRD_PARTY_NOTICES_SOURCE + "'. Run a build to copy it from the repository root.")
 	else:
 		sections.append({"title": "Third-party components of dsgd_64.dll", "data": notices_data})
 	return sections
@@ -850,12 +852,12 @@ func _collect_directstorage_sections(runtime: Dictionary) -> Array[Dictionary]:
 	var version := String(runtime.get("version", "unknown"))
 	var license_data := _read_notice_source(String(runtime.get("license_path", "")))
 	if license_data.is_empty():
-		push_warning("[DirectStorage Exporter] Could not read the DirectStorage runtime license text for version " + version + ".")
+		push_warning(LOG_PREFIX + "Could not read the DirectStorage runtime license text for version " + version + ".")
 	else:
 		sections.append({"title": "Microsoft DirectStorage runtime license (version %s)" % version, "data": license_data})
 	var notices_data := _read_notice_source(String(runtime.get("notices_path", "")))
 	if notices_data.is_empty():
-		push_warning("[DirectStorage Exporter] Could not read the DirectStorage runtime notices for version " + version + ".")
+		push_warning(LOG_PREFIX + "Could not read the DirectStorage runtime notices for version " + version + ".")
 	else:
 		sections.append({"title": "Microsoft DirectStorage runtime third-party notices (version %s)" % version, "data": notices_data})
 	return sections
@@ -896,7 +898,7 @@ func _resolve_directstorage_texts(warn_on_failure: bool = true) -> Dictionary:
 			if String(entry["version"]) == active_version:
 				return entry
 		if warn_on_failure:
-			push_warning("[DirectStorage Exporter] The active DirectStorage runtime '" + active_version + "' has no license texts at '" + RUNTIME_VERSIONS_DIR + "'. No runtime license file was written.")
+			push_warning(LOG_PREFIX + "The active DirectStorage runtime '" + active_version + "' has no license texts at '" + RUNTIME_VERSIONS_DIR + "'. No runtime license file was written.")
 		return {}
 	if found.size() == 1:
 		return found[0]
@@ -904,7 +906,7 @@ func _resolve_directstorage_texts(warn_on_failure: bool = true) -> Dictionary:
 		var names := PackedStringArray()
 		for entry in found:
 			names.append(String(entry["version"]))
-		push_warning("[DirectStorage Exporter] Multiple DirectStorage runtime versions carry license texts (" + ", ".join(names) + ") and none is marked active. Set an active runtime through Manage DirectStorage Runtime; no runtime license file was written.")
+		push_warning(LOG_PREFIX + "Multiple DirectStorage runtime versions carry license texts (" + ", ".join(names) + ") and none is marked active. Set an active runtime through Manage DirectStorage Runtime; no runtime license file was written.")
 	return {}
 
 
@@ -963,13 +965,13 @@ func _read_notice_source(path: String) -> PackedByteArray:
 func _write_notice_file(target: String, data: PackedByteArray) -> bool:
 	var file := FileAccess.open(target, FileAccess.WRITE)
 	if file == null:
-		push_warning("[DirectStorage Exporter] Could not open '" + target + "' for writing: " + error_string(FileAccess.get_open_error()) + ".")
+		push_warning(LOG_PREFIX + "Could not open '" + target + "' for writing: " + error_string(FileAccess.get_open_error()) + ".")
 		return false
 	file.store_buffer(data)
 	var write_error := file.get_error()
 	file.close()
 	if write_error != OK:
-		push_warning("[DirectStorage Exporter] Failed to write '" + target + "': " + error_string(write_error) + ".")
+		push_warning(LOG_PREFIX + "Failed to write '" + target + "': " + error_string(write_error) + ".")
 		return false
 	return true
 
@@ -989,7 +991,7 @@ func _remove_managed_notice_files() -> void:
 			continue
 		var remove_error := DirAccess.remove_absolute(target)
 		if remove_error != OK and FileAccess.file_exists(target):
-			push_warning("[DirectStorage Exporter] Could not remove stale license file '" + target + "': " + error_string(remove_error) + ".")
+			push_warning(LOG_PREFIX + "Could not remove stale license file '" + target + "': " + error_string(remove_error) + ".")
 
 
 func _option_bool(option: StringName, default_value: bool) -> bool:
@@ -1021,17 +1023,17 @@ func _verify_written_archive() -> bool:
 	if bridge == null:
 		return false
 	if not ClassDB.class_has_method("DSPkg", "begin_global_key_scope", true) or not ClassDB.class_has_method("DSPkg", "end_global_key_scope", true):
-		push_error("[DirectStorage Exporter] The loaded DSPkg binary does not support scoped archive keys. Rebuild the extension.")
+		push_error(LOG_PREFIX + "The loaded DSPkg binary does not support scoped archive keys. Rebuild the extension.")
 		return false
 
 	var token: int = int(bridge.call("begin_key_scope", _archive_key))
 	if token == 0:
-		push_error("[DirectStorage Exporter] Failed to scope the generated archive key; the written archive cannot be verified.")
+		push_error(LOG_PREFIX + "Failed to scope the generated archive key; the written archive cannot be verified.")
 		return false
 
 	var result: bool = _verify_written_archive_inner(bridge)
 	if not bool(bridge.call("end_key_scope", token)):
-		push_error("[DirectStorage Exporter] Failed to restore the previous archive key state.")
+		push_error(LOG_PREFIX + "Failed to restore the previous archive key state.")
 		return false
 	_clear_archive_key()
 	return result
@@ -1042,19 +1044,19 @@ func _verify_written_archive() -> bool:
 func _verify_written_archive_inner(bridge: GDScript) -> bool:
 	var key_id: String = String(bridge.call("get_global_key_id"))
 	if key_id.is_empty():
-		push_error("[DirectStorage Exporter] The generated archive key is not active; the written archive cannot be verified.")
+		push_error(LOG_PREFIX + "The generated archive key is not active; the written archive cannot be verified.")
 		return false
 
 	var reader: RefCounted = ClassDB.instantiate("DSPkg")
 	if reader == null:
-		push_error("[DirectStorage Exporter] Failed to create a DSPkg reader for the writer round-trip.")
+		push_error(LOG_PREFIX + "Failed to create a DSPkg reader for the writer round-trip.")
 		return false
 	var err: Error = reader.open(_target_dspkg_path, _archive_id)
 	if err != OK:
-		push_error("[DirectStorage Exporter] The written archive does not open with the generated key and archive id: " + error_string(err))
+		push_error(LOG_PREFIX + "The written archive does not open with the generated key and archive id: " + error_string(err))
 		return false
 
-	print("[DirectStorage Exporter] Writer round-trip verified (key id: ", key_id, ", entries: ", reader.get_entry_count(), ").")
+	print(LOG_PREFIX + "Writer round-trip verified (key id: ", key_id, ", entries: ", reader.get_entry_count(), ").")
 	return true
 
 ## Loads the static key bridge once per export, only when the native class is
@@ -1066,12 +1068,12 @@ func _get_dspkg_static() -> GDScript:
 		return null
 	if not ClassDB.class_exists("DSPkg"):
 		_dspkg_static_unavailable = true
-		push_warning("[DirectStorage Exporter] The DSPkg class is not available; the generated key cannot be installed.")
+		push_warning(LOG_PREFIX + "The DSPkg class is not available; the generated key cannot be installed.")
 		return null
 	var script := load(DSPKG_STATIC_PATH) as GDScript
 	if script == null:
 		_dspkg_static_unavailable = true
-		push_error("[DirectStorage Exporter] Failed to load the static DSPkg bridge at: " + DSPKG_STATIC_PATH)
+		push_error(LOG_PREFIX + "Failed to load the static DSPkg bridge at: " + DSPKG_STATIC_PATH)
 		return null
 	_dspkg_static = script
 	return script
@@ -1090,7 +1092,7 @@ func _cleanup_legacy_user_temp() -> void:
 	var global_path := ProjectSettings.globalize_path(LEGACY_TEMP_DSPKG_PATH)
 	var remove_err := DirAccess.remove_absolute(global_path)
 	if remove_err != OK and FileAccess.file_exists(LEGACY_TEMP_DSPKG_PATH):
-		push_warning("[DirectStorage Exporter] Could not remove legacy temporary archive '" + LEGACY_TEMP_DSPKG_PATH + "': " + error_string(remove_err) + ". Remove it before the next export.")
+		push_warning(LOG_PREFIX + "Could not remove legacy temporary archive '" + LEGACY_TEMP_DSPKG_PATH + "': " + error_string(remove_err) + ". Remove it before the next export.")
 
 func _remove_file_silent(abs_path: String) -> void:
 	if abs_path.is_empty() or not FileAccess.file_exists(abs_path):
@@ -1141,11 +1143,11 @@ func _warn_if_low_disk_space(abs_dir: String) -> void:
 	if free_bytes < 0:
 		return
 	var rewrite_bytes := _estimate_rewrite_bytes()
-	print("[DirectStorage Exporter] Free space on export drive: ", _format_bytes(free_bytes), " (", abs_dir, ")")
+	print(LOG_PREFIX + "Free space on export drive: ", _format_bytes(free_bytes), " (", abs_dir, ")")
 	if rewrite_bytes > 0:
-		print("[DirectStorage Exporter] Previous exe/PCK/archive in the target directory total ", _format_bytes(rewrite_bytes), "; this export rewrites them.")
+		print(LOG_PREFIX + "Previous exe/PCK/archive in the target directory total ", _format_bytes(rewrite_bytes), "; this export rewrites them.")
 	if free_bytes < WARN_THRESHOLD_BYTES or free_bytes < rewrite_bytes + HEADROOM_BYTES:
-		push_warning("[DirectStorage Exporter] Low disk space: only " + _format_bytes(free_bytes) + " free at '" + abs_dir + "'. This export rewrites about " + _format_bytes(rewrite_bytes) + " of exe/PCK/archive plus " + _format_bytes(HEADROOM_BYTES) + " of headroom. Free up space before the export fails with file-write errors.")
+		push_warning(LOG_PREFIX + "Low disk space: only " + _format_bytes(free_bytes) + " free at '" + abs_dir + "'. This export rewrites about " + _format_bytes(rewrite_bytes) + " of exe/PCK/archive plus " + _format_bytes(HEADROOM_BYTES) + " of headroom. Free up space before the export fails with file-write errors.")
 
 ## Best-effort size of the artifact set this export overwrites in the target
 ## directory. Zero means "first export" (nothing to measure), in which case only
@@ -1221,7 +1223,7 @@ func _resolve_pack_path() -> String:
 
 
 func _report_pack_unverified(text: String) -> void:
-	push_warning("[DirectStorage Exporter] " + text)
+	push_warning(LOG_PREFIX + text)
 	var platform: EditorExportPlatform = get_export_platform()
 	if platform != null and platform.has_method("add_message"):
 		platform.add_message(EditorExportPlatform.EXPORT_MESSAGE_WARNING, "DirectStorage", text)
@@ -1237,11 +1239,11 @@ func _verify_pack_protection() -> bool:
 			_report_pack_unverified("Pack verification is disabled and the verifier script is missing; nothing was checked.")
 			return true
 		_pack_failure_detail = "The exported PCK could not be verified: the pack verifier script is missing. Treat this build as unprotected."
-		push_error("[DirectStorage Exporter] " + _pack_failure_detail)
+		push_error(LOG_PREFIX + _pack_failure_detail)
 		return false
 	if not _verify_pack_enabled:
 		var off: Dictionary = verify.call("skipped", "disabled_by_setting")
-		print("[DirectStorage Exporter] " + String(verify.call("format_line", off, _target_export_path)))
+		print(LOG_PREFIX + String(verify.call("format_line", off, _target_export_path)))
 		_report_pack_unverified("Pack verification is disabled in this preset; the exported PCK was not scanned, so this build is not verified.")
 		return true
 	var pack_path: String = _resolve_pack_path()
@@ -1254,7 +1256,7 @@ func _verify_pack_protection() -> bool:
 		result = verify.call("skipped", "zip_export")
 	else:
 		result = verify.call("verify_pack", pack_path)
-	print("[DirectStorage Exporter] " + String(verify.call("format_line", result, pack_path)))
+	print(LOG_PREFIX + String(verify.call("format_line", result, pack_path)))
 	# ok means "nothing to fail on", not "verified": unverified/skipped are named
 	# in the status word and never counted as verified.
 	if bool(result.get("ok", false)):
@@ -1262,7 +1264,7 @@ func _verify_pack_protection() -> bool:
 			_report_pack_unverified("The PCK is embedded in the executable; the pack scan cannot read it, so PCK protection is not verified for this build.")
 		return true
 	_pack_failure_detail = "The exported PCK failed verification (reason: %s). Do not distribute this build as a protected build; see the PACK_VERIFY line above." % String(result.get("reason", "unknown"))
-	push_error("[DirectStorage Exporter] " + _pack_failure_detail)
+	push_error(LOG_PREFIX + _pack_failure_detail)
 	return false
 
 func _is_disk_space_error(err: Error) -> bool:
@@ -1278,7 +1280,7 @@ func _report_storage_failure(stage: String, err: Error, abs_path: String) -> voi
 		if probe != null and probe.is_open():
 			staging_bytes = int(probe.get_length())
 			probe.close()
-	var detail := "[DirectStorage Exporter] FATAL: failed to " + stage + " ('" + abs_path + "'): " + error_string(err)
+	var detail := LOG_PREFIX + "FATAL: failed to " + stage + " ('" + abs_path + "'): " + error_string(err)
 	if _is_disk_space_error(err):
 		detail += ". This is most likely OUT OF DISK SPACE on the export drive"
 		if not _target_export_dir.is_empty():

@@ -106,6 +106,9 @@
 		</method>
 	</methods>
 	<constants>
+		<constant name="LOG_PREFIX" value="&quot;[dsgd Extension] &quot;">
+			Log prefix prepended to [DSPreloader] diagnostic and warning messages.
+		</constant>
 		<constant name="PREWARMABLE_EXTENSIONS" value='["png", "jpg", "jpeg", "webp"]'>
 			List of image source file extensions supported for DirectStorage prewarming.
 		</constant>

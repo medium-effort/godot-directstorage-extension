@@ -3,6 +3,7 @@
 #include "ds_texture_pipeline_common.h"
 #include "core/ds_settings.h"
 #include "../core/ds_context.h"
+#include "../core/ds_log.h"
 #include "../core/ds_cpu_budget.h"
 #include "../core/ds_gdeflate_stream.h"
 #include "../core/ds_request.h"
@@ -1724,7 +1725,7 @@ uint64_t DSPreloader::prewarm_gpu_async(const PackedStringArray &p_paths, int p_
 	bool prefer_gpu = p_prefer_gpu;
 	if (prefer_gpu && ctx->get_auto_tune_for_integrated_gpu() && ctx->is_integrated_gpu()) {
 		prefer_gpu = false;
-		UtilityFunctions::print("[DirectStorage] Integrated/UMA GPU detected: prewarm_gpu_async auto-routed to System RAM prewarm to eliminate loading screen hitches (dsgd_extension/auto_tune_for_integrated_gpu=true).");
+		UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "Integrated/UMA GPU detected: prewarm_gpu_async auto-routed to System RAM prewarm to eliminate loading screen hitches (dsgd_extension/auto_tune_for_integrated_gpu=true).");
 	}
 	const bool gpu_ok = prefer_gpu && is_gpu_prewarm_available();
 	const int chunk_size = p_chunk_size > 0 ? p_chunk_size : 16;
@@ -2410,7 +2411,7 @@ bool DSPreloader::is_terminal(const Ref<DSRequest> &p_request, uint64_t p_timeou
 		if (cancel_time > 0 && Time::get_singleton()) {
 			uint64_t now_us = Time::get_singleton()->get_ticks_usec();
 			if (now_us > cancel_time && (now_us - cancel_time) > p_timeout_usec) {
-				UtilityFunctions::push_error("[DirectStorage] Preloader: GPU cancellation retirement timed out (>5.0s, GPU hang/TDR). Force-retiring request.");
+				UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "Preloader: GPU cancellation retirement timed out (>5.0s, GPU hang/TDR). Force-retiring request.");
 				p_request->set_gpu_in_flight(false);
 				return true;
 			}
@@ -3181,7 +3182,7 @@ Ref<Texture2D> DSPreloader::await_pending_texture(const String &p_path, uint32_t
 		return Ref<Texture2D>();
 	}
 	if (timed_out) {
-		UtilityFunctions::print_verbose("[DirectStorage] await_pending_texture timed out waiting for '", p_path, "' after ", (int64_t)p_timeout_ms, " ms; falling through to cache/CPU path.");
+		UtilityFunctions::print_verbose(String(dsgd_log::EXTENSION_PREFIX) + "await_pending_texture timed out waiting for '", p_path, "' after ", (int64_t)p_timeout_ms, " ms; falling through to cache/CPU path.");
 	}
 	// Re-fetch after sleeping: DSTextureCache may have been replaced or torn
 	// down while this thread waited on pending_cv.

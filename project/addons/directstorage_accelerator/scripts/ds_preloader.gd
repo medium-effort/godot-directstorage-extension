@@ -32,6 +32,9 @@ extends RefCounted
 ## - Everything here runs on the main thread. Scene-tree attachment
 ##   ([code]add_child()[/code]) is main-thread-only.
 
+## Log prefix used by [DSPreloader] diagnostic and warning messages.
+const LOG_PREFIX: String = "[dsgd Extension] "
+
 ## Texture extensions accepted by the native preloader
 ## (mirrors [code]DSPreloader::is_engine_source_path[/code]).
 const PREWARMABLE_EXTENSIONS: PackedStringArray = ["png", "jpg", "jpeg", "webp"]
@@ -97,7 +100,7 @@ static func _warn_missing_stream_pump() -> void:
 		return
 	_missing_pump_warned = true
 	push_error(
-		"[DirectStorage] DSPreloader: async prewarm unavailable - neither /root/%s nor /root/%s exists, so nothing submits or harvests the stream queue (requests would sit there forever). Enable the dsgd plugin in Project Settings > Plugins so it registers the autoload, or add '%s' to autoload manually." % [STREAM_PUMP_AUTOLOAD, STREAM_PUMP_LEGACY_AUTOLOAD, STREAM_PUMP_AUTOLOAD]
+		LOG_PREFIX + "DSPreloader: async prewarm unavailable - neither /root/%s nor /root/%s exists, so nothing submits or harvests the stream queue (requests would sit there forever). Enable the dsgd plugin in Project Settings > Plugins so it registers the autoload, or add '%s' to autoload manually." % [STREAM_PUMP_AUTOLOAD, STREAM_PUMP_LEGACY_AUTOLOAD, STREAM_PUMP_AUTOLOAD]
 	)
 
 
@@ -291,11 +294,11 @@ static func is_stream_prewarm_available() -> bool:
 ## a tag returned without a driver would never complete.
 static func prewarm_async(paths: PackedStringArray) -> int:
 	if not ClassDB.class_exists("DSTextureCache"):
-		push_warning("[DirectStorage] DSPreloader: DSTextureCache class unavailable; prewarm_async aborted.")
+		push_warning(LOG_PREFIX + "DSPreloader: DSTextureCache class unavailable; prewarm_async aborted.")
 		return 0
 	var cache: Object = Engine.get_singleton("DSTextureCache")
 	if cache == null or not cache.has_method("prewarm_async"):
-		push_warning("[DirectStorage] DSPreloader: DSTextureCache singleton unavailable; prewarm_async aborted.")
+		push_warning(LOG_PREFIX + "DSPreloader: DSTextureCache singleton unavailable; prewarm_async aborted.")
 		return 0
 	if not _has_stream_pump():
 		_warn_missing_stream_pump()
@@ -340,11 +343,11 @@ static func is_gpu_prewarm_available() -> bool:
 ## Returns 0 when native singletons or the stream driver are unavailable.
 static func prewarm_gpu_async(paths: PackedStringArray, chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0) -> int:
 	if not ClassDB.class_exists("DSTextureCache"):
-		push_warning("[DirectStorage] DSPreloader: DSTextureCache class unavailable; prewarm_gpu_async aborted.")
+		push_warning(LOG_PREFIX + "DSPreloader: DSTextureCache class unavailable; prewarm_gpu_async aborted.")
 		return 0
 	var cache: Object = Engine.get_singleton("DSTextureCache")
 	if cache == null:
-		push_warning("[DirectStorage] DSPreloader: DSTextureCache singleton unavailable; prewarm_gpu_async aborted.")
+		push_warning(LOG_PREFIX + "DSPreloader: DSTextureCache singleton unavailable; prewarm_gpu_async aborted.")
 		return 0
 	if not _has_stream_pump():
 		_warn_missing_stream_pump()
@@ -426,7 +429,7 @@ static func cancel_scene_prewarm(scene_tag: int) -> void:
 static func start_scene_prewarm(scene_path: String, extra_scan_dirs: PackedStringArray = PackedStringArray(), chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0, precollected_deps: PackedStringArray = PackedStringArray()) -> int:
 	var runtime: Node = _get_stream_pump()
 	if runtime == null or not runtime.has_method("start_scene_prewarm"):
-		push_warning("[DirectStorage] DSPreloader: DSRuntime autoload unavailable; start_scene_prewarm aborted.")
+		push_warning(LOG_PREFIX + "DSPreloader: DSRuntime autoload unavailable; start_scene_prewarm aborted.")
 		return 0
 	var deps: PackedStringArray = precollected_deps if not precollected_deps.is_empty() else collect_scene_textures(scene_path, extra_scan_dirs)
 	return int(runtime.call("start_scene_prewarm", scene_path, deps, chunk_size, prefer_gpu, max_chunk_bytes))
@@ -440,7 +443,7 @@ static func start_scene_prewarm(scene_path: String, extra_scan_dirs: PackedStrin
 static func prewarm_scene_async(scene_path: String, extra_scan_dirs: PackedStringArray = PackedStringArray(), chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0, on_progress: Callable = Callable(), precollected_deps: PackedStringArray = PackedStringArray()) -> PackedScene:
 	var runtime: Node = _get_stream_pump()
 	if runtime == null or not runtime.has_method("start_scene_prewarm"):
-		push_warning("[DirectStorage] DSPreloader: DSRuntime autoload unavailable; falling back to synchronous ResourceLoader.load().")
+		push_warning(LOG_PREFIX + "DSPreloader: DSRuntime autoload unavailable; falling back to synchronous ResourceLoader.load().")
 		var fallback_loop: MainLoop = Engine.get_main_loop()
 		if fallback_loop is SceneTree:
 			await (fallback_loop as SceneTree).process_frame
@@ -533,7 +536,7 @@ static func _warn_prewarm_stall(tag: int, progress: Vector2i, stall_timeout_msec
 	if not _has_stream_pump():
 		cause = "no /root/%s or /root/%s in the scene tree, so nothing submits the stream queue; enable the DirectStorage Accelerator plugin so it registers the autoload" % [STREAM_PUMP_AUTOLOAD, STREAM_PUMP_LEGACY_AUTOLOAD]
 	push_warning(
-		"[DirectStorage] DSPreloader: prewarm tag %d stalled - no progress for %d ms, cancelling it so the caller can fall back. state: progress=(%d, %d) complete=%s pending=%d unbuilt=%d (cpu=%d gpu=%d). cause: %s"
+		LOG_PREFIX + "DSPreloader: prewarm tag %d stalled - no progress for %d ms, cancelling it so the caller can fall back. state: progress=(%d, %d) complete=%s pending=%d unbuilt=%d (cpu=%d gpu=%d). cause: %s"
 		% [
 			tag,
 			stall_timeout_msec,
@@ -645,7 +648,7 @@ static func load_scene_with_loading_screen(tree: SceneTree, scene_path: String, 
 		# prewarm.
 		packed = ResourceLoader.load(scene_path, "PackedScene", ResourceLoader.CACHE_MODE_REUSE) as PackedScene
 	if packed == null:
-		push_warning("[DirectStorage] DSPreloader: failed to load scene '", scene_path, "'.")
+		push_warning(LOG_PREFIX + "DSPreloader: failed to load scene '", scene_path, "'.")
 		loading_screen.visible = false
 		return null
 	var instance: Node = packed.instantiate()

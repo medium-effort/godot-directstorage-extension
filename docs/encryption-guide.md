@@ -17,8 +17,10 @@ You get the strongest configuration by doing five things in this order:
 1. **Generate one PCK key and keep it out of the repository.**
 2. **Build Godot yourself with that key.** Stock Godot cannot open a PCK encrypted with your key.
    This is Godot's rule; the add-on does not remove the step.
-3. **Set the key and the include filter on the preset's Encryption tab.** The filter must cover
-   `res://.dspkg/toc.key`. Without it, turning on PCK encryption encrypts nothing.
+3. **Configure the export preset: point Custom Template to your keyed build, and set the key and
+   include filter on the Encryption tab.** The filter must cover `res://.dspkg/toc.key` (without it,
+   turning on PCK encryption encrypts nothing), and leaving Custom Template blank uses stock Godot
+   (which exports cleanly but fails to open the encrypted PCK at launch).
 4. **Export.** The add-on generates a fresh archive key, builds the archive with it, and injects it
    into the encrypted PCK.
 5. **Boot the exported player and check the pack scan.** A build counts as protected only after the
@@ -171,9 +173,18 @@ your_project/addons/directstorage_accelerator/
 
 ### 4. Configure the export preset
 
-In **Project > Export**, select your preset. The settings below are split across two tabs (labels as
+In **Project > Export**, select your preset. The settings below are split across three tabs (labels as
 of Godot 4.7):
 
+- **Options** tab — **Custom Template**:
+  - **Release** (`custom_template/release`): path to the keyed `template_release` binary you built
+    in step 2 (for example, `godot.windows.template_release.x86_64.exe`).
+  - **Debug** (`custom_template/debug`): path to the keyed `template_debug` binary if you also
+    export debug builds.
+  - Leaving these empty uses Godot's stock template (unless you replaced the default templates on
+    disk). The export will still finish without errors, but the exported executable will fail to
+    open the encrypted `.pck` at launch (often showing *"Couldn't load project data ... Is the .pck
+    file missing?"* / `disable_path_overrides=no`).
 - **Resources** tab — **Export Mode**: `Export all resources in the project` (`all_resources`). This is
   the only mode tested end to end; see the note below.
 - **Encryption** tab — everything else:

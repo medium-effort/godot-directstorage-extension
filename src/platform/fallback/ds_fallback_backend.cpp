@@ -1,5 +1,6 @@
 #include "ds_fallback_backend.h"
 #include "core/ds_cpu_budget.h"
+#include "core/ds_log.h"
 #include "core/ds_profiler.h"
 #include "core/ds_settings.h"
 #include <godot_cpp/classes/file_access.hpp>
@@ -247,7 +248,7 @@ bool FallbackBackend::initialize() {
 	for (uint32_t i = 0; i < num_workers; ++i) {
 		worker_threads.emplace_back(&FallbackBackend::worker_thread_func, this);
 	}
-	UtilityFunctions::print("[DirectStorage] FallbackBackend initialized (CPU Workers: " + String::num_int64(num_workers) + ").");
+	UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "FallbackBackend initialized (CPU Workers: " + String::num_int64(num_workers) + ").");
 	return true;
 }
 
@@ -464,7 +465,7 @@ void FallbackBackend::submit_batch() {
 		pending_requests.clear();
 	}
 	if (timed_out) {
-		UtilityFunctions::push_error("[DirectStorage] Timed out waiting for the previous batch to complete.");
+		UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "Timed out waiting for the previous batch to complete.");
 		for (int i = 0; i < batch.size(); i++) {
 			if (batch[i].is_valid() && batch[i]->get_status() == DSRequest::STATUS_SUBMITTED) {
 				batch[i]->set_status(DSRequest::STATUS_FAILED);

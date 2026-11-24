@@ -8,6 +8,7 @@ extends EditorPlugin
 ## DSPkg export plugin in the Godot Editor. Enable this plugin to get the
 ## automatic texture import and archive bundling workflow.
 
+const LOG_PREFIX: String = "[dsgd Extension] "
 const AUTOLOAD_NAME: String = "DSRuntime"
 const AUTOLOAD_PATH: String = "res://addons/directstorage_accelerator/scripts/ds_runtime.gd"
 const LEGACY_AUTOLOAD_NAME: String = "DSBatchManager"
@@ -75,11 +76,11 @@ func _enter_tree() -> void:
 
 	if not ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
 		push_error(
-			"[DirectStorage] Failed to register the %s autoload in project.godot. Async texture prewarm needs that node to drive the stream queue and will stay unavailable until 'autoload/%s' exists in Project Settings." % [AUTOLOAD_NAME, AUTOLOAD_NAME]
+			LOG_PREFIX + "Failed to register the %s autoload in project.godot. Async texture prewarm needs that node to drive the stream queue and will stay unavailable until 'autoload/%s' exists in Project Settings." % [AUTOLOAD_NAME, AUTOLOAD_NAME]
 		)
 
 	print(
-		"[DirectStorage] Plugin enabled by MediumEffort. Autoload, Importer, and Exporter registered."
+		LOG_PREFIX + "by MediumEffort. Addon enabled. Autoload, Importer, and Exporter registered."
 	)
 
 	for internal_setting in [
@@ -168,10 +169,19 @@ func _exit_tree() -> void:
 
 	if not _is_disabling:
 		print(
-			"[DirectStorage] Editor hooks unloaded (%s autoload kept in project.godot)."
+			LOG_PREFIX + "Editor hooks unloaded (%s autoload kept in project.godot)."
 			% AUTOLOAD_NAME
 		)
 	_is_disabling = false
+
+
+## Called by the engine only when the user enables the addon in the Plugin tab
+## of Project Settings (never on normal editor startup). When the DirectStorage
+## runtime DLLs are not installed yet on Windows, open the runtime manager
+## automatically so the user can accept the license and install them right away.
+func _enable_plugin() -> void:
+	if _should_prompt_runtime_install_on_enable():
+		_on_runtime_menu.call_deferred()
 
 
 ## Called by the engine only when the user disables the addon in the Plugin tab
@@ -183,7 +193,7 @@ func _disable_plugin() -> void:
 	_sync_autoload(AUTOLOAD_NAME, "")
 
 	print(
-		"[DirectStorage] Addon disabled in Project Settings. %s autoload and editor hooks unregistered."
+		LOG_PREFIX + "Addon disabled in Project Settings. %s autoload and editor hooks unregistered."
 		% AUTOLOAD_NAME
 	)
 
@@ -278,7 +288,7 @@ func _report_extension_state() -> void:
 
 	if matching.size() > 1:
 		push_warning(
-			"[DirectStorage] %d copies of the native library are loaded and only one can own the DirectStorage classes. Disable or remove all but one: %s"
+			LOG_PREFIX + "%d copies of the native library are loaded and only one can own the DirectStorage classes. Disable or remove all but one: %s"
 			% [matching.size(), ", ".join(matching)]
 		)
 		return
@@ -286,13 +296,13 @@ func _report_extension_state() -> void:
 	if matching.size() == 1:
 		if matching[0].get_base_dir().simplify_path() != expected_dir:
 			push_warning(
-				"[DirectStorage] The native library is loaded from %s but this addon expects %s. Disable the stale copy, then reload the extension."
+				LOG_PREFIX + "The native library is loaded from %s but this addon expects %s. Disable the stale copy, then reload the extension."
 				% [matching[0], expected_manifest if not expected_manifest.is_empty() else expected_dir]
 			)
 		return
 
 	push_warning(
-		"[DirectStorage] The native library is not loaded, so DSContext and the importer's native classes are unavailable. Build and deploy the addon, then use Project Settings > GDExtension > Reload (Godot 4.7+) or restart the editor. Expected manifest: %s"
+		LOG_PREFIX + "The native library is not loaded, so DSContext and the importer's native classes are unavailable. Build and deploy the addon, then use Project Settings > GDExtension > Reload (Godot 4.7+) or restart the editor. Expected manifest: %s"
 		% (expected_manifest if not expected_manifest.is_empty() else expected_dir)
 	)
 
@@ -375,12 +385,12 @@ func _reinitialize_native_backend_after_reload() -> void:
 
 	if ds_context.initialize_ds():
 		print(
-			"[DirectStorage] Native extension reloaded; backend re-initialized (%s)."
+			LOG_PREFIX + "Native extension reloaded; backend re-initialized (%s)."
 			% ds_context.get_active_backend_name()
 		)
 	else:
 		push_warning(
-			"[DirectStorage] Native extension reloaded but the DirectStorage backend could not be re-initialized."
+			LOG_PREFIX + "Native extension reloaded but the DirectStorage backend could not be re-initialized."
 		)
 
 
@@ -404,8 +414,33 @@ func _warn_if_runtime_missing(p_ds_context: Object) -> void:
 		return
 
 	push_warning(
-		"[DirectStorage] DirectStorage runtime DLLs are not installed, so this project runs on the CPU fallback (no NVMe acceleration, no GPU decompression). Open Tools > DSGD Tools... > Manage DirectStorage Runtime... to install one, then restart the editor."
+		LOG_PREFIX + "DirectStorage runtime DLLs are not installed, so this project runs on the CPU fallback (no NVMe acceleration, no GPU decompression). Open Tools > DSGD Tools... > Manage DirectStorage Runtime... to install one, then restart the editor."
 	)
+
+
+func _should_prompt_runtime_install_on_enable() -> bool:
+	if not Engine.is_editor_hint() or EditorInterface.get_editor_main_screen() == null:
+		return false
+	if not ClassDB.class_exists("DSContext"):
+		return false
+	var ds_context = Engine.get_singleton("DSContext")
+	var pending := String(RUNTIME_INSTALLER_SCRIPT.get_pending_version())
+	return _is_runtime_missing_for_prompt(ds_context, pending, OS.get_name(), DisplayServer.get_name())
+
+
+static func _is_runtime_missing_for_prompt(
+	p_ds_context: Object,
+	p_pending_version: String,
+	p_os_name: String,
+	p_display_name: String
+) -> bool:
+	if p_os_name != "Windows" or p_display_name == "headless":
+		return false
+	if not p_pending_version.is_empty():
+		return false
+	if p_ds_context == null or not p_ds_context.is_initialized() or p_ds_context.is_supported():
+		return false
+	return String(p_ds_context.get_runtime_info().get("version", "")) == "Unavailable"
 
 
 ## Registers the project-wide import profile used by the DirectStorage importer.
@@ -439,7 +474,7 @@ func _register_import_profile() -> void:
 
 	if ProjectSettings.has_setting("importer_defaults/directstorage_texture"):
 		push_warning(
-			"[DirectStorage] 'importer_defaults/directstorage_texture' is set and overrides the project import profile for new imports."
+			LOG_PREFIX + "'importer_defaults/directstorage_texture' is set and overrides the project import profile for new imports."
 		)
 
 
@@ -472,7 +507,7 @@ func _sync_autoload(p_name: String, p_path: String) -> void:
 	var err := ProjectSettings.save()
 	if err != OK:
 		push_warning(
-			"[DirectStorage] Could not persist %s to project.godot (error %d)." % [key, err]
+			LOG_PREFIX + "Could not persist %s to project.godot (error %d)." % [key, err]
 		)
 
 
@@ -532,7 +567,7 @@ func _check_scene_compatibility(root: Node, scene_path: String) -> void:
 	if invalid_assets.is_empty():
 		return
 
-	var msg := "[color=yellow][DirectStorage][/color] Scene [b]%s[/b] has " % scene_path.get_file()
+	var msg := "[color=yellow]" + LOG_PREFIX.strip_edges() + "[/color] Scene [b]%s[/b] has " % scene_path.get_file()
 	var parts: Array[String] = []
 	if light_count > 0:
 		parts.append("%d Light3D projector(s)" % light_count)
@@ -559,7 +594,7 @@ func _check_scene_compatibility(root: Node, scene_path: String) -> void:
 func _on_verify_exported_pack() -> void:
 	var dialog_scene := load(VERIFY_DIALOG_SCENE) as PackedScene
 	if dialog_scene == null:
-		push_error("[DirectStorage] Pack scan dialog missing at " + VERIFY_DIALOG_SCENE_PATH)
+		push_error(LOG_PREFIX + "Pack scan dialog missing at " + VERIFY_DIALOG_SCENE_PATH)
 		return
 	var dialog := dialog_scene.instantiate() as Window
 	_verify_dialog = dialog
@@ -580,7 +615,7 @@ func _apply_pending_runtime() -> void:
 	var error: int = RUNTIME_INSTALLER_SCRIPT.apply_pending()
 	if error != OK:
 		push_warning(
-			"[DirectStorage] A staged runtime update could not be applied (%s); it will be retried on the next editor start." % error_string(error)
+			LOG_PREFIX + "A staged runtime update could not be applied (%s); it will be retried on the next editor start." % error_string(error)
 		)
 
 
@@ -596,7 +631,7 @@ func _on_runtime_menu() -> void:
 		_runtime_dialog = null
 	var dialog_scene := ResourceLoader.load(RUNTIME_DIALOG_SCENE_PATH, "PackedScene", ResourceLoader.CACHE_MODE_IGNORE) as PackedScene
 	if dialog_scene == null:
-		push_error("[DirectStorage] Runtime manager dialog missing at " + RUNTIME_DIALOG_SCENE_PATH)
+		push_error(LOG_PREFIX + "Runtime manager dialog missing at " + RUNTIME_DIALOG_SCENE_PATH)
 		return
 	_runtime_dialog = dialog_scene.instantiate() as Window
 	var base := EditorInterface.get_base_control()
@@ -616,7 +651,7 @@ func _on_migration_menu() -> void:
 		_migration_dialog = null
 	var dialog_scene := ResourceLoader.load(MIGRATION_DIALOG_SCENE_PATH, "PackedScene", ResourceLoader.CACHE_MODE_IGNORE) as PackedScene
 	if dialog_scene == null:
-		push_error("[DirectStorage] Migration dialog missing at " + MIGRATION_DIALOG_SCENE_PATH)
+		push_error(LOG_PREFIX + "Migration dialog missing at " + MIGRATION_DIALOG_SCENE_PATH)
 		return
 	_migration_dialog = dialog_scene.instantiate() as Window
 	var base := EditorInterface.get_base_control()

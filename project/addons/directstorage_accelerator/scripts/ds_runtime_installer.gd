@@ -28,6 +28,7 @@ signal install_finished(version: String, error: int, message: String)
 ## call accept_license() or decline_license().
 signal license_required(version: String, license_text: String)
 
+const LOG_PREFIX: String = "[dsgd Extension] "
 const ADDON_BIN: String = "res://addons/directstorage_accelerator/bin"
 const VERSIONS_PATH: String = ADDON_BIN + "/.versions"
 const PENDING_PATH: String = ADDON_BIN + "/.pending.json"
@@ -95,16 +96,16 @@ static func get_versions() -> Dictionary:
 static func _read_manifest_versions() -> Dictionary:
 	var versions: Dictionary = {}
 	if not FileAccess.file_exists(VERSIONS_MANIFEST_PATH):
-		push_warning("[DirectStorage] Runtime version manifest missing (%s); using the built-in package table." % VERSIONS_MANIFEST_PATH)
+		push_warning(LOG_PREFIX + "Runtime version manifest missing (%s); using the built-in package table." % VERSIONS_MANIFEST_PATH)
 		return versions
 	var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(VERSIONS_MANIFEST_PATH))
 	if typeof(parsed) != TYPE_DICTIONARY:
-		push_warning("[DirectStorage] Runtime version manifest is not a JSON object; using the built-in package table.")
+		push_warning(LOG_PREFIX + "Runtime version manifest is not a JSON object; using the built-in package table.")
 		return versions
 	for version in (parsed as Dictionary):
 		var meta: Variant = (parsed as Dictionary)[version]
 		if typeof(meta) != TYPE_DICTIONARY or not _is_valid_entry(meta as Dictionary):
-			push_warning("[DirectStorage] Ignoring incomplete manifest entry for %s (an https url, sha512 and a positive size are required)." % String(version))
+			push_warning(LOG_PREFIX + "Ignoring incomplete manifest entry for %s (an https url, sha512 and a positive size are required)." % String(version))
 			continue
 		versions[String(version)] = meta
 	return versions
@@ -178,12 +179,12 @@ static func apply_pending() -> int:
 
 	var pending: Variant = JSON.parse_string(FileAccess.get_file_as_string(PENDING_PATH))
 	if typeof(pending) != TYPE_DICTIONARY:
-		push_warning("[DirectStorage] Runtime stage is not valid JSON; ignoring it. Delete %s to reset." % PENDING_PATH)
+		push_warning(LOG_PREFIX + "Runtime stage is not valid JSON; ignoring it. Delete %s to reset." % PENDING_PATH)
 		return ERR_FILE_CORRUPT
 
 	var version := String((pending as Dictionary).get("version", ""))
 	if version.is_empty():
-		push_warning("[DirectStorage] Runtime stage has no version; ignoring it.")
+		push_warning(LOG_PREFIX + "Runtime stage has no version; ignoring it.")
 		return ERR_FILE_CORRUPT
 
 	var source_dir := VERSIONS_PATH.path_join(version)
@@ -197,19 +198,19 @@ static func apply_pending() -> int:
 		var destination := ADDON_BIN.path_join(file_name)
 		var backup := backup_dir.path_join(file_name)
 		if FileAccess.file_exists(destination) and not _copy_verified(destination, backup):
-			push_warning("[DirectStorage] Could not snapshot %s before the runtime swap; no files were changed." % file_name)
+			push_warning(LOG_PREFIX + "Could not snapshot %s before the runtime swap; no files were changed." % file_name)
 			return ERR_FILE_CANT_WRITE
 
 	for file_name in RUNTIME_FILES:
 		var source := source_dir.path_join(file_name)
 		var destination := ADDON_BIN.path_join(file_name)
 		if not FileAccess.file_exists(source):
-			push_warning("[DirectStorage] Runtime stage for %s is missing %s; reinstalling is required." % [version, file_name])
+			push_warning(LOG_PREFIX + "Runtime stage for %s is missing %s; reinstalling is required." % [version, file_name])
 			_restore_pair(backup_dir)
 			return ERR_FILE_NOT_FOUND
 		if not _copy_verified(source, destination):
 			_restore_pair(backup_dir)
-			push_warning("[DirectStorage] Runtime update to %s is staged but %s is in use; the previous pair was restored and the update will be retried on the next editor start." % [version, file_name])
+			push_warning(LOG_PREFIX + "Runtime update to %s is staged but %s is in use; the previous pair was restored and the update will be retried on the next editor start." % [version, file_name])
 			return ERR_FILE_CANT_WRITE
 
 	if not _write_json(ACTIVE_PATH, {"active": version}):
@@ -224,7 +225,7 @@ static func _restore_pair(backup_dir: String) -> void:
 		var backup := backup_dir.path_join(file_name)
 		var destination := ADDON_BIN.path_join(file_name)
 		if FileAccess.file_exists(backup) and not _copy_verified(backup, destination):
-			push_error("[DirectStorage] Could not restore %s after a failed runtime swap; reinstall the runtime before the next start." % file_name)
+			push_error(LOG_PREFIX + "Could not restore %s after a failed runtime swap; reinstall the runtime before the next start." % file_name)
 
 
 ## Stages an already-downloaded version for the next start (rollback path).
@@ -479,18 +480,18 @@ static func _read_json(path: String) -> Dictionary:
 static func _write_json(path: String, value: Dictionary) -> bool:
 	var file := FileAccess.open(path, FileAccess.WRITE)
 	if file == null:
-		push_warning("[DirectStorage] Could not write %s: %s" % [path, error_string(FileAccess.get_open_error())])
+		push_warning(LOG_PREFIX + "Could not write %s: %s" % [path, error_string(FileAccess.get_open_error())])
 		return false
 	file.store_string(JSON.stringify(value))
 	var write_error := file.get_error()
 	file.close()
 	if write_error != OK:
-		push_warning("[DirectStorage] Could not write %s: %s" % [path, error_string(write_error)])
+		push_warning(LOG_PREFIX + "Could not write %s: %s" % [path, error_string(write_error)])
 		return false
 	return true
 
 
 func _finish(version: String, error: int, message: String) -> void:
 	if error != OK:
-		push_warning("[DirectStorage] " + message)
+		push_warning(LOG_PREFIX + message)
 	install_finished.emit(version, error, message)

@@ -1,4 +1,5 @@
 #include "ds_build_provenance.h"
+#include "ds_log.h"
 
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/json.hpp>
@@ -93,7 +94,7 @@ String _describe_entry(const String &p_file, const Dictionary &p_entry, const St
 
 String _build_warning(const String &p_dir, const BinaryProvenancePair &p_pair) {
 	const String other_role = RUNNING_DEBUG_BUILD ? "for export" : "editor/debug";
-	String message = "[DirectStorage] Binary mismatch in '" + p_dir + "':\n";
+	String message = String(dsgd_log::EXTENSION_PREFIX) + "Binary mismatch in '" + p_dir + "':\n";
 	message += _describe_entry(p_pair.this_file, p_pair.this_entry, "this build");
 	message += "\n" + _describe_entry(p_pair.other_file, p_pair.other_entry, other_role);
 

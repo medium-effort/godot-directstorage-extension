@@ -1,5 +1,6 @@
 #include "ds_context.h"
 #include "ds_error_handler.h"
+#include "ds_log.h"
 #include "ds_profiler.h"
 #include "ds_request_budget.h"
 #include "ds_settings.h"
@@ -51,13 +52,13 @@ static bool validate_d3d12_rendering_device_active(const String &p_phase) {
 #ifdef _WIN32
 	RenderingServer *rs = safe_get_rendering_server();
 	if (!rs || rs->get_current_rendering_driver_name().to_lower() != "d3d12") {
-		UtilityFunctions::push_error("[DirectStorage] D3D12 RenderingDevice validation unavailable during " + p_phase + ": D3D12 is not active.");
+		UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "D3D12 RenderingDevice validation unavailable during " + p_phase + ": D3D12 is not active.");
 		return false;
 	}
 
 	RenderingDevice *rd = rs->get_rendering_device();
 	if (!rd) {
-		UtilityFunctions::push_error("[DirectStorage] D3D12 RenderingDevice validation unavailable during " + p_phase + ": no RenderingDevice is active.");
+		UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "D3D12 RenderingDevice validation unavailable during " + p_phase + ": no RenderingDevice is active.");
 		return false;
 	}
 
@@ -72,7 +73,7 @@ static bool validate_d3d12_rendering_device_active(const String &p_phase) {
 	//   synchronized via ID3D12Fence / IDStorageQueue completion fences.
 	return true;
 #else
-	UtilityFunctions::push_error("[DirectStorage] D3D12 RenderingDevice validation unavailable during " + p_phase + ": platform is not Windows.");
+	UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "D3D12 RenderingDevice validation unavailable during " + p_phase + ": platform is not Windows.");
 	return false;
 #endif
 }
@@ -124,7 +125,7 @@ void DSContext::evict_old_reports_if_needed_locked() {
 	// over capacity here, growth is unbounded until those requests terminate.
 	// Verbose-only to avoid spamming the main-thread flush path per request.
 	if (request_execution_reports.size() > (int)MAX_EXECUTION_REPORTS) {
-		UtilityFunctions::print_verbose("[DirectStorage] Execution reports over cap (", (int64_t)request_execution_reports.size(), " > ", (int64_t)MAX_EXECUTION_REPORTS, ") with pending/in-flight IDs blocking eviction; growth bounded by request termination.");
+		UtilityFunctions::print_verbose(String(dsgd_log::EXTENSION_PREFIX) + "Execution reports over cap (", (int64_t)request_execution_reports.size(), " > ", (int64_t)MAX_EXECUTION_REPORTS, ") with pending/in-flight IDs blocking eviction; growth bounded by request termination.");
 	}
 }
 
@@ -165,7 +166,7 @@ void DSContext::finalize_completed_reports_locked() {
 			if (cancel_time > 0 && Time::get_singleton()) {
 				uint64_t now_us = Time::get_singleton()->get_ticks_usec();
 				if (now_us > cancel_time && (now_us - cancel_time) > 5000000ULL) {
-					UtilityFunctions::push_error("[DirectStorage] Context: GPU cancellation retirement timed out (>5.0s, GPU hang/TDR). Force-finalizing request.");
+					UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "Context: GPU cancellation retirement timed out (>5.0s, GPU hang/TDR). Force-finalizing request.");
 					request->set_gpu_in_flight(false);
 				} else {
 					++it;
@@ -868,7 +869,7 @@ bool DSContext::wait_for_priority_completion(int p_priority, int p_timeout_msec)
 bool DSContext::_wait_for_completion_sliced(int p_priority, int p_timeout_msec) {
 	const bool lane_scoped = p_priority >= 0;
 	if (p_timeout_msec < 0) {
-		UtilityFunctions::push_error("[DirectStorage] Completion wait rejected: timeout must not be negative.");
+		UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "Completion wait rejected: timeout must not be negative.");
 		return false;
 	}
 
@@ -882,7 +883,7 @@ bool DSContext::_wait_for_completion_sliced(int p_priority, int p_timeout_msec) 
 				has_gpu_pending = gpu_requests_pending;
 			}
 			if (has_gpu_pending) {
-				UtilityFunctions::push_error("[DirectStorage] Completion wait failed: GPU requests have no completion fence.");
+				UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "Completion wait failed: GPU requests have no completion fence.");
 				return false;
 			}
 			return true;
@@ -907,7 +908,7 @@ bool DSContext::_wait_for_completion_sliced(int p_priority, int p_timeout_msec) 
 		// a teardown race, and must still hear about it.
 		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 		if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
-			UtilityFunctions::push_error("[DirectStorage] Completion fence wait failed: context not initialized or already shut down.");
+			UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "Completion fence wait failed: context not initialized or already shut down.");
 			return false;
 		}
 		if (active_backend->get_name() != "Win32DirectStorage") {
@@ -944,13 +945,13 @@ bool DSContext::_wait_for_completion_sliced(int p_priority, int p_timeout_msec) 
 				// would spin hot for the rest of the budget.
 				const uint64_t after_msec = Time::get_singleton() ? static_cast<uint64_t>(Time::get_singleton()->get_ticks_msec()) : 0;
 				if (after_msec >= now_msec && (after_msec - now_msec) < COMPLETION_WAIT_SLICE_MS / 2) {
-					UtilityFunctions::push_error("[DirectStorage] Completion fence wait failed.");
+					UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "Completion fence wait failed.");
 					return false;
 				}
 			}
 		}
 		if (remaining_msec == 0) {
-			UtilityFunctions::push_error("[DirectStorage] Completion fence wait timed out.");
+			UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "Completion fence wait timed out.");
 			return false;
 		}
 	}
@@ -965,13 +966,13 @@ bool DSContext::_wait_for_completion_sliced(int p_priority, int p_timeout_msec) 
 
 RID DSContext::create_destination_texture(const Ref<RDTextureFormat> &p_format, const Ref<RDTextureView> &p_view) {
 	if (p_format.is_null()) {
-		UtilityFunctions::push_error("[DirectStorage] create_destination_texture failed: format is null.");
+		UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "create_destination_texture failed: format is null.");
 		return RID();
 	}
 	RenderingServer *rs = safe_get_rendering_server();
 	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
 	if (!rd) {
-		UtilityFunctions::push_error("[DirectStorage] create_destination_texture failed: RenderingDevice is not available.");
+		UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "create_destination_texture failed: RenderingDevice is not available.");
 		return RID();
 	}
 	Ref<RDTextureView> view = p_view;
@@ -988,7 +989,7 @@ RID DSContext::create_destination_texture(const Ref<RDTextureFormat> &p_format, 
 	// only freshly created, unused GPU targets to DESTINATION_GPU_*.
 	RID tex_rid = rd->texture_create(p_format, view, TypedArray<PackedByteArray>());
 	if (!tex_rid.is_valid()) {
-		UtilityFunctions::push_error("[DirectStorage] create_destination_texture failed: texture_create failed.");
+		UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "create_destination_texture failed: texture_create failed.");
 		return RID();
 	}
 	return tex_rid;
@@ -1036,13 +1037,13 @@ Dictionary DSContext::get_drive_info(const String &p_path) const {
 Error DSContext::initialize_ds_for_path(const String &p_path) {
 	std::lock_guard<std::mutex> lock(init_mutex);
 	if (p_path.strip_edges().is_empty()) {
-		UtilityFunctions::push_warning("[DirectStorage] Empty path supplied; falling back to res:// initialization.");
+		UtilityFunctions::push_warning(String(dsgd_log::EXTENSION_PREFIX) + "Empty path supplied; falling back to res:// initialization.");
 		return initialize_ds_locked() ? OK : ERR_CANT_CREATE;
 	}
 
 #ifdef _WIN32
 	if (!Win32Backend::is_path_valid(p_path)) {
-		UtilityFunctions::push_warning("[DirectStorage] Path '" + p_path + "' is invalid; falling back to res:// initialization.");
+		UtilityFunctions::push_warning(String(dsgd_log::EXTENSION_PREFIX) + "Path '" + p_path + "' is invalid; falling back to res:// initialization.");
 		if (initialized.load(std::memory_order_acquire)) {
 			shutdown_ds_locked();
 		}
@@ -1052,7 +1053,7 @@ Error DSContext::initialize_ds_for_path(const String &p_path) {
 
 	Dictionary drive_info = Win32Backend::get_drive_info_for_path(p_path);
 	if (!drive_info.get("directstorage_supported", false)) {
-		UtilityFunctions::push_warning("[DirectStorage] Path '" + p_path + "' is on an unsupported volume; falling back to res:// initialization.");
+		UtilityFunctions::push_warning(String(dsgd_log::EXTENSION_PREFIX) + "Path '" + p_path + "' is on an unsupported volume; falling back to res:// initialization.");
 		if (initialized.load(std::memory_order_acquire)) {
 			shutdown_ds_locked();
 		}
@@ -1069,7 +1070,7 @@ Error DSContext::initialize_ds_for_path(const String &p_path) {
 	{
 		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
 		if (path_initialized && active_backend && active_backend->get_name() == "Win32DirectStorage") {
-			UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized for path '" + p_path + "'.");
+			UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "DirectStorage Context initialized for path '" + p_path + "'.");
 			return OK;
 		}
 	}
@@ -1077,10 +1078,10 @@ Error DSContext::initialize_ds_for_path(const String &p_path) {
 	if (initialized.load(std::memory_order_acquire)) {
 		shutdown_ds_locked();
 	}
-	UtilityFunctions::push_warning("[DirectStorage] Path-aware DirectStorage initialization failed; falling back to res:// initialization.");
+	UtilityFunctions::push_warning(String(dsgd_log::EXTENSION_PREFIX) + "Path-aware DirectStorage initialization failed; falling back to res:// initialization.");
 	return initialize_ds_locked() ? OK : ERR_CANT_CREATE;
 #else
-	UtilityFunctions::push_warning("[DirectStorage] Path-aware initialization is unavailable on this platform; falling back to res:// initialization.");
+	UtilityFunctions::push_warning(String(dsgd_log::EXTENSION_PREFIX) + "Path-aware initialization is unavailable on this platform; falling back to res:// initialization.");
 	return initialize_ds_locked() ? OK : ERR_CANT_CREATE;
 #endif
 }
@@ -1170,7 +1171,7 @@ bool DSContext::initialize_ds_locked() {
 			clamped_staging = std::min<uint32_t>(clamped_staging, UMA_MAX_STAGING_BUFFER_SIZE_MB);
 			clamped_queue = std::min<uint16_t>(clamped_queue, UMA_MAX_QUEUE_CAPACITY);
 			if (clamped_staging != requested_staging || clamped_queue != requested_queue) {
-				UtilityFunctions::print("[DirectStorage] Integrated/UMA GPU detected ('" +
+				UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "Integrated/UMA GPU detected ('" +
 						String(adapter.get("adapter_name", "unknown")) +
 						"'): auto-tune clamped staging " + String::num_uint64(requested_staging) +
 						"->" + String::num_uint64(clamped_staging) + " MiB, queue " +
@@ -1181,7 +1182,7 @@ bool DSContext::initialize_ds_locked() {
 			const uint32_t cap_mb = low_vram_staging_cap_mb(dedicated_mb);
 			if (cap_mb > 0 && clamped_staging > cap_mb) {
 				clamped_staging = cap_mb;
-				UtilityFunctions::print("[DirectStorage] Low-VRAM GPU detected ('" +
+				UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "Low-VRAM GPU detected ('" +
 						String(adapter.get("adapter_name", "unknown")) + "', dedicated VRAM " +
 						String::num_int64(dedicated_mb) + " MiB): auto-tune clamped staging " +
 						String::num_uint64(requested_staging) + "->" + String::num_uint64(clamped_staging) +
@@ -1207,7 +1208,7 @@ bool DSContext::initialize_ds_locked() {
 	OS *bench_os = OS::get_singleton();
 	if (bench_os && bench_os->get_environment("DSGD_BENCH_FORCE_FALLBACK") == "1") {
 		bench_try_win32 = false;
-		UtilityFunctions::print("[DirectStorage] BENCH force-fallback override: skipping Win32Backend.");
+		UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "BENCH force-fallback override: skipping Win32Backend.");
 	}
 #endif
 	if (bench_try_win32) {
@@ -1232,15 +1233,15 @@ bool DSContext::initialize_ds_locked() {
 			}
 			init_status.store(INIT_STATUS_DIRECTSTORAGE_D3D12, std::memory_order_release);
 			initialized.store(true, std::memory_order_release);
-			UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with Win32Backend.");
+			UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "DirectStorage Context initialized with Win32Backend.");
 			return true;
 		} else {
 			// Never published, so there is nothing to un-publish.
 			memdelete(backend);
-			UtilityFunctions::print("[DirectStorage] Win32DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
+			UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "Win32DirectStorage initialization failed or unavailable. Falling back to FallbackBackend.");
 		}
 	} else if (force_software_fallback.load(std::memory_order_acquire)) {
-		UtilityFunctions::print("[DirectStorage] force_software_fallback=true: skipping Win32Backend (SoftwareFallback selected).");
+		UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "force_software_fallback=true: skipping Win32Backend (SoftwareFallback selected).");
 	}
 #endif
 
@@ -1254,7 +1255,7 @@ bool DSContext::initialize_ds_locked() {
 	if (!fallback_backend->initialize()) {
 		memdelete(fallback_backend);
 		init_status.store(INIT_STATUS_FAILED, std::memory_order_release);
-		UtilityFunctions::push_error("[DirectStorage] DirectStorage Context initialization failed: FallbackBackend could not start.");
+		UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "DirectStorage Context initialization failed: FallbackBackend could not start.");
 		return false;
 	}
 	{
@@ -1273,13 +1274,13 @@ bool DSContext::initialize_ds_locked() {
 		if (!Thread::is_main_thread() && warning_rs &&
 				warning_rs->get_current_rendering_driver_name().to_lower() == "d3d12" &&
 				!s_off_main_fallback_warned.exchange(true)) {
-			UtilityFunctions::push_warning("[DirectStorage] DirectStorage context initialized on a background thread and fell back to the software backend. Initialize it on the main thread at startup (the DSRuntime autoload does this).");
+			UtilityFunctions::push_warning(String(dsgd_log::EXTENSION_PREFIX) + "DirectStorage context initialized on a background thread and fell back to the software backend. Initialize it on the main thread at startup (the DSRuntime autoload does this).");
 		}
 	}
 #endif
 	init_status.store(INIT_STATUS_SOFTWARE_FALLBACK, std::memory_order_release);
 	initialized.store(true, std::memory_order_release);
-	UtilityFunctions::print("[DirectStorage] DirectStorage Context initialized with FallbackBackend.");
+	UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "DirectStorage Context initialized with FallbackBackend.");
 	return true;
 }
 
@@ -1318,7 +1319,7 @@ void DSContext::shutdown_ds_locked() {
 			// use-after-free Win32Backend's own contract forbids, so the object is
 			// parked instead - deliberately leaked for the life of the process.
 			abandoned_backends.push_back(backend_to_delete);
-			UtilityFunctions::push_warning("[DirectStorage] Backend left unreleased: the shutdown drain timed out, its completion thread is detached, and DMA may still be active. This is a deliberate leak; restart the application to reclaim it.");
+			UtilityFunctions::push_warning(String(dsgd_log::EXTENSION_PREFIX) + "Backend left unreleased: the shutdown drain timed out, its completion thread is detached, and DMA may still be active. This is a deliberate leak; restart the application to reclaim it.");
 		}
 	}
 
@@ -1352,7 +1353,7 @@ void DSContext::shutdown_ds_locked() {
 		}
 	}
 	initialized.store(false, std::memory_order_release);
-	UtilityFunctions::print("[DirectStorage] DirectStorage Context shut down.");
+	UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) + "DirectStorage Context shut down.");
 }
 
 bool DSContext::enqueue_request(Ref<DSRequest> p_request, bool p_from_stream) {

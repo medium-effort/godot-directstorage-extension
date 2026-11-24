@@ -44,6 +44,71 @@ func test_plugin_source_lifecycle_and_reload_wiring() -> void:
 	assert_true("\"extensions_reloaded\"" in source_code)
 	assert_true("ClassDB.class_exists(\"DSContext\")" in _function_body(source_code, "_reinitialize_native_backend_after_reload"))
 	assert_true("call_deferred" in _function_body(source_code, "_queue_native_reinit"))
+	assert_true("func _enable_plugin" in source_code)
+	assert_true("_should_prompt_runtime_install_on_enable" in _function_body(source_code, "_enable_plugin"))
+	assert_true("_on_runtime_menu.call_deferred()" in _function_body(source_code, "_enable_plugin"))
+
+
+class _FakeDSContext:
+	var initialized := true
+	var supported := false
+	var runtime_version := "Unavailable"
+
+	func is_initialized() -> bool:
+		return initialized
+
+	func is_supported() -> bool:
+		return supported
+
+	func get_runtime_info() -> Dictionary:
+		return {"version": runtime_version}
+
+
+func test_enable_plugin_runtime_prompt_guard() -> void:
+	var plugin_script := load(PLUGIN_SCRIPT_PATH) as GDScript
+	assert_not_null(plugin_script, "ds_plugin.gd loads")
+
+	var ctx := _FakeDSContext.new()
+	assert_true(
+		plugin_script._is_runtime_missing_for_prompt(ctx, "", "Windows", "windows"),
+		"prompts on Windows when runtime is Unavailable and no pending swap exists"
+	)
+	assert_false(
+		plugin_script._is_runtime_missing_for_prompt(ctx, "", "Linux", "x11"),
+		"never prompts on non-Windows"
+	)
+	assert_false(
+		plugin_script._is_runtime_missing_for_prompt(ctx, "", "Windows", "headless"),
+		"never prompts in headless mode"
+	)
+	assert_false(
+		plugin_script._is_runtime_missing_for_prompt(ctx, "1.3.0", "Windows", "windows"),
+		"skips prompt when a runtime install is already pending"
+	)
+	assert_false(
+		plugin_script._is_runtime_missing_for_prompt(null, "", "Windows", "windows"),
+		"skips prompt when DSContext is missing"
+	)
+
+	ctx.initialized = false
+	assert_false(
+		plugin_script._is_runtime_missing_for_prompt(ctx, "", "Windows", "windows"),
+		"skips prompt when DSContext is uninitialized"
+	)
+
+	ctx.initialized = true
+	ctx.supported = true
+	assert_false(
+		plugin_script._is_runtime_missing_for_prompt(ctx, "", "Windows", "windows"),
+		"skips prompt when DirectStorage is already supported"
+	)
+
+	ctx.supported = false
+	ctx.runtime_version = "1.3.2506.2501"
+	assert_false(
+		plugin_script._is_runtime_missing_for_prompt(ctx, "", "Windows", "windows"),
+		"skips prompt when runtime DLLs are already present on disk"
+	)
 
 
 func test_autoload_project_settings_contract() -> void:

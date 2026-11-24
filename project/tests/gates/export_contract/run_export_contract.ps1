@@ -644,7 +644,7 @@ function Assert-BootFail {
     }
 }
 
-$verifyRegex = New-Object System.Text.RegularExpressions.Regex('(?m)^\[DirectStorage Exporter\] PACK_VERIFY status=(\w+) reason=(\w+) dir_encrypted=(\w+) entries=(\d+) bytes=(\d+) ms=(\d+) file=(.+)$')
+$verifyRegex = New-Object System.Text.RegularExpressions.Regex('(?m)^\[dsgd Exporter\] PACK_VERIFY status=(\w+) reason=(\w+) dir_encrypted=(\w+) entries=(\d+) bytes=(\d+) ms=(\d+) file=(.+)$')
 
 function Invoke-Scan {
     param([string]$PackPath)

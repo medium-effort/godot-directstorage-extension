@@ -12,14 +12,19 @@ config_version=5
 
 config/name="dsgd Demo"
 config/description="NVMe asset streaming and GPU texture decompression for Godot 4.7, built on the Microsoft DirectStorage API."
+config/version="1.0.0"
 run/main_scene="res://main.tscn"
 config/features=PackedStringArray("4.7")
-config/icon="res://addons/directstorage_accelerator/icons/dsgd.svg"
+config/icon="uid://g230hac6a4gl"
 config/author="MediumEffort"
 
 [autoload]
 
 DSRuntime="*res://addons/directstorage_accelerator/scripts/ds_runtime.gd"
+
+[dsgd_extension]
+
+show_preview_runtimes=false
 
 [editor_plugins]
 

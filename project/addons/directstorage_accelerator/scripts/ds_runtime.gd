@@ -1,5 +1,6 @@
 extends Node
 
+const LOG_PREFIX: String = "[dsgd Extension] "
 const RUNTIME_INSTALLER_PATH: String = "res://addons/directstorage_accelerator/scripts/ds_runtime_installer.gd"
 
 ## Shared completion predicate. A tracked prewarm tag is only finished once its
@@ -214,7 +215,7 @@ func is_tracking_prewarm(tag: int) -> bool:
 ## and CACHE_MODE_REUSE). Returns a positive `scene_tag` or `0` on invalid input.
 func start_scene_prewarm(scene_path: String, deps: PackedStringArray, chunk_size: int = 16, prefer_gpu: bool = true, max_chunk_bytes: int = 0) -> int:
 	if scene_path.is_empty():
-		push_warning("[DirectStorage] DSRuntime: start_scene_prewarm called with empty scene_path.")
+		push_warning(LOG_PREFIX + "DSRuntime: start_scene_prewarm called with empty scene_path.")
 		return 0
 	var scene_tag: int = _next_scene_tag
 	_next_scene_tag += 1
@@ -468,9 +469,9 @@ func _ready() -> void:
 		var ctx = Engine.get_singleton("DSContext")
 		if ctx:
 			ctx.initialize_ds()
-			print("[DirectStorage] Autoload initialized. Active Backend: ", ctx.get_active_backend_name())
+			print(LOG_PREFIX + "Autoload initialized. Active Backend: ", ctx.get_active_backend_name())
 	else:
-		push_error("[DirectStorage] GDExtension ClassDB entry 'DSContext' not found. Ensure GDExtension library is built and deployed.")
+		push_error(LOG_PREFIX + "GDExtension ClassDB entry 'DSContext' not found. Ensure GDExtension library is built and deployed.")
 		if not OS.has_feature("editor"):
 			_fail_boot(
 				"missing_extension",
@@ -516,9 +517,9 @@ func _ready() -> void:
 
 			if not candidate_found:
 				var candidate_list := "'" + "', '".join(candidates) + "'"
-				print("[DirectStorage] Archive '", archive_name, "' not found. Searched candidates: ", candidate_list, ".")
+				print(LOG_PREFIX + "Archive '", archive_name, "' not found. Searched candidates: ", candidate_list, ".")
 				var err_msg := "Missing required game asset archive: '" + archive_name + "'.\n\nPlease verify game file integrity or reinstall the game."
-				push_error("[DirectStorage] FATAL: " + err_msg)
+				push_error(LOG_PREFIX + "FATAL: " + err_msg)
 				_fail_boot("missing_archive", err_msg, "Missing Game Files")
 				return
 			if ClassDB.class_exists("DSPkg"):
@@ -541,13 +542,13 @@ func _ready() -> void:
 							reason = "archive_pairing_mismatch"
 							title = "Mismatched Game Files"
 							open_msg = "Game asset archive does not match this build: '" + archive_name + "'.\n\nThe archive and the game files come from different exports. Reinstall the game or re-export it."
-						push_error("[DirectStorage] FATAL: " + open_msg)
+						push_error(LOG_PREFIX + "FATAL: " + open_msg)
 						_fail_boot(reason, open_msg, title)
 						return
 					if probe.has_method("get_entry_count"):
 						archive_entries = int(probe.call("get_entry_count"))
 		else:
-			print("[DirectStorage] Textures are packaged in PCK (bundle_dspkg disabled); operating in CPU decompression mode.")
+			print(LOG_PREFIX + "Textures are packaged in PCK (bundle_dspkg disabled); operating in CPU decompression mode.")
 		_report_boot_ok(archive_entries)
 
 
@@ -631,7 +632,7 @@ func _emit_boot_line(line: String) -> void:
 	if file == null:
 		file = FileAccess.open(sink, FileAccess.WRITE)
 	if file == null:
-		push_warning("[DirectStorage] Cannot append the boot sentinel to DSPKG_VALIDATE_OUT: " + sink)
+		push_warning(LOG_PREFIX + "Cannot append the boot sentinel to DSPKG_VALIDATE_OUT: " + sink)
 		return
 	file.seek_end()
 	file.store_line(line)
@@ -652,7 +653,7 @@ func _emit_boot_line(line: String) -> void:
 ## recorded here and re-applied in `_exit_tree`.
 func _fail_boot(reason: String, message: String, title: String, code: int = 1) -> void:
 	_emit_boot_line("%s status=fail reason=%s mode=%s" % [BOOT_SENTINEL, reason, _boot_mode()])
-	printerr("[DirectStorage] ", message.replace("\n", " "))
+	printerr(LOG_PREFIX, message.replace("\n", " "))
 	if not _is_non_interactive():
 		if get_tree() and get_tree().root:
 			get_tree().root.hide()
@@ -713,7 +714,7 @@ func _process(delta: float) -> void:
 	if not ctx.has_method("flush_stream_async") or not ctx.has_method("has_stream_pending"):
 		if not _stream_api_missing_warned:
 			_stream_api_missing_warned = true
-			push_warning("[DirectStorage] DSRuntime: stream API (flush_stream_async/has_stream_pending) missing; async prewarm disabled, sync loads unaffected.")
+			push_warning(LOG_PREFIX + "DSRuntime: stream API (flush_stream_async/has_stream_pending) missing; async prewarm disabled, sync loads unaffected.")
 		_poll_legacy_completions(ctx)
 		_poll_scene_prewarms()
 		return
@@ -852,7 +853,7 @@ func _process(delta: float) -> void:
 					slice_label = "warm"
 			if slice_label != _slice_label:
 				if _slice_debug:
-					print("[DirectStorage] DSRuntime slice: %s -> %s (ema %.1f ms)" % [_slice_label, slice_label, _slice_ema_ms])
+					print(LOG_PREFIX + "DSRuntime slice: %s -> %s (ema %.1f ms)" % [_slice_label, slice_label, _slice_ema_ms])
 				_slice_label = slice_label
 			# Phase-2 GPU prewarm: in background mode, gate on GPU request
 			# completion and adaptive frame headroom; in loading-screen mode,
@@ -963,7 +964,7 @@ func _process(delta: float) -> void:
 				_record_slice_stat(gpu_slice_label)
 			if not _drain_reported and _poll_task_id == -1 and _has_get_unbuilt and int(cache.get_unbuilt_prewarm_count(0)) == 0:
 				if _slice_debug:
-					print("[DirectStorage] DSRuntime prewarm drained: warm=%d mild=%d heavy=%d" % [_warm_slices, _mild_slices, _heavy_slices])
+					print(LOG_PREFIX + "DSRuntime prewarm drained: warm=%d mild=%d heavy=%d" % [_warm_slices, _mild_slices, _heavy_slices])
 				_drain_reported = true
 				# Counters intentionally NOT reset here; Settings resets them at
 				# benchmark start and reads them in its end-of-load summary.
@@ -1003,7 +1004,7 @@ func _poll_prewarm_progress(ctx: Object) -> void:
 		# unobservable here anyway, so drop the watch after one warning.
 		if not _prewarm_api_missing_warned:
 			_prewarm_api_missing_warned = true
-			push_warning("[DirectStorage] DSRuntime: prewarm progress API missing; clearing the tag watch (progress cannot be polled).")
+			push_warning(LOG_PREFIX + "DSRuntime: prewarm progress API missing; clearing the tag watch (progress cannot be polled).")
 		_tracked_tags.clear()
 		return
 	for tag in _tracked_tags.keys():
@@ -1081,7 +1082,7 @@ func _poll_scene_prewarms() -> void:
 			if tex_tag <= 0 or PRELOADER_SCRIPT.is_prewarm_complete(tex_tag):
 				var err: Error = ResourceLoader.load_threaded_request(scene_path, "PackedScene", false, ResourceLoader.CACHE_MODE_REUSE)
 				if err != OK:
-					push_warning("[DirectStorage] DSRuntime: load_threaded_request failed for '", scene_path, "' (err=", err, ").")
+					push_warning(LOG_PREFIX + "DSRuntime: load_threaded_request failed for '", scene_path, "' (err=", err, ").")
 					_finish_scene_prewarm(scene_tag, scene_path, null)
 					continue
 				entry["stage"] = _ScenePrewarmStage.STAGE_THREADED_SCENE_LOAD
@@ -1098,7 +1099,7 @@ func _poll_scene_prewarms() -> void:
 				_emit_scene_prewarm_progress(scene_tag, entry, "done", 1.0)
 				_finish_scene_prewarm(scene_tag, scene_path, packed)
 			else:
-				push_warning("[DirectStorage] DSRuntime: threaded scene load failed for '", scene_path, "' (status=", status, ").")
+				push_warning(LOG_PREFIX + "DSRuntime: threaded scene load failed for '", scene_path, "' (status=", status, ").")
 				_finish_scene_prewarm(scene_tag, scene_path, null)
 		elif stage == _ScenePrewarmStage.STAGE_CANCELLING_SCENE_LOAD:
 			var status: ResourceLoader.ThreadLoadStatus = ResourceLoader.load_threaded_get_status(scene_path)
