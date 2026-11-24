@@ -115,31 +115,54 @@ GDEX_TEST(static_lifetime, win32_backend_dedup_has_no_static_godot_string) {
 }
 
 GDEX_TEST(static_lifetime, resource_loader_dedup_has_no_static_godot_string) {
-	string text;
-	GDEX_EXPECT_TRUE(read_source("src/integration/ds_resource_format_loader.cpp", text));
-	if (text.empty()) {
-		GDEX_FAIL("could not read the resource loader source");
+	string loader_text;
+	string common_hdr;
+	string common_src;
+	GDEX_EXPECT_TRUE(read_source("src/integration/ds_resource_format_loader.cpp", loader_text));
+	GDEX_EXPECT_TRUE(read_source("src/integration/ds_texture_pipeline_common.h", common_hdr));
+	GDEX_EXPECT_TRUE(read_source("src/integration/ds_texture_pipeline_common.cpp", common_src));
+	if (loader_text.empty() || common_hdr.empty() || common_src.empty()) {
+		GDEX_FAIL("could not read resource loader or shared pipeline sources");
 		return;
 	}
-	GDEX_EXPECT_FALSE(contains(text, "static String s_last_reported_unauth_path"));
-	assert_shared_invariants(ctx, text,
+	GDEX_EXPECT_FALSE(count_static_godot_string_decls(loader_text) != 0);
+	GDEX_EXPECT_FALSE(count_static_godot_string_decls(common_hdr) != 0);
+	GDEX_EXPECT_FALSE(contains(loader_text, "static String s_last_reported_unauth_path"));
+	GDEX_EXPECT_TRUE(contains(loader_text, "UnauthorizedReportDedup s_loader_unauth_dedup"));
+	GDEX_EXPECT_TRUE(contains(loader_text, "open_archive_with_pairing"));
+	GDEX_EXPECT_TRUE(contains(loader_text, "\"DirectStorage\""));
+	GDEX_EXPECT_TRUE(contains(common_hdr, "struct UnauthorizedReportDedup"));
+	GDEX_EXPECT_TRUE(contains(common_hdr, "std::mutex mutex;"));
+	GDEX_EXPECT_TRUE(contains(common_hdr, "uint64_t last_hash"));
+	GDEX_EXPECT_TRUE(contains(common_hdr, "bool has_reported"));
+	assert_shared_invariants(ctx, common_src,
 			"Decryption unauthorized or key mismatch for package",
 			"open_err == ERR_UNAUTHORIZED",
 			"return Ref<DSPkg>();",
-			"s_last_reported_unauth_hash", "s_has_reported_unauth", "s_unauth_report_mutex");
+			"r_dedup.last_hash", "r_dedup.has_reported", "r_dedup.mutex");
 }
 
 GDEX_TEST(static_lifetime, preloader_dedup_has_no_static_godot_string) {
-	string text;
-	GDEX_EXPECT_TRUE(read_source("src/integration/ds_preloader.cpp", text));
-	if (text.empty()) {
-		GDEX_FAIL("could not read the preloader source");
+	string preloader_text;
+	string common_hdr;
+	string common_src;
+	GDEX_EXPECT_TRUE(read_source("src/integration/ds_preloader.cpp", preloader_text));
+	GDEX_EXPECT_TRUE(read_source("src/integration/ds_texture_pipeline_common.h", common_hdr));
+	GDEX_EXPECT_TRUE(read_source("src/integration/ds_texture_pipeline_common.cpp", common_src));
+	if (preloader_text.empty() || common_hdr.empty() || common_src.empty()) {
+		GDEX_FAIL("could not read preloader or shared pipeline sources");
 		return;
 	}
-	GDEX_EXPECT_FALSE(contains(text, "static String s_last_reported_preloader_unauth"));
-	assert_shared_invariants(ctx, text,
-			"DirectStorage Preloader: Decryption unauthorized or key mismatch for package",
+	GDEX_EXPECT_FALSE(count_static_godot_string_decls(preloader_text) != 0);
+	GDEX_EXPECT_FALSE(count_static_godot_string_decls(common_hdr) != 0);
+	GDEX_EXPECT_FALSE(contains(preloader_text, "static String s_last_reported_preloader_unauth"));
+	GDEX_EXPECT_TRUE(contains(preloader_text, "UnauthorizedReportDedup s_preloader_unauth_dedup"));
+	GDEX_EXPECT_TRUE(contains(preloader_text, "open_archive_with_pairing"));
+	GDEX_EXPECT_TRUE(contains(preloader_text, "\"DirectStorage Preloader\""));
+	GDEX_EXPECT_TRUE(contains(preloader_text, "return false;"));
+	assert_shared_invariants(ctx, common_src,
+			"Decryption unauthorized or key mismatch for package",
 			"open_err == ERR_UNAUTHORIZED",
-			"return false;",
-			"s_last_reported_preloader_unauth_hash", "s_has_reported_preloader_unauth", "s_unauth_report_mutex");
+			"return Ref<DSPkg>();",
+			"r_dedup.last_hash", "r_dedup.has_reported", "r_dedup.mutex");
 }

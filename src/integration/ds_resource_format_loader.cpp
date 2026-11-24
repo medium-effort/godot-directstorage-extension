@@ -2,6 +2,7 @@
 #include "ds_preloader.h"
 #include "ds_texture_cache.h"
 #include "ds_texture_owner.h"
+#include "ds_texture_pipeline_common.h"
 #include "../compression/gdeflate_decompressor.h"
 #include "../core/ds_context.h"
 #include "../core/ds_request.h"
@@ -39,24 +40,13 @@ namespace {
 // Unauthorized-archive log dedup state. Native, trivially destructible types only:
 // a godot::String here would destruct at DLL unload, after Godot's allocator is
 // gone (GODOT_QUIRKS.md Section 6). Mirrors DSPkg's own dedup state.
-std::mutex s_unauth_report_mutex;
-uint64_t s_last_reported_unauth_hash = 0;
-bool s_has_reported_unauth = false;
+dsgd_texture_pipeline::UnauthorizedReportDedup s_loader_unauth_dedup;
 
 // Bounded wait for a threaded ResourceLoader worker that hits a texture already
 // in-flight in DSPreloader. Finite so a stalled prewarm cannot pin a worker
 // indefinitely; on timeout the worker falls through to the duplicate CPU decode
 // rather than blocking the load forever. The main/render-thread path uses 0.
 static constexpr uint32_t kThreadedLoaderAwaitPendingMs = 1000;
-
-// 0 means the archive is unpaired; pairing is the random archive id, compared
-// in full 64-bit width when the expected value is non-zero.
-uint64_t resolve_expected_fingerprint(ProjectSettings * /*p_ps*/) {
-	if (dsgd_settings::has_setting("archive_id", "export/archive_id")) {
-		return static_cast<uint64_t>(dsgd_settings::get_setting("archive_id", "export/archive_id"));
-	}
-	return 0;
-}
 
 // Loader-local archive-path cache. Has its own guard and generation and
 // shares no state with the preloader, so the sync and async queues stay
@@ -79,22 +69,6 @@ struct LoaderArchiveResolution {
 LoaderArchiveResolution &loader_archive_resolution() {
 	static LoaderArchiveResolution s;
 	return s;
-}
-
-// Full Godot mip chain length for Image::create_from_data(use_mipmaps=true).
-// Partial chains (1 < mips < full) must fall back to base-mip-only instead of failing.
-static uint32_t ds_full_mip_chain_count(uint32_t p_w, uint32_t p_h) {
-	uint32_t n = 1;
-	while (p_w > 1 || p_h > 1) {
-		if (p_w > 1) {
-			p_w /= 2;
-		}
-		if (p_h > 1) {
-			p_h /= 2;
-		}
-		++n;
-	}
-	return n;
 }
 
 } // namespace
@@ -175,25 +149,14 @@ String DSResourceFormatLoader::_get_resource_type(const String &p_path) const {
 }
 
 String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_path) const {
-	Engine *engine = Engine::get_singleton();
-	OS *os = OS::get_singleton();
-	ProjectSettings *project_settings = ProjectSettings::get_singleton();
-
-	bool force_resolution = dsgd_settings::has_setting("force_archive_resolution", "force_archive_resolution") &&
-			static_cast<bool>(dsgd_settings::get_setting("force_archive_resolution", "force_archive_resolution"));
-
-	if (!force_resolution && ((engine && engine->is_editor_hint()) || (os && os->has_feature("editor")))) {
+	if (dsgd_texture_pipeline::archive_resolution_blocked_by_editor()) {
 		return String();
 	}
 
-	String archive_filename = "textures.dspkg";
-	if (dsgd_settings::has_setting("archive_name", "archive_name")) {
-		String custom_name = dsgd_settings::get_setting("archive_name", "archive_name");
-		if (!custom_name.is_empty()) {
-			archive_filename = custom_name;
-		}
-	}
-	String canonical_logical = "res://" + archive_filename;
+	OS *os = OS::get_singleton();
+	ProjectSettings *project_settings = ProjectSettings::get_singleton();
+	const String archive_filename = dsgd_texture_pipeline::resolve_configured_archive_filename();
+	const String canonical_logical = "res://" + archive_filename;
 
 	if (FileAccess::file_exists(p_logical_path)) {
 		if (project_settings && p_logical_path.begins_with("res://")) {
@@ -222,27 +185,7 @@ String DSResourceFormatLoader::_resolve_archive_path(const String &p_logical_pat
 		}
 	}
 
-	String found;
-	if (os) {
-		String exe_dir = os->get_executable_path().get_base_dir();
-		String executable_custom = exe_dir.path_join(archive_filename);
-		String executable_default = exe_dir.path_join("textures.dspkg");
-		if (FileAccess::file_exists(executable_custom)) {
-			found = executable_custom;
-		} else if (FileAccess::file_exists(executable_default)) {
-			found = executable_default;
-		}
-	}
-
-	if (found.is_empty() && project_settings) {
-		String globalized_custom = project_settings->globalize_path(canonical_logical);
-		String globalized_default = project_settings->globalize_path("res://textures.dspkg");
-		if (FileAccess::file_exists(globalized_custom)) {
-			found = globalized_custom;
-		} else if (FileAccess::file_exists(globalized_default)) {
-			found = globalized_default;
-		}
-	}
+	String found = dsgd_texture_pipeline::probe_physical_archive_candidates(archive_filename);
 
 	{
 		std::lock_guard<std::mutex> lock(loader_archive_resolution().mutex);
@@ -362,27 +305,8 @@ Ref<DSPkg> DSResourceFormatLoader::_open_archive_instance(const String &p_archiv
 		debug_archive_io_hook(ARCHIVE_IO_OPEN);
 	}
 #endif
-	uint64_t expected_fingerprint = resolve_expected_fingerprint(ProjectSettings::get_singleton());
-
-	Ref<DSPkg> archive;
-	archive.instantiate();
-	Error open_err = archive->open(p_archive_path, expected_fingerprint);
-	if (open_err != OK) {
-		if (open_err == ERR_UNAUTHORIZED) {
-			// The guard stays: two callers may open concurrently now that
-			// archive_mutex does not cover the parse. The dedup state itself must
-			// be native so it cannot destruct at DLL unload (Section 6).
-			std::lock_guard<std::mutex> report_lock(s_unauth_report_mutex);
-			const uint64_t path_hash = p_archive_path.hash();
-			if (!s_has_reported_unauth || s_last_reported_unauth_hash != path_hash) {
-				s_has_reported_unauth = true;
-				s_last_reported_unauth_hash = path_hash;
-				UtilityFunctions::push_error("DirectStorage: Decryption unauthorized or key mismatch for package '" + p_archive_path + "'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.");
-			}
-		}
-		return Ref<DSPkg>();
-	}
-	return archive;
+	return dsgd_texture_pipeline::open_archive_with_pairing(
+			p_archive_path, s_loader_unauth_dedup, "DirectStorage", false);
 }
 
 bool DSResourceFormatLoader::_is_texture_archive_entry(const String &p_path) const {
@@ -632,24 +556,8 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	}
 
 	if (can_attempt_gpu) {
-		Ref<RDTextureFormat> rd_fmt;
-		rd_fmt.instantiate();
-		rd_fmt->set_width(static_cast<int32_t>(p_width));
-		rd_fmt->set_height(static_cast<int32_t>(p_height));
-		rd_fmt->set_format(static_cast<RenderingDevice::DataFormat>(p_pixel_format));
-		rd_fmt->set_mipmaps(static_cast<int32_t>(p_mip_count > 0 ? p_mip_count : 1));
-		rd_fmt->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);
-		rd_fmt->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
-		// Shareable-list validation (rendering_device.cpp:1552): a non-empty
-		// list MUST contain the base format itself. Add base first, then the
-		// sRGB counterpart for 3D PBR albedo sampling.
-		if (!DSTex::is_rd_format_srgb(static_cast<int>(p_pixel_format))) {
-			int srgb_fmt = DSTex::get_srgb_rd_format(static_cast<int>(p_pixel_format));
-			if (srgb_fmt != RenderingDevice::DATA_FORMAT_MAX && srgb_fmt != static_cast<int>(p_pixel_format)) {
-				rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(p_pixel_format));
-				rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(srgb_fmt));
-			}
-		}
+		Ref<RDTextureFormat> rd_fmt = dsgd_texture_pipeline::build_gpu_destination_texture_format(
+				p_width, p_height, p_pixel_format, p_mip_count);
 
 		Ref<RDTextureView> rd_view;
 		rd_view.instantiate();
@@ -661,94 +569,30 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				// Sync _load path: explicit from_stream=false so the batch manager's
 				// stream flush can never steal a sync request. One batch, one flush,
 				// even when a chunked payload becomes several requests.
-				Vector<Ref<DSRequest>> uploads;
-				auto make_upload = [&](uint64_t p_upload_offset, uint32_t p_size, uint32_t p_uncompressed,
-						uint32_t p_first_subresource, uint32_t p_subresource_count) -> Ref<DSRequest> {
-					Ref<DSRequest> req;
-					req.instantiate();
-					req->set_file_path(p_file_path);
-					req->set_offset(p_upload_offset);
-					req->set_size(p_size);
-					req->set_uncompressed_size(p_uncompressed);
-					req->set_destination_type(DSRequest::DESTINATION_GPU_TEXTURE);
-					req->set_destination_resource(tex_rid);
-					req->set_first_subresource(p_first_subresource);
-					req->set_subresource_count(p_subresource_count);
-					req->set_texture_format(static_cast<uint32_t>(native_format));
-					req->set_compression_format(is_gdeflate ? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
-					req->set_debug_label(p_cache_key);
-					uploads.push_back(req);
-					return req;
-				};
+				dsgd_texture_pipeline::GpuUploadPlanInput plan_input;
+				plan_input.file_path = &p_file_path;
+				plan_input.debug_label = &p_cache_key;
+				plan_input.width = p_width;
+				plan_input.height = p_height;
+				plan_input.pixel_format = p_pixel_format;
+				plan_input.mip_count = p_mip_count;
+				plan_input.compression_format = static_cast<uint8_t>(p_compression_format);
+				plan_input.data_offset = p_offset;
+				plan_input.compressed_size = p_compressed_size;
+				plan_input.original_size = p_original_size;
+				plan_input.chunked = p_chunked;
+				plan_input.mip_offsets = &p_mip_offsets;
+				plan_input.mip_sizes = &p_mip_sizes;
+				plan_input.mip_uncompressed_sizes = &p_mip_uncompressed_sizes;
+				plan_input.mip_row_pitches = &p_mip_row_pitches;
+				plan_input.mip_chunk_counts = &p_mip_chunk_counts;
+				plan_input.chunk_offsets = &p_chunk_offsets;
+				plan_input.chunk_compressed_sizes = &p_chunk_compressed_sizes;
+				plan_input.chunk_uncompressed_sizes = &p_chunk_uncompressed_sizes;
 
-				bool chunk_layout_ok = true;
-				if (p_chunked) {
-					// One request per chunk. A single-chunk mip keeps the whole-
-					// subresource destination: its chunk table entry does not exist.
-					int64_t chunk_cursor = 0;
-					for (uint32_t mip = 0; mip < p_mip_count; ++mip) {
-						const int32_t chunk_count = p_mip_chunk_counts.size() > static_cast<int64_t>(mip) ? p_mip_chunk_counts[mip] : 1;
-						const int32_t pitch = p_mip_row_pitches.size() > static_cast<int64_t>(mip) ? p_mip_row_pitches[mip] : 0;
-						if (chunk_count <= 1) {
-							// A single-chunk mip has no chunk-table entry and targets
-							// ONE subresource: keep it on MULTIPLE_SUBRESOURCES_RANGE
-							// (no texture row region) so <4x4 BCn tail mips do not
-							// submit non-4-aligned D3D12_BOX extents.
-							make_upload(static_cast<uint64_t>(p_mip_offsets[mip]),
-									static_cast<uint32_t>(p_mip_sizes[mip]),
-									static_cast<uint32_t>(p_mip_uncompressed_sizes[mip]), mip, 1);
-							continue;
-						}
-						if (pitch <= 0) {
-							chunk_layout_ok = false;
-							break;
-						}
-						// Chunk uncompressed sizes are whole storage rows (block rows for
-						// the 4x4 formats), so `row` stays in that unit for the byte-sum
-						// check below; only the request band is converted to the texel
-						// rows a D3D12_BOX expects.
-						const uint32_t mip_height = std::max<uint32_t>(1u, p_height >> mip);
-						uint32_t row = 0;
-						for (int32_t c = 0; c < chunk_count; ++c, ++chunk_cursor) {
-							if (chunk_cursor >= p_chunk_offsets.size() ||
-									chunk_cursor >= p_chunk_compressed_sizes.size() ||
-									chunk_cursor >= p_chunk_uncompressed_sizes.size()) {
-								chunk_layout_ok = false;
-								break;
-							}
-							const uint32_t uncompressed = static_cast<uint32_t>(p_chunk_uncompressed_sizes[chunk_cursor]);
-							if (uncompressed % static_cast<uint32_t>(pitch) != 0) {
-								chunk_layout_ok = false;
-								break;
-							}
-							const uint32_t rows = uncompressed / static_cast<uint32_t>(pitch);
-							uint32_t region_top = 0;
-							uint32_t region_bottom = 0;
-							if (!DSTex::get_chunk_texel_region(mip_height, row, rows, img_fmt, region_top, region_bottom)) {
-								chunk_layout_ok = false;
-								break;
-							}
-							Ref<DSRequest> req = make_upload(static_cast<uint64_t>(p_chunk_offsets[chunk_cursor]),
-									static_cast<uint32_t>(p_chunk_compressed_sizes[chunk_cursor]), uncompressed, mip, 1);
-							req->set_texture_region(region_top, region_bottom);
-							row += rows;
-						}
-						if (!chunk_layout_ok || static_cast<uint64_t>(row) * static_cast<uint64_t>(pitch) !=
-								static_cast<uint64_t>(p_mip_uncompressed_sizes[mip])) {
-							chunk_layout_ok = false;
-							break;
-						}
-					}
-				} else {
-					uint64_t start_offset = (p_mip_offsets.size() > 0) ? static_cast<uint64_t>(p_mip_offsets[0]) : p_offset;
-					uint64_t total_span = p_compressed_size;
-					if (p_mip_offsets.size() >= static_cast<int64_t>(p_mip_count) && p_mip_sizes.size() >= static_cast<int64_t>(p_mip_count) && p_mip_count > 0) {
-						uint64_t last_idx = p_mip_count - 1;
-						total_span = (static_cast<uint64_t>(p_mip_offsets[last_idx]) + static_cast<uint64_t>(p_mip_sizes[last_idx])) - start_offset;
-					}
-					make_upload(start_offset, static_cast<uint32_t>(total_span),
-							static_cast<uint32_t>(p_original_size), 0, p_mip_count);
-				}
+				Vector<Ref<DSRequest>> uploads;
+				const bool chunk_layout_ok = dsgd_texture_pipeline::build_gpu_upload_requests(
+						plan_input, tex_rid, native_format, uploads);
 
 				const uint32_t queue_capacity = ds_ctx->get_queue_capacity();
 				if (!chunk_layout_ok) {
@@ -1065,7 +909,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				// Partial chains slice mip 0 and build without mipmaps + warning.
 				bool use_mipmaps = mip_count > 1;
 				PackedByteArray image_data;
-				const uint32_t full_chain = ds_full_mip_chain_count(p_width, p_height);
+				const uint32_t full_chain = dsgd_texture_pipeline::full_mip_chain_count(p_width, p_height);
 				if (use_mipmaps && mip_count < full_chain) {
 					const DSTexMipLayout base_layout = DSTex::get_mip_layout(p_width, p_height, img_fmt);
 					const int64_t base_size = static_cast<int64_t>(base_layout.source_size);
@@ -1142,7 +986,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 				// Graceful Base Fallback (v1): partial chains slice mip 0, no mipmaps.
 				bool use_mipmaps_v1 = mip_count > 1;
 				PackedByteArray image_data_v1;
-				const uint32_t full_chain_v1 = ds_full_mip_chain_count(p_width, p_height);
+				const uint32_t full_chain_v1 = dsgd_texture_pipeline::full_mip_chain_count(p_width, p_height);
 				if (use_mipmaps_v1 && mip_count < full_chain_v1) {
 					const DSTexMipLayout base_layout_v1 = DSTex::get_mip_layout(p_width, p_height, img_fmt);
 					const int64_t base_size_v1 = static_cast<int64_t>(base_layout_v1.source_size);

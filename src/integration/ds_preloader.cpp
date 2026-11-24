@@ -1,5 +1,6 @@
 #include "ds_preloader.h"
 #include "ds_texture_cache.h"
+#include "ds_texture_pipeline_common.h"
 #include "core/ds_settings.h"
 #include "../core/ds_context.h"
 #include "../core/ds_cpu_budget.h"
@@ -47,9 +48,7 @@ static std::atomic<int> s_last_poll_offloads{ 0 };
 // Unauthorized-archive log dedup state. Native, trivially destructible types only:
 // a godot::String here would destruct at DLL unload, after Godot's allocator is
 // gone (GODOT_QUIRKS.md Section 6). Mirrors DSPkg's own dedup state.
-static std::mutex s_unauth_report_mutex;
-static uint64_t s_last_reported_preloader_unauth_hash = 0;
-static bool s_has_reported_preloader_unauth = false;
+static dsgd_texture_pipeline::UnauthorizedReportDedup s_preloader_unauth_dedup;
 
 // Upper bound per prewarm request output buffer. The sync loader imposes no
 // cap, but prewarm fans out to dozens of speculative buffers, so a corrupt
@@ -82,96 +81,40 @@ static uint64_t estimate_payload_bytes(const DSPreloader::Payload &p_meta);
 //
 // Returns false when the table does not exactly cover the payload: array
 // lengths disagree, a mip's chunk count overruns or undershoots the table, a
-// pitch is unusable, a chunk size is not a whole number of rows, or a mip's
-// chunks do not sum to its footprint. Callers treat false as "ineligible".
-template <typename Fn>
-static bool walk_gpu_upload_units(const DSPreloader::Payload &p_meta, Fn &&p_visit) {
-	const int64_t mips = static_cast<int64_t>(p_meta.mip_count);
-	if (mips <= 0) {
-		return false;
-	}
-	if (p_meta.mip_chunk_counts.size() < mips || p_meta.mip_row_pitches.size() < mips) {
-		return false;
-	}
-	const int64_t table_size = p_meta.chunk_offsets.size();
-	if (p_meta.chunk_compressed_sizes.size() != table_size ||
-			p_meta.chunk_uncompressed_sizes.size() != table_size) {
-		return false;
-	}
-	const int img_fmt = DSTex::rd_format_to_godot_format(static_cast<int>(p_meta.pixel_format));
-	int64_t cursor = 0;
-	for (int64_t mip = 0; mip < mips; ++mip) {
-		const int32_t count = p_meta.mip_chunk_counts[mip];
-		// Single-chunk mips have no chunk-table entries (same convention as
-		// expand_requests and the loader path).
-		if (count <= 1) {
-			if (!p_visit(static_cast<uint32_t>(mip), static_cast<int64_t>(-1), 0u, 0u)) {
-				return false;
-			}
-			continue;
-		}
-		const int32_t pitch = p_meta.mip_row_pitches[mip];
-		if (pitch <= 0) {
-			return false;
-		}
-		if (cursor + count > table_size) {
-			return false;
-		}
-		// `row` stays in storage rows (block rows for the 4x4 formats) because
-		// that is the unit of `pitch` and of the byte-sum check below; the
-		// visitor receives texel rows, which is what a D3D12_BOX speaks.
-		const uint32_t mip_height = std::max<uint32_t>(1u, p_meta.height >> static_cast<uint32_t>(mip));
-		uint32_t row = 0;
-		for (int32_t c = 0; c < count; ++c) {
-			const int64_t chunk_index = cursor + c;
-			const int64_t uncompressed = static_cast<int64_t>(p_meta.chunk_uncompressed_sizes[chunk_index]);
-			const int64_t compressed = static_cast<int64_t>(p_meta.chunk_compressed_sizes[chunk_index]);
-			if (uncompressed <= 0 || uncompressed > UINT32_MAX || compressed <= 0 || compressed > UINT32_MAX) {
-				return false;
-			}
-			if (uncompressed % pitch != 0) {
-				return false;
-			}
-			const uint32_t rows = static_cast<uint32_t>(uncompressed / pitch);
-			uint32_t region_top = 0;
-			uint32_t region_bottom = 0;
-			if (rows == 0 ||
-					!DSTex::get_chunk_texel_region(mip_height, row, rows, img_fmt, region_top, region_bottom)) {
-				return false;
-			}
-			if (!p_visit(static_cast<uint32_t>(mip), chunk_index, region_top, region_bottom - region_top)) {
-				return false;
-			}
-			row += rows;
-		}
-		if (static_cast<uint64_t>(row) * static_cast<uint64_t>(pitch) !=
-				static_cast<uint64_t>(p_meta.mip_uncompressed_sizes[mip])) {
-			return false;
-		}
-		cursor += count;
-	}
-	return cursor == table_size;
+static dsgd_texture_pipeline::GpuUploadPlanInput make_gpu_upload_plan_input(const DSPreloader::Payload &p_meta, uint64_t p_tag = 0) {
+	dsgd_texture_pipeline::GpuUploadPlanInput input;
+	input.file_path = &p_meta.file_path;
+	input.debug_label = &p_meta.engine_path;
+	input.width = p_meta.width;
+	input.height = p_meta.height;
+	input.pixel_format = p_meta.pixel_format;
+	input.mip_count = p_meta.mip_count;
+	input.compression_format = p_meta.compression_format;
+	input.data_offset = p_meta.data_offset;
+	input.compressed_size = p_meta.compressed_size;
+	input.original_size = p_meta.original_size;
+	input.chunked = p_meta.chunked;
+	input.gdeflate_prevalidated = p_meta.gdeflate_prevalidated;
+	input.cancellation_tag = p_tag;
+	input.mip_offsets = &p_meta.mip_offsets;
+	input.mip_sizes = &p_meta.mip_sizes;
+	input.mip_uncompressed_sizes = &p_meta.mip_uncompressed_sizes;
+	input.mip_row_pitches = &p_meta.mip_row_pitches;
+	input.mip_chunk_counts = &p_meta.mip_chunk_counts;
+	input.chunk_offsets = &p_meta.chunk_offsets;
+	input.chunk_compressed_sizes = &p_meta.chunk_compressed_sizes;
+	input.chunk_uncompressed_sizes = &p_meta.chunk_uncompressed_sizes;
+	return input;
 }
 
 // Request fan-out the GPU path will stage for one payload: 1 for plain
-// payloads, otherwise one per upload unit. Mirrors walk_gpu_upload_units so the
+// payloads, otherwise one per upload unit. Mirrors enumerate_gpu_upload_units so the
 // per-callback slicer budgets in requests, not textures. A whole texture is
 // never split across callbacks (pending entries attach all requests in one
 // alloc), so an estimate above the cap still rides as one oversized chunk and
 // the render-side queue-budget guard diverts it.
 static size_t count_gpu_requests_for_payload(const DSPreloader::Payload &p_meta) {
-	if (!p_meta.chunked) {
-		return 1;
-	}
-	size_t total = 0;
-	const bool shaped = walk_gpu_upload_units(p_meta,
-			[&total](uint32_t, int64_t, uint32_t, uint32_t) {
-				++total;
-				return true;
-			});
-	// A malformed table is rejected by is_gpu_prewarm_eligible() before it can be
-	// queued; counting it as one keeps a stray entry from stalling the tag.
-	return (shaped && total > 0) ? total : 1;
+	return dsgd_texture_pipeline::count_gpu_upload_requests(make_gpu_upload_plan_input(p_meta));
 }
 
 // One render-thread callback's worth of GPU prewarm items.
@@ -228,21 +171,6 @@ static void count_gpu_shortfall(DSContext *p_ctx, uint64_t p_tag, size_t p_units
 	}
 }
 
-// Full Godot mip chain length for Image::create_from_data(use_mipmaps=true).
-static uint32_t ds_preloader_full_mip_chain_count(uint32_t p_w, uint32_t p_h) {
-	uint32_t n = 1;
-	while (p_w > 1 || p_h > 1) {
-		if (p_w > 1) {
-			p_w /= 2;
-		}
-		if (p_h > 1) {
-			p_h /= 2;
-		}
-		++n;
-	}
-	return n;
-}
-
 DSPreloader::State &DSPreloader::state() {
 	static State s;
 	return s;
@@ -254,14 +182,7 @@ bool DSPreloader::is_engine_source_path(const String &p_path) {
 }
 
 String DSPreloader::resolve_archive_path() {
-	Engine *engine = Engine::get_singleton();
-	OS *os = OS::get_singleton();
-	ProjectSettings *ps = ProjectSettings::get_singleton();
-
-	bool force_resolution = dsgd_settings::has_setting("force_archive_resolution", "force_archive_resolution") &&
-			static_cast<bool>(dsgd_settings::get_setting("force_archive_resolution", "force_archive_resolution"));
-
-	if (!force_resolution && ((engine && engine->is_editor_hint()) || (os && os->has_feature("editor")))) {
+	if (dsgd_texture_pipeline::archive_resolution_blocked_by_editor()) {
 		return String();
 	}
 
@@ -273,14 +194,8 @@ String DSPreloader::resolve_archive_path() {
 		}
 	}
 
-	String archive_filename = "textures.dspkg";
-	if (dsgd_settings::has_setting("archive_name", "archive_name")) {
-		String custom_name = dsgd_settings::get_setting("archive_name", "archive_name");
-		if (!custom_name.is_empty()) {
-			archive_filename = custom_name;
-		}
-	}
-	String logical = "res://" + archive_filename;
+	const String archive_filename = dsgd_texture_pipeline::resolve_configured_archive_filename();
+	const String logical = "res://" + archive_filename;
 
 	String found;
 	if (FileAccess::file_exists(logical)) {
@@ -288,25 +203,7 @@ String DSPreloader::resolve_archive_path() {
 	} else if (FileAccess::file_exists("res://textures.dspkg")) {
 		found = "res://textures.dspkg";
 	} else {
-		if (os) {
-			String exe_dir = os->get_executable_path().get_base_dir();
-			String exe_custom = exe_dir.path_join(archive_filename);
-			String exe_default = exe_dir.path_join("textures.dspkg");
-			if (FileAccess::file_exists(exe_custom)) {
-				found = exe_custom;
-			} else if (FileAccess::file_exists(exe_default)) {
-				found = exe_default;
-			}
-		}
-		if (found.is_empty() && ps) {
-			String globalized_custom = ps->globalize_path(logical);
-			String globalized_default = ps->globalize_path("res://textures.dspkg");
-			if (FileAccess::file_exists(globalized_custom)) {
-				found = globalized_custom;
-			} else if (FileAccess::file_exists(globalized_default)) {
-				found = globalized_default;
-			}
-		}
+		found = dsgd_texture_pipeline::probe_physical_archive_candidates(archive_filename);
 	}
 	{
 		std::lock_guard<std::mutex> lock(state().archive_mutex);
@@ -361,30 +258,9 @@ bool DSPreloader::fill_from_dspkg(const String &p_engine_path, Payload &r_out) {
 		// Open the archive with no lock held: this mutex also guards the state the
 		// main thread reads, so a TOC read and decrypt (up to 64 MiB) must not run
 		// inside it. DSPkg::open touches only the instance it is called on.
-		Ref<DSPkg> fresh;
-		fresh.instantiate();
-		// 0 means the archive is unpaired; pairing is the random archive id,
-		// compared in full 64-bit width when the expected value is non-zero.
-		uint64_t expected_fingerprint = 0;
-		if (dsgd_settings::has_setting("archive_id", "export/archive_id")) {
-			expected_fingerprint = static_cast<uint64_t>(dsgd_settings::get_setting("archive_id", "export/archive_id"));
-		}
-		Error open_err = fresh->open(archive_path, expected_fingerprint);
-		if (open_err != OK) {
-			if (open_err == ERR_UNAUTHORIZED) {
-				// The guard stays: two callers may open concurrently now that
-				// archive_mutex does not cover the parse. The dedup state itself must
-				// be native so it cannot destruct at DLL unload (Section 6).
-				std::lock_guard<std::mutex> report_lock(s_unauth_report_mutex);
-				const uint64_t path_hash = archive_path.hash();
-				if (!s_has_reported_preloader_unauth || s_last_reported_preloader_unauth_hash != path_hash) {
-					s_has_reported_preloader_unauth = true;
-					s_last_reported_preloader_unauth_hash = path_hash;
-					UtilityFunctions::push_error("DirectStorage Preloader: Decryption unauthorized or key mismatch for package '" + archive_path + "'. The archive key is read from res://.dspkg/toc.key inside the game's encrypted PCK, so the PCK and the archive must ship as a pair.");
-				}
-			} else {
-				UtilityFunctions::push_error("DirectStorage Preloader: Failed to open DirectStorage package '" + archive_path + "': " + UtilityFunctions::error_string(open_err));
-			}
+		Ref<DSPkg> fresh = dsgd_texture_pipeline::open_archive_with_pairing(
+				archive_path, s_preloader_unauth_dedup, "DirectStorage Preloader", true);
+		if (fresh.is_null()) {
 			return false;
 		}
 		{
@@ -1716,10 +1592,8 @@ bool DSPreloader::is_gpu_prewarm_eligible(const Payload &p_payload) {
 		// The walker is the single definition of a valid upload shape, so it
 		// validates the table (lengths, coverage, pitches, row alignment, mip
 		// sums) and the alloc path cannot disagree with this decision.
-		return walk_gpu_upload_units(p_payload,
-				[](uint32_t, int64_t, uint32_t, uint32_t) {
-					return true;
-				});
+		std::vector<dsgd_texture_pipeline::GpuUploadUnit> units;
+		return dsgd_texture_pipeline::enumerate_gpu_upload_units(make_gpu_upload_plan_input(p_payload), units);
 	}
 	return true;
 }
@@ -2086,21 +1960,8 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 
 	// Mirror the loader can_attempt_gpu texture_create (Component 1 sRGB
 	// share included) so 3D PBR albedo sampling stays valid.
-	Ref<RDTextureFormat> rd_fmt;
-	rd_fmt.instantiate();
-	rd_fmt->set_width(static_cast<int32_t>(m.width));
-	rd_fmt->set_height(static_cast<int32_t>(m.height));
-	rd_fmt->set_format(static_cast<RenderingDevice::DataFormat>(m.pixel_format));
-	rd_fmt->set_mipmaps(static_cast<int32_t>(m.mip_count > 0 ? m.mip_count : 1));
-	rd_fmt->set_texture_type(RenderingDevice::TEXTURE_TYPE_2D);
-	rd_fmt->set_usage_bits(RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT | RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
-	if (!DSTex::is_rd_format_srgb(static_cast<int>(m.pixel_format))) {
-		int srgb_fmt = DSTex::get_srgb_rd_format(static_cast<int>(m.pixel_format));
-		if (srgb_fmt != RenderingDevice::DATA_FORMAT_MAX && srgb_fmt != static_cast<int>(m.pixel_format)) {
-			rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(m.pixel_format));
-			rd_fmt->add_shareable_format(static_cast<RenderingDevice::DataFormat>(srgb_fmt));
-		}
-	}
+	Ref<RDTextureFormat> rd_fmt = dsgd_texture_pipeline::build_gpu_destination_texture_format(
+			m.width, m.height, m.pixel_format, m.mip_count);
 
 	Ref<RDTextureView> rd_view;
 	rd_view.instantiate();
@@ -2121,79 +1982,13 @@ void DSPreloader::alloc_gpu_item_on_render_thread(RenderingDevice *p_rd, DSConte
 		return;
 	}
 
-	// Loader-style GPU upload: a plain payload keeps one request spanning all
+	// Shared GPU upload planner: a plain payload keeps one request spanning all
 	// mips; a chunked payload emits one row-range request per chunk (and a
 	// whole-subresource request per single-chunk mip). The backend validates
 	// each subresource range against the created texture.
 	Vector<Ref<DSRequest>> uploads;
-	auto make_upload = [&](uint64_t p_upload_offset, uint32_t p_size, uint32_t p_uncompressed,
-			uint32_t p_first_subresource, uint32_t p_subresource_count) -> Ref<DSRequest> {
-		Ref<DSRequest> req;
-		req.instantiate();
-		req->set_file_path(m.file_path);
-		req->set_offset(p_upload_offset);
-		req->set_size(p_size);
-		req->set_uncompressed_size(p_uncompressed);
-		req->set_compression_format(m.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)
-				? DSRequest::COMPRESSION_GDEFLATE : DSRequest::COMPRESSION_NONE);
-		req->set_cancellation_tag(p_tag);
-		req->set_destination_type(DSRequest::DESTINATION_GPU_TEXTURE);
-		req->set_destination_resource(tex_rid);
-		req->set_first_subresource(p_first_subresource);
-		req->set_subresource_count(p_subresource_count);
-		req->set_texture_format(static_cast<uint32_t>(native));
-		req->set_debug_label(m.engine_path);
-		// Finding 1.2 off-thread validation covered this payload's streams; stamp
-		// the request so Win32Backend skips its synchronous per-mip file probe.
-		// Single-stream stamp covers row-region chunks and single-mip requests;
-		// the range stamp covers whole-texture (multi-mip) requests.
-		if (m.gdeflate_prevalidated && m.compression_format == static_cast<uint8_t>(DSCompressionFormat::GDEFLATE)) {
-			req->set_gdeflate_stream_prevalidated(m.file_path, p_upload_offset, p_uncompressed);
-			if (p_subresource_count > 1) {
-				req->set_gdeflate_streams_prevalidated(m.file_path, p_upload_offset, p_first_subresource, p_subresource_count);
-			}
-		}
-		uploads.push_back(req);
-		return req;
-	};
-
-	bool chunk_layout_ok = true;
-	if (m.chunked) {
-		// One request per upload unit: a row-range request per chunk, and a
-		// whole-subresource request for a single-chunk mip (no table entry).
-		chunk_layout_ok = walk_gpu_upload_units(m,
-				[&](uint32_t p_mip, int64_t p_chunk_index, uint32_t p_row, uint32_t p_rows) -> bool {
-					if (p_chunk_index < 0) {
-						// A single-chunk mip has no chunk-table entry and targets ONE
-						// subresource: keep it on MULTIPLE_SUBRESOURCES_RANGE (no
-						// texture row region) so <4x4 BCn tail mips do not submit
-						// non-4-aligned D3D12_BOX extents to TEXTURE_REGION.
-						make_upload(static_cast<uint64_t>(m.mip_offsets[p_mip]),
-								static_cast<uint32_t>(m.mip_sizes[p_mip]),
-								static_cast<uint32_t>(m.mip_uncompressed_sizes[p_mip]), p_mip, 1);
-						return true;
-					}
-					Ref<DSRequest> req = make_upload(static_cast<uint64_t>(m.chunk_offsets[p_chunk_index]),
-							static_cast<uint32_t>(m.chunk_compressed_sizes[p_chunk_index]),
-							static_cast<uint32_t>(m.chunk_uncompressed_sizes[p_chunk_index]), p_mip, 1);
-					req->set_texture_region(p_row, p_row + p_rows);
-					return true;
-				});
-	} else {
-		const uint64_t start_offset = static_cast<uint64_t>(m.mip_offsets[0]);
-		const uint64_t last_idx = static_cast<uint64_t>(m.mip_count - 1);
-		const uint64_t total_span = (static_cast<uint64_t>(m.mip_offsets[last_idx]) + static_cast<uint64_t>(m.mip_sizes[last_idx])) - start_offset;
-		uint64_t total_uncomp = 0;
-		for (uint32_t i = 0; i < m.mip_count; ++i) {
-			total_uncomp += static_cast<uint64_t>(m.mip_uncompressed_sizes[i]);
-		}
-		if (total_span == 0 || total_span > UINT32_MAX || total_uncomp == 0 || total_uncomp > UINT32_MAX) {
-			chunk_layout_ok = false;
-		} else {
-			make_upload(start_offset, static_cast<uint32_t>(total_span),
-					static_cast<uint32_t>(total_uncomp), 0, m.mip_count);
-		}
-	}
+	const bool chunk_layout_ok = dsgd_texture_pipeline::build_gpu_upload_requests(
+			make_gpu_upload_plan_input(m, p_tag), tex_rid, native, uploads);
 	if (!chunk_layout_ok || uploads.is_empty()) {
 		UtilityFunctions::push_warning("DSPreloader: GPU payload layout out of range for '", m.engine_path, "'; sync load remains available.");
 		p_rd->free_rid(tex_rid);
@@ -2762,7 +2557,7 @@ Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vect
 	// Graceful Base Fallback: partial chains slice mip 0, no mipmaps + warning.
 	bool use_mipmaps = p_meta.mip_count > 1;
 	PackedByteArray image_data;
-	const uint32_t full_chain = ds_preloader_full_mip_chain_count(p_meta.width, p_meta.height);
+	const uint32_t full_chain = dsgd_texture_pipeline::full_mip_chain_count(p_meta.width, p_meta.height);
 	if (use_mipmaps && p_meta.mip_count < full_chain) {
 		int64_t base_size = 0;
 		if (p_meta.is_v2 && !layouts.empty()) {
