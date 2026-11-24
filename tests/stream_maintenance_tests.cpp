@@ -443,6 +443,62 @@ GDEX_TEST_T(stream_maintenance, has_stream_pending_counts_staged_submit_retries,
 }
 #endif
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+// Step 2 of the prewarm stutter plan: only a memory-only stream may be
+// offloaded. has_stream_gpu_pending() must see both queued GPU requests and
+// GPU requests staged for a retried submit, and go false once they are gone.
+GDEX_TEST_T(stream_maintenance, has_stream_gpu_pending_tracks_queued_and_staged, TAG_INTEGRATION) {
+    godot::DSContext *ds = require_initialized_context(ctx);
+    GDEX_EXPECT_FALSE(ds->has_stream_gpu_pending());
+
+    const char *path = "user://gdextest_stream_gpu_pending.bin";
+    if (!write_probe_file(path)) {
+        GDEX_FAIL("failed to stage probe file.");
+    }
+    ctx.add_teardown([path]() { remove_probe_file(path); });
+
+    // Memory-only queue: safe to offload even while a stream flush is pending.
+    const uint64_t mem_tag = 101;
+    godot::Ref<godot::DSRequest> mem_req = make_memory_request(path, mem_tag);
+    GDEX_ASSERT_TRUE(ds->enqueue_request(mem_req, true));
+    GDEX_EXPECT_TRUE(ds->has_stream_pending());
+    GDEX_EXPECT_FALSE(ds->has_stream_gpu_pending());
+
+    // A GPU-destination request in the same queue flips the verdict.
+    const uint64_t gpu_tag = 102;
+    godot::Ref<godot::DSRequest> gpu_req;
+    gpu_req.instantiate();
+    gpu_req->set_file_path(godot::String(path));
+    gpu_req->set_size(static_cast<uint32_t>(kProbeBytes));
+    gpu_req->set_cancellation_tag(gpu_tag);
+    gpu_req->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    GDEX_ASSERT_TRUE(ds->enqueue_request(gpu_req, true));
+    GDEX_EXPECT_TRUE(ds->has_stream_gpu_pending());
+
+    // Cancellation drops the GPU request from the queue again; the memory
+    // request is still pending, so has_stream_pending() stays true.
+    ds->cancel_prewarm(gpu_tag);
+    GDEX_EXPECT_FALSE(ds->has_stream_gpu_pending());
+    GDEX_EXPECT_TRUE(ds->has_stream_pending());
+
+    // Staged-for-retry GPU state is tracked independently of the queue.
+    ds->_debug_set_stream_pending_submit_requests_for_testing(3);
+    ds->_debug_set_stream_pending_submit_has_gpu_for_testing(true);
+    ctx.add_teardown([ds]() {
+        ds->_debug_set_stream_pending_submit_requests_for_testing(0);
+        ds->_debug_set_stream_pending_submit_has_gpu_for_testing(false);
+    });
+    GDEX_EXPECT_TRUE(ds->has_stream_gpu_pending());
+    ds->_debug_set_stream_pending_submit_has_gpu_for_testing(false);
+    GDEX_EXPECT_FALSE(ds->has_stream_gpu_pending());
+
+    // The GPU flag without a non-zero staged count must not block offload.
+    ds->_debug_set_stream_pending_submit_has_gpu_for_testing(true);
+    ds->_debug_set_stream_pending_submit_requests_for_testing(0);
+    GDEX_EXPECT_FALSE(ds->has_stream_gpu_pending());
+}
+#endif
+
 // Regression for #0277: concurrent worker + main-thread flush_stream_async()
 // calls over >128 requests (spanning multiple flushes) must never strand
 // staged requests in an unsubmitted slot with has_stream_pending() == false.

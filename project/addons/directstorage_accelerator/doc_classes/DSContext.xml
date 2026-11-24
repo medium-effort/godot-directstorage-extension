@@ -194,6 +194,10 @@
 			<return type="bool" />
 			<description>Returns [code]true[/code] when a completed batch is waiting to be harvested, even if a sibling batch is still in flight. Use this instead of [method is_batch_complete] to decide whether to call [method collect_completed_results].</description>
 		</method>
+		<method name="has_stream_gpu_pending" qualifiers="const">
+			<return type="bool" />
+			<description>Returns [code]true[/code] if the async stream (prewarm) queue holds a [constant DSRequest.DESTINATION_GPU_TEXTURE] or [constant DSRequest.DESTINATION_GPU_BUFFER] request, or if such a request was staged into a backend batch slot but is waiting for a retried submit. Memory-only stream queues return [code]false[/code]. Used to decide whether [method flush_stream_async] may be offloaded to a worker thread without risking a render-thread wait.</description>
+		</method>
 		<method name="has_stream_pending" qualifiers="const">
 			<return type="bool" />
 			<description>Returns [code]true[/code] if the async stream (prewarm) queue holds requests awaiting [method flush_stream_async].</description>

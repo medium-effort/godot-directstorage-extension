@@ -1325,6 +1325,7 @@ void DSContext::shutdown_ds_locked() {
 		std::lock_guard<std::mutex> stream_lock(stream_mutex);
 		stream_queue.clear();
 		stream_pending_submit_requests.store(0, std::memory_order_release);
+		stream_pending_submit_has_gpu.store(false, std::memory_order_release);
 		for (std::unordered_map<uint64_t, StreamTagInfo>::iterator it = stream_tags.begin(); it != stream_tags.end(); ++it) {
 			it->second.cancel_requested = true;
 			// The requests themselves are going away with the backend: no
@@ -1652,6 +1653,7 @@ Error DSContext::flush_stream_async() {
 		}
 	}
 	int submitted_request_count = 0;
+	bool staged_has_gpu = false;
 	std::deque<Ref<DSRequest>> unsubmitted_requests;
 	for (std::deque<Ref<DSRequest>>::iterator it = to_submit.begin(); it != to_submit.end(); ++it) {
 		Ref<DSRequest> request = *it;
@@ -1668,6 +1670,11 @@ Error DSContext::flush_stream_async() {
 		PlatformBackend::EnqueueOutcome outcome = PlatformBackend::EnqueueOutcome::TERMINAL;
 		if (enqueue_stream_request_internal(request, &outcome)) {
 			submitted_request_count++;
+			const DSRequest::DSDestinationType destination_type = request->get_destination_type();
+			if (destination_type == DSRequest::DESTINATION_GPU_BUFFER ||
+					destination_type == DSRequest::DESTINATION_GPU_TEXTURE) {
+				staged_has_gpu = true;
+			}
 		} else {
 			// Retryability comes from the backend's classification, never from
 			// matching its human-readable message: the text is for operators.
@@ -1702,10 +1709,16 @@ Error DSContext::flush_stream_async() {
 		// Another submitter claimed the slot between the check above and here.
 		// The requests are already staged in the backend slot; remember how many
 		// so the next flush retries the submit even with an empty stream queue.
+		// Publish the GPU flag before the counter so a reader that observes a
+		// non-zero count cannot miss that a staged request needs the render thread.
+		if (staged_has_gpu) {
+			stream_pending_submit_has_gpu.store(true, std::memory_order_release);
+		}
 		stream_pending_submit_requests.fetch_add(submitted_request_count, std::memory_order_acq_rel);
 		return ERR_BUSY;
 	}
 	const int pending_before = stream_pending_submit_requests.exchange(0, std::memory_order_acq_rel);
+	stream_pending_submit_has_gpu.store(false, std::memory_order_release);
 	const int batch_request_count = submitted_request_count + pending_before;
 	uint64_t backend_fence = 0;
 #ifdef _WIN32
@@ -1734,6 +1747,28 @@ Error DSContext::flush_stream_async() {
 bool DSContext::has_stream_pending() const {
 	std::lock_guard<std::mutex> lock(stream_mutex);
 	return !stream_queue.empty() || stream_pending_submit_requests.load(std::memory_order_acquire) > 0;
+}
+
+bool DSContext::has_stream_gpu_pending() const {
+	std::lock_guard<std::mutex> lock(stream_mutex);
+	// Requests staged into the backend but not yet submitted still belong to
+	// this thread's enqueue path; a GPU destination there would need the render
+	// thread again when the next flush retries the submit.
+	if (stream_pending_submit_requests.load(std::memory_order_acquire) > 0 &&
+			stream_pending_submit_has_gpu.load(std::memory_order_acquire)) {
+		return true;
+	}
+	for (const Ref<DSRequest> &request : stream_queue) {
+		if (!request.is_valid() || request->get_status() == DSRequest::STATUS_FAILED) {
+			continue;
+		}
+		const DSRequest::DSDestinationType destination_type = request->get_destination_type();
+		if (destination_type == DSRequest::DESTINATION_GPU_BUFFER ||
+				destination_type == DSRequest::DESTINATION_GPU_TEXTURE) {
+			return true;
+		}
+	}
+	return false;
 }
 
 int DSContext::get_stream_pending_count() const {
@@ -2230,6 +2265,7 @@ void DSContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("flush_batch_async"), &DSContext::flush_batch_async);
 	ClassDB::bind_method(D_METHOD("flush_stream_async"), &DSContext::flush_stream_async);
 	ClassDB::bind_method(D_METHOD("has_stream_pending"), &DSContext::has_stream_pending);
+	ClassDB::bind_method(D_METHOD("has_stream_gpu_pending"), &DSContext::has_stream_gpu_pending);
 	ClassDB::bind_method(D_METHOD("get_stream_pending_count"), &DSContext::get_stream_pending_count);
 	ClassDB::bind_method(D_METHOD("prewarm_async", "paths"), &DSContext::prewarm_async);
 	ClassDB::bind_method(D_METHOD("is_prewarm_complete", "tag"), &DSContext::is_prewarm_complete);

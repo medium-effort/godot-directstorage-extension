@@ -187,6 +187,13 @@ private:
 	// empty stream queue, so the final chunk of a prewarm cannot sit staged
 	// forever waiting for an enqueue that will never come.
 	std::atomic<int> stream_pending_submit_requests{ 0 };
+	// True when the staged-for-retry requests above include a GPU destination.
+	// Step 2 of the prewarm stutter plan: DSRuntime may only offload a memory-only
+	// flush to WorkerThreadPool; a staged GPU request would be re-enqueued on the
+	// worker and ds_win32_query_destination_resource_on_render_thread() could
+	// deadlock a single-threaded-render teardown. Paired with the queue scan in
+	// has_stream_gpu_pending().
+	std::atomic<bool> stream_pending_submit_has_gpu{ false };
 	// C++-only: mirrors DSPreloader's background-pacing mode so the stream
 	// flush can choose the tight (gameplay) or scaled (loading) request budget.
 	std::atomic<bool> stream_background_pacing{ false };
@@ -335,6 +342,7 @@ public:
 	Error flush_batch_async();
 	Error flush_stream_async();
 	bool has_stream_pending() const;
+	bool has_stream_gpu_pending() const;
 	int get_stream_pending_count() const;
 	uint64_t prewarm_async(const PackedStringArray &p_paths);
 	bool is_prewarm_complete(uint64_t p_tag) const;
@@ -423,6 +431,11 @@ public:
 	// an ERR_BUSY retry with an empty stream_queue. Never bound in _bind_methods().
 	void _debug_set_stream_pending_submit_requests_for_testing(int p_count) {
 		stream_pending_submit_requests.store(p_count, std::memory_order_release);
+	}
+	// Companion seam for has_stream_gpu_pending(): forces the staged-for-retry
+	// GPU flag without needing a real submit_async() slot conflict.
+	void _debug_set_stream_pending_submit_has_gpu_for_testing(bool p_value) {
+		stream_pending_submit_has_gpu.store(p_value, std::memory_order_release);
 	}
 #endif
 };
