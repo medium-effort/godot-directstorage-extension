@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 21 November 2026
+Last updated: 24 November 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -1987,3 +1987,45 @@ func _process(delta: float) -> void:
 ```
 
 Re-arm the sampler when it restarts (a frame with no previous sample is meaningless). Godot still applies its own frame pacing and `OS::add_frame_delay()` jitter to the wall-clock interval, so a 17 ms "threshold" sits inside normal jitter even with the correct clock source; use sustained multi-frame evidence, not a single spike, to trigger backoff. Related: Q77 (long frames are cut above 133 ms), Q13 (budget by usec, not frames), Q41 (poll by usec budget). Diagnosed during the November 2026 review of the `ds_runtime.gd` pacing fix.
+
+---
+
+## 82. `PackedByteArray::resize()` Eagerly Zero-Fills on the Calling Thread
+
+### The Engine Reality
+Godot 4.7 implements `Vector<uint8_t>::resize_uninitialized()` internally (and binds it for `String` in `godot/core/extension/gdextension_interface.cpp:1065`), but `PackedByteArray::resize()` in `godot-cpp` (`godot-cpp/gen/src/variant/packed_byte_array.cpp:89-90`) binds to `PackedByteArray::resize_initialized` (`godot/core/variant/variant_call.cpp:2761`) -> `CowData<uint8_t>::resize<true>()` -> `memnew_arr_placement` (`godot/core/templates/cowdata.h:438-440`). No uninitialized resize is exposed to GDExtension, so growing a `PackedByteArray` synchronously zero-fills every byte on the calling thread and forces Windows OS zero-page faults across all freshly `VirtualAlloc`'d 4 KiB pages.
+
+### The Trap / Symptom
+Measured on the GTX 1050 Ti / i3-12100F host, a single 64 MiB `PackedByteArray::resize()` takes **14.1 ms** (~220 us/MiB; documented in `src/integration/ds_preloader.cpp:2345-2348`). When `Win32Backend::enqueue_request()` (`src/platform/win32/ds_win32_backend.cpp:5061`) called `ensure_destination_buffer_capacity()` on the main thread while holding `batch_mutex`, Mode 4 (`T1_DS_RAM_RAW` uncompressed and `T2_DS_RAM_GDEFLATE`) suffered 10-14 dropped frames / 27-33 ms spikes in Bistro 60 FPS Paced B2 and `31.08 ms` `_process` p95 in Arena v2 B1, whereas `FallbackBackend` (`src/platform/fallback/ds_fallback_backend.cpp:365,394`) allocated on worker threads and had 0 streaming drops.
+
+### The Rule
+Never call `PackedByteArray::resize()` for multi-MiB buffers on the main thread or while holding a mutex polled by the main thread (e.g. `batch_mutex`); GDExtension exposes only `resize_initialized()`, which synchronously zero-faults every page (~220 us/MiB, ~14 ms per 64 MiB).
+
+```cpp
+// Pre-size DESTINATION_MEMORY buffers off the main thread and BEFORE acquiring batch_mutex
+// (after validate_gdeflate_stream_size() so corrupt headers are rejected first).
+p_request->ensure_destination_buffer_capacity(uncompressed_size);
+```
+
+See Q41 (`kCpuBuildUsecPerMiB` in `src/integration/ds_preloader.cpp`) and `win32_memory_prewarm_main_thread_stutter_plan.md`.
+
+## 83. Renderer-Owned VRAM Floor Is Not a Texture-Cache Leak
+
+### The Engine Reality
+Godot allocates render-feature textures once, on first use, in renderer singletons rather than on the scene node: the directional shadow atlas (`servers/rendering/renderer_rd/storage_rd/light_storage.cpp:2761`, 4096x4096 D32 by default), volumetric fog maps (`servers/rendering/renderer_rd/environment/fog.cpp:476-511`, six 128^3 3D textures), the decal and area-light atlases (`servers/rendering/renderer_rd/storage_rd/texture_storage.cpp:3887`, `:3484`), reflection probe cubemaps (`light_storage.cpp:1755-1773`), sky radiance (`servers/rendering/renderer_rd/environment/sky.cpp:351,651,1574`), and the viewport's own color/depth/effect targets (`servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp:186-200`). Unloading the level therefore does not free them. `RenderSceneBuffersRD::clear_context()` is bound (`render_scene_buffers_rd.cpp:61,495`) and called internally when effects are disabled (`ss_effects.cpp:1097,1430`), but the object is an internal rendering-server object reachable from script only transiently through `RenderData.get_render_scene_buffers()` in a `CompositorEffect` callback; `RenderingServer` has no clear/finalize binding and `ResourceLoader` has no cache-clear method.
+
+### The Trap / Symptom
+A standalone D3D12 probe in the benchmark repository (`benchmark/probes/vram_rid_probe.gd`, derived from that repo's benchmark runner) measured Arena v2 main-level texture VRAM: baseline `22,405,120` bytes -> loaded `2,046,681,088` -> after scene free and a 30-frame drain `595,320,832` bytes, leaving ~546 MiB on a 4 GiB card. The loaded and post-free numbers were byte-for-byte identical between DirectStorage Mode 5 and vanilla Mode 1 with DirectStorage shut down via `_configure_mode_environment(1, true)`. After eviction, 0/324 prewarmed `Texture2DRD` RIDs were still valid, 0/329 texture paths were cached, `stream_gpu_pending` was 0, two full cycles returned to the exact same floor, a 4-second idle did not lower it, and synthetic RD texture cycles (BC1/BC3/BC4/BC5/BC7, with/without mipmaps and shareable sRGB formats) reclaimed 100%. The original diagnosis wrongly blamed `DSTextureCache` eviction and cost several hours of probing.
+
+### The Rule
+Never diagnose a fixed post-unload texture-VRAM remainder as a cache leak; renderer-owned shadow/fog/decal/effect allocations persist for the process lifetime and have no public GDScript release API.
+
+```gdscript
+# Discriminate before changing eviction code: run the same scene with DS shut down.
+_configure_mode_environment(1, true) # vanilla Mode 1
+# Compare RENDER_TEXTURE_MEM_USED baseline / loaded / post-free against Mode 5.
+# Identical floors => engine working set (Q83), not a leak in DSTextureCache.
+```
+
+Treat the number as a benchmark measurement caveat rather than a defect (see Q78, Q80). Reducing it requires disabling the responsible Environment features *before* they first render, or a smaller shadow/fog configuration; the only guaranteed full release is a process restart. Script cannot enumerate or free these internal RIDs: `RenderingDevice.free_rid()` requires an RID you own, and `RenderSceneBuffers` is documented as an internal object.
+

@@ -21,6 +21,11 @@
 #      so a fresh worktree cannot link without them. Copying ~1.7 MB from the
 #      primary is faster than re-fetching and never opens a license window during
 #      worktree creation; the hook fails if the primary has not fetched the SDK.
+#   5. the pinned GUT download archive (see tools/wt_bootstrap_gut.ps1). Both
+#      .cache/gut and project/addons/gut are gitignored, so without this hook
+#      run_gut.py downloads GUT in every worktree and fails outright offline.
+#      Copying the ~1.1 MB verified archive from the primary keeps first test runs
+#      local; the hook never downloads and fails if the primary has no archive.
 #
 # Every other piece of build state is private per worktree by construction:
 # .sconsign.dblite, the .obj files written next to their sources,
@@ -56,6 +61,13 @@ godotcpp = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_workt
 # Both paths are passed explicitly because the script must never infer the primary.
 [[pre-start]]
 directstorage = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ worktree_path }}/tools/wt_bootstrap_directstorage.ps1 {{ primary_worktree_path }} {{ worktree_path }}"
+
+# Resolved from the primary, not the new worktree: this hook only copies a cache
+# archive, and run_gut.py reads the pinned version from whichever branch it runs on.
+# Resolving from the new worktree would break worktrees created from older commits
+# that do not have this script yet.
+[[pre-start]]
+gut = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_bootstrap_gut.ps1 {{ primary_worktree_path }} {{ worktree_path }}"
 
 [[pre-start]]
 env = "powershell -NoProfile -ExecutionPolicy Bypass -File {{ primary_worktree_path }}/tools/wt_bootstrap_env.ps1 {{ primary_worktree_path }} -DestinationPath {{ worktree_path }}/.env -GodotCppPrebuilt"
