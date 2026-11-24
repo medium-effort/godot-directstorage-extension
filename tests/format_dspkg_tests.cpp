@@ -3082,4 +3082,67 @@ GDEX_TEST_T(dspkg, add_texture_mip_metadata_override_survives_finalize, TAG_INTE
 	}
 }
 
+// Source consumption is opt-in: the default builder must leave every source
+// .dstex on disk after finalize(), as editor/export callers expect.
+GDEX_TEST_T(dspkg, consume_sources_disabled_preserves_source, TAG_INTEGRATION) {
+	const char *src = "user://gdextest_dspkg_consume_off.dstex";
+	const char *pkg = "user://gdextest_dspkg_consume_off.dspkg";
+	ctx.add_teardown([src, pkg]() {
+		remove_temp_file(src);
+		remove_temp_file(pkg);
+	});
+	GDEX_ASSERT_TRUE(write_temp_dstex(src, 64, 4, 1, 1024));
+
+	godot::Ref<godot::DSPkg> builder;
+	builder.instantiate();
+	GDEX_ASSERT_TRUE(builder.is_valid());
+	GDEX_ASSERT_TRUE(builder->create(godot::String(pkg)) == godot::OK);
+	GDEX_ASSERT_FALSE(builder->is_consume_sources_enabled());
+	GDEX_ASSERT_TRUE(builder->add_texture("res://consume_off.png", godot::String(src)) == godot::OK);
+	GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+	GDEX_ASSERT_TRUE(godot::FileAccess::file_exists(godot::String(src)));
+
+	godot::Ref<godot::DSPkg> reader;
+	reader.instantiate();
+	GDEX_EXPECT_TRUE(reader->open(godot::String(pkg)) == godot::OK);
+	GDEX_EXPECT_EQ(reader->get_entry_count(), 1);
+}
+
+// With the opt-in enabled, two alias entries sharing one .dstex consume the
+// source only after the last canonical payload write, with dedup on and off.
+// The resulting archive must still open and serve both entries.
+GDEX_TEST_T(dspkg, consume_sources_enabled_deletes_shared_source, TAG_INTEGRATION) {
+	for (int dedup = 0; dedup <= 1; ++dedup) {
+		const std::string suffix = dedup != 0 ? "_dedup" : "_plain";
+		const std::string src_s = std::string("user://gdextest_dspkg_consume_on") + suffix + ".dstex";
+		const std::string pkg_s = std::string("user://gdextest_dspkg_consume_on") + suffix + ".dspkg";
+		const char *src = src_s.c_str();
+		const char *pkg = pkg_s.c_str();
+		ctx.add_teardown([src_s, pkg_s]() {
+			remove_temp_file(src_s.c_str());
+			remove_temp_file(pkg_s.c_str());
+		});
+		GDEX_ASSERT_TRUE(write_temp_dstex_repeated(src, 128, 128, 1, 128 * 128 * 4));
+
+		godot::Ref<godot::DSPkg> builder;
+		builder.instantiate();
+		GDEX_ASSERT_TRUE(builder.is_valid());
+		GDEX_ASSERT_TRUE(builder->create(godot::String(pkg)) == godot::OK);
+		builder->set_consume_sources_enabled(true);
+		builder->set_payload_dedup_enabled(dedup != 0);
+		GDEX_ASSERT_TRUE(builder->is_consume_sources_enabled());
+		GDEX_ASSERT_TRUE(builder->add_texture("a.png", godot::String(src)) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->add_texture("b.png", godot::String(src)) == godot::OK);
+		GDEX_ASSERT_TRUE(builder->finalize() == godot::OK);
+		GDEX_ASSERT_FALSE(godot::FileAccess::file_exists(godot::String(src)));
+
+		godot::Ref<godot::DSPkg> reader;
+		reader.instantiate();
+		GDEX_ASSERT_TRUE(reader->open(godot::String(pkg)) == godot::OK);
+		GDEX_EXPECT_EQ(reader->get_entry_count(), 2);
+		GDEX_EXPECT_FALSE(reader->read_texture("a.png").is_empty());
+		GDEX_EXPECT_FALSE(reader->read_texture("b.png").is_empty());
+	}
+}
+
 

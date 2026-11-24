@@ -73,6 +73,10 @@
 			<return type="bool" />
 			<description>Returns whether 1 MiB chunk bin-packing is enabled for payload alignment.</description>
 		</method>
+		<method name="is_consume_sources_enabled" qualifiers="const">
+			<return type="bool" />
+			<description>Returns whether [method finalize] deletes each source [code].dstex[/code] after its payload has been streamed into the archive.</description>
+		</method>
 		<method name="is_payload_dedup_enabled" qualifiers="const">
 			<return type="bool" />
 			<description>Returns whether identical-source payload deduplication is enabled for the archive builder.</description>
@@ -131,6 +135,11 @@
 			<return type="void" />
 			<param index="0" name="alignment" type="int" />
 			<description>Sets the payload byte alignment for archive entries. Must be a power of two and &gt;= [code]512[/code]. For SteamPipe delta patching, pass [code]1048576[/code] (1 MiB).</description>
+		</method>
+		<method name="set_consume_sources_enabled">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>Enables or disables deleting each source [code].dstex[/code] file immediately after its payload has been streamed into the archive during [method finalize]. Opt-in and off by default: editor and export callers keep their sources unless they enable it. Must be called while building an archive.</description>
 		</method>
 		<method name="set_payload_dedup_enabled">
 			<return type="void" />

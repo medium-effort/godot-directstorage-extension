@@ -564,6 +564,8 @@ void DSPkg::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_bin_packing_enabled"), &DSPkg::is_bin_packing_enabled);
 	ClassDB::bind_method(D_METHOD("set_payload_dedup_enabled", "enabled"), &DSPkg::set_payload_dedup_enabled);
 	ClassDB::bind_method(D_METHOD("is_payload_dedup_enabled"), &DSPkg::is_payload_dedup_enabled);
+	ClassDB::bind_method(D_METHOD("set_consume_sources_enabled", "enabled"), &DSPkg::set_consume_sources_enabled);
+	ClassDB::bind_method(D_METHOD("is_consume_sources_enabled"), &DSPkg::is_consume_sources_enabled);
 	ClassDB::bind_method(D_METHOD("set_repack_uncompressed", "enabled"), &DSPkg::set_repack_uncompressed);
 	ClassDB::bind_method(D_METHOD("is_repack_uncompressed"), &DSPkg::is_repack_uncompressed);
 	ClassDB::bind_method(D_METHOD("add_texture", "resource_path", "dstex_path", "mip_metadata"), &DSPkg::add_texture, DEFVAL(Dictionary()));
@@ -600,6 +602,7 @@ Error DSPkg::create(const String &p_output_path, uint64_t p_archive_fingerprint)
 	payload_alignment = DEFAULT_PAYLOAD_ALIGNMENT;
 	bin_packing_enabled = false;
 	payload_dedup_enabled = false;
+	consume_sources_enabled = false;
 	repack_uncompressed = false;
 	staging_entries.clear();
 	is_building = true;
@@ -614,6 +617,7 @@ Error DSPkg::create(const String &p_output_path, uint64_t p_archive_fingerprint)
 
 void DSPkg::close_write() {
 	is_building = false;
+	consume_sources_enabled = false;
 	staging_entries.clear();
 }
 
@@ -845,6 +849,18 @@ void DSPkg::set_payload_dedup_enabled(bool p_enabled) {
 
 bool DSPkg::is_payload_dedup_enabled() const {
 	return payload_dedup_enabled;
+}
+
+void DSPkg::set_consume_sources_enabled(bool p_enabled) {
+	if (!is_building) {
+		UtilityFunctions::push_error("DSPkg: Not in building state. Call create() first.");
+		return;
+	}
+	consume_sources_enabled = p_enabled;
+}
+
+bool DSPkg::is_consume_sources_enabled() const {
+	return consume_sources_enabled;
 }
 
 void DSPkg::set_repack_uncompressed(bool p_enabled) {
@@ -1794,6 +1810,25 @@ Error DSPkg::finalize() {
 		return true;
 	};
 
+	// Opt-in source consumption. Aliases can share one .dstex, so count the
+	// canonical writes per simplified path and unlink only after the last one
+	// has streamed successfully.
+	HashMap<String, uint32_t> remaining_refs_by_dstex_path;
+	if (consume_sources_enabled) {
+		for (uint32_t i = 0; i < count; ++i) {
+			if (canonical_index[i] != i) {
+				continue;
+			}
+			const String key = sorted_entries[i]->dstex_path.simplify_path();
+			uint32_t *refs = remaining_refs_by_dstex_path.getptr(key);
+			if (refs == nullptr) {
+				remaining_refs_by_dstex_path.insert(key, 1);
+			} else {
+				++(*refs);
+			}
+		}
+	}
+
 	for (uint32_t i = 0; i < count; ++i) {
 		if (canonical_index[i] != i) {
 			continue;
@@ -2012,6 +2047,16 @@ Error DSPkg::finalize() {
 			}
 		}
 		source->close();
+		if (consume_sources_enabled) {
+			const String key = item.dstex_path.simplify_path();
+			uint32_t *refs = remaining_refs_by_dstex_path.getptr(key);
+			if (refs != nullptr && --(*refs) == 0) {
+				const Error remove_error = DirAccess::remove_absolute(item.dstex_path);
+				if (remove_error != OK && FileAccess::file_exists(item.dstex_path)) {
+					UtilityFunctions::push_error("DSPkg: Failed to remove consumed source texture: " + item.dstex_path);
+				}
+			}
+		}
 	}
 
 	// A short write that store_buffer() did not report would still ship a
