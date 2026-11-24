@@ -2582,7 +2582,7 @@ Ref<Texture2D> DSPreloader::build_texture(const Payload &p_meta, const std::vect
 		image = Image::create_from_data((int)p_meta.width, (int)p_meta.height, use_mipmaps, (Image::Format)img_fmt, image_data);
 	}
 	if (image.is_valid() && !image->is_empty()) {
-		Ref<ImageTexture> img_tex = ImageTexture::create_from_image(image);
+		Ref<ImageTexture> img_tex = dsgd_texture_pipeline::create_image_texture_safe(image);
 		// NPOT display size via the engine-blessed path: get_width() reports
 		// the logical size and the RS override covers render-side queries.
 		if (img_tex.is_valid() && p_meta.logical_width > 0 && p_meta.logical_height > 0 &&

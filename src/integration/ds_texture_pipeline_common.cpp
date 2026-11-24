@@ -5,11 +5,15 @@
 #include "../formats/dspkg_format.h"
 #include "../formats/dstex_format.h"
 
+#include <godot_cpp/classes/display_server.hpp>
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/image.hpp>
+#include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_device.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
@@ -348,6 +352,29 @@ bool build_gpu_upload_requests(const GpuUploadPlanInput &p_input,
 	make_upload(start_offset, static_cast<uint32_t>(total_span),
 			static_cast<uint32_t>(total_uncomp), 0, p_input.mip_count);
 	return !r_uploads.is_empty();
+}
+
+bool is_dummy_renderer() {
+	DisplayServer *ds = DisplayServer::get_singleton();
+	if (ds != nullptr && ds->get_name().nocasecmp_to("headless") == 0) {
+		return true;
+	}
+	RenderingServer *rs = RenderingServer::get_singleton();
+	return rs != nullptr && (rs->get_current_rendering_driver_name().nocasecmp_to("dummy") == 0 ||
+			rs->get_current_rendering_method().nocasecmp_to("dummy") == 0);
+}
+
+std::mutex &dummy_texture_owner_mutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+Ref<ImageTexture> create_image_texture_safe(const Ref<Image> &p_image) {
+	if (is_dummy_renderer()) {
+		std::lock_guard<std::mutex> lock(dummy_texture_owner_mutex());
+		return ImageTexture::create_from_image(p_image);
+	}
+	return ImageTexture::create_from_image(p_image);
 }
 
 } // namespace dsgd_texture_pipeline

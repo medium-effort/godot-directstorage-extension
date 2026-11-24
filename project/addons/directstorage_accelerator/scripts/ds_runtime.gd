@@ -948,6 +948,13 @@ func _process(delta: float) -> void:
 			if _poll_task_id == -1 and has_cpu_unbuilt:
 				if _background_pacing and _cpu_poll_cooldown_frames > 0:
 					_cpu_poll_cooldown_frames -= 1
+				elif DisplayServer.get_name() == "headless" or RenderingServer.get_current_rendering_driver_name().to_lower() == "dummy" or RenderingServer.get_current_rendering_method().to_lower() == "dummy":
+					# RendererDummy::TextureStorage::texture_owner is not thread-safe on
+					# Godot < 4.8 (godot#124139). Keep CPU builds inline on the main thread
+					# (p_max_usec = 0 avoids parallel_first worker fan-out).
+					cache.poll_completed(0, slice_items, 0)
+					_record_slice_stat(slice_label)
+					recorded_slice = true
 				else:
 					_poll_task_id = WorkerThreadPool.add_task(_background_poll_slice.bind(slice_items, slice_usec), false, "DS_PollCompleted")
 					_record_slice_stat(slice_label)

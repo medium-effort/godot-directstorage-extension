@@ -166,19 +166,19 @@ func test_prewarm_scene_async_and_stage_cancels() -> void:
 
 func _pump_until(ctx: Object, cache: Object, tag: int) -> bool:
 	var frames := 0
-	while not ctx.is_prewarm_complete(tag):
+	while not PreloaderScript.is_prewarm_complete(tag):
 		if ctx.is_batch_complete() and ctx.has_pending_results():
 			ctx.collect_completed_results()
 		if ctx.has_stream_pending():
 			ctx.flush_stream_async()
-		cache.poll_completed()
+		cache.poll_completed(tag, 0, 0)
 		frames += 1
 		if frames > MAX_PUMP_FRAMES:
 			return false
 		await get_tree().process_frame
 	if ctx.is_batch_complete() and ctx.has_pending_results():
 		ctx.collect_completed_results()
-	cache.poll_completed()
+	cache.poll_completed(tag, 0, 0)
 	return true
 
 

@@ -929,7 +929,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					image = Image::create_from_data(p_width, p_height, use_mipmaps, static_cast<Image::Format>(img_fmt), image_data);
 				}
 				if (image.is_valid() && !image->is_empty()) {
-					Ref<ImageTexture> img_tex = ImageTexture::create_from_image(image);
+					Ref<ImageTexture> img_tex = dsgd_texture_pipeline::create_image_texture_safe(image);
 					if (needs_size_override && img_tex.is_valid()) {
 						// Engine-blessed path (mirrors CompressedTexture2D):
 						// reports logical dims from get_width() and applies
@@ -1006,7 +1006,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 					image = Image::create_from_data(p_width, p_height, use_mipmaps_v1, static_cast<Image::Format>(img_fmt), image_data_v1);
 				}
 				if (image.is_valid() && !image->is_empty()) {
-					Ref<ImageTexture> img_tex_v1 = ImageTexture::create_from_image(image);
+					Ref<ImageTexture> img_tex_v1 = dsgd_texture_pipeline::create_image_texture_safe(image);
 					if (needs_size_override && img_tex_v1.is_valid()) {
 						img_tex_v1->set_size_override(Vector2i(static_cast<int32_t>(logical_width), static_cast<int32_t>(logical_height)));
 					}

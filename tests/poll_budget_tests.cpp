@@ -723,3 +723,56 @@ GDEX_TEST_T(poll_budget, parallel_first_offload_lock_safety, TAG_UNIT) {
 
 	GDEX_EXPECT_TRUE(pump_until_unbuilt(cache, tag, 64));
 }
+
+// Regression for godot#124139: under --headless (RendererDummy), concurrent
+// ImageTexture::create_from_image() and ~ImageTexture() -> free_rid() across
+// worker and main threads raced on the unlocked DummyTexture RID_PtrOwner.
+GDEX_TEST_T(poll_budget, dummy_renderer_concurrent_image_texture_builds_safe, TAG_UNIT) {
+	godot::DSTextureCache *cache = make_budget_cache(ctx);
+	const uint64_t tag = 0x7FFF0145ULL;
+	constexpr int kUniquePaths = 8;
+	constexpr int kTotalEntries = 64;
+	constexpr uint64_t kSmallBytes = 64ULL * 64ULL * 4ULL;
+
+	godot::PackedByteArray data;
+	data.resize(static_cast<int64_t>(kSmallBytes));
+	data.fill(180);
+
+	std::vector<godot::String> paths;
+	paths.reserve(kUniquePaths);
+	for (int i = 0; i < kUniquePaths; ++i) {
+		paths.push_back(godot::String("user://gdextest_dummy_race_") + godot::String::num_int64(i) + ".png");
+	}
+	for (int i = 0; i < kTotalEntries; ++i) {
+		godot::DSPreloader::Payload meta = make_payload(paths[i % kUniquePaths].utf8().get_data(), 64);
+		meta.original_size = kSmallBytes;
+		meta.mip_uncompressed_sizes.push_back(static_cast<int32_t>(kSmallBytes));
+		godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
+	}
+	warm_worker_pool();
+
+	std::atomic<bool> stop_workers{ false };
+	auto worker_fn = [&]() {
+		while (!stop_workers.load()) {
+			godot::DSPreloader::poll_completed(tag, 8, 8000, "", false);
+			std::this_thread::yield();
+		}
+	};
+	std::thread worker_a(worker_fn);
+	std::thread worker_b(worker_fn);
+
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	while (cache->get_unbuilt_prewarm_count(tag) > 0 && std::chrono::steady_clock::now() < deadline) {
+		cache->poll_completed(tag, 8, 8000, false);
+		std::this_thread::yield();
+	}
+
+	stop_workers.store(true);
+	worker_a.join();
+	worker_b.join();
+
+	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 0);
+	for (int i = 0; i < kUniquePaths; ++i) {
+		GDEX_EXPECT_TRUE(cache->get_cached(paths[i]).is_valid());
+	}
+}

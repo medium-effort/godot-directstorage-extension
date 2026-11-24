@@ -1,6 +1,7 @@
 #include "ds_texture_cache.h"
 #include "ds_preloader.h"
 #include "ds_texture_owner.h"
+#include "ds_texture_pipeline_common.h"
 #include "../core/ds_context.h"
 #include "core/ds_settings.h"
 #include <godot_cpp/classes/engine.hpp>
@@ -328,7 +329,12 @@ static void ds_texture_cache_release_evicted(std::vector<Ref<Texture2D>> &p_evic
 			DSTextureOwner::attach(p_evicted[i], rid);
 		}
 	}
-	p_evicted.clear();
+	if (dsgd_texture_pipeline::is_dummy_renderer()) {
+		std::lock_guard<std::mutex> lock(dsgd_texture_pipeline::dummy_texture_owner_mutex());
+		p_evicted.clear();
+	} else {
+		p_evicted.clear();
+	}
 }
 
 DSTextureCache *DSTextureCache::singleton = nullptr;

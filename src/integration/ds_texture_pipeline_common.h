@@ -18,6 +18,8 @@ namespace godot {
 
 class DSPkg;
 class DSRequest;
+class Image;
+class ImageTexture;
 
 namespace dsgd_texture_pipeline {
 
@@ -106,6 +108,16 @@ bool build_gpu_upload_requests(const GpuUploadPlanInput &p_input,
 		const RID &p_tex_rid,
 		uint64_t p_native_format,
 		Vector<Ref<DSRequest>> &r_uploads);
+
+// True when Godot is running on the headless Dummy renderer (godot#124139).
+bool is_dummy_renderer();
+
+// Leaf mutex serializing DummyTexture RID allocation/freeing on Godot < 4.8.
+std::mutex &dummy_texture_owner_mutex();
+
+// Worker-safe ImageTexture::create_from_image wrapper that serializes under
+// dummy_texture_owner_mutex() when is_dummy_renderer() is true.
+Ref<ImageTexture> create_image_texture_safe(const Ref<Image> &p_image);
 
 } // namespace dsgd_texture_pipeline
 } // namespace godot

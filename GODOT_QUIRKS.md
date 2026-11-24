@@ -656,7 +656,7 @@ As detailed in Section 2, `Texture2DRD` cannot be constructed on background work
    ```
 
 ### The Rule
-Constructing and populating `Image` and `ImageTexture` on background worker threads is completely free of thread-affinity hazards, justifying its use as the authoritative, stall-free fallback pathway during threaded scene loads.
+Constructing and populating `Image` and `ImageTexture` on background worker threads is completely free of thread-affinity hazards on real renderers (`RendererRD` and `GLES3`, where `texture_owner` is instantiated with `THREAD_SAFE = true`), justifying its use as the authoritative, stall-free fallback pathway during threaded scene loads. Under `--headless` (`RendererDummy`) on Godot < 4.8, `texture_owner` is **not** thread-safe; see Section 84 (`Q84`).
 
 ---
 
@@ -2028,4 +2028,36 @@ _configure_mode_environment(1, true) # vanilla Mode 1
 ```
 
 Treat the number as a benchmark measurement caveat rather than a defect (see Q78, Q80). Reducing it requires disabling the responsible Environment features *before* they first render, or a smaller shadow/fog configuration; the only guaranteed full release is a process restart. Script cannot enumerate or free these internal RIDs: `RenderingDevice.free_rid()` requires an RID you own, and `RenderSceneBuffers` is documented as an internal object.
+
+---
+
+## 84. `RendererDummy` `texture_owner` Is Not Thread-Safe (`--headless`)
+
+### The Engine Reality
+`RenderingServerDefault::texture_2d_create()` (`servers/rendering/rendering_server_default.h:147-156`, `:214`) calls `RSG::texture_storage->texture_allocate()` directly on the caller's thread before pushing `texture_2d_initialize()` to `command_queue`. Both real renderers (`RendererRD` at `servers/rendering/renderer_rd/storage_rd/texture_storage.h:209` and `GLES3` at `drivers/gles3/storage/texture_storage.h:433`) declare `RID_Owner<Texture, true>` (`THREAD_SAFE = true`). In Godot < 4.8, `RendererDummy::TextureStorage` (`servers/rendering/dummy/storage/texture_storage.h:45`) instead declares `mutable RID_PtrOwner<DummyTexture> texture_owner;` (`THREAD_SAFE = false`), leaving `make_rid()` and `free()` completely unlocked. Tracked upstream in `godotengine/godot#124139` and fixed in Godot 4.8 via `godotengine/godot#121958`.
+
+### The Trap / Symptom
+Under `--headless` (such as GUT unit tests or dedicated-server runs), when a `WorkerThreadPool` task (e.g., `DSRuntime` / `DSPreloader` CPU texture building) calls `ImageTexture::create_from_image()` concurrently with main-thread `ImageTexture::create_from_image()` or `~ImageTexture() -> free_rid()`, two threads can collide on the same `free_index` or `alloc_count` inside `RID_Alloc`. One thread overwrites the other's `validator`, causing `texture_2d_initialize()` to see `nullptr` and emit:
+```text
+ERROR: Parameter "t" is null.
+   at: texture_2d_initialize (./servers/rendering/dummy/storage/texture_storage.h:85)
+```
+followed by `ERROR: 1 RID allocations of type 'DummyTexture' were leaked at exit.` Because the collision window inside `make_rid()` is sub-microsecond, the failure reproduces intermittently (e.g., on `test_ds_preloader.gd::test_async_prewarm_archive_import_and_cancel`).
+
+### The Rule
+Never call `ImageTexture::create_from_image()` / `RenderingServer::texture_2d_create()` concurrently across threads under `--headless` (`RendererDummy`) on Godot < 4.8; detect headless/dummy via `DisplayServer.get_name() == "headless"` (not `get_current_rendering_driver_name()` alone) and serialize `DummyTexture` RID allocation/freeing or keep CPU texture builds on the main thread.
+
+```cpp
+bool is_dummy_renderer() {
+    DisplayServer *ds = DisplayServer::get_singleton();
+    if (ds != nullptr && ds->get_name().nocasecmp_to("headless") == 0) {
+        return true; // --headless leaves get_current_rendering_driver_name() at project setting ("d3d12")
+    }
+    RenderingServer *rs = RenderingServer::get_singleton();
+    return rs != nullptr && (rs->get_current_rendering_driver_name().nocasecmp_to("dummy") == 0 ||
+            rs->get_current_rendering_method().nocasecmp_to("dummy") == 0);
+}
+```
+
+Implemented in `src/integration/ds_texture_pipeline_common.cpp` (used by `ds_preloader.cpp` and `ds_resource_format_loader.cpp`), `src/integration/ds_texture_cache.cpp` (`ds_texture_cache_release_evicted()`), and `project/addons/directstorage_accelerator/scripts/ds_runtime.gd` (inline main-thread `poll_completed()` when `DisplayServer.get_name() == "headless"` or `"dummy"` driver/method). Related: Q25 (`ImageTexture` worker-safety on real renderers), Q09 (`--headless` uses `RasterizerDummy`).
 
