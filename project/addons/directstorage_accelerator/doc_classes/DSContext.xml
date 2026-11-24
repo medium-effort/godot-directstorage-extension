@@ -42,7 +42,7 @@
 			<param index="0" name="format" type="RDTextureFormat" />
 			<param index="1" name="view" type="RDTextureView" default="null" />
 			<description>
-				Creates a RenderingDevice destination texture resource with [param format] and optional [param view] suitable for DirectStorage direct-to-GPU copy operations. Returns the [RID] of the created texture.
+				Creates a freshly allocated, unused RenderingDevice destination texture resource with [param format] and optional [param view] suitable for DirectStorage direct-to-GPU copy operations. Returns the [RID] of the created texture. DirectStorage does not emit custom D3D12 resource-state barriers, so GPU destination resources must be freshly created and unused (not textures already sampled or rendered by Godot).
 			</description>
 		</method>
 		<method name="enqueue_request">

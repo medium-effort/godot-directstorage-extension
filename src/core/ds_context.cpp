@@ -966,9 +966,14 @@ RID DSContext::create_destination_texture(const Ref<RDTextureFormat> &p_format, 
 	if (view.is_null()) {
 		view.instantiate();
 	}
-	// DirectStorage GPU decompression requires destination textures to be in D3D12_RESOURCE_STATE_COMMON.
-	// Empty texture creation with an empty data array allocates committed resources on D3D12 DEFAULT heap,
-	// which inherently initializes in D3D12_RESOURCE_STATE_COMMON.
+	// DirectStorage writes directly to freshly created, unused RenderingDevice
+	// resources without issuing custom D3D12 resource barriers (Godot does not
+	// expose its internal tracked resource state via get_driver_resource()).
+	// Empty rd->texture_create() allocates a fresh DEFAULT-heap texture in
+	// D3D12_BARRIER_LAYOUT_UNDEFINED / D3D12_RESOURCE_STATE_COMMON (Enhanced
+	// Barriers or relaxed casting) or D3D12_RESOURCE_STATE_COPY_DEST (legacy
+	// fallback), before Godot's render graph transitions it. Callers must pass
+	// only freshly created, unused GPU targets to DESTINATION_GPU_*.
 	RID tex_rid = rd->texture_create(p_format, view, TypedArray<PackedByteArray>());
 	if (!tex_rid.is_valid()) {
 		UtilityFunctions::push_error("[DirectStorage] create_destination_texture failed: texture_create failed.");

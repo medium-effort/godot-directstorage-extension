@@ -550,12 +550,12 @@ GDEX_TEST_T(subresource, gpu_oversized_per_mip_requests, TAG_INTEGRATION | TAG_S
 }
 
 GDEX_TEST_T(subresource, gpu_bracket_barrier_multi_texture_async, TAG_INTEGRATION | TAG_SLOW) {
-    // Tests D3D12 bracket barrier transitions:
-    // 1. Multi-texture batching: Transitions 2 distinct hardware textures in one batch.
-    // 2. Async dispatch: Verifies worker-thread -> render-thread barrier dispatch
-    //    via s_barrier_dispatch_ctx and condition variable synchronization in submit_async().
+    // Tests multi-texture async DirectStorage GPU writes:
+    // 1. Multi-texture batching: Streams 2 distinct hardware textures in one batch.
+    // 2. Async dispatch: Verifies worker-thread -> render-thread destination resource
+    //    query and async batch completion.
     // 3. Sequential batch reuse: Submits a second batch immediately to verify
-    //    D3D12BarrierContext command allocator reset and fence monotonicity.
+    //    slot reuse and fence monotonicity.
     // 4. Data integrity: Verifies readback matches written pattern payload for both textures.
     if (!godot::ClassDB::class_exists("DSRequest") || !godot::ClassDB::class_exists("DSContext")) {
         GDEX_SKIP("DSRequest/DSContext classes unavailable");

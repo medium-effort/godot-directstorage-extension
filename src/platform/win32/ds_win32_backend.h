@@ -56,25 +56,6 @@ bool ds_win32_debug_probe_texture_region(const RID &p_texture, uint32_t p_subres
 #endif
 
 class Win32Backend : public PlatformBackend {
-public:
-#ifdef _WIN32
-	struct GPUTargetTransition {
-		Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-		D3D12_RESOURCE_STATES original_state = D3D12_RESOURCE_STATE_COMMON;
-		uint32_t first_subresource = 0;
-		uint32_t subresource_count = 1;
-	};
-	struct D3D12BarrierContext {
-		ID3D12CommandAllocator *cmd_allocator = nullptr;
-		ID3D12GraphicsCommandList *cmd_list = nullptr;
-		ID3D12Fence *transition_fence = nullptr;
-		uint64_t fence_value = 0;
-		HANDLE fence_event = nullptr;
-		Microsoft::WRL::ComPtr<ID3D12CommandQueue> command_queue;
-		std::mutex mutex;
-	};
-#endif
-
 private:
 #ifdef _WIN32
 	static constexpr int QUEUE_COUNT = 3;
@@ -86,7 +67,6 @@ private:
 		std::vector<DSTORAGE_REQUEST> dstorage_requests;
 		std::unordered_map<std::string, Ref<DSRequest>> request_name_map;
 		Vector<IDStorageFile *> files;
-		Vector<GPUTargetTransition> gpu_transitions;
 		// Open-file cache: normalized path -> slot-owned handle. Exported
 		// builds funnel ~256 requests per flush through one archive, so
 		// opening per request costs hundreds of kernel opens on the calling
@@ -237,7 +217,6 @@ private:
 		// Path -> handle for the references this zombie owns; released only
 		// after the hardware fence retires (same rule as resource guards).
 		std::unordered_map<std::wstring, IDStorageFile *> file_cache;
-		Vector<GPUTargetTransition> gpu_transitions;
 	};
 	std::vector<ZombieBatchSlot> zombie_slots;
 	// Instance-owned runtime state. These were file-level statics in the .cpp, so
@@ -317,10 +296,6 @@ private:
 	// demand. Never bound in _bind_methods().
 	std::function<HRESULT(int p_queue_index, ID3D12Fence *p_fence, uint64_t p_value, HANDLE p_event)> drain_arm_hook;
 #endif
-	// Test-only seam: forces the pre-submit transition gate in submit_async() and
-	// submit_batch() to abort even when pre_transitions is empty, so transition-abort
-	// slot cleanup can be tested without a live D3D12 device removal. Never bound in _bind_methods().
-	bool debug_force_transition_failure = false;
 #endif
 
 #ifdef _WIN32
@@ -378,10 +353,6 @@ private:
 	// already been harvested/aborted. Caller holds batch_mutex and has already
 	// released resource guards and closed the slot's file handles.
 	static void clear_completed_slot_locked(BatchSlot &r_slot);
-	// Aborts an unsubmitted slot after pre-submit barrier failure: fails its
-	// requests, releases guards and handles, and clears all four staging
-	// containers so the slot is clean for reuse. Caller holds batch_mutex.
-	void abort_batch_slot_locked(BatchSlot &r_slot);
 	void clear_persistent_files();
 	IDStorageFile *resolve_source_file(const std::wstring &p_wpath, String &r_error);
 	void release_source_file(const std::wstring &p_wpath, IDStorageFile *p_file);
@@ -409,13 +380,6 @@ private:
 		bool &registered;
 	};
 	static int priority_to_queue_index(DSRequest::DSPriority p_priority);
-
-	D3D12BarrierContext barrier_context;
-	bool init_barrier_context(ID3D12Device *p_device, ID3D12CommandQueue *p_queue = nullptr);
-	void cleanup_barrier_context();
-	bool execute_transitions(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common);
-	bool execute_transitions_internal(const Vector<GPUTargetTransition> &p_transitions, bool p_to_common);
-	friend void ds_win32_execute_transitions_on_render_thread();
 #endif
 
 public:
@@ -608,9 +572,6 @@ public:
 	// the file-level statics, which is exactly what the isolation test
 	// discriminates on. Never bound in _bind_methods().
 	Dictionary _debug_instance_state_for_testing() const;
-	// Test-only seam: toggles forced transition-failure aborts in submit_async() and
-	// submit_batch(). Never bound in _bind_methods().
-	void _debug_set_force_transition_failure_for_testing(bool p_force);
 	// Test-only seam: runs the .dstex/.dspkg mip parser without a live queue or
 	// device. The parser is pure file I/O + validation, so this stays
 	// headless-safe and lets the v3/v5 guard suite pin forged headers.

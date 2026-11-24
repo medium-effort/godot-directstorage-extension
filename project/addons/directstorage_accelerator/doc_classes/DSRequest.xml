@@ -107,7 +107,7 @@
 		<method name="set_destination_resource">
 			<return type="void" />
 			<param index="0" name="resource" type="RID" />
-			<description>Sets the target GPU buffer or texture [RID] when [member destination_type] is [constant DESTINATION_GPU_BUFFER] or [constant DESTINATION_GPU_TEXTURE].</description>
+			<description>Sets the target GPU buffer or texture [RID] when [member destination_type] is [constant DESTINATION_GPU_BUFFER] or [constant DESTINATION_GPU_TEXTURE]. Must be a freshly created, unused [RenderingDevice] resource (for textures, allocate via [method DSContext.create_destination_texture]); DirectStorage does not query or transition Godot's internal D3D12 resource states, so reusing a resource already sampled or rendered by Godot is unsupported.</description>
 		</method>
 		<method name="set_destination_type">
 			<return type="void" />
@@ -182,7 +182,7 @@
 			The destination memory buffer where decompressed or raw uncompressed bytes are written when [member destination_type] is [constant DESTINATION_MEMORY].
 		</member>
 		<member name="destination_resource" type="RID" setter="set_destination_resource" getter="get_destination_resource" default="RID()">
-			The GPU buffer or texture resource [RID] when [member destination_type] is [constant DESTINATION_GPU_BUFFER] or [constant DESTINATION_GPU_TEXTURE].
+			The GPU buffer or texture resource [RID] when [member destination_type] is [constant DESTINATION_GPU_BUFFER] or [constant DESTINATION_GPU_TEXTURE]. Must be a freshly created, unused [RenderingDevice] resource (for textures, allocate via [method DSContext.create_destination_texture]); DirectStorage does not query or transition Godot's internal D3D12 resource states, so reusing a resource already sampled or rendered by Godot is unsupported.
 		</member>
 		<member name="destination_type" type="int" setter="set_destination_type" getter="get_destination_type" enum="DSRequest.DSDestinationType" default="0">
 			The destination type where read data will be delivered ([constant DESTINATION_MEMORY], [constant DESTINATION_GPU_BUFFER], or [constant DESTINATION_GPU_TEXTURE]).
@@ -244,10 +244,10 @@
 			Destination is a CPU system memory buffer ([member destination_buffer]).
 		</constant>
 		<constant name="DESTINATION_GPU_BUFFER" value="1" enum="DSDestinationType">
-			Destination is a GPU buffer identified by [member destination_resource].
+			Destination is a freshly created, unused GPU buffer identified by [member destination_resource]. Reusing a buffer already bound or transitioned by Godot is unsupported.
 		</constant>
 		<constant name="DESTINATION_GPU_TEXTURE" value="2" enum="DSDestinationType">
-			Destination is a GPU texture identified by [member destination_resource].
+			Destination is a freshly created, unused GPU texture identified by [member destination_resource] (allocate via [method DSContext.create_destination_texture]). Reusing a texture already sampled or rendered by Godot is unsupported.
 		</constant>
 		<constant name="PRIORITY_LOW" value="0" enum="DSPriority">
 			Low queue priority for background asset streaming.
