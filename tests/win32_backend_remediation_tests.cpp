@@ -2407,12 +2407,16 @@ GDEX_TEST_T(win32_remediation, submit_preserves_unread_error, TAG_INTEGRATION) {
     if (profiler != nullptr) {
         bool sample_found = false;
         int64_t sample_error_state = -1;
+        int64_t sample_start_us = 0;
+        int64_t sample_end_us = 0;
         const auto sample_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (std::chrono::steady_clock::now() < sample_deadline) {
             godot::Ref<godot::DSProfilerResult> sample = profiler->get_last_result();
             if (sample.is_valid() && sample->get_compressed_bytes_read() == 1024 &&
                     sample->get_request_count() == 1) {
                 sample_error_state = static_cast<int64_t>(sample->get_error_state());
+                sample_start_us = sample->get_start_time_usec();
+                sample_end_us = sample->get_end_time_usec();
                 sample_found = true;
                 break;
             }
@@ -2421,6 +2425,8 @@ GDEX_TEST_T(win32_remediation, submit_preserves_unread_error, TAG_INTEGRATION) {
         GDEX_EXPECT_TRUE(sample_found);
         if (sample_found) {
             GDEX_EXPECT_EQ(sample_error_state, static_cast<int64_t>(0));
+            GDEX_EXPECT_TRUE(sample_start_us > 0);
+            GDEX_EXPECT_TRUE(sample_end_us >= sample_start_us);
         }
     }
 #else

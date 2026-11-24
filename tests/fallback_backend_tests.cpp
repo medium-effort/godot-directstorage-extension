@@ -319,5 +319,7 @@ GDEX_TEST_T(fallback_profiler, batch_metrics_reported_on_async_completion, TAG_I
     GDEX_EXPECT_EQ(after->get_uncompressed_bytes_produced(), static_cast<int64_t>(8192));
     GDEX_EXPECT_EQ(after->get_request_count(), 2);
     GDEX_EXPECT_TRUE(after->get_physical_read_duration_usec() > 0);
+    GDEX_EXPECT_TRUE(after->get_start_time_usec() > 0);
+    GDEX_EXPECT_TRUE(after->get_end_time_usec() >= after->get_start_time_usec());
     GDEX_EXPECT_EQ(after->get_error_state(), 0);
 }

@@ -23,6 +23,9 @@ namespace godot {
 // (the Win32 backend carries the same forward declaration).
 void ds_profiler_set_batch_metrics(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes,
 		int p_request_count, int64_t p_decompression_duration_us, int p_error_state);
+void ds_profiler_set_batch_metrics_timed(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes,
+		int p_request_count, int64_t p_decompression_duration_us, int p_error_state,
+		int64_t p_start_time_usec, int64_t p_end_time_usec);
 
 namespace {
 uint64_t fallback_now_us() {
@@ -119,12 +122,14 @@ void FallbackBackend::report_batch_metrics(const BatchMetrics &p_metrics) {
 	// consumes, so this pair must stay on the thread that observed completion.
 	// Neither call touches a Godot allocator and record_workload() takes only
 	// profiler_mutex (never batch_mutex), so the Q46 lock order is preserved.
-	ds_profiler_set_batch_metrics(
+	ds_profiler_set_batch_metrics_timed(
 			p_metrics.compressed_bytes,
 			p_metrics.uncompressed_bytes,
 			p_metrics.request_count,
 			-1,
-			p_metrics.error_state);
+			p_metrics.error_state,
+			static_cast<int64_t>(p_metrics.start_time_us),
+			static_cast<int64_t>(end_us));
 	profiler->record_workload(p_metrics.compressed_bytes, duration_us);
 }
 

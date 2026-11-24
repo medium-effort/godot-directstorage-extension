@@ -31,6 +31,10 @@ private:
 	double logical_throughput_bytes_per_sec = 0.0;
 	double physical_throughput_bytes_per_sec = 0.0;
 	int error_state = 0;
+	// Monotonic wall-clock brackets (microseconds) for this batch. Legacy
+	// callers leave both at 0, so consumers can detect missing timestamps.
+	int64_t start_time_usec = 0;
+	int64_t end_time_usec = 0;
 
 protected:
 	static void _bind_methods();
@@ -42,6 +46,8 @@ public:
 	int64_t get_physical_read_duration_usec() const;
 	int64_t get_decompression_duration_usec() const;
 	int get_error_state() const;
+	int64_t get_start_time_usec() const;
+	int64_t get_end_time_usec() const;
 
 	double get_logical_throughput_mbps() const;
 	double get_logical_throughput_mibps() const;
@@ -70,6 +76,8 @@ private:
 		double logical_throughput_bytes_per_sec = 0.0;
 		double physical_throughput_bytes_per_sec = 0.0;
 		int error_state = 0;
+		int64_t start_time_usec = 0;
+		int64_t end_time_usec = 0;
 	};
 	ProfilerSample last_sample;
 	bool has_last_sample = false;

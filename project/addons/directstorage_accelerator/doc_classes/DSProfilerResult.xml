@@ -21,6 +21,12 @@
 				Returns the decompression duration in microseconds, or [code]-1[/code] if decompression was integrated with GPU completion or not separately measurable.
 			</description>
 		</method>
+		<method name="get_end_time_usec" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the monotonic end timestamp of the batch in microseconds, or [code]0[/code] when the caller did not supply timestamps.
+			</description>
+		</method>
 		<method name="get_error_state" qualifiers="const">
 			<return type="int" />
 			<description>
@@ -63,6 +69,12 @@
 				Returns the number of read requests included in the profiled workload.
 			</description>
 		</method>
+		<method name="get_start_time_usec" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the monotonic start timestamp of the batch in microseconds, or [code]0[/code] when the caller did not supply timestamps.
+			</description>
+		</method>
 		<method name="get_uncompressed_bytes_produced" qualifiers="const">
 			<return type="int" />
 			<description>
@@ -76,6 +88,9 @@
 		</member>
 		<member name="decompression_duration_usec" type="int" setter="" getter="get_decompression_duration_usec" default="-1">
 			Duration of decompression in microseconds, or [code]-1[/code] when decompression timing is integrated into GPU completion.
+		</member>
+		<member name="end_time_usec" type="int" setter="" getter="get_end_time_usec" default="0">
+			Monotonic end timestamp of the batch in microseconds, or [code]0[/code] for legacy callers.
 		</member>
 		<member name="error_state" type="int" setter="" getter="get_error_state" default="0">
 			Error state code recorded during the workload ([code]0[/code] for success, non-zero on failure).
@@ -91,6 +106,9 @@
 		</member>
 		<member name="request_count" type="int" setter="" getter="get_request_count" default="0">
 			Number of read requests included in the batch.
+		</member>
+		<member name="start_time_usec" type="int" setter="" getter="get_start_time_usec" default="0">
+			Monotonic start timestamp of the batch in microseconds, or [code]0[/code] for legacy callers.
 		</member>
 		<member name="uncompressed_bytes_produced" type="int" setter="" getter="get_uncompressed_bytes_produced" default="0">
 			Total number of uncompressed (logical) bytes produced after decompression.

@@ -112,6 +112,7 @@ void Win32Backend::_set_capacity_reject_text_for_testing(const String &p_text) {
 #endif
 
 void ds_profiler_set_batch_metrics(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes, int p_request_count, int64_t p_decompression_duration_us, int p_error_state);
+void ds_profiler_set_batch_metrics_timed(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes, int p_request_count, int64_t p_decompression_duration_us, int p_error_state, int64_t p_start_time_usec, int64_t p_end_time_usec);
 
 #ifdef _WIN32
 #ifndef FSCTL_MANAGE_BYPASS_IO
@@ -2471,12 +2472,14 @@ void Win32Backend::completion_thread_func() {
 		uint64_t duration_us = (end_time > batch.start_time) ? (end_time - batch.start_time) : 1;
 		DSProfiler *profiler = DSProfiler::get_singleton();
 		if (profiler) {
-			ds_profiler_set_batch_metrics(
+			ds_profiler_set_batch_metrics_timed(
 					batch.compressed_bytes,
 					batch.uncompressed_bytes,
 					batch.request_count,
 					-1,
-					(err_handler && err_handler->get_error_sequence() != batch.error_sequence) ? 1 : 0);
+					(err_handler && err_handler->get_error_sequence() != batch.error_sequence) ? 1 : 0,
+					static_cast<int64_t>(batch.start_time),
+					static_cast<int64_t>(end_time));
 				profiler->record_workload(batch.compressed_bytes, duration_us);
 		}
 		batch_cv.notify_all();

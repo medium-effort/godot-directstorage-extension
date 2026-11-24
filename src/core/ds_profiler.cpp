@@ -21,6 +21,8 @@ struct PendingBatchMetrics {
 	int request_count = 0;
 	int64_t decompression_duration_us = -1;
 	int error_state = 0;
+	int64_t start_time_usec = 0;
+	int64_t end_time_usec = 0;
 };
 
 thread_local PendingBatchMetrics pending_batch_metrics;
@@ -28,13 +30,22 @@ thread_local PendingBatchMetrics pending_batch_metrics;
 } // namespace
 
 // Internal bridge for batch metrics without changing the legacy public API.
-void ds_profiler_set_batch_metrics(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes, int p_request_count, int64_t p_decompression_duration_us, int p_error_state) {
+// The timed variant carries monotonic per-batch brackets so the benchmark can
+// merge overlapping intervals instead of summing overlapped durations.
+void ds_profiler_set_batch_metrics_timed(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes, int p_request_count, int64_t p_decompression_duration_us, int p_error_state, int64_t p_start_time_usec, int64_t p_end_time_usec) {
 	pending_batch_metrics.valid = true;
 	pending_batch_metrics.compressed_bytes = p_compressed_bytes;
 	pending_batch_metrics.uncompressed_bytes = p_uncompressed_bytes;
 	pending_batch_metrics.request_count = p_request_count;
 	pending_batch_metrics.decompression_duration_us = p_decompression_duration_us;
 	pending_batch_metrics.error_state = p_error_state;
+	pending_batch_metrics.start_time_usec = p_start_time_usec;
+	pending_batch_metrics.end_time_usec = p_end_time_usec;
+}
+
+void ds_profiler_set_batch_metrics(uint64_t p_compressed_bytes, uint64_t p_uncompressed_bytes, int p_request_count, int64_t p_decompression_duration_us, int p_error_state) {
+	ds_profiler_set_batch_metrics_timed(p_compressed_bytes, p_uncompressed_bytes, p_request_count,
+			p_decompression_duration_us, p_error_state, 0, 0);
 }
 
 DSProfiler *DSProfiler::get_singleton() {
@@ -63,6 +74,14 @@ int64_t DSProfilerResult::get_decompression_duration_usec() const {
 
 int DSProfilerResult::get_error_state() const {
 	return error_state;
+}
+
+int64_t DSProfilerResult::get_start_time_usec() const {
+	return start_time_usec;
+}
+
+int64_t DSProfilerResult::get_end_time_usec() const {
+	return end_time_usec;
 }
 
 double DSProfilerResult::get_logical_throughput_mbps() const {
@@ -135,6 +154,8 @@ void DSProfiler::record_workload(uint64_t p_bytes, uint64_t p_duration_us) {
 		metrics.request_count = 1;
 		metrics.decompression_duration_us = -1;
 		metrics.error_state = 0;
+		metrics.start_time_usec = 0;
+		metrics.end_time_usec = 0;
 	}
 
 	// Build plain sample only: no Godot allocation on the calling (worker) thread.
@@ -147,6 +168,8 @@ void DSProfiler::record_workload(uint64_t p_bytes, uint64_t p_duration_us) {
 	sample.logical_throughput_bytes_per_sec = p_duration_us > 0 ? static_cast<double>(metrics.uncompressed_bytes) * 1000000.0 / static_cast<double>(p_duration_us) : 0.0;
 	sample.physical_throughput_bytes_per_sec = p_duration_us > 0 ? static_cast<double>(metrics.compressed_bytes) * 1000000.0 / static_cast<double>(p_duration_us) : 0.0;
 	sample.error_state = metrics.error_state;
+	sample.start_time_usec = metrics.start_time_usec;
+	sample.end_time_usec = metrics.end_time_usec;
 
 	std::lock_guard<std::mutex> lock(profiler_mutex);
 	_push_sample_locked(sample);
@@ -186,6 +209,8 @@ Ref<DSProfilerResult> DSProfiler::_make_result(const ProfilerSample &p_sample) {
 	result->logical_throughput_bytes_per_sec = p_sample.logical_throughput_bytes_per_sec;
 	result->physical_throughput_bytes_per_sec = p_sample.physical_throughput_bytes_per_sec;
 	result->error_state = p_sample.error_state;
+	result->start_time_usec = p_sample.start_time_usec;
+	result->end_time_usec = p_sample.end_time_usec;
 	return result;
 }
 
@@ -204,6 +229,8 @@ void DSProfiler::record_result(const Ref<DSProfilerResult> &p_result) {
 	sample.logical_throughput_bytes_per_sec = p_result->logical_throughput_bytes_per_sec;
 	sample.physical_throughput_bytes_per_sec = p_result->physical_throughput_bytes_per_sec;
 	sample.error_state = p_result->error_state;
+	sample.start_time_usec = p_result->start_time_usec;
+	sample.end_time_usec = p_result->end_time_usec;
 
 	std::lock_guard<std::mutex> lock(profiler_mutex);
 	_push_sample_locked(sample);
@@ -421,6 +448,8 @@ void DSProfilerResult::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_physical_throughput_mbps"), &DSProfilerResult::get_physical_throughput_mbps);
 	ClassDB::bind_method(D_METHOD("get_physical_throughput_mibps"), &DSProfilerResult::get_physical_throughput_mibps);
 	ClassDB::bind_method(D_METHOD("get_error_state"), &DSProfilerResult::get_error_state);
+	ClassDB::bind_method(D_METHOD("get_start_time_usec"), &DSProfilerResult::get_start_time_usec);
+	ClassDB::bind_method(D_METHOD("get_end_time_usec"), &DSProfilerResult::get_end_time_usec);
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "compressed_bytes_read"), "", "get_compressed_bytes_read");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "uncompressed_bytes_produced"), "", "get_uncompressed_bytes_produced");
@@ -430,6 +459,8 @@ void DSProfilerResult::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "logical_throughput_mbps"), "", "get_logical_throughput_mbps");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "physical_throughput_mbps"), "", "get_physical_throughput_mbps");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "error_state"), "", "get_error_state");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "start_time_usec"), "", "get_start_time_usec");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "end_time_usec"), "", "get_end_time_usec");
 }
 
 } // namespace godot
