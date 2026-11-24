@@ -144,6 +144,12 @@ var _cpu_window_items: int = 4
 var _cpu_window_bytes: int = 4 * 1024 * 1024
 const GPU_LOADING_PUMP_MAX_CHUNKS_PER_FRAME: int = 8
 const GPU_LOADING_PUMP_BUDGET_USEC: int = 5000
+## Background CPU pump ceilings. One dispatch is capped at 16 MiB so the
+## Win32 backend pipelines across both batch slots (up to 32 MiB in flight)
+## instead of stalling one slot and bursting a full 64 MiB window.
+const CPU_BG_WINDOW_MAX_ITEMS: int = 32
+const CPU_BG_WINDOW_MAX_BYTES: int = 32 * 1024 * 1024
+const CPU_BG_PUMP_MAX_BYTES_PER_CALL: int = 16 * 1024 * 1024
 ## Adaptive slice backpressure
 ## EMA of main-thread frame time; slice budgets passed by value to the
 ## worker via bind() so no cross-thread mutable read occurs.
@@ -319,6 +325,8 @@ func set_background_pacing(enabled: bool) -> void:
 	_cpu_poll_cooldown_frames = 0
 	_gpu_pump_cooldown_frames = 0
 	_gpu_window_chunks = 1
+	_cpu_window_init = false
+	_cpu_pump_cooldown_frames = 0
 	if ClassDB.class_exists("DSTextureCache"):
 		var cache = Engine.get_singleton("DSTextureCache")
 		if cache != null and cache.has_method("set_background_pacing"):
@@ -342,6 +350,8 @@ func reset_slice_stats() -> void:
 	_cpu_poll_cooldown_frames = 0
 	_gpu_pump_cooldown_frames = 0
 	_gpu_window_chunks = 1
+	_cpu_window_init = false
+	_cpu_pump_cooldown_frames = 0
 
 
 func _is_frame_capped() -> bool:
@@ -388,6 +398,23 @@ func _should_pump_gpu_now(slice_label: String, frame_ms: float = 0.0, mild_budge
 		return false
 	_gpu_pump_frames_since = 0
 	return true
+
+
+## CPU pump AIMD state step. No engine calls, so GUT can assert window
+## transitions without frame timing. Backoff runs on every overshoot; additive
+## increase requires did_pump so idle frames waiting on an in-flight Win32
+## batch cannot ramp the window straight back to the ceiling.
+func _step_cpu_aimd(p_slice_label: String, p_frame_ms: float, p_mild_at: float, p_heavy_at: float, p_cores: int, p_did_pump: bool) -> void:
+	if p_slice_label == "heavy" or p_frame_ms > p_heavy_at:
+		_cpu_window_items = maxi(1, _cpu_window_items / 2)
+		_cpu_window_bytes = maxi(1024 * 1024, _cpu_window_bytes / 2)
+		_cpu_pump_cooldown_frames = maxi(_cpu_pump_cooldown_frames, 1)
+	elif p_slice_label == "mild" or p_frame_ms > p_mild_at:
+		_cpu_window_items = maxi(2, int(float(_cpu_window_items) * 0.75))
+		_cpu_window_bytes = maxi(2 * 1024 * 1024, int(float(_cpu_window_bytes) * 0.75))
+	elif p_slice_label == "warm" and p_frame_ms <= p_mild_at and _smooth_streak >= 2 and p_did_pump:
+		_cpu_window_items = mini(CPU_BG_WINDOW_MAX_ITEMS, _cpu_window_items + maxi(1, p_cores / 4))
+		_cpu_window_bytes = mini(CPU_BG_WINDOW_MAX_BYTES, _cpu_window_bytes + 2 * 1024 * 1024)
 
 
 func _record_slice_stat(label: String) -> void:
@@ -879,25 +906,23 @@ func _process(delta: float) -> void:
 							_cpu_window_items = clampi(cores / 2, 2, 16)
 							_cpu_window_bytes = clampi(cores / 4, 1, 8) * 2 * 1024 * 1024
 							_cpu_window_init = true
-						if slice_label == "heavy" or frame_ms > heavy_at:
-							_cpu_window_items = maxi(1, _cpu_window_items / 2)
-							_cpu_window_bytes = maxi(1024 * 1024, _cpu_window_bytes / 2)
-							_cpu_pump_cooldown_frames = maxi(_cpu_pump_cooldown_frames, 1)
-						elif slice_label == "mild" or frame_ms > mild_at:
-							_cpu_window_items = maxi(2, int(float(_cpu_window_items) * 0.75))
-							_cpu_window_bytes = maxi(2 * 1024 * 1024, int(float(_cpu_window_bytes) * 0.75))
-						elif slice_label == "warm" and frame_ms <= mild_at and _smooth_streak >= 2:
-							_cpu_window_items = mini(64, _cpu_window_items + maxi(1, cores / 4))
-							_cpu_window_bytes = mini(64 * 1024 * 1024, _cpu_window_bytes + 2 * 1024 * 1024)
+						# Probe headroom before AIMD changes the window. Additive
+						# increase only happens when this frame actually pumps.
+						var in_flight_items: int = int(cache.get_in_flight_cpu_prewarm_count(0)) if _has_get_in_flight_cpu else 0
+						var in_flight_bytes: int = int(cache.get_in_flight_cpu_prewarm_bytes(0)) if _has_get_in_flight_cpu_bytes else 0
+						var avail_items: int = _cpu_window_items - in_flight_items
+						var avail_bytes: int = _cpu_window_bytes - in_flight_bytes
+						var did_pump: bool = _cpu_pump_cooldown_frames == 0 and _cpu_pump_task_id == -1 and avail_items > 0 and avail_bytes > 0
+						_step_cpu_aimd(slice_label, frame_ms, mild_at, heavy_at, cores, did_pump)
 						if _cpu_pump_cooldown_frames > 0:
 							_cpu_pump_cooldown_frames -= 1
 						else:
-							var in_flight_items: int = int(cache.get_in_flight_cpu_prewarm_count(0)) if _has_get_in_flight_cpu else 0
-							var in_flight_bytes: int = int(cache.get_in_flight_cpu_prewarm_bytes(0)) if _has_get_in_flight_cpu_bytes else 0
-							var avail_items: int = _cpu_window_items - in_flight_items
-							var avail_bytes: int = _cpu_window_bytes - in_flight_bytes
+							# Recompute after backoff and cap one dispatch to 16 MiB.
+							avail_items = _cpu_window_items - in_flight_items
+							avail_bytes = _cpu_window_bytes - in_flight_bytes
 							if avail_items > 0 and avail_bytes > 0 and _cpu_pump_task_id == -1:
-								_cpu_pump_task_id = WorkerThreadPool.add_task(_background_cpu_pump.bind(avail_items, avail_bytes), false, "DS_CpuPrewarmPump")
+								var pump_bytes: int = mini(avail_bytes, CPU_BG_PUMP_MAX_BYTES_PER_CALL)
+								_cpu_pump_task_id = WorkerThreadPool.add_task(_background_cpu_pump.bind(avail_items, pump_bytes), false, "DS_CpuPrewarmPump")
 					else:
 						if _cpu_pump_task_id == -1:
 							_cpu_pump_task_id = WorkerThreadPool.add_task(_background_cpu_pump.bind(queued_cpu, 0), false, "DS_CpuPrewarmPump")

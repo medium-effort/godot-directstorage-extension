@@ -122,6 +122,49 @@ func test_adaptive_gpu_backpressure_stride_state_machine() -> void:
 	assert_eq(heavy_pumps, 1, "heavy is paced, never stopped")
 
 
+func test_cpu_pump_aimd_only_ramps_when_pumping() -> void:
+	var root := get_tree().root
+	var rt := root.get_node_or_null("DSRuntime")
+	assert_not_null(rt, "DSRuntime autoload present")
+
+	# An idle warm frame waiting on an in-flight Win32 batch must not undo backoff.
+	rt._cpu_window_items = 4
+	rt._cpu_window_bytes = 4 * 1024 * 1024
+	rt._cpu_pump_cooldown_frames = 0
+	rt._step_cpu_aimd("warm", 8.0, rt.GPU_FRAME_BUDGET_MILD_MS, rt.GPU_FRAME_BUDGET_HEAVY_MS, 8, false)
+	assert_eq(rt._cpu_window_items, 4, "idle warm frame does not ramp items")
+	assert_eq(rt._cpu_window_bytes, 4 * 1024 * 1024, "idle warm frame does not ramp bytes")
+
+	# A warm frame that really pumps ramps up, then caps at the ceilings.
+	for _i in range(100):
+		rt._step_cpu_aimd("warm", 8.0, rt.GPU_FRAME_BUDGET_MILD_MS, rt.GPU_FRAME_BUDGET_HEAVY_MS, 8, true)
+	assert_eq(rt._cpu_window_items, rt.CPU_BG_WINDOW_MAX_ITEMS, "items cap at CPU_BG_WINDOW_MAX_ITEMS")
+	assert_eq(rt._cpu_window_bytes, rt.CPU_BG_WINDOW_MAX_BYTES, "bytes cap at CPU_BG_WINDOW_MAX_BYTES")
+
+	# Overshoot cuts the window and arms a cooldown frame.
+	rt._step_cpu_aimd("heavy", 40.0, rt.GPU_FRAME_BUDGET_MILD_MS, rt.GPU_FRAME_BUDGET_HEAVY_MS, 8, true)
+	assert_eq(rt._cpu_window_items, rt.CPU_BG_WINDOW_MAX_ITEMS / 2, "heavy halves items")
+	assert_eq(rt._cpu_window_bytes, rt.CPU_BG_WINDOW_MAX_BYTES / 2, "heavy halves bytes")
+	assert_eq(rt._cpu_pump_cooldown_frames, 1, "heavy arms one cooldown frame")
+	rt._step_cpu_aimd("mild", 20.0, rt.GPU_FRAME_BUDGET_MILD_MS, rt.GPU_FRAME_BUDGET_HEAVY_MS, 8, false)
+	assert_eq(rt._cpu_window_items, 12, "mild multiplies items by 0.75")
+	assert_eq(rt._cpu_window_bytes, 12 * 1024 * 1024, "mild multiplies bytes by 0.75")
+
+	# Both reset paths clear the init flag and cooldown.
+	rt._cpu_window_init = true
+	rt._cpu_pump_cooldown_frames = 3
+	rt.reset_slice_stats()
+	assert_false(rt._cpu_window_init, "reset_slice_stats clears window init")
+	assert_eq(rt._cpu_pump_cooldown_frames, 0, "reset_slice_stats clears cooldown")
+	rt._cpu_window_init = true
+	rt._cpu_pump_cooldown_frames = 3
+	var was_pacing: bool = bool(rt.is_background_pacing())
+	rt.set_background_pacing(not was_pacing)
+	rt.set_background_pacing(was_pacing)
+	assert_false(rt._cpu_window_init, "set_background_pacing clears window init")
+	assert_eq(rt._cpu_pump_cooldown_frames, 0, "set_background_pacing clears cooldown")
+
+
 func _pump_requests_only(ctx: Object, tag: int) -> bool:
 	var frames := 0
 	while not bool(ctx.is_prewarm_complete(tag)):
