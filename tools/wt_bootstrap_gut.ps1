@@ -72,12 +72,33 @@ if (-not (Test-Path -LiteralPath $destinationCache -PathType Container)) {
     [System.IO.Directory]::CreateDirectory($destinationCache) | Out-Null
 }
 
+# Use .NET directly, not Get-FileHash: worktrunk invokes hooks in a nested
+# powershell.exe where cmdlet autoload can fail with CommandNotFoundException.
+# The DirectStorage bootstrap hook uses the same helper for the same reason.
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            return [Convert]::ToBase64String($sha.ComputeHash($stream))
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
 $copied = 0
 foreach ($archive in $archives) {
     $destination = Join-Path $destinationCache $archive.Name
-    $sourceHash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash
+    $sourceHash = Get-FileSha256 -Path $archive.FullName
     if (Test-Path -LiteralPath $destination -PathType Leaf) {
-        $destinationHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+        $destinationHash = Get-FileSha256 -Path $destination
         if ($destinationHash -eq $sourceHash) {
             Write-Host "[wt] GUT archive already current: $($archive.Name)" -ForegroundColor DarkGray
             continue
