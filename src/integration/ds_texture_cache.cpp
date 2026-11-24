@@ -673,16 +673,24 @@ Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode
 			result = entry.texture;
 		}
 
-		std::vector<const Texture2D *> live_refs;
-		live_refs.reserve(cache_map.size());
-		for (const KeyValue<String, CacheEntry> &kv : cache_map) {
-			if (kv.value.texture.is_valid()) {
-				live_refs.push_back(kv.value.texture.ptr());
+		// The live-pointer set is only used to filter evicted textures. A pure
+		// hit has none, so scanning the whole cache under cache_mutex here is
+		// guaranteed work with no effect (measured ~23.7 ms per 4,140 hits
+		// with 274 cached textures on the Bistro-like cache-hit path).
+		if (!evicted.empty()) {
+			std::vector<const Texture2D *> live_refs;
+			live_refs.reserve(cache_map.size());
+			for (const KeyValue<String, CacheEntry> &kv : cache_map) {
+				if (kv.value.texture.is_valid()) {
+					live_refs.push_back(kv.value.texture.ptr());
+				}
 			}
+			ds_texture_cache_drop_live_refs(evicted, live_refs);
 		}
-		ds_texture_cache_drop_live_refs(evicted, live_refs);
 	}
-	ds_texture_cache_release_evicted(evicted);
+	if (!evicted.empty()) {
+		ds_texture_cache_release_evicted(evicted);
+	}
 	return result;
 }
 

@@ -8,9 +8,11 @@
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/color.hpp>
 #include <godot_cpp/variant/rid.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
 
 #include <string>
 #include <thread>
@@ -612,6 +614,39 @@ GDEX_TEST_T(cache, med10_in_flight_gpu_resource_query, TAG_INTEGRATION) {
     GDEX_EXPECT_TRUE(test_tex.is_valid());
     GDEX_EXPECT_TRUE(test_tex->get_rid() == valid_rid);
     GDEX_EXPECT_FALSE(ds_ctx->is_resource_in_flight(valid_rid));
+}
+
+// Micro-benchmark for the P1 Bistro "Ph 3 Bind" investigation: measure the
+// cache-hit fast path with a realistic 274-entry cache and 4,140 hits (the
+// reported level.tscn texture-reference count). The timing line is printed so
+// the same case can be compared before and after a candidate optimization.
+GDEX_TEST_T(cache, cache_hit_microbench, TAG_INTEGRATION) {
+    constexpr int kEntries = 274;
+    constexpr int kHits = 4140;
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+    cache->set_max_entries(kEntries + 8);
+
+    for (int i = 0; i < kEntries; ++i) {
+        cache->store(cache_path("res://gdextest_cache_bench_", i), make_test_texture(0.5f));
+    }
+    GDEX_EXPECT_EQ(cache->get_cached_count(), kEntries);
+
+    // Warm the paths once so the measured loop is steady-state.
+    for (int i = 0; i < kEntries; ++i) {
+        GDEX_ASSERT_TRUE(cache->get_cached(cache_path("res://gdextest_cache_bench_", i)).is_valid());
+    }
+
+    int hits = 0;
+    const int64_t start_us = godot::Time::get_singleton()->get_ticks_usec();
+    for (int i = 0; i < kHits; ++i) {
+        if (cache->get_cached(cache_path("res://gdextest_cache_bench_", i % kEntries)).is_valid()) {
+            ++hits;
+        }
+    }
+    const int64_t elapsed_us = godot::Time::get_singleton()->get_ticks_usec() - start_us;
+    godot::UtilityFunctions::print("[CACHE_MICROBENCH] entries=", kEntries, " hits=", hits,
+            " elapsed_us=", elapsed_us);
+    GDEX_EXPECT_EQ(hits, kHits);
 }
 
 
