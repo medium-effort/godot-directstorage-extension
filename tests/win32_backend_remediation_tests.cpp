@@ -4393,6 +4393,12 @@ GDEX_TEST_ASYNC_T(win32_remediation, concurrent_gpu_destination_enqueues_all_acc
         requests[i]->set_destination_resource(rids[i]);
     }
 
+    // R1 residual: both submits come from worker threads, so both must take the
+    // render-thread handoff. Record a baseline because the telemetry is process-wide.
+    const godot::Dictionary handoff_before = backend->get_backend_diagnostics();
+    const int64_t handoffs_before = static_cast<int64_t>(handoff_before.get("handoffs", 0));
+    const int64_t timeouts_before = static_cast<int64_t>(handoff_before.get("timeouts", 0));
+
     std::atomic<int> ready{ 0 };
     std::atomic<bool> go{ false };
     std::atomic<int> finished{ 0 };
@@ -4429,6 +4435,10 @@ GDEX_TEST_ASYNC_T(win32_remediation, concurrent_gpu_destination_enqueues_all_acc
     GDEX_EXPECT_EQ(finished.load(std::memory_order_acquire), 2);
     GDEX_EXPECT_TRUE(accepted[0].load());
     GDEX_EXPECT_TRUE(accepted[1].load());
+
+    const godot::Dictionary handoff_after = backend->get_backend_diagnostics();
+    GDEX_EXPECT_EQ(static_cast<int64_t>(handoff_after.get("handoffs", 0)), handoffs_before + 2);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(handoff_after.get("timeouts", 0)), timeouts_before);
 
     backend->submit_async();
     const uint64_t fence = backend->get_completion_fence();

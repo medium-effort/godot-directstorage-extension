@@ -2,6 +2,7 @@
 #define PLATFORM_BACKEND_H
 
 #include <godot_cpp/classes/ref.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include "../core/ds_request.h"
 
@@ -21,6 +22,11 @@ public:
 	// resources must be left alone (Win32Backend's drain-timeout path leaks on
 	// purpose for exactly this reason).
 	virtual bool was_drain_clean() const { return true; }
+	// Optional backend-specific telemetry merged into
+	// DSContext.get_capability_report()["destination_handoff"]. Backends with no
+	// such telemetry return an empty Dictionary and the key is omitted, so the
+	// report shape stays stable on every platform.
+	virtual Dictionary get_backend_diagnostics() const { return Dictionary(); }
 
 	// How a backend refusal should be treated by the caller's retry loop.
 	// STAGED is "accepted". TRANSIENT is "resource busy, retry once the slot

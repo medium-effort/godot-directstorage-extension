@@ -445,6 +445,7 @@ public:
 	bool initialize(const String &p_path);
 	void shutdown() override;
 	bool was_drain_clean() const override;
+	Dictionary get_backend_diagnostics() const override;
 
 	bool enqueue_request(Ref<DSRequest> p_request, PlatformBackend::EnqueueOutcome *r_outcome = nullptr) override;
 	void submit_batch() override;

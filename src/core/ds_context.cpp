@@ -745,6 +745,18 @@ Dictionary DSContext::get_capability_report() const {
 	report["loader_gpu_loads"] = loader_stats["loader_gpu_loads"];
 	report["loader_cache_hits"] = loader_stats["loader_cache_hits"];
 	report["loader_cpu_fallbacks"] = loader_stats["loader_cpu_fallbacks"];
+	// R1: expose the backend's render-thread handoff telemetry when it has any.
+	// A backend without rendezvous (fallback, or Win32 on a single-thread model)
+	// returns an empty Dictionary and the key is left out entirely.
+	{
+		std::shared_lock<std::shared_mutex> backend_lock(backend_lifecycle_mutex);
+		if (active_backend) {
+			Dictionary handoff = active_backend->get_backend_diagnostics();
+			if (!handoff.is_empty()) {
+				report["destination_handoff"] = handoff;
+			}
+		}
+	}
 	return report;
 }
 

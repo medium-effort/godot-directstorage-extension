@@ -1122,6 +1122,16 @@ struct DSGPUDestinationContext {
 // during DLL_PROCESS_DETACH and touch D3D12 under the loader lock.
 static DSRenderHandoffQueue<DSGPUDestinationContext> &s_gpu_dest_query_queue = *new DSRenderHandoffQueue<DSGPUDestinationContext>();
 
+// R1 residual telemetry. The overwrite race is closed by the queue above, but an
+// off-render-thread enqueue still parks its caller on a bounded 250 ms CV wait.
+// These counters make that second half measurable instead of assumed: they are
+// merged into DSContext.get_capability_report()["destination_handoff"] so a
+// project can see whether its thread model actually takes the rendezvous path.
+static std::atomic<uint64_t> s_gpu_dest_handoffs{ 0 };
+static std::atomic<uint64_t> s_gpu_dest_handoff_wait_us{ 0 };
+static std::atomic<uint64_t> s_gpu_dest_handoff_max_wait_us{ 0 };
+static std::atomic<uint64_t> s_gpu_dest_handoff_timeouts{ 0 };
+
 static void ds_win32_fetch_destination_resource_on_render_thread() {
 	std::shared_ptr<DSGPUDestinationContext> ctx = s_gpu_dest_query_queue.take_front();
 	if (!ctx) {
@@ -1201,14 +1211,25 @@ static bool ds_win32_query_destination_resource_on_render_thread(
 	s_gpu_dest_query_queue.push(ctx);
 	rs->call_on_render_thread(callable_mp_static(ds_win32_fetch_destination_resource_on_render_thread));
 
+	const auto handoff_started = std::chrono::steady_clock::now();
 	{
 		std::unique_lock<std::mutex> lock(ctx->mutex);
 		constexpr std::chrono::milliseconds kDestQueryTimeout(250);
 		bool signaled = ctx->cv.wait_for(lock, kDestQueryTimeout, [&ctx] { return ctx->completed; });
+		const uint64_t waited_us = static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::microseconds>(
+						std::chrono::steady_clock::now() - handoff_started).count());
+		s_gpu_dest_handoffs.fetch_add(1, std::memory_order_relaxed);
+		s_gpu_dest_handoff_wait_us.fetch_add(waited_us, std::memory_order_relaxed);
+		uint64_t previous_max = s_gpu_dest_handoff_max_wait_us.load(std::memory_order_relaxed);
+		while (waited_us > previous_max && !s_gpu_dest_handoff_max_wait_us.compare_exchange_weak(
+				previous_max, waited_us, std::memory_order_relaxed)) {
+		}
 		if (!signaled) {
 			// HIGH-02: Bounded timeout with no secondary unbounded wait. Drop this
 			// query from the handoff so a late callback cannot service a caller that
 			// already returned.
+			s_gpu_dest_handoff_timeouts.fetch_add(1, std::memory_order_relaxed);
 			s_gpu_dest_query_queue.prune(ctx);
 			return false;
 		}
@@ -4040,6 +4061,22 @@ bool Win32Backend::drain_all_queues(uint32_t p_timeout_ms) {
 
 bool Win32Backend::was_drain_clean() const {
 	return last_shutdown_drained.load();
+}
+
+Dictionary Win32Backend::get_backend_diagnostics() const {
+#ifdef _WIN32
+	// The counters live inside the file's main _WIN32 block; keep their only
+	// readers inside it too so this .cpp still compiles on Linux/macOS, where
+	// SCons builds it for the portable fallback.
+	Dictionary out;
+	out["handoffs"] = static_cast<int64_t>(s_gpu_dest_handoffs.load(std::memory_order_relaxed));
+	out["total_wait_us"] = static_cast<int64_t>(s_gpu_dest_handoff_wait_us.load(std::memory_order_relaxed));
+	out["max_wait_us"] = static_cast<int64_t>(s_gpu_dest_handoff_max_wait_us.load(std::memory_order_relaxed));
+	out["timeouts"] = static_cast<int64_t>(s_gpu_dest_handoff_timeouts.load(std::memory_order_relaxed));
+	return out;
+#else
+	return Dictionary();
+#endif
 }
 
 void Win32Backend::shutdown() {

@@ -101,7 +101,7 @@
 		</method>
 		<method name="get_capability_report" qualifiers="const">
 			<return type="Dictionary" />
-			<description>Returns a comprehensive [Dictionary] detailing the active backend, Direct3D 12 device status, GPU decompression support tier, GPU decompression enabled status, queue capacity, staging buffer configuration, and DXGI adapter identity ([code]adapter_name[/code], [code]adapter_vendor[/code], [code]dedicated_vram_mb[/code], [code]shared_system_mb[/code], [code]software_adapter[/code], [code]integrated_gpu_guess[/code]).</description>
+			<description>Returns a comprehensive [Dictionary] detailing the active backend, Direct3D 12 device status, GPU decompression support tier, GPU decompression enabled status, queue capacity, staging buffer configuration, and DXGI adapter identity ([code]adapter_name[/code], [code]adapter_vendor[/code], [code]dedicated_vram_mb[/code], [code]shared_system_mb[/code], [code]software_adapter[/code], [code]integrated_gpu_guess[/code]). When the backend has render-thread destination-handoff telemetry, the optional [code]destination_handoff[/code] key holds a [Dictionary] with [code]handoffs[/code], [code]total_wait_us[/code], [code]max_wait_us[/code] and [code]timeouts[/code]; the key is omitted entirely on backends without such telemetry.</description>
 		</method>
 		<method name="get_runtime_info" qualifiers="const">
 			<return type="Dictionary" />
