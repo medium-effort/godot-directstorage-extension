@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 25 November 2026
+Last updated: 26 November 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -2085,4 +2085,30 @@ Never rely on `shader_baker/enabled=true` alone to eliminate first-frame D3D12 P
 ```
 
 Implemented in `tps-demo/menu/pso_warmer.gd` and wired into `tps-demo/menu/menu.gd` (Phase 1c, `80% -> 100%`), reducing cold `-ForcePsoWarmup` `draw1` to `199.0 ms` (`draw2=16.2 ms`, max hitch `205.7 ms`) in `tps-demo/logs/standalone/run_20261125_061500_COLD.log`. Related: Q16 (keep loading overlay over `instantiate + add_child + 1 frame`).
+
+## 86. Fresh D3D12 Texture State Is Capability-Dependent and Not Queryable
+
+### The Engine Reality
+Godot 4.7.2 chooses the resource-creation path from `D3D12_FEATURE_DATA_D3D12_OPTIONS12`. When `EnhancedBarriersSupported` is set, or when cross-family relaxed casting applies, it calls `CreateResource3` with `D3D12_BARRIER_LAYOUT_UNDEFINED`/`COMMON` and records `initial_state = D3D12_RESOURCE_STATE_COMMON`; otherwise it calls `CreateResource` with `D3D12_RESOURCE_STATE_COPY_DEST` (`drivers/d3d12/rendering_device_driver_d3d12.cpp:1381-1402`, capability probe at `:6215-6220`). The state Godot tracks internally is not exposed through `RenderingDevice::get_driver_resource()`.
+
+### The Trap / Symptom
+On the GTX 1050 Ti test host the capability probe reported `EnhancedBarriersSupported=0`, `RelaxedFormatCastingSupported=1`, and the production format's base plus sRGB shareable formats are in the same DXGI family, so every fresh GPU destination texture starts in `COPY_DEST` - a state Microsoft's `dstorage.h:359` forbids. The windowed `gpu_*` suite still passed 34/0/1, but without a working validation layer there was no evidence about whether that state is harmless. Cost: the investigation behind audit finding A20261125-MED-02 and three documentation edits.
+
+### The Rule
+Never assume a freshly created RenderingDevice texture is in D3D12_RESOURCE_STATE_COMMON; Godot only creates it in COMMON with Enhanced Barriers (or cross-family relaxed casting), and get_driver_resource() does not expose the tracked state.
+
+Treat "fresh and unused" as a documented caller precondition in `project/addons/directstorage_accelerator/doc_classes/DSRequest.xml`, `DSContext.xml` and the addon `README.md`, not as a runtime-enforced invariant. A hard capability gate would disable GPU textures entirely on legacy-barrier adapters. Related: Q80, Q85.
+
+## 87. --gpu-validation Can Silently Lose D3D12 or Crash in the Debug Layer
+
+### The Engine Reality
+Godot enables its D3D12 validation path only when `--gpu-validation` is passed. `RenderingContextDriverD3D12::initialize()` calls `_initialize_debug_layers()`, which requires `D3D12GetDebugInterface` to succeed and then calls `EnableDebugLayer()` (`drivers/d3d12/rendering_context_driver_d3d12.cpp:124-139, 217-224`). If the layer is missing, device creation under D3D12 cannot proceed and the engine falls back to another driver; if the layer DLL and the runtime are different builds, the validation layer itself crashes.
+
+### The Trap / Symptom
+With no Graphics Tools layer: `ERROR: Condition "!((HRESULT)(res) >= 0)" is true ... at: _initialize_debug_layers (...:137)`, followed by `Win32Backend initialization failed: Rendering driver is 'vulkan'` and `skipped: D3D12 GPU decompression unavailable (headless or non-D3D12 driver)` - a skip that looks like a green run. After installing Graphics Tools, `d3d12sdklayers.dll` was `10.0.22621.1` while `D3D12.dll` and `D3D12Core.dll` were `10.0.22621.5415`, and Godot died with `CrashHandlerException: Program crashed with signal 11` with the backtrace inside `d3d12sdklayers.dll` before any case ran. Putting a version-matched app-local Agility SDK 1.618.5 beside Godot then made DirectStorage GPU requests fail with queue HRESULT `0x80070057 (E_INVALIDARG)` both with and without the flag, so it was reverted.
+
+### The Rule
+Never treat a skipped GPU test under --gpu-validation as a pass; confirm the D3D12 device line in stdout and that d3d12sdklayers.dll matches D3D12Core.dll before trusting the run.
+
+Check `Settings > Optional features > Graphics Tools` and compare layer/runtime file versions before a validation run. Do not install an app-local Agility SDK merely to obtain a layer: it changes the runtime and broke DirectStorage independently of validation here. Related: Q84.
 
