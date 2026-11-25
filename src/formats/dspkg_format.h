@@ -233,7 +233,9 @@ private:
 	bool payload_dedup_enabled = false;
 	// Opt-in: unlink each source .dstex after its payload has been streamed into
 	// the archive, so generation peaks at ~1.0x disk instead of ~2.0x. Default
-	// false keeps editor/export callers' sources untouched.
+	// false keeps editor/export callers' sources untouched. On a failed finalize
+	// the partial archive is removed but already-consumed sources are not restored;
+	// enable only when those generated files can be regenerated.
 	bool consume_sources_enabled = false;
 	bool repack_uncompressed = false;
 	std::vector<DSPkgStagedEntry> staging_entries;
