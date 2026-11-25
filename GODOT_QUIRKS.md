@@ -1,6 +1,6 @@
 # Godot Architectural Quirks, Edge Cases & Real-World Lessons
 
-Last updated: 24 November 2026
+Last updated: 25 November 2026
 
 Sourced from Godot 4.7 docs and source code.
 
@@ -2060,4 +2060,29 @@ bool is_dummy_renderer() {
 ```
 
 Implemented in `src/integration/ds_texture_pipeline_common.cpp` (used by `ds_preloader.cpp` and `ds_resource_format_loader.cpp`), `src/integration/ds_texture_cache.cpp` (`ds_texture_cache_release_evicted()`), and `project/addons/directstorage_accelerator/scripts/ds_runtime.gd` (inline main-thread `poll_completed()` when `DisplayServer.get_name() == "headless"` or `"dummy"` driver/method). Related: Q25 (`ImageTexture` worker-safety on real renderers), Q09 (`--headless` uses `RasterizerDummy`).
+
+---
+
+## 85. `shader_baker` Does Not Prevent D3D12 First-Frame PSO Stalls
+
+### The Engine Reality
+Godot's `shader_baker/enabled=true` export option pre-compiles shader source into backend shader bytecode (DXIL on D3D12), which avoids runtime HLSL/SPIR-V compilation, but it does **not** pre-create D3D12 driver `ID3D12PipelineState` (PSO) objects. Driver PSOs depend on the exact combination of shader permutation, material features, vertex layout, render-pass attachment formats, MSAA, HDR 2D, and AA/scaling settings, so the GPU driver still compiles each unseen PSO synchronously on the first draw call that uses it (extending Q16).
+
+### The Trap / Symptom
+An exported Windows D3D12 Forward+ build of `tps-demo` with `shader_baker/enabled=true` (`tps-demo/export_presets.cfg:36`) still stalled for over 6 seconds on the first rendered level frame on a GTX 1050 Ti (`tps-demo/logs/standalone/run_20261125_051817.log:37`):
+```text
+[Benchmark] Level First-Frame Split: ready->pre1=28.44 ms | draw1=6205.23 ms | gap->pre2=7.90 ms | draw2=19.86 ms
+```
+Even after decoupling `VoxelGI` and staging scene loads, the first rendered frame (`draw1`) remained the dominant single-frame freeze until material probes were pre-rendered offscreen.
+
+### The Rule
+Never rely on `shader_baker/enabled=true` alone to eliminate first-frame D3D12 PSO stalls; pre-warm unique material/shader permutations offscreen in an isolated `SubViewport` (`own_world_3d = true`) whose render-target flags (`use_hdr_2d`, `msaa_3d`, `screen_space_aa`, `use_taa`, `scaling_3d_mode`, `scaling_3d_scale`) match the main viewport.
+
+```gdscript
+# Extract unique material/shader permutations from PackedScene.get_state() without instantiating Level,
+# then render 1-3 probes per frame into an offscreen 256x256 SubViewport (UPDATE_ONCE) with mirrored
+# viewport flags and a cached hardware/driver/exe-mtime/settings fingerprint.
+```
+
+Implemented in `tps-demo/menu/pso_warmer.gd` and wired into `tps-demo/menu/menu.gd` (Phase 1c, `80% -> 100%`), reducing cold `-ForcePsoWarmup` `draw1` to `199.0 ms` (`draw2=16.2 ms`, max hitch `205.7 ms`) in `tps-demo/logs/standalone/run_20261125_061500_COLD.log`. Related: Q16 (keep loading overlay over `instantiate + add_child + 1 frame`).
 
