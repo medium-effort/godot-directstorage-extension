@@ -3,6 +3,7 @@
 #include "ds_texture_owner.h"
 #include "ds_texture_pipeline_common.h"
 #include "../core/ds_context.h"
+#include "../core/ds_log.h"
 #include "core/ds_settings.h"
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
@@ -434,10 +435,14 @@ void DSTextureCache::apply_vram_budget_guard(const Dictionary &p_adapter) {
 			static_cast<bool>(adapter.get("integrated_gpu_guess", false));
 	const int64_t dedicated_mb = static_cast<int64_t>(adapter.get("dedicated_vram_mb", static_cast<int64_t>(0)));
 	int cap = 0;
+	bool cap_from_integrated = false;
 	if (auto_integrated && integrated) {
 		cap = 128;
+		cap_from_integrated = true;
 	} else if (auto_low_vram && available && !integrated && dedicated_mb > 0) {
-		if (dedicated_mb < 4096) {
+		if (dedicated_mb < 3584) {
+			// DXGI-safe 4 GiB boundary: real 4 GiB cards report ~4004 MiB,
+			// so 3584 keeps them in the 256-entry tier instead of the <4 GiB one.
 			cap = 128;
 		} else if (dedicated_mb < 7168) {
 			// DXGI-safe 8 GiB boundary: real 8 GiB cards report ~7900-8060 MiB,
@@ -448,7 +453,16 @@ void DSTextureCache::apply_vram_budget_guard(const Dictionary &p_adapter) {
 	if (cap > 0) {
 		std::lock_guard<std::mutex> lock(cache_mutex);
 		if (!max_entries_user_overridden) {
+			const int previous_max = max_entries;
 			max_entries = std::min(max_entries, cap);
+			if (max_entries < previous_max) {
+				const char *tune_setting = cap_from_integrated ? "auto_tune_for_integrated_gpu" : "auto_tune_for_low_vram_gpu";
+				UtilityFunctions::print(String(dsgd_log::EXTENSION_PREFIX) +
+						"Texture cache auto-tune clamped texture_cache_max_entries " +
+						String::num_int64(previous_max) + "->" + String::num_int64(max_entries) +
+						" (cap " + String::num_int64(cap) + " from dsgd_extension/" + tune_setting +
+						"=true; set false to use the configured value).");
+			}
 		}
 	}
 }
@@ -484,7 +498,9 @@ bool DSTextureCache::_is_entry_evictable_locked(const String &p_path, const Ref<
 // eviction to newer entries). Returns false when every entry is externally
 // held (or the list is empty), in which case r_evicted is untouched and the
 // caller keeps temporary over-capacity instead of force-freeing a live RID.
-bool DSTextureCache::_evict_oldest(std::vector<Ref<Texture2D>> &r_evicted) {
+// With p_skip_prewarm, unconsumed prewarm-origin entries are also skipped so a
+// batch cannot evict its own textures before the scene consumes them.
+bool DSTextureCache::_evict_oldest(std::vector<Ref<Texture2D>> &r_evicted, bool p_skip_prewarm) {
 	if (lru_list.is_empty()) {
 		return false;
 	}
@@ -499,11 +515,19 @@ bool DSTextureCache::_evict_oldest(std::vector<Ref<Texture2D>> &r_evicted) {
 		if (!cache_map.has(path)) {
 			lru_list.erase(e);
 		} else if (_is_entry_evictable_locked(path, cache_map[path].texture)) {
+			// Mid-batch, an unconsumed prewarm texture must stay on the shelf:
+			// evicting it only forces a synchronous reload later at the same
+			// VRAM cost. Consumed entries have prewarm_origin cleared by
+			// get_cached(), so ordinary turnover is unaffected.
+			if (p_skip_prewarm && cache_map[path].prewarm_origin) {
+				e = older;
+				continue;
+			}
 			if (cache_map[path].prewarm_origin) {
 				prewarm_evictions++;
 				if (!warned_prewarm_eviction) {
 					warned_prewarm_eviction = true;
-					UtilityFunctions::push_warning("DSTextureCache: a prewarmed texture was evicted before its batch finished; raise dsgd_extension/texture_cache_max_entries or prewarm in smaller batches.");
+					UtilityFunctions::push_warning("DSTextureCache: a prewarmed texture was evicted before its batch finished; raise dsgd_extension/texture_cache_max_entries or prewarm in smaller batches (auto-tune may have lowered the limit; see the startup log).");
 				}
 			}
 			r_evicted.push_back(cache_map[path].texture);
@@ -737,16 +761,17 @@ bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 				// Ref, and removes the entry; still-cached Refs can no longer
 				// land in `evicted`, so drop_live_refs below only filters the
 				// capacity-replace twin case as before.
-				if (!_evict_oldest(evicted)) {
+				if (!_evict_oldest(evicted, p_prewarm)) {
 					if (lru_list.is_empty()) {
 						// Inconsistent state (entries without LRU nodes):
 						// never mass-free live RIDs; keep over-capacity.
 						UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)max_entries, ") reached with no LRU order; keeping '", p_path, "' over capacity instead of freeing live RIDs.");
 					} else {
-						// Every entry is externally held: keep them (temporary
-						// over-capacity) instead of force-freeing the oldest
-						// live RID (see GODOT_QUIRKS.md section 35).
-						UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)max_entries, ") reached with all entries externally held; keeping '", p_path, "' over capacity instead of freeing a live RID.");
+						// Either every entry is externally held, or every
+						// candidate belongs to the prewarm batch in progress.
+						// Keep temporary over-capacity instead of force-freeing
+						// a live RID (see GODOT_QUIRKS.md section 35).
+						UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)max_entries, ") reached with no evictable entry (all held or in the active prewarm batch); keeping '", p_path, "' over capacity instead of freeing a live RID.");
 					}
 					break;
 				}

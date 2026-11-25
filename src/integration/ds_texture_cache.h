@@ -48,7 +48,7 @@ private:
 	HashSet<String> in_flight_takeovers;
 
 	bool _is_entry_evictable_locked(const String &p_path, const Ref<Texture2D> &p_texture) const;
-	bool _evict_oldest(std::vector<Ref<Texture2D>> &r_evicted);
+	bool _evict_oldest(std::vector<Ref<Texture2D>> &r_evicted, bool p_skip_prewarm = false);
 	void _remove_entry(const String &p_canonical_path);
 	void _bind_alias_locked(const String &p_canonical_path, const String &p_alias_path);
 	void _unbind_alias_locked(const String &p_alias_path);

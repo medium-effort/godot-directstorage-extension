@@ -43,10 +43,12 @@ GDEX_TEST(cache_budget, prewarm_origin_eviction_is_counted_and_warned_once) {
 		memdelete(cache);
 	});
 
-	// Third store evicts the oldest prewarm-origin entry.
+	// A prewarm-origin entry evicted by ordinary pressure must be counted.
+	// Prewarm stores now protect their own batch, so the evicting store is a
+	// normal one (see prewarm_batch_does_not_evict_its_own_entries below).
 	GDEX_ASSERT_TRUE(cache->store("res://cache_budget_a", make_test_texture(0.1f), godot::DSTextureCache::CACHE_MODE_REUSE, "", true));
 	GDEX_ASSERT_TRUE(cache->store("res://cache_budget_b", make_test_texture(0.2f), godot::DSTextureCache::CACHE_MODE_REUSE, "", true));
-	GDEX_ASSERT_TRUE(cache->store("res://cache_budget_c", make_test_texture(0.3f), godot::DSTextureCache::CACHE_MODE_REUSE, "", true));
+	GDEX_ASSERT_TRUE(cache->store("res://cache_budget_c", make_test_texture(0.3f), godot::DSTextureCache::CACHE_MODE_REUSE, "", false));
 	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->_get_prewarm_eviction_count_for_testing()), static_cast<int64_t>(1));
 
 	// Ordinary (non-prewarm) eviction must not inflate the diagnostic counter.
@@ -118,16 +120,28 @@ GDEX_TEST(cache_budget, vram_guard_clamps_default_by_adapter_tier) {
 		return c;
 	};
 
-	// Discrete <4 GiB -> clamped to 128.
+	// Discrete <3.5 GiB -> clamped to 128.
 	{
 		godot::DSTextureCache *c = make_cache();
 		godot::Dictionary adapter;
 		adapter["available"] = true;
 		adapter["is_uma"] = false;
 		adapter["integrated_gpu_guess"] = false;
-		adapter["dedicated_vram_mb"] = static_cast<int64_t>(4095);
+		adapter["dedicated_vram_mb"] = static_cast<int64_t>(3583);
 		c->apply_vram_budget_guard(adapter);
 		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(128));
+	}
+
+	// Real 4 GiB DXGI report (~4004 MiB) -> medium tier, not the <4 GiB cap.
+	{
+		godot::DSTextureCache *c = make_cache();
+		godot::Dictionary adapter;
+		adapter["available"] = true;
+		adapter["is_uma"] = false;
+		adapter["integrated_gpu_guess"] = false;
+		adapter["dedicated_vram_mb"] = static_cast<int64_t>(4004);
+		c->apply_vram_budget_guard(adapter);
+		GDEX_EXPECT_EQ(static_cast<int64_t>(c->get_max_entries()), static_cast<int64_t>(256));
 	}
 
 	// Discrete 4-8 GiB -> clamped to 256.
@@ -230,10 +244,45 @@ GDEX_TEST(cache_budget, initialize_ds_applies_vram_guard_on_live_d3d12) {
 			static_cast<bool>(adapter.get("integrated_gpu_guess", false));
 	const int64_t dedicated_mb = static_cast<int64_t>(adapter.get("dedicated_vram_mb", static_cast<int64_t>(0)));
 	int64_t expected_cap = 512;
-	if (integrated || (dedicated_mb > 0 && dedicated_mb < 4096)) {
+	if (integrated || (dedicated_mb > 0 && dedicated_mb < 3584)) {
 		expected_cap = 128;
-	} else if (dedicated_mb >= 4096 && dedicated_mb < 7168) {
+	} else if (dedicated_mb >= 3584 && dedicated_mb < 7168) {
 		expected_cap = 256;
 	}
 	GDEX_EXPECT_LE(static_cast<int64_t>(fresh_cache->get_max_entries()), expected_cap);
+}
+
+// A prewarm batch must not evict its own unconsumed entries. With a 2-entry
+// cap, three prewarm stores stay resident; only a later ordinary store turns
+// the now-consumed entries back into normal LRU victims.
+GDEX_TEST(cache_budget, prewarm_batch_does_not_evict_its_own_entries) {
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	cache->set_max_entries(2);
+	cache->_reset_prewarm_eviction_stats_for_testing();
+	ctx.add_teardown([cache]() {
+		cache->clear();
+		memdelete(cache);
+	});
+
+	GDEX_ASSERT_TRUE(cache->store("res://cache_guard_a", make_test_texture(0.1f), godot::DSTextureCache::CACHE_MODE_REUSE, "", true));
+	GDEX_ASSERT_TRUE(cache->store("res://cache_guard_b", make_test_texture(0.2f), godot::DSTextureCache::CACHE_MODE_REUSE, "", true));
+	GDEX_ASSERT_TRUE(cache->store("res://cache_guard_c", make_test_texture(0.3f), godot::DSTextureCache::CACHE_MODE_REUSE, "", true));
+
+	// All three survive the batch despite the 2-entry cap. These lookups also
+	// consume them, clearing prewarm_origin for the turnover leg below.
+	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->_get_prewarm_eviction_count_for_testing()), static_cast<int64_t>(0));
+	GDEX_ASSERT_TRUE(cache->get_cached("res://cache_guard_a").is_valid());
+	GDEX_ASSERT_TRUE(cache->get_cached("res://cache_guard_b").is_valid());
+	GDEX_ASSERT_TRUE(cache->get_cached("res://cache_guard_c").is_valid());
+
+	// Ordinary pressure can now evict the consumed entries normally.
+	cache->_reset_prewarm_eviction_stats_for_testing();
+	GDEX_ASSERT_TRUE(cache->store("res://cache_guard_d", make_test_texture(0.4f), godot::DSTextureCache::CACHE_MODE_REUSE, "", false));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->_get_prewarm_eviction_count_for_testing()), static_cast<int64_t>(0));
+	GDEX_ASSERT_FALSE(cache->get_cached("res://cache_guard_a").is_valid());
+	GDEX_ASSERT_FALSE(cache->get_cached("res://cache_guard_b").is_valid());
+	GDEX_ASSERT_TRUE(cache->get_cached("res://cache_guard_c").is_valid());
+	GDEX_ASSERT_TRUE(cache->get_cached("res://cache_guard_d").is_valid());
 }
