@@ -520,10 +520,18 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	// Every outcome is recorded (review item R3). The availability flags in
 	// get_capability_report() cannot tell "GPU path configured" from "GPU path
 	// taken", and a threaded load falls back with print_verbose only.
-	auto note_fallback = [ds_ctx, &p_cache_key](DSContext::LoaderFallback p_reason) {
-		if (ds_ctx != nullptr) {
-			ds_ctx->note_loader_cpu_fallback(p_reason, p_cache_key);
+	auto note_fallback = [ds_ctx, &p_cache_key, &p_original_cache_key](DSContext::LoaderFallback p_reason) {
+		if (ds_ctx == nullptr) {
+			return;
 		}
+		// Show the path the caller asked for first; the hashed .godot/imported
+		// payload path is only useful as secondary context (and may be empty for
+		// direct loads, where it equals the original path).
+		String display_path = p_cache_key;
+		if (!p_original_cache_key.is_empty() && p_original_cache_key != p_cache_key) {
+			display_path = p_original_cache_key + String("', payload '") + p_cache_key;
+		}
+		ds_ctx->note_loader_cpu_fallback(p_reason, display_path);
 	};
 	if (p_as_image_texture) {
 		UtilityFunctions::print_verbose("DSResourceFormatLoader: Texture requested as ImageTexture for '" + p_cache_key + "'; bypassing GPU direct upload.");
