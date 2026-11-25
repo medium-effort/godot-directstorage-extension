@@ -353,7 +353,7 @@ void DSTextureCache::_bind_methods() {
 	BIND_ENUM_CONSTANT(CACHE_MODE_IGNORE_DEEP);
 
 	ClassDB::bind_method(D_METHOD("get_cached", "path", "cache_mode"), &DSTextureCache::get_cached, DEFVAL(static_cast<int>(CACHE_MODE_REUSE)));
-	ClassDB::bind_method(D_METHOD("store", "path", "texture", "cache_mode", "alias_path"), &DSTextureCache::store, DEFVAL(static_cast<int>(CACHE_MODE_REUSE)), DEFVAL(String()));
+	ClassDB::bind_method(D_METHOD("store", "path", "texture", "cache_mode", "alias_path"), &DSTextureCache::store_bound, DEFVAL(static_cast<int>(CACHE_MODE_REUSE)), DEFVAL(String()));
 	ClassDB::bind_method(D_METHOD("add_alias", "canonical_path", "alias_path"), &DSTextureCache::add_alias);
 	ClassDB::bind_method(D_METHOD("remove_alias", "alias_path"), &DSTextureCache::remove_alias);
 	ClassDB::bind_method(D_METHOD("has_alias", "alias_path"), &DSTextureCache::has_alias);
@@ -731,6 +731,10 @@ Ref<Texture2D> DSTextureCache::get_cached(const String &p_path, int p_cache_mode
 		ds_texture_cache_release_evicted(evicted);
 	}
 	return result;
+}
+
+bool DSTextureCache::store_bound(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode, const String &p_alias_path) {
+	return store(p_path, p_texture, p_cache_mode, p_alias_path);
 }
 
 bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode, const String &p_alias_path, bool p_prewarm) {

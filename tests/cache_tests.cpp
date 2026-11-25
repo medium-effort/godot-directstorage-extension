@@ -92,6 +92,23 @@ GDEX_TEST_T(cache, disabled_cache_stores_nothing, TAG_INTEGRATION) {
     GDEX_EXPECT_TRUE(cache->get_cached("res://gdextest_cache_disabled_0").is_null());
 }
 
+GDEX_TEST_T(cache, binding_store_keeps_documented_four_arg_api, TAG_INTEGRATION) {
+    godot::DSTextureCache *cache = new_enabled_cache(ctx);
+
+    // Regression for #0313: the bound method must accept the documented
+    // 2- and 4-argument forms. Binding the 5-parameter C++ overload directly
+    // advertised 5 args while D_METHOD named 4, so Object::call with 2-4 args
+    // raised "Invalid call error argument index" (and callv with 3/4 args
+    // crashed the process). That is what made the MED-03 reload probe spin.
+    auto r2 = cache->call("store", godot::String("res://gdextest_store_bind_2"), make_test_texture(1.0f));
+    GDEX_EXPECT_TRUE(static_cast<bool>(r2));
+
+    auto r4 = cache->call("store", godot::String("res://gdextest_store_bind_4"), make_test_texture(0.5f),
+            static_cast<int64_t>(godot::DSTextureCache::CACHE_MODE_REUSE), godot::String());
+    GDEX_EXPECT_TRUE(static_cast<bool>(r4));
+    GDEX_EXPECT_EQ(cache->get_cached_count(), 2);
+}
+
 GDEX_TEST_T(cache, lru_eviction_honors_entry_cap, TAG_INTEGRATION) {
     godot::DSTextureCache *cache = new_enabled_cache(ctx);
     cache->set_max_entries(3);

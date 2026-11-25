@@ -68,6 +68,12 @@ private:
 protected:
 	static void _bind_methods();
 
+	// Binding shim at the documented 4-argument shape. store() itself carries
+	// a 5th C++-only parameter (p_prewarm); binding that overload directly
+	// makes the MethodBind advertise 5 arguments while D_METHOD names only 4,
+	// so GDScript calls with 2-4 arguments error or crash (#0313).
+	bool store_bound(const String &p_path, const Ref<Texture2D> &p_texture, int p_cache_mode, const String &p_alias_path);
+
 public:
 	enum CacheMode {
 		CACHE_MODE_IGNORE = 0,
