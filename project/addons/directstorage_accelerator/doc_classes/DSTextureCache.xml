@@ -168,7 +168,7 @@
 		<method name="set_max_entries">
 			<return type="void" />
 			<param index="0" name="max" type="int" />
-			<description>Sets the cache capacity. Values less than [code]1[/code] are clamped to [code]1[/code]; excess oldest entries are evicted immediately. Entries still held outside the cache are skipped during eviction, so the cache can temporarily exceed capacity rather than freeing a texture that is still in use.</description>
+			<description>Sets the cache capacity. Values less than [code]1[/code] are clamped to [code]1[/code]; excess oldest entries are evicted immediately. Entries still held outside the cache are skipped during eviction, so the cache can temporarily exceed capacity rather than freeing a texture that is still in use. A prewarm batch may temporarily hold up to 25% more entries than this value (at least one extra) while its textures are waiting to be consumed; beyond that bounded cap the oldest waiting prewarm entry is evicted instead of growing the cache further.</description>
 		</method>
 		<method name="store">
 			<return type="bool" />
@@ -185,7 +185,7 @@
 			[b]Note:[/b] The singleton initializes this from the [code]directstorage/texture_cache_enabled[/code] project setting, which defaults to [code]true[/code]. Disabling also empties the cache and makes async prewarm refuse to start (a prewarmed texture that nothing holds would be released immediately). GPU decompression itself is unaffected: uncached textures are owned directly by the loader and free their device RID when released.
 		</member>
 		<member name="max_entries" type="int" setter="set_max_entries" getter="get_max_entries" default="512">
-			Maximum number of textures retained by the least-recently-used cache. The singleton initializes this from the [code]dsgd_extension/texture_cache_max_entries[/code] project setting (default [code]512[/code], range [code]16[/code]-[code]2048[/code]). Auto-tune lowers the effective value to [code]128[/code] on integrated GPUs and discrete GPUs under 4 GiB, and to [code]256[/code] on 4-8 GiB discrete GPUs. Evicting a prewarmed entry before its batch finishes emits a one-time warning. Values below [code]1[/code] are clamped to [code]1[/code].
+			Maximum number of textures retained by the least-recently-used cache. The singleton initializes this from the [code]dsgd_extension/texture_cache_max_entries[/code] project setting (default [code]512[/code], range [code]16[/code]-[code]2048[/code]). Auto-tune lowers the effective value to [code]128[/code] on integrated GPUs and discrete GPUs under 4 GiB, and to [code]256[/code] on 4-8 GiB discrete GPUs. A prewarm batch may temporarily hold up to 25% more entries than this value (at least one extra) so it does not evict its own waiting textures; beyond that bounded cap the oldest unconsumed prewarm entry is evicted. Evicting a prewarmed entry before its batch finishes emits a one-time warning, as does reaching the bounded prewarm cap. Values below [code]1[/code] are clamped to [code]1[/code].
 		</member>
 	</members>
 	<constants>

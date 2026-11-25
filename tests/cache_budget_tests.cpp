@@ -286,3 +286,45 @@ GDEX_TEST(cache_budget, prewarm_batch_does_not_evict_its_own_entries) {
 	GDEX_ASSERT_TRUE(cache->get_cached("res://cache_guard_c").is_valid());
 	GDEX_ASSERT_TRUE(cache->get_cached("res://cache_guard_d").is_valid());
 }
+
+// Six prewarm stores with no consumer must not grow the cache past the bounded
+// hard cap. The unfixed tree reached 6 here with zero prewarm evictions; the
+// control leg below stays at 2 on both sides of the fix.
+GDEX_TEST(cache_budget, prewarm_overshoot_is_bounded) {
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	cache->set_max_entries(2);
+	cache->_reset_prewarm_eviction_stats_for_testing();
+	ctx.add_teardown([cache]() {
+		cache->clear();
+		memdelete(cache);
+	});
+
+	// Control leg: six ordinary stores of identical texture shape stay at the cap.
+	for (int i = 0; i < 6; ++i) {
+		const godot::String path = "res://cache_bounded_ctrl_" + godot::String::num_int64(i);
+		GDEX_ASSERT_TRUE(cache->store(path, make_test_texture(0.1f + 0.05f * i),
+				godot::DSTextureCache::CACHE_MODE_REUSE, "", false));
+	}
+	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->get_cached_count()), static_cast<int64_t>(2)); // A1
+
+	cache->clear();
+	cache->_reset_prewarm_eviction_stats_for_testing();
+
+	// Defect leg: six prewarm stores, no consumer clears prewarm_origin.
+	for (int i = 0; i < 6; ++i) {
+		const godot::String path = "res://cache_bounded_pw_" + godot::String::num_int64(i);
+		GDEX_ASSERT_TRUE(cache->store(path, make_test_texture(0.1f + 0.05f * i),
+				godot::DSTextureCache::CACHE_MODE_REUSE, "", true));
+	}
+
+	// The cap-2 hard ceiling is 3 (cap + max(1, cap/4)); pin it so a later
+	// tuning change cannot silently move the bound this case asserts.
+	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->_get_prewarm_hard_cap_for_testing()), static_cast<int64_t>(3)); // A2a
+	GDEX_EXPECT_LE(static_cast<int64_t>(cache->get_cached_count()),
+			static_cast<int64_t>(cache->_get_prewarm_hard_cap_for_testing()));                                 // A2b
+	GDEX_EXPECT_GE(static_cast<int64_t>(cache->_get_prewarm_eviction_count_for_testing()),
+			static_cast<int64_t>(1));                                                        // A3
+	GDEX_EXPECT_TRUE(cache->get_cached("res://cache_bounded_pw_5").is_valid());                // A4
+}

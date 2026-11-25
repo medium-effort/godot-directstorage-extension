@@ -34,6 +34,10 @@ private:
 	// makes the otherwise silent "prewarm self-eviction" failure diagnosable.
 	int prewarm_evictions = 0;
 	bool warned_prewarm_eviction = false;
+	// One-shot gate for the capacity warning emitted by store(). Kept separate
+	// from warned_prewarm_eviction: consuming it there would silence the real
+	// "prewarm entry evicted before its batch finished" diagnostic later.
+	bool warned_prewarm_over_capacity = false;
 
 	struct CacheEntry {
 		Ref<Texture2D> texture;
@@ -55,6 +59,10 @@ private:
 	String _resolve_canonical_locked(const String &p_path) const;
 	static bool _is_cache_mode_ignored(int p_cache_mode);
 	static bool _is_cache_mode_replace(int p_cache_mode);
+	// Protected prewarm entries may overshoot max_entries by a bounded amount
+	// so a batch cannot evict its own waiting textures, but the overshoot must
+	// still cap resident textures. Shared by store() and the test seam.
+	static int prewarm_hard_cap(int p_max_entries);
 	bool _can_own_locked(int p_cache_mode) const;
 
 protected:
@@ -125,6 +133,7 @@ public:
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	// C++-only test seams; deliberately not bound (no new GDScript surface).
 	int64_t _get_prewarm_eviction_count_for_testing() const;
+	int _get_prewarm_hard_cap_for_testing() const;
 	void _reset_prewarm_eviction_stats_for_testing();
 #endif
 	void set_background_pacing(bool p_enabled);

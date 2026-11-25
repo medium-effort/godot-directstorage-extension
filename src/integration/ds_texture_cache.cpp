@@ -499,7 +499,9 @@ bool DSTextureCache::_is_entry_evictable_locked(const String &p_path, const Ref<
 // held (or the list is empty), in which case r_evicted is untouched and the
 // caller keeps temporary over-capacity instead of force-freeing a live RID.
 // With p_skip_prewarm, unconsumed prewarm-origin entries are also skipped so a
-// batch cannot evict its own textures before the scene consumes them.
+// batch cannot evict its own textures before the scene consumes them. store()
+// re-enables those entries as victims once the batch exceeds prewarm_hard_cap(),
+// which bounds the protected overshoot.
 bool DSTextureCache::_evict_oldest(std::vector<Ref<Texture2D>> &r_evicted, bool p_skip_prewarm) {
 	if (lru_list.is_empty()) {
 		return false;
@@ -537,6 +539,13 @@ bool DSTextureCache::_evict_oldest(std::vector<Ref<Texture2D>> &r_evicted, bool 
 		e = older;
 	}
 	return false;
+}
+
+int DSTextureCache::prewarm_hard_cap(int p_max_entries) {
+	const int cap = p_max_entries < 1 ? 1 : p_max_entries;
+	// 25% headroom (at least one entry) keeps a batch from evicting its own
+	// waiting textures while still bounding resident textures by the cap.
+	return cap + std::max(1, cap / 4);
 }
 
 void DSTextureCache::_remove_entry(const String &p_canonical_path) {
@@ -756,24 +765,50 @@ bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 				lru_list.move_to_front(entry.lru_element);
 			}
 		} else {
-			while (static_cast<int>(cache_map.size()) >= max_entries) {
-				// _evict_oldest() scans pristine counts, retains the victim's
-				// Ref, and removes the entry; still-cached Refs can no longer
-				// land in `evicted`, so drop_live_refs below only filters the
-				// capacity-replace twin case as before.
-				if (!_evict_oldest(evicted, p_prewarm)) {
-					if (lru_list.is_empty()) {
-						// Inconsistent state (entries without LRU nodes):
-						// never mass-free live RIDs; keep over-capacity.
-						UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)max_entries, ") reached with no LRU order; keeping '", p_path, "' over capacity instead of freeing live RIDs.");
-					} else {
-						// Either every entry is externally held, or every
-						// candidate belongs to the prewarm batch in progress.
-						// Keep temporary over-capacity instead of force-freeing
-						// a live RID (see GODOT_QUIRKS.md section 35).
-						UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)max_entries, ") reached with no evictable entry (all held or in the active prewarm batch); keeping '", p_path, "' over capacity instead of freeing a live RID.");
+			// _evict_oldest() scans pristine counts and retains the victim's
+			// Ref; still-cached Refs can no longer land in `evicted`, so
+			// drop_live_refs below only filters the capacity-replace twin case.
+			if (p_prewarm) {
+				const int hard_cap = prewarm_hard_cap(max_entries);
+				// Soft overshoot: protect the waiting batch up to max_entries
+				// exactly as before, but warn only once instead of per entry.
+				while (static_cast<int>(cache_map.size()) >= max_entries) {
+					if (!_evict_oldest(evicted, true)) {
+						if (!warned_prewarm_over_capacity) {
+							warned_prewarm_over_capacity = true;
+							UtilityFunctions::push_warning("DSTextureCache: prewarm batch exceeds texture_cache_max_entries (", (int64_t)max_entries, "); keeping up to the bounded cap of ", (int64_t)hard_cap, " resident entries and evicting the oldest waiting entry beyond it.");
+						}
+						break;
 					}
-					break;
+				}
+				// Hard ceiling: beyond the bounded overshoot the oldest
+				// unconsumed prewarm entry becomes an ordinary victim, so
+				// VRAM stays bounded by the cap. _evict_oldest counts and
+				// warns once for that prewarm eviction.
+				while (static_cast<int>(cache_map.size()) >= hard_cap) {
+					if (!_evict_oldest(evicted, false)) {
+						if (!warned_prewarm_over_capacity) {
+							warned_prewarm_over_capacity = true;
+							UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)hard_cap, ") reached with no evictable entry; keeping '", p_path, "' over capacity instead of freeing a live RID.");
+						}
+						break;
+					}
+				}
+			} else {
+				while (static_cast<int>(cache_map.size()) >= max_entries) {
+					if (!_evict_oldest(evicted, false)) {
+						if (lru_list.is_empty()) {
+							// Inconsistent state (entries without LRU nodes):
+							// never mass-free live RIDs; keep over-capacity.
+							UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)max_entries, ") reached with no LRU order; keeping '", p_path, "' over capacity instead of freeing live RIDs.");
+						} else {
+							// Every entry is externally held: keep temporary
+							// over-capacity instead of force-freeing a live RID
+							// (see GODOT_QUIRKS.md section 35).
+							UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)max_entries, ") reached with no evictable entry (all held); keeping '", p_path, "' over capacity instead of freeing a live RID.");
+						}
+						break;
+					}
 				}
 			}
 
@@ -1134,10 +1169,16 @@ int64_t DSTextureCache::_get_prewarm_eviction_count_for_testing() const {
 	return prewarm_evictions;
 }
 
+int DSTextureCache::_get_prewarm_hard_cap_for_testing() const {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	return prewarm_hard_cap(max_entries);
+}
+
 void DSTextureCache::_reset_prewarm_eviction_stats_for_testing() {
 	std::lock_guard<std::mutex> lock(cache_mutex);
 	prewarm_evictions = 0;
 	warned_prewarm_eviction = false;
+	warned_prewarm_over_capacity = false;
 }
 #endif
 
