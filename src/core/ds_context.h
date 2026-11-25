@@ -188,11 +188,11 @@ private:
 	// forever waiting for an enqueue that will never come.
 	std::atomic<int> stream_pending_submit_requests{ 0 };
 	// True when the staged-for-retry requests above include a GPU destination.
-	// Step 2 of the prewarm stutter plan: DSRuntime may only offload a memory-only
-	// flush to WorkerThreadPool; a staged GPU request would be re-enqueued on the
-	// worker and ds_win32_query_destination_resource_on_render_thread() could
-	// deadlock a single-threaded-render teardown. Paired with the queue scan in
-	// has_stream_gpu_pending().
+	// DSRuntime uses this (paired with the queue scan in has_stream_gpu_pending)
+	// to avoid dispatching a pointless worker task. It is only an optimisation:
+	// the authoritative affinity check is re-derived by the executing thread at
+	// the top of flush_stream_async(), so a same-frame GPU stage cannot turn a
+	// worker flush into an off-render-thread GPU enqueue.
 	std::atomic<bool> stream_pending_submit_has_gpu{ false };
 	// C++-only: mirrors DSPreloader's background-pacing mode so the stream
 	// flush can choose the tight (gameplay) or scaled (loading) request budget.

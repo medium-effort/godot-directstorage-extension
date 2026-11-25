@@ -499,6 +499,51 @@ GDEX_TEST_T(stream_maintenance, has_stream_gpu_pending_tracks_queued_and_staged,
 }
 #endif
 
+// A flush running on a worker must not consume a GPU-destination request that
+// was staged after the DSRuntime gate snapshot. The gate is an optimisation;
+// the flush re-derives affinity from the executing thread.
+GDEX_TEST_T(stream_maintenance, worker_flush_leaves_gpu_requests_queued, TAG_INTEGRATION) {
+    const char *path = "user://gdextest_worker_flush_gpu.bin";
+    remove_probe_file(path); // clean any stale fixture from an interrupted run
+    if (!write_probe_file(path)) {
+        GDEX_FAIL("failed to stage probe file.");
+    }
+    ctx.add_teardown([path]() { remove_probe_file(path); }); // runs after shutdown
+    godot::DSContext *ds = require_initialized_context(ctx);
+
+    // Gate verdict: memory only, so DSRuntime would dispatch a worker flush.
+    const uint64_t mem_tag = 201;
+    godot::Ref<godot::DSRequest> mem_req = make_memory_request(path, mem_tag);
+    GDEX_ASSERT_TRUE(ds->enqueue_request(mem_req, true));
+    GDEX_EXPECT_FALSE(ds->has_stream_gpu_pending());
+
+    // Same-frame GPU stage invalidates that snapshot before the worker runs.
+    const uint64_t gpu_tag = 202;
+    godot::Ref<godot::DSRequest> gpu_req;
+    gpu_req.instantiate();
+    gpu_req->set_file_path(godot::String(path));
+    gpu_req->set_size(static_cast<uint32_t>(kProbeBytes));
+    gpu_req->set_cancellation_tag(gpu_tag);
+    gpu_req->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    GDEX_ASSERT_TRUE(ds->enqueue_request(gpu_req, true));
+    GDEX_EXPECT_TRUE(ds->has_stream_gpu_pending());
+
+    // The worker's flush drains memory work but must leave GPU work queued.
+    std::thread worker([ds]() { ds->flush_stream_async(); });
+    worker.join();
+
+    GDEX_EXPECT_TRUE(ds->has_stream_gpu_pending());
+    GDEX_EXPECT_EQ(ds->get_stream_pending_count(), 1);
+    GDEX_EXPECT_EQ(static_cast<int64_t>(gpu_req->get_status()),
+                   static_cast<int64_t>(godot::DSRequest::Status(0)));
+    GDEX_EXPECT_TRUE(ds->has_stream_pending());
+
+    // Control: the same request is processed normally on the main thread.
+    GDEX_ASSERT_EQ(static_cast<int64_t>(ds->flush_stream_async()), static_cast<int64_t>(godot::OK));
+    GDEX_EXPECT_FALSE(ds->has_stream_gpu_pending());
+    GDEX_EXPECT_EQ(ds->get_stream_pending_count(), 0);
+}
+
 // Regression for #0277: concurrent worker + main-thread flush_stream_async()
 // calls over >128 requests (spanning multiple flushes) must never strand
 // staged requests in an unsubmitted slot with has_stream_pending() == false.

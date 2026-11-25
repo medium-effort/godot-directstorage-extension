@@ -1131,8 +1131,9 @@ func _background_poll_slice(p_items: int, p_usec: int) -> void:
 
 
 ## Background stream flush for memory-only batches. Deliberately touches no
-## RenderingServer / RenderingDevice API: GPU destinations stay on the main
-## thread, so joining this task during teardown cannot deadlock.
+## RenderingServer / RenderingDevice API. The gate in _process() is a snapshot;
+## if a GPU destination is staged after it, the native flush re-derives the
+## executing thread and leaves that request queued for an eligible flusher.
 func _background_stream_flush() -> void:
 	if not ClassDB.class_exists("DSContext"):
 		return

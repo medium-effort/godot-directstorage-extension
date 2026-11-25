@@ -48,6 +48,18 @@ static RenderingServer *safe_get_rendering_server() {
 	return RenderingServer::get_singleton();
 }
 
+// Derive the flush mode from the thread that actually executes it. The
+// DSRuntime gate is a snapshot taken earlier on the main thread: a GPU
+// destination staged after that check must not be processed by a worker,
+// because the Win32 destination query would need a render-thread handoff.
+static bool stream_flush_is_memory_only() {
+	if (Thread::is_main_thread()) {
+		return false;
+	}
+	RenderingServer *rs = safe_get_rendering_server();
+	return rs == nullptr || !rs->is_on_render_thread();
+}
+
 static bool validate_d3d12_rendering_device_active(const String &p_phase) {
 #ifdef _WIN32
 	RenderingServer *rs = safe_get_rendering_server();
@@ -1623,6 +1635,7 @@ Error DSContext::flush_stream_async() {
 	if (!initialized.load(std::memory_order_acquire) || shut_down.load(std::memory_order_acquire) || !active_backend) {
 		return ERR_UNCONFIGURED;
 	}
+	const bool memory_only = stream_flush_is_memory_only();
 	std::deque<Ref<DSRequest>> to_submit;
 	bool has_staged_pending = false;
 	{
@@ -1657,6 +1670,15 @@ Error DSContext::flush_stream_async() {
 		size_t accumulated_subresources = 0;
 		while (!stream_queue.empty() && to_submit.size() < max_logical_requests) {
 			Ref<DSRequest> next_req = stream_queue.front();
+			if (memory_only && next_req.is_valid()) {
+				const DSRequest::DSDestinationType destination_type = next_req->get_destination_type();
+				if (destination_type == DSRequest::DESTINATION_GPU_BUFFER ||
+						destination_type == DSRequest::DESTINATION_GPU_TEXTURE) {
+					// Leave GPU work (and everything behind it) queued for the
+					// next main-thread or render-thread flush. Strict FIFO.
+					break;
+				}
+			}
 			uint32_t req_cost = 1;
 			if (next_req.is_valid()) {
 				uint32_t subs = next_req->get_subresource_count();
