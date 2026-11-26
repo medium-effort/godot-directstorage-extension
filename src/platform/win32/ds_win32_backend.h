@@ -554,6 +554,12 @@ public:
 	// second load cycle must raise it again; a process-wide latch did not. Never
 	// bound in _bind_methods().
 	static int _debug_dstorage_config_apply_count();
+	// Test-only seam: the process-wide load epoch. It advances only when the
+	// own-reference count goes 0 -> 1, i.e. a genuinely new runtime instance
+	// cycle. Lets the config tests assert one apply per new instance instead of
+	// assuming a full unload/reload in a shared process. Never bound in
+	// _bind_methods().
+	static uint64_t _debug_dstorage_load_epoch();
 	// Test-only seam: the byte count last handed to
 	// IDStorageFactory::SetStagingBufferSize (0 before the first successful
 	// init). The factory exposes no getter, so this is the only way to prove the

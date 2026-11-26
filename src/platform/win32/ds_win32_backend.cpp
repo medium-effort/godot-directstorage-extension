@@ -6041,6 +6041,14 @@ int Win32Backend::_debug_dstorage_config_apply_count() {
 #endif
 }
 
+uint64_t Win32Backend::_debug_dstorage_load_epoch() {
+#ifdef _WIN32
+	return s_dstorage_load_epoch;
+#else
+	return 0;
+#endif
+}
+
 int64_t Win32Backend::_debug_last_applied_staging_bytes() {
 #ifdef _WIN32
 	return s_last_applied_staging_bytes.load();
