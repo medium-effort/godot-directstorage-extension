@@ -203,13 +203,14 @@ GDEX_TEST_T(poll_budget, first_cpu_item_over_budget_is_offloaded, TAG_UNIT) {
 	GDEX_ASSERT_EQ(cache->get_unbuilt_prewarm_count(tag), 1);
 	warm_worker_pool();
 
-	const uint64_t t0 = godot::Time::get_singleton()->get_ticks_usec();
 	const int stored = cache->poll_completed(tag, 0, 500);
-	const uint64_t elapsed = godot::Time::get_singleton()->get_ticks_usec() - t0;
 
+	// Assert the dispatch split via deterministic counters rather than a tight
+	// wall-clock ceiling or pre-completion pending count (both race OS/VM
+	// scheduling on shared Windows CI runners).
 	GDEX_EXPECT_EQ(stored, 0); // the slice stored nothing; the build left the thread
-	GDEX_EXPECT_LT(elapsed, static_cast<uint64_t>(3500)); // 500 us budget + 3 ms tolerance
-	GDEX_EXPECT_EQ(cache->get_unbuilt_prewarm_count(tag), 1); // still held, in flight
+	GDEX_EXPECT_EQ(godot::DSPreloader::_get_last_poll_inline_builds_for_testing(), 0);
+	GDEX_EXPECT_EQ(godot::DSPreloader::_get_last_poll_offloads_for_testing(), 1);
 
 	GDEX_EXPECT_TRUE(wait_until_unbuilt(cache, tag, 5000));
 	GDEX_EXPECT_TRUE(cache->get_cached("user://gdextest_poll_budget_big.png").is_valid());
@@ -325,12 +326,15 @@ GDEX_TEST_T(poll_budget, default_budget_is_bounded, TAG_UNIT) {
 	godot::PrewarmBudgetTest::inject_terminal_cpu_entry(tag, meta, data);
 	warm_worker_pool();
 
-	const uint64_t t0 = godot::Time::get_singleton()->get_ticks_usec();
 	const int stored = cache->poll_completed(tag);
-	const uint64_t elapsed = godot::Time::get_singleton()->get_ticks_usec() - t0;
 
+	// Assert the dispatch split via deterministic counters rather than a tight
+	// wall-clock ceiling: on shared 2-4 vCPU Windows CI runners, OS/VM
+	// preemption during WorkerThreadPool wake-up can exceed 8 ms (observed
+	// 22.2 ms with stored == 0).
 	GDEX_EXPECT_EQ(stored, 0);
-	GDEX_EXPECT_LT(elapsed, static_cast<uint64_t>(8000)); // 4 ms default + 4 ms tolerance
+	GDEX_EXPECT_EQ(godot::DSPreloader::_get_last_poll_inline_builds_for_testing(), 0);
+	GDEX_EXPECT_EQ(godot::DSPreloader::_get_last_poll_offloads_for_testing(), 1);
 	GDEX_EXPECT_TRUE(wait_until_unbuilt(cache, tag, 5000));
 	GDEX_EXPECT_TRUE(cache->get_cached("user://gdextest_poll_budget_default.png").is_valid());
 }
