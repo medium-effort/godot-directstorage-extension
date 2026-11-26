@@ -2045,7 +2045,10 @@ GDEX_TEST_T(win32_remediation, runtime_configuration_applies_per_loaded_instance
     GDEX_EXPECT_TRUE(godot::Win32Backend::probe_system_support());
     const int64_t count_after_cycle = static_cast<int64_t>(godot::Win32Backend::_debug_dstorage_config_apply_count());
     const int64_t epoch_after_cycle = static_cast<int64_t>(godot::Win32Backend::_debug_dstorage_load_epoch());
-    GDEX_EXPECT_EQ(count_after_cycle - count_before_cycle, epoch_after_cycle - epoch_before_cycle);
+    const int64_t count_delta_cycle = count_after_cycle - count_before_cycle;
+    const int64_t epoch_delta_cycle = epoch_after_cycle - epoch_before_cycle;
+    GDEX_EXPECT_TRUE(epoch_delta_cycle > 0);
+    GDEX_EXPECT_EQ(count_delta_cycle, epoch_delta_cycle);
 #else
     (void)ctx;
     GDEX_SKIP("The runtime-configuration counter is compiled out of release builds.");
@@ -2105,7 +2108,10 @@ GDEX_TEST_T(win32_remediation, runtime_configuration_survives_module_release, TA
     GDEX_EXPECT_TRUE(godot::Win32Backend::probe_system_support());
     const int64_t count_after_control = static_cast<int64_t>(godot::Win32Backend::_debug_dstorage_config_apply_count());
     const int64_t epoch_after_control = static_cast<int64_t>(godot::Win32Backend::_debug_dstorage_load_epoch());
-    GDEX_EXPECT_EQ(count_after_control - applied_after, epoch_after_control - epoch_before_control);
+    const int64_t count_delta_control = count_after_control - applied_after;
+    const int64_t epoch_delta_control = epoch_after_control - epoch_before_control;
+    GDEX_EXPECT_TRUE(epoch_delta_control > 0);
+    GDEX_EXPECT_EQ(count_delta_control, epoch_delta_control);
 #else
     (void)ctx;
     GDEX_SKIP("The runtime-configuration counter is compiled out of release builds.");

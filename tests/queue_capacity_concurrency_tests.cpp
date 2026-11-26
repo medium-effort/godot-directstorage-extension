@@ -193,8 +193,8 @@ GDEX_TEST_T(queue_capacity_concurrency, claim_gate_allows_two_budgeted_submitter
 	GDEX_EXPECT_EQ(static_cast<int64_t>(second->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
 }
 
-// Pre-fix RED probe: a post-lock TRANSIENT rejection must not retain the buffer
-// that enqueue_request() grew before taking batch_mutex.
+// Regression: a post-lock TRANSIENT rejection must not retain the buffer that
+// enqueue_request() grew before taking batch_mutex.
 GDEX_TEST_T(queue_capacity_concurrency, transient_rejection_releases_preallocated_destination_buffer, TAG_INTEGRATION) {
 	const godot::String fixture = "user://queue_capacity_presize_fixture.bin";
 	remove_temp_file(fixture);
@@ -242,7 +242,7 @@ GDEX_TEST_T(queue_capacity_concurrency, transient_rejection_releases_preallocate
 	GDEX_EXPECT_FALSE(backend->enqueue_request(rejected, &outcome));
 	GDEX_EXPECT_EQ(static_cast<int64_t>(outcome),
 			static_cast<int64_t>(PlatformBackend::EnqueueOutcome::TRANSIENT));
-	// The pre-size at ds_win32_backend.cpp:4490 has run; nothing releases it.
+	// The pre-size ran; the reject path must have released it.
 	GDEX_EXPECT_EQ(static_cast<int64_t>(rejected->get_destination_buffer().size()), 0);
 }
 

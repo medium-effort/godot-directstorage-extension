@@ -5125,7 +5125,6 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 			child->set_subresource_count(p_request->get_subresource_count());
 			child->set_texture_format(p_request->get_texture_format());
 			child->set_texture_layout(p_request->get_texture_layout());
-			child->get_destination_buffer_ref().resize(static_cast<int64_t>(destination_end - destination_begin));
 			staged_children.push_back(child);
 			staged_destination_offsets.push_back(destination_begin);
 		}
@@ -6043,6 +6042,7 @@ int Win32Backend::_debug_dstorage_config_apply_count() {
 
 uint64_t Win32Backend::_debug_dstorage_load_epoch() {
 #ifdef _WIN32
+	std::lock_guard<std::mutex> lock(s_dstorage_config_mutex);
 	return s_dstorage_load_epoch;
 #else
 	return 0;

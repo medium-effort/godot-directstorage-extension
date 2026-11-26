@@ -178,7 +178,8 @@ bool DSRequest::ensure_destination_buffer_capacity(uint64_t p_required_size) {
 
 bool DSRequest::resize_destination_buffer(uint64_t p_size) {
 	if (destination_buffer.size() != static_cast<int64_t>(p_size)) {
-		destination_buffer.resize(static_cast<int64_t>(p_size));
+		const int64_t rc = destination_buffer.resize(static_cast<int64_t>(p_size));
+		return rc == 0;
 	}
 	return true;
 }

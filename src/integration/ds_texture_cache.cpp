@@ -16,6 +16,7 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -542,10 +543,13 @@ bool DSTextureCache::_evict_oldest(std::vector<Ref<Texture2D>> &r_evicted, bool 
 }
 
 int DSTextureCache::prewarm_hard_cap(int p_max_entries) {
-	const int cap = p_max_entries < 1 ? 1 : p_max_entries;
+	const int64_t cap = std::max<int64_t>(1, p_max_entries);
 	// 25% headroom (at least one entry) keeps a batch from evicting its own
 	// waiting textures while still bounding resident textures by the cap.
-	return cap + std::max(1, cap / 4);
+	// Compute in 64 bits: set_max_entries() accepts any int, and cap + cap/4
+	// overflows signed int above ~1.7e9 (UB, wraps negative).
+	const int64_t with_headroom = cap + std::max<int64_t>(1, cap / 4);
+	return static_cast<int>(std::min<int64_t>(with_headroom, std::numeric_limits<int>::max()));
 }
 
 void DSTextureCache::_remove_entry(const String &p_canonical_path) {
@@ -791,8 +795,8 @@ bool DSTextureCache::store(const String &p_path, const Ref<Texture2D> &p_texture
 				// warns once for that prewarm eviction.
 				while (static_cast<int>(cache_map.size()) >= hard_cap) {
 					if (!_evict_oldest(evicted, false)) {
-						if (!warned_prewarm_over_capacity) {
-							warned_prewarm_over_capacity = true;
+						if (!warned_prewarm_hard_cap) {
+							warned_prewarm_hard_cap = true;
 							UtilityFunctions::push_warning("DSTextureCache: capacity (", (int64_t)hard_cap, ") reached with no evictable entry; keeping '", p_path, "' over capacity instead of freeing a live RID.");
 						}
 						break;
@@ -1178,11 +1182,17 @@ int DSTextureCache::_get_prewarm_hard_cap_for_testing() const {
 	return prewarm_hard_cap(max_entries);
 }
 
+bool DSTextureCache::_get_prewarm_hard_cap_warning_for_testing() const {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	return warned_prewarm_hard_cap;
+}
+
 void DSTextureCache::_reset_prewarm_eviction_stats_for_testing() {
 	std::lock_guard<std::mutex> lock(cache_mutex);
 	prewarm_evictions = 0;
 	warned_prewarm_eviction = false;
 	warned_prewarm_over_capacity = false;
+	warned_prewarm_hard_cap = false;
 }
 #endif
 

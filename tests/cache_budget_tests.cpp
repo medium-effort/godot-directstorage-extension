@@ -13,6 +13,8 @@
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/variant/color.hpp>
 
+#include <climits>
+
 namespace {
 
 godot::Ref<godot::Texture2D> make_test_texture(float p_red) {
@@ -30,6 +32,46 @@ GDEX_TEST(cache_budget, registered_default_is_512) {
 	}
 	const godot::Variant value = ps->get_setting("dsgd_extension/texture_cache_max_entries");
 	GDEX_EXPECT_EQ(static_cast<int64_t>(value), static_cast<int64_t>(512));
+}
+
+// An extreme max_entries must not wrap the prewarm hard cap (signed overflow UB).
+GDEX_TEST(cache_budget, extreme_max_entries_hard_cap_does_not_overflow) {
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	ctx.add_teardown([cache]() {
+		cache->clear();
+		memdelete(cache);
+	});
+
+	cache->set_max_entries(128);
+	GDEX_EXPECT_EQ(static_cast<int64_t>(cache->_get_prewarm_hard_cap_for_testing()), static_cast<int64_t>(160));
+
+	cache->set_max_entries(INT_MAX);
+	const int64_t extreme_cap = static_cast<int64_t>(cache->_get_prewarm_hard_cap_for_testing());
+	GDEX_EXPECT_EQ(extreme_cap, static_cast<int64_t>(INT_MAX));
+}
+
+// The hard-cap diagnostic needs its own gate: the soft loop always fires first.
+GDEX_TEST(cache_budget, hard_cap_warning_is_reachable_when_all_entries_are_held) {
+	godot::DSTextureCache *cache = memnew(godot::DSTextureCache);
+	GDEX_ASSERT_TRUE(cache != nullptr);
+	cache->set_enabled(true);
+	cache->set_max_entries(2); // hard cap = 3
+	cache->_reset_prewarm_eviction_stats_for_testing();
+	ctx.add_teardown([cache]() {
+		cache->clear();
+		memdelete(cache);
+	});
+
+	// External Refs make every entry ineligible for eviction.
+	godot::Ref<godot::Texture2D> held[4];
+	for (int i = 0; i < 4; ++i) {
+		held[i] = make_test_texture(0.1f * static_cast<float>(i + 1));
+		GDEX_ASSERT_TRUE(cache->store("res://cache_hard_cap_" + godot::String::num_int64(i),
+				held[i], godot::DSTextureCache::CACHE_MODE_REUSE, "", true));
+	}
+	GDEX_EXPECT_TRUE(cache->_get_prewarm_hard_cap_warning_for_testing());
 }
 
 GDEX_TEST(cache_budget, prewarm_origin_eviction_is_counted_and_warned_once) {

@@ -43,8 +43,8 @@ void fail_submitted_pending_requests(Vector<Ref<DSRequest>> &p_pending) {
 	const String message = "DirectStorage backend shut down before batch completion.";
 	for (int i = 0; i < p_pending.size(); i++) {
 		if (p_pending[i].is_valid() && p_pending[i]->get_status() == DSRequest::STATUS_SUBMITTED) {
-			p_pending[i]->set_status(DSRequest::STATUS_FAILED);
 			p_pending[i]->set_error_message(message);
+			p_pending[i]->set_status(DSRequest::STATUS_FAILED);
 		}
 	}
 }
@@ -485,8 +485,8 @@ void FallbackBackend::submit_batch() {
 		UtilityFunctions::push_error(String(dsgd_log::EXTENSION_PREFIX) + "Timed out waiting for the previous batch to complete.");
 		for (int i = 0; i < batch.size(); i++) {
 			if (batch[i].is_valid() && batch[i]->get_status() == DSRequest::STATUS_SUBMITTED) {
-				batch[i]->set_status(DSRequest::STATUS_FAILED);
 				batch[i]->set_error_message("Timed out waiting for the previous batch to complete.");
+				batch[i]->set_status(DSRequest::STATUS_FAILED);
 			}
 		}
 		return;

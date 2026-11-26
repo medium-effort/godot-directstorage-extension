@@ -38,6 +38,10 @@ private:
 	// from warned_prewarm_eviction: consuming it there would silence the real
 	// "prewarm entry evicted before its batch finished" diagnostic later.
 	bool warned_prewarm_over_capacity = false;
+	// Separate gate for the hard-cap diagnostic: the soft loop always sets the
+	// shared flag before the hard loop can be reached, so reusing it there makes
+	// "all entries externally held at hard cap" unobservable.
+	bool warned_prewarm_hard_cap = false;
 
 	struct CacheEntry {
 		Ref<Texture2D> texture;
@@ -140,6 +144,7 @@ public:
 	// C++-only test seams; deliberately not bound (no new GDScript surface).
 	int64_t _get_prewarm_eviction_count_for_testing() const;
 	int _get_prewarm_hard_cap_for_testing() const;
+	bool _get_prewarm_hard_cap_warning_for_testing() const;
 	void _reset_prewarm_eviction_stats_for_testing();
 #endif
 	void set_background_pacing(bool p_enabled);
