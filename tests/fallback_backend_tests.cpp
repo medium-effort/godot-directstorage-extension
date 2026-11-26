@@ -323,3 +323,45 @@ GDEX_TEST_T(fallback_profiler, batch_metrics_reported_on_async_completion, TAG_I
     GDEX_EXPECT_TRUE(after->get_end_time_usec() >= after->get_start_time_usec());
     GDEX_EXPECT_EQ(after->get_error_state(), 0);
 }
+
+// A staged request is claimed into SUBMITTED and parked in pending_requests.
+// Workers only drain request_queue, so shutdown must fail it before clearing
+// the staging container; otherwise a holder of the Ref never converges.
+GDEX_TEST_T(fallback_shutdown, staged_request_failed_on_shutdown, TAG_UNIT) {
+    const char *kPath = "user://gdextest_fallback_shutdown.bin";
+    ctx.add_teardown([kPath]() { remove_file(kPath); });
+    GDEX_ASSERT_TRUE(write_bytes(kPath, make_stream_header(0, 0)));
+
+    godot::FallbackBackend backend;
+    godot::Ref<godot::DSRequest> req = make_raw_request(kPath, 0, 8);
+    GDEX_ASSERT_TRUE(backend.enqueue_request(req));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(req->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_SUBMITTED));
+
+    backend.shutdown();
+
+    GDEX_EXPECT_EQ(static_cast<int64_t>(req->get_status()),
+            static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(req->get_error_message().find("shut down") != -1);
+    GDEX_EXPECT_TRUE(backend.is_batch_complete());
+}
+
+// Control of the same shape: a request that was actually submitted reaches a
+// terminal state, and shutdown must not overwrite that result. This catches an
+// unguarded fail-everything loop as well as proving the healthy leg exists.
+GDEX_TEST_T(fallback_shutdown, submitted_request_result_survives_shutdown, TAG_UNIT) {
+    const char *kPath = "user://gdextest_fallback_shutdown_control.bin";
+    ctx.add_teardown([kPath]() { remove_file(kPath); });
+    GDEX_ASSERT_TRUE(write_bytes(kPath, make_stream_header(0, 0)));
+
+    godot::FallbackBackend backend;
+    godot::Ref<godot::DSRequest> req = make_raw_request(kPath, 0, 8);
+    GDEX_ASSERT_TRUE(backend.enqueue_request(req));
+    backend.submit_batch();
+
+    const int64_t terminal = static_cast<int64_t>(req->get_status());
+    GDEX_ASSERT_TRUE(terminal == static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED) ||
+            terminal == static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    backend.shutdown();
+    GDEX_EXPECT_EQ(static_cast<int64_t>(req->get_status()), terminal);
+}

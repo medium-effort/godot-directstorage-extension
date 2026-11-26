@@ -33,6 +33,21 @@ uint64_t fallback_now_us() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 			std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+
+// A request accepted by enqueue_request() is claimed into SUBMITTED and parks
+// in pending_requests. Workers only drain request_queue, so a lifecycle method
+// that clears the staging container must fail those requests first; otherwise
+// a holder of the Ref never observes a terminal status. Mirror the Win32
+// shutdown wording so callers see the same message from either backend.
+void fail_submitted_pending_requests(Vector<Ref<DSRequest>> &p_pending) {
+	const String message = "DirectStorage backend shut down before batch completion.";
+	for (int i = 0; i < p_pending.size(); i++) {
+		if (p_pending[i].is_valid() && p_pending[i]->get_status() == DSRequest::STATUS_SUBMITTED) {
+			p_pending[i]->set_status(DSRequest::STATUS_FAILED);
+			p_pending[i]->set_error_message(message);
+		}
+	}
+}
 } // namespace
 
 struct FallbackBackend::WorkerScratch {
@@ -231,6 +246,7 @@ bool FallbackBackend::initialize() {
 	{
 		std::lock_guard<std::mutex> lock(batch_mutex);
 		active_workers = 0;
+		fail_submitted_pending_requests(pending_requests);
 		pending_requests.clear();
 		request_queue.clear();
 		in_flight_batch_infos.clear();
@@ -276,6 +292,7 @@ void FallbackBackend::shutdown() {
 		in_flight_batch_infos.clear();
 		completed_batch_infos.clear();
 		cancelled_tags.clear();
+		fail_submitted_pending_requests(pending_requests);
 		pending_requests.clear();
 	}
 	batch_in_flight.store(false);
