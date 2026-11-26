@@ -32,6 +32,7 @@
 namespace {
 
 constexpr int64_t kPayloadBytes = 1 << 20; // 1 MiB: big enough to be a real read
+constexpr int64_t kLargePayloadBytes = 8 << 20; // 8 MiB: material pre-size retention
 
 void remove_temp_file(const godot::String &p_path) {
 	godot::ProjectSettings *ps = godot::ProjectSettings::get_singleton();
@@ -70,6 +71,34 @@ godot::Ref<godot::DSRequest> make_memory_request(const godot::String &p_path) {
 	request->set_compression_format(godot::DSRequest::COMPRESSION_NONE);
 	// Memory destinations produce no GPU transitions, so the parked submitter
 	// reaches the enqueue hook on its first instruction after the claim.
+	request->set_destination_type(godot::DSRequest::DESTINATION_MEMORY);
+	return request;
+}
+
+bool write_fixture_sized(const godot::String &p_path, int64_t p_bytes) {
+	godot::Ref<godot::FileAccess> file = godot::FileAccess::open(p_path, godot::FileAccess::WRITE);
+	if (file.is_null() || !file->is_open()) {
+		return false;
+	}
+	godot::PackedByteArray payload;
+	payload.resize(p_bytes);
+	uint8_t *write = payload.ptrw();
+	for (int64_t i = 0; i < p_bytes; ++i) {
+		write[i] = static_cast<uint8_t>(i & 0xFF);
+	}
+	file->store_buffer(payload);
+	file->close();
+	return true;
+}
+
+godot::Ref<godot::DSRequest> make_memory_request_sized(const godot::String &p_path, int64_t p_bytes) {
+	godot::Ref<godot::DSRequest> request;
+	request.instantiate();
+	request->set_file_path(p_path);
+	request->set_offset(0);
+	request->set_size(static_cast<uint32_t>(p_bytes));
+	request->set_uncompressed_size(static_cast<uint32_t>(p_bytes));
+	request->set_compression_format(godot::DSRequest::COMPRESSION_NONE);
 	request->set_destination_type(godot::DSRequest::DESTINATION_MEMORY);
 	return request;
 }
@@ -164,6 +193,59 @@ GDEX_TEST_T(queue_capacity_concurrency, claim_gate_allows_two_budgeted_submitter
 	GDEX_EXPECT_EQ(static_cast<int64_t>(second->get_status()), static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
 }
 
+// Pre-fix RED probe: a post-lock TRANSIENT rejection must not retain the buffer
+// that enqueue_request() grew before taking batch_mutex.
+GDEX_TEST_T(queue_capacity_concurrency, transient_rejection_releases_preallocated_destination_buffer, TAG_INTEGRATION) {
+	const godot::String fixture = "user://queue_capacity_presize_fixture.bin";
+	remove_temp_file(fixture);
+	ctx.add_teardown([fixture]() { remove_temp_file(fixture); });
+
+	godot::Win32Backend *backend = memnew(godot::Win32Backend);
+	ctx.add_teardown([backend]() { memdelete(backend); });
+
+	if (!backend->is_available()) {
+		GDEX_SKIP("DirectStorage runtime absent on this machine.");
+	}
+	if (!backend->initialize()) {
+		GDEX_SKIP("Win32Backend initialize() failed (windowed D3D12 required).");
+	}
+	if (!write_fixture_sized(fixture, kLargePayloadBytes)) {
+		GDEX_FAIL("could not write the pre-size fixture");
+		return;
+	}
+
+	// Control leg: a request admitted with a free slot legitimately keeps its
+	// 8 MiB buffer, and completes. Same size, destination, codec and fixture.
+	godot::Ref<godot::DSRequest> admitted = make_memory_request_sized(fixture, kLargePayloadBytes);
+	PlatformBackend::EnqueueOutcome admitted_outcome = PlatformBackend::EnqueueOutcome::TERMINAL;
+	GDEX_EXPECT_TRUE(backend->enqueue_request(admitted, &admitted_outcome));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(admitted_outcome),
+			static_cast<int64_t>(PlatformBackend::EnqueueOutcome::STAGED));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(admitted->get_destination_buffer().size()),
+			static_cast<int64_t>(kLargePayloadBytes));
+	backend->submit_batch();
+	GDEX_EXPECT_TRUE(backend->wait_for_completion(backend->get_completion_fence(), 5000));
+	for (int i = 0; i < 100 && admitted->get_status() != godot::DSRequest::STATUS_COMPLETED; ++i) {
+		backend->poll_batch_status();
+		backend->collect_completed_results();
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	}
+	GDEX_EXPECT_EQ(static_cast<int64_t>(admitted->get_status()),
+			static_cast<int64_t>(godot::DSRequest::STATUS_COMPLETED));
+
+	// Force a post-lock TRANSIENT rejection on a request of the same shape.
+	for (int queue_index = 0; queue_index < 3; ++queue_index) {
+		backend->_debug_mark_queue_slots_submitted_for_testing(queue_index);
+	}
+	godot::Ref<godot::DSRequest> rejected = make_memory_request_sized(fixture, kLargePayloadBytes);
+	PlatformBackend::EnqueueOutcome outcome = PlatformBackend::EnqueueOutcome::TERMINAL;
+	GDEX_EXPECT_FALSE(backend->enqueue_request(rejected, &outcome));
+	GDEX_EXPECT_EQ(static_cast<int64_t>(outcome),
+			static_cast<int64_t>(PlatformBackend::EnqueueOutcome::TRANSIENT));
+	// The pre-size at ds_win32_backend.cpp:4490 has run; nothing releases it.
+	GDEX_EXPECT_EQ(static_cast<int64_t>(rejected->get_destination_buffer().size()), 0);
+}
+
 #else
 
 GDEX_TEST_T(queue_capacity_concurrency, claim_gate_allows_two_budgeted_submitters, TAG_INTEGRATION) {
@@ -171,10 +253,20 @@ GDEX_TEST_T(queue_capacity_concurrency, claim_gate_allows_two_budgeted_submitter
 	GDEX_SKIP("The enqueue-window seam is compiled out of release builds.");
 }
 
+GDEX_TEST_T(queue_capacity_concurrency, transient_rejection_releases_preallocated_destination_buffer, TAG_INTEGRATION) {
+	(void)ctx;
+	GDEX_SKIP("The Win32 pre-size seam is compiled out of release builds.");
+}
+
 #endif
 #else
 
 GDEX_TEST_T(queue_capacity_concurrency, claim_gate_allows_two_budgeted_submitters, TAG_INTEGRATION) {
+	(void)ctx;
+	GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
+}
+
+GDEX_TEST_T(queue_capacity_concurrency, transient_rejection_releases_preallocated_destination_buffer, TAG_INTEGRATION) {
 	(void)ctx;
 	GDEX_SKIP("Win32Backend sources are excluded from the test build on non-Windows.");
 }

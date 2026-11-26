@@ -167,7 +167,11 @@ uint8_t *DSRequest::get_destination_buffer_ptrw() {
 
 bool DSRequest::ensure_destination_buffer_capacity(uint64_t p_required_size) {
 	if (destination_buffer.size() < static_cast<int64_t>(p_required_size)) {
-		destination_buffer.resize(static_cast<int64_t>(p_required_size));
+		// godot-cpp declares PackedByteArray::resize() as int64_t; 0 is success.
+		const int64_t rc = destination_buffer.resize(static_cast<int64_t>(p_required_size));
+		if (rc != 0) {
+			return false;
+		}
 	}
 	return true;
 }

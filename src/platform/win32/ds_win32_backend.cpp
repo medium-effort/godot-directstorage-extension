@@ -1363,10 +1363,10 @@ void Win32Backend::complete_chunked_requests() {
 				const uint64_t required_size = state.parent->get_uncompressed_size() > 0
 						? state.parent->get_uncompressed_size()
 						: state.parent->get_size();
-				state.parent->ensure_destination_buffer_capacity(required_size);
+				const bool capacity_ok = state.parent->ensure_destination_buffer_capacity(required_size);
 				PackedByteArray &destination = state.parent->get_destination_buffer_ref();
-				bool valid_destination = true;
-				for (int i = 0; i < state.children.size(); i++) {
+				bool valid_destination = capacity_ok;
+				for (int i = 0; capacity_ok && i < state.children.size(); i++) {
 					PackedByteArray child_data = state.children[i]->get_destination_buffer();
 					uint64_t destination_offset = state.destination_offsets[i];
 					if (destination_offset + static_cast<uint64_t>(child_data.size()) > static_cast<uint64_t>(destination.size())) {
@@ -1381,7 +1381,9 @@ void Win32Backend::complete_chunked_requests() {
 					state.parent->set_status(DSRequest::STATUS_COMPLETED);
 				} else {
 					state.parent->set_status(DSRequest::STATUS_FAILED);
-					state.parent->set_error_message("DirectStorage GDeflate chunk output exceeded the parent destination buffer.");
+					state.parent->set_error_message(capacity_ok
+							? "DirectStorage GDeflate chunk output exceeded the parent destination buffer."
+							: "DirectStorage: parent destination buffer allocation failed during chunk merge.");
 				}
 			}
 		}
@@ -4244,14 +4246,23 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	if (r_outcome != nullptr) {
 		*r_outcome = EnqueueOutcome::STAGED;
 	}
+	// True only when this call grew the destination buffer below. A retryable
+	// refusal sends the request back to stream_queue, so the growth must be
+	// released here; a caller-supplied buffer that was already large enough is
+	// never touched by this path.
+	bool pre_sized_destination = false;
 	// The one place a refusal is expressed: status, operator-facing message and
 	// retry classification are set together, so the caller never has to read the
 	// message to decide whether the request is retryable.
-	auto reject = [r_outcome](const Ref<DSRequest> &p_target, const String &p_message,
+	auto reject = [r_outcome, &pre_sized_destination](const Ref<DSRequest> &p_target, const String &p_message,
 			EnqueueOutcome p_outcome) -> bool {
 		if (p_target.is_valid()) {
 			p_target->set_status(DSRequest::STATUS_FAILED);
 			p_target->set_error_message(p_message);
+			if (p_outcome == EnqueueOutcome::TRANSIENT && pre_sized_destination &&
+					p_target->get_destination_type() == DSRequest::DESTINATION_MEMORY) {
+				p_target->resize_destination_buffer(0);
+			}
 		}
 		if (r_outcome != nullptr) {
 			*r_outcome = p_outcome;
@@ -4487,7 +4498,11 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 	if (!is_gpu_buffer && !is_gpu_texture &&
 			(staging_size == 0 || request_size <= staging_size ||
 					p_request->get_compression_format() != DSRequest::COMPRESSION_GDEFLATE)) {
-		p_request->ensure_destination_buffer_capacity(uncompressed_size);
+		const int64_t before_size = p_request->get_destination_buffer().size();
+		if (!p_request->ensure_destination_buffer_capacity(uncompressed_size)) {
+			return reject(p_request, "Win32Backend: destination buffer resize failed.", EnqueueOutcome::TERMINAL);
+		}
+		pre_sized_destination = p_request->get_destination_buffer().size() > before_size;
 	}
 
 	std::lock_guard<std::mutex> lock(batch_mutex);
@@ -4850,7 +4865,10 @@ bool Win32Backend::enqueue_request(Ref<DSRequest> p_request, PlatformBackend::En
 		request.Destination.MultipleSubresourcesRange.FirstSubresource = p_child->get_first_subresource();
 		request.Destination.MultipleSubresourcesRange.NumSubresources = p_child->get_subresource_count();
 	} else {
-		p_child->ensure_destination_buffer_capacity(uncompressed_size);
+		if (!p_child->ensure_destination_buffer_capacity(uncompressed_size)) {
+			reject(p_child, "Win32Backend: destination buffer resize failed.", EnqueueOutcome::TERMINAL);
+			return EnqueueOutcome::TERMINAL;
+		}
 
 		// Children are internal to this call and never exposed to scripts, so this
 		// store is completion bookkeeping, not the mutation guard. The caller's parent
