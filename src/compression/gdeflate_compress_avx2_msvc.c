@@ -1,3 +1,13 @@
+// SPDX-FileCopyrightText: 2026 MediumEffort
+// SPDX-License-Identifier: MPL-2.0
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Note: This MSVC wrapper file is MPL-2.0; the #include "gdeflate_compress.c"
+// it compiles remains under libdeflate's MIT / Apache-2.0 license.
+
 #if defined(_MSC_VER) && defined(_M_X64)
 
 /*

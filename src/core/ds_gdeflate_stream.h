@@ -1,3 +1,10 @@
+// SPDX-FileCopyrightText: 2026 MediumEffort
+// SPDX-License-Identifier: MPL-2.0
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Shared GDeflate tile-stream header validation.
 //
 // The Win32 backend validates a GDeflate payload's 8-byte tile-stream header

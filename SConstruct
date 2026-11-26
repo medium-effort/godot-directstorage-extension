@@ -939,6 +939,12 @@ install_license = env.InstallAs(
 )
 env.NoCache(install_license)
 targets.append(install_license)
+install_license_mit = env.InstallAs(
+    "project/addons/directstorage_accelerator/LICENSE-MIT",
+    "LICENSE-MIT",
+)
+env.NoCache(install_license_mit)
+targets.append(install_license_mit)
 
 # --- gdextest integration (test-only build target) ---
 # Build with: scons tests=true

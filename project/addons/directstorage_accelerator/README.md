@@ -274,9 +274,18 @@ A source build can compile the archive key into the extension binary (`DSPKG_ENC
 
 ## Trademarks and Attribution
 
+### License
+
+`dsgd` is licensed under the **Mozilla Public License, v. 2.0 (MPL-2.0)** (`LICENSE`), except for the four shipped runtime GDScript helpers (`ds_runtime.gd`, `ds_preloader.gd`, `ds_batch_manager.gd`, and `ds_dspkg_static.gd`), which are licensed under the **MIT License** (`LICENSE-MIT`) so games can freely localize, tune, or adapt them.
+
+- **Closed-source and commercial games are permitted:** You can bundle `dsgd` with proprietary games without disclosing your game's own code or assets; only modifications made to `dsgd`'s own MPL-2.0 files must be shared under MPL-2.0.
+- **Export compliance (MPL-2.0 Section 3.2(a)):** Keep `dsgd_extension/include_dsgd_license_file` enabled (default) so `dsgd_LICENSE.txt` is written beside exported binaries. If you disable it to display attributions in-game, include the MPL-2.0 license notice, the DSGD source URL (`https://github.com/medium-effort/godot-directstorage-extension`), and the attributions from `THIRD_PARTY_NOTICES.txt` (plus Microsoft's DirectStorage runtime `LICENSE.txt` and `NOTICES.txt` when shipping `dstorage.dll` / `dstoragecore.dll`).
+
+### Trademarks and Notices
+
 This addon/extension (DSGD) is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft. Microsoft and DirectStorage are trademarks of the Microsoft group of companies. The DirectStorage runtime is installed under Microsoft's license and is not bundled with this addon/extension; see Runtime Install & License.
 
-Third-party license texts and attributions are in `THIRD_PARTY_NOTICES.txt`; the project's own license is in `LICENSE`. Both ship with the addon and are copied next to exported binaries as `dsgd_LICENSE.txt` (with the DirectStorage runtime texts appended when merging is enabled) or as a separate `DIRECTSTORAGE_LICENSE.txt`. The exporter removes and rewrites those files on every export, so the directory always matches the preset.
+Third-party license texts and attributions are in `THIRD_PARTY_NOTICES.txt`; the project's own licenses are in `LICENSE` (MPL-2.0) and `LICENSE-MIT` (MIT). They ship with the addon and are copied next to exported binaries as `dsgd_LICENSE.txt` (with the DirectStorage runtime texts appended when merging is enabled) or as a separate `DIRECTSTORAGE_LICENSE.txt`. The exporter removes and rewrites those files on every export, so the directory always matches the preset.
 
 
 

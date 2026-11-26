@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: 2026 MediumEffort
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License. See LICENSE-MIT in the repository/addon root.
+
 extends Node
 
 const LOG_PREFIX: String = "[dsgd Extension] "
