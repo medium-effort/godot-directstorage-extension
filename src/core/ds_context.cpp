@@ -1670,7 +1670,10 @@ Error DSContext::flush_stream_async() {
 		size_t accumulated_subresources = 0;
 		while (!stream_queue.empty() && to_submit.size() < max_logical_requests) {
 			Ref<DSRequest> next_req = stream_queue.front();
-			if (memory_only && next_req.is_valid()) {
+			// A terminal entry is not GPU work: let it through so the loop below
+			// discards it instead of blocking every memory request behind it.
+			if (memory_only && next_req.is_valid() &&
+					next_req->get_status() != DSRequest::STATUS_FAILED) {
 				const DSRequest::DSDestinationType destination_type = next_req->get_destination_type();
 				if (destination_type == DSRequest::DESTINATION_GPU_BUFFER ||
 						destination_type == DSRequest::DESTINATION_GPU_TEXTURE) {

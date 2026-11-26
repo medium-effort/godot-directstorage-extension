@@ -544,6 +544,59 @@ GDEX_TEST_T(stream_maintenance, worker_flush_leaves_gpu_requests_queued, TAG_INT
     GDEX_EXPECT_EQ(ds->get_stream_pending_count(), 0);
 }
 
+// Regression for A20261125 remediation-review Finding 1: a STATUS_FAILED GPU
+// request left at the head of stream_queue must not wedge a worker flush.
+// has_stream_gpu_pending() skips terminal entries, so DSRuntime dispatches a
+// worker flush every frame; the memory_only guard used to break on the failed
+// GPU head without popping it, starving every memory request behind it.
+GDEX_TEST_T(stream_maintenance, worker_flush_drains_failed_gpu_head, TAG_INTEGRATION) {
+    const char *path = "user://gdextest_failed_gpu_head.bin";
+    remove_probe_file(path); // clean any stale fixture from an interrupted run
+    if (!write_probe_file(path)) {
+        GDEX_FAIL("failed to stage probe file.");
+    }
+    // Registered before the context teardown so LIFO order shuts the backend
+    // down before the probe file is removed.
+    ctx.add_teardown([path]() { remove_probe_file(path); });
+    godot::DSContext *ds = require_initialized_context(ctx);
+
+    // enqueue_request(req, true) accepts an already-FAILED request - the same
+    // terminal state cancel_prewarm() leaves behind for entries it did not
+    // cancel - so the GPU request stays at the head while the gate skips it.
+    const uint64_t gpu_tag = 301;
+    godot::Ref<godot::DSRequest> gpu_req;
+    gpu_req.instantiate();
+    gpu_req->set_file_path(godot::String(path));
+    gpu_req->set_size(static_cast<uint32_t>(kProbeBytes));
+    gpu_req->set_cancellation_tag(gpu_tag);
+    gpu_req->set_destination_type(godot::DSRequest::DESTINATION_GPU_TEXTURE);
+    gpu_req->set_status(godot::DSRequest::STATUS_FAILED);
+    gpu_req->set_error_message("simulated terminal GPU failure");
+    GDEX_ASSERT_TRUE(ds->enqueue_request(gpu_req, true));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(gpu_req->get_status()),
+                   static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+
+    // A memory request behind the failed GPU head must still be drained.
+    const uint64_t mem_tag = 302;
+    godot::Ref<godot::DSRequest> mem_req = make_memory_request(path, mem_tag);
+    GDEX_ASSERT_TRUE(ds->enqueue_request(mem_req, true));
+    GDEX_EXPECT_TRUE(ds->has_stream_pending());
+    GDEX_EXPECT_FALSE(ds->has_stream_gpu_pending());
+    GDEX_EXPECT_EQ(ds->get_stream_pending_count(), 2);
+
+    // Worker context => memory_only == true, the exact livelock path.
+    std::thread worker([ds]() { ds->flush_stream_async(); });
+    worker.join();
+
+    GDEX_EXPECT_EQ(ds->get_stream_pending_count(), 0);
+    GDEX_EXPECT_FALSE(ds->has_stream_pending());
+    GDEX_EXPECT_TRUE(static_cast<int64_t>(mem_req->get_status()) !=
+                     static_cast<int64_t>(godot::DSRequest::STATUS_PENDING));
+    GDEX_EXPECT_EQ(static_cast<int64_t>(gpu_req->get_status()),
+                   static_cast<int64_t>(godot::DSRequest::STATUS_FAILED));
+    GDEX_EXPECT_TRUE(gpu_req->get_error_message().find("simulated terminal GPU failure") != -1);
+}
+
 // Regression for #0277: concurrent worker + main-thread flush_stream_async()
 // calls over >128 requests (spanning multiple flushes) must never strand
 // staged requests in an unsubmitted slot with has_stream_pending() == false.
