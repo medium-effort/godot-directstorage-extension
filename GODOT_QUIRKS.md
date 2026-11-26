@@ -2112,3 +2112,34 @@ Never treat a skipped GPU test under --gpu-validation as a pass; confirm the D3D
 
 Check `Settings > Optional features > Graphics Tools` and compare layer/runtime file versions before a validation run. Do not install an app-local Agility SDK merely to obtain a layer: it changes the runtime and broke DirectStorage independently of validation here. Related: Q84.
 
+## 88. `EditorFileSystem.is_scanning()` Ignores Reimporting and Pumps Frames Re-Entrantly
+
+### The Engine Reality
+`EditorFileSystem::is_scanning()` returns `scanning || scanning_changes || first_scan` and does not check the `importing` flag (`editor/file_system/editor_file_system.cpp:1838-1840`). Once scanning ends, Godot enters `EditorFileSystem::reimport_files()`, which runs a modal `EditorProgress` (`ProgressDialog`) and calls `ep->step(...)` per asset — pumping UI events and `SceneTree` `process_frame` ticks while `reimport_files()` is still on the C++ call stack (`editor_file_system.cpp:3420-3442`). Only after `importing = false` does Godot emit `resources_reimported` (`:3440`) and unwind.
+
+### The Trap / Symptom
+In an `EditorScript` (`generate_demo_assets_tool.gd`) that writes `.png` + `.import` sidecars and calls `fs.scan()`:
+- `while fs.is_scanning(): await get_tree().process_frame` exited before 98 generated textures finished importing (~50 s), so `DemoAssetGenerator.build_level_scenes()` immediately failed with `ERR_FILE_NOT_FOUND`.
+- Polling `not fs.is_scanning() and DemoAssetGenerator.textures_imported()` on `process_frame` instead resumed **inside** `reimport_files()` during `EditorProgress::step()`, while a modal `AcceptDialog` stayed open underneath `ProgressDialog`; re-initializing `DSContext`, building scenes, and calling `fs.scan()` re-entrantly crashed the Godot 4.7.2 Editor.
+
+### The Rule
+Never treat `not EditorFileSystem.is_scanning()` (or on-disk `.import` polling on `process_frame`) as proof that `fs.scan()` finished reimporting; hide any modal `AcceptDialog` first, wait for `fs.resources_reimported`, and yield two `process_frame`s before calling `fs.scan()` or loading reimported assets.
+
+```gdscript
+hide()
+await get_tree().process_frame
+var reimport_state := {"done": false}
+var on_reimported := func(_resources: PackedStringArray) -> void:
+    reimport_state["done"] = true
+fs.connect("resources_reimported", on_reimported)
+fs.scan()
+while not (bool(reimport_state["done"]) and not fs.is_scanning()):
+    await get_tree().process_frame
+if fs.is_connected("resources_reimported", on_reimported):
+    fs.disconnect("resources_reimported", on_reimported)
+await get_tree().process_frame
+await get_tree().process_frame
+```
+
+Implemented in `project/demo/editor_scripts/generate_demo_assets_tool.gd` (alongside setting `detect_3d/compress_to = 0` on generated Vanilla `.import` sidecars in `demo_asset_generator.gd` so saving 3D scenes does not trigger a second reimport). Related: Q74, Q47.
+
