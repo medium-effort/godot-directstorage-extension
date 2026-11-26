@@ -172,22 +172,12 @@ def _git_state(root):
     return head_commit, branch, is_dirty
 
 
-def _parse_iso_utc(raw):
-    if not raw or not isinstance(raw, str):
-        return None
-    text = raw.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        dt = datetime.datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return dt.astimezone(datetime.timezone.utc)
-    except Exception:
-        return None
-
-
 def _cleanup_primary_handover(ledger_dir, active_sigs):
+    # Only drop pins that primary has already materialized into active_targets.
+    # Leave expired pins in _handover.json so `tools/scons_cache.ps1 -Action
+    # TrimOrphans` can delete their payload files when no build is active;
+    # removing them here without deleting the cache files turns them into
+    # untracked orphans.
     handover_path = os.path.join(ledger_dir, "_handover.json")
     data = _read_json(handover_path)
     if not data:
@@ -196,15 +186,10 @@ def _cleanup_primary_handover(ledger_dir, active_sigs):
     if not isinstance(pins, dict):
         return
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
     kept = {}
     changed = False
     for sig, meta in pins.items():
         if sig in active_sigs:
-            changed = True
-            continue
-        exp = _parse_iso_utc(meta.get("expires_at") if isinstance(meta, dict) else None)
-        if exp is not None and exp <= now_utc:
             changed = True
             continue
         kept[sig] = meta
@@ -247,8 +232,6 @@ def _flush_worktree_ledger():
         existing = _read_json(ledger_path)
 
         if not retrieved and not pushed and existing is None:
-            if is_primary:
-                _cleanup_primary_handover(ledger_dir, set())
             return
 
         active_targets = {}

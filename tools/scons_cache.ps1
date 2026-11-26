@@ -24,7 +24,8 @@ Actions
   TrimWorktree  selectively delete cache entries exclusive to -WorktreePath,
                 handing over clean landed commits to the primary checkout
   TrimOrphans   sweep ledgers for removed worktrees, superseded intermediate keys,
-                expired handover pins, and optionally enforce -MaxMiB
+                expired handover pins, untracked unlinked payload entries, and
+                optionally enforce -MaxMiB
 
 Refuses to touch anything while an scons/cl/link process is alive unless -Force;
 -WaitSeconds waits for the machine to go idle first. There is no kernel lock in
@@ -1126,6 +1127,7 @@ switch ($Action) {
 
         $processed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $deletedCount = 0
+        $untrackedDeleted = 0
         [long]$freedBytes = 0
         $skippedHardlinked = 0
         $handoverPinned = 0
@@ -1225,6 +1227,19 @@ switch ($Action) {
             }
         }
 
+        # Sweep untracked unlinked payload entries (e.g. legacy pre-ledger builds).
+        if ($liveLedgers.Count -gt 0 -or $handover.ActivePins.Count -gt 0) {
+            foreach ($entry in @(Get-CachePayloadFile -CacheRoot $cacheDir)) {
+                $sig = $entry.Name
+                if ($liveKeys.Contains($sig)) { continue }
+                $beforeDeleted = $deletedCount
+                [void](Invoke-DeleteExclusiveKey -CacheRoot $cacheDir -Sig $sig -ProcessedKeys $processed -DeletedCount ([ref]$deletedCount) -FreedBytes ([ref]$freedBytes) -SkippedHardlinked ([ref]$skippedHardlinked))
+                if ($deletedCount -gt $beforeDeleted) {
+                    $untrackedDeleted++
+                }
+            }
+        }
+
         if ($handoverChanged) {
             Save-HandoverState -HandoverPath $handover.Path -Pins $handover.ActivePins
         }
@@ -1266,6 +1281,7 @@ switch ($Action) {
                 dead_ledgers       = $deadLedgers.Count
                 live_ledgers       = $liveLedgers.Count
                 deleted            = $deletedCount
+                untracked_deleted  = $untrackedDeleted
                 freed_mib          = [math]::Round($freedBytes / 1MB, 1)
                 handover_pinned    = $handoverPinned
                 skipped_hardlinked = $skippedHardlinked
@@ -1275,7 +1291,8 @@ switch ($Action) {
             Write-Output ($payload | ConvertTo-Json -Compress)
         }
         else {
-            Write-Host ("[cache] TrimOrphans: " + $deadLedgers.Count + " dead ledger(s), " + $liveLedgers.Count + " live ledger(s); deleted " + $deletedCount + " entr(ies), freed " + [math]::Round($freedBytes / 1MB, 1) + " MiB, handover-pinned " + $handoverPinned + ", skipped-hardlinked " + $skippedHardlinked + "; now " + $after.MiB + " MiB in " + $after.Files + " files")
+            $untrackedNote = if ($untrackedDeleted -gt 0) { " (incl. " + $untrackedDeleted + " untracked)" } else { "" }
+            Write-Host ("[cache] TrimOrphans: " + $deadLedgers.Count + " dead ledger(s), " + $liveLedgers.Count + " live ledger(s); deleted " + $deletedCount + " entr(ies)" + $untrackedNote + ", freed " + [math]::Round($freedBytes / 1MB, 1) + " MiB, handover-pinned " + $handoverPinned + ", skipped-hardlinked " + $skippedHardlinked + "; now " + $after.MiB + " MiB in " + $after.Files + " files")
         }
         exit 0
     }

@@ -926,15 +926,24 @@ elseif ($null -eq $BuildGuard.Owned) {
 # generation (~0.4 GiB measured for template_debug + tests). Left alone it grew
 # to 5.5 GiB on a drive with 2.2 GiB free. Measuring it costs about half a second
 # over a few thousand entries, so this runs BEFORE the compile rather than after:
-# a warning after a four minute build is too late to prevent a full disk. Local
-# mode only - a remote build fills Device B's cache, not this one - and never in
-# -Json mode, where stdout must stay machine-readable. Advisory by design: the
-# tool's exit code is ignored so a full cache can never fail a build.
+# a warning after a four minute build is too late to prevent a full disk. When
+# the soft/hard limit is reached, auto-run TrimOrphans -QuietIfBusy (no -MaxMiB)
+# to sweep dead worktree ledgers, superseded live keys, expired handovers, and
+# untracked nlink==1 orphans without evicting live worktree entries, then re-run
+# Check so any remaining over-limit warning is still shown. Local mode only - a
+# remote build fills Device B's cache, not this one - and never in -Json mode,
+# where stdout must stay machine-readable. Advisory by design: exit codes are
+# ignored so a full cache can never fail a build.
 if (-not $AuditOnly -and -not $IsRemote -and -not $Json) {
     $CacheTool = Join-Path $WorkspaceRoot "tools\scons_cache.ps1"
     if (Test-Path -LiteralPath $CacheTool -PathType Leaf) {
         try {
-            & powershell -NoProfile -ExecutionPolicy Bypass -File $CacheTool -Action Check
+            $null = & powershell -NoProfile -ExecutionPolicy Bypass -File $CacheTool -Action Check -Json
+            $cacheExit = $LASTEXITCODE
+            if ($cacheExit -eq 1 -or $cacheExit -eq 2) {
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $CacheTool -Action TrimOrphans -QuietIfBusy
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $CacheTool -Action Check
+            }
         }
         catch {
             Write-Status ("[cache] Warning: could not measure the SCons cache: " + $_.Exception.Message) -ForegroundColor Yellow
