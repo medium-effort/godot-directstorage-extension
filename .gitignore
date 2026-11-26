@@ -62,6 +62,7 @@ project/addons/directstorage_accelerator/bin/dstoragecore.dll
 /project/exports
 project/test_assets/*.glb
 project/test_assets/*.png
+project/demo_generated/
 *.dspkg
 *.dstex
 

@@ -1,0 +1,104 @@
+[gd_scene format=3 uid="uid://bwnhxi8vtfyh4"]
+
+[ext_resource type="Script" uid="uid://b51rgk0msocos" path="res://demo/loading_demo_menu.gd" id="1_menu"]
+[ext_resource type="PackedScene" path="res://demo/loading_screen.tscn" id="2_ls"]
+
+[node name="LoadingDemoMenu" type="Control" unique_id=768224241]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_menu")
+
+[node name="MenuRoot" type="MarginContainer" parent="." unique_id=1291133216]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/margin_left = 24
+theme_override_constants/margin_top = 24
+theme_override_constants/margin_right = 24
+theme_override_constants/margin_bottom = 24
+
+[node name="VBox" type="VBoxContainer" parent="MenuRoot" unique_id=1387918613]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="Header" type="HBoxContainer" parent="MenuRoot/VBox" unique_id=1998870554]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="Title" type="Label" parent="MenuRoot/VBox/Header" unique_id=1803468333]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_font_sizes/font_size = 22
+text = "Loading Screen & Prewarm Comparison Demo"
+
+[node name="BackToABButton" type="Button" parent="MenuRoot/VBox/Header" unique_id=16354851]
+unique_name_in_owner = true
+layout_mode = 2
+text = "A/B Benchmark"
+
+[node name="BackendLabel" type="Label" parent="MenuRoot/VBox" unique_id=605245907]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Backend: ..."
+autowrap_mode = 3
+
+[node name="AssetStatusLabel" type="Label" parent="MenuRoot/VBox" unique_id=415259103]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Checking demo assets..."
+autowrap_mode = 3
+
+[node name="Controls" type="HBoxContainer" parent="MenuRoot/VBox" unique_id=1599385055]
+layout_mode = 2
+theme_override_constants/separation = 12
+
+[node name="ModeLabel" type="Label" parent="MenuRoot/VBox/Controls" unique_id=1153787293]
+layout_mode = 2
+text = "Load Mode:"
+
+[node name="ModeSelect" type="OptionButton" parent="MenuRoot/VBox/Controls" unique_id=1720179392]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(260, 0)
+layout_mode = 2
+selected = 4
+item_count = 5
+popup/item_0/text = "Vanilla Load (Sync)"
+popup/item_0/id = 0
+popup/item_1/text = "Vanilla Optimized (Threaded)"
+popup/item_1/id = 1
+popup/item_2/text = "DS (CPU Prewarm)"
+popup/item_2/id = 2
+popup/item_3/text = "DS (GPU Prewarm)"
+popup/item_3/id = 3
+popup/item_4/text = "DS (GPU Prewarm + Threaded Scene)"
+popup/item_4/id = 4
+
+[node name="LaunchButton" type="Button" parent="MenuRoot/VBox/Controls" unique_id=143281677]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Launch Level"
+
+[node name="ClearCacheButton" type="Button" parent="MenuRoot/VBox/Controls" unique_id=1955270026]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Clear Caches"
+
+[node name="ResultsBox" type="RichTextLabel" parent="MenuRoot/VBox" unique_id=476577355]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3
+bbcode_enabled = true
+scroll_following = true
+
+[node name="LoadingScreen" parent="." unique_id=686487798 instance=ExtResource("2_ls")]
+unique_name_in_owner = true
+visible = false
+layout_mode = 1

@@ -21,13 +21,21 @@ const PASSES := 5
 @onready var _results_box: RichTextLabel = %ResultsBox
 @onready var _preview_rect: TextureRect = %PreviewRect
 @onready var _run_button: Button = %RunButton
+@onready var _loading_demo_button: Button = %LoadingDemoButton
 
 var _running := false
 
 
 func _ready() -> void:
 	_run_button.pressed.connect(_on_run_pressed)
+	_loading_demo_button.pressed.connect(_on_loading_demo_pressed)
 	_update_backend_banner()
+
+
+func _on_loading_demo_pressed() -> void:
+	if _running:
+		return
+	get_tree().change_scene_to_file("res://demo/loading_demo_menu.tscn")
 
 
 func _on_run_pressed() -> void:
