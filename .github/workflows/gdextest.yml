@@ -22,7 +22,7 @@ on:
       - '.gitignore'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: gdextest-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
