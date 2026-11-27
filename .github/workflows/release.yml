@@ -35,7 +35,6 @@ jobs:
   test:
     name: Run Tests
     uses: ./.github/workflows/gdextest.yml
-    secrets: inherit
 
   build:
     name: Build (${{ matrix.os }})
@@ -64,12 +63,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Checkout submodules
-        shell: bash
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.SUBMODULES_TOKEN }}@github.com/medium-effort/".insteadOf "https://github.com/medium-effort/"
-          git submodule update --init --recursive
+        with:
+          submodules: recursive
 
       - name: Configure C++ compiler (Linux/Ubuntu)
         if: runner.os == 'Linux'
