@@ -3,12 +3,10 @@
 This is the install-and-setup guide for running several agents on this repository at once, each in its
 own git worktree, sharing one build cache and one prebuilt godot-cpp. By the end of it a new device can
 create a worktree, build it, run the native suite, land exactly one commit on the target branch with no
-merge commit, and clean up — which is the same sequence the `do-it-in-a-worktree` skill tells agents to
-follow.
+merge commit, and clean up.
 
-Verified on Windows against worktrunk v0.81.0 and this repository at `b19ee59`, 2026-11-02. Everything
-labelled "measured" was run on that device; the `wt step push` behaviour comes from worktrunk's docs and
-has not been exercised here yet.
+Verified on Windows against worktrunk v0.81.0, 2026-11-02. Everything
+labelled "measured" was run on that device; the `wt step push` behaviour comes from worktrunk's docs and has not been exercised here yet.
 
 ---
 
@@ -191,7 +189,7 @@ alone changes nothing for them.
 
 ## 7. Approve the project hooks
 
-`.config/wt.toml` defines three `pre-start` commands. Worktrunk asks for approval the first time it
+`.config/wt.toml` defines five `pre-start` commands (`submodules`, `godotcpp`, `directstorage`, `gut`, `env`) and one `post-remove` hook (`scons_cache_trim`). Worktrunk asks for approval the first time it
 would run them; approve once and it is remembered in `%APPDATA%\worktrunk\approvals.toml`.
 
 For unattended runs add `--yes` to `wt switch`, or pre-approve:
@@ -217,8 +215,7 @@ wt switch --create wt-smoke --base=@ --yes
 cd .worktrees/wt-smoke
 ```
 
-Expected: "Created branch wt-smoke from <your branch>", then three hook lines — submodules, the shared
-godot-cpp link, and the `.env` write. Confirm the result:
+Expected: "Created branch wt-smoke from <your branch>", then five `pre-start` hook lines (submodules, shared `godot-cpp`, DirectStorage SDK bootstrap, GUT bootstrap, and the `.env` write). Confirm the result:
 
 ```powershell
 (Get-Item godot-cpp/gen).LinkType                  # Junction
@@ -249,7 +246,7 @@ branch is fine, the checkout has simply never been imported. `--path project --q
 build says nothing about GDScript validity.
 
 Measured expectations: about 40 s for the plain build, about 1.2 min with tests, and the headless suite
-reporting **168 passed / 0 failed / 30 skipped**. The skips are the D3D12/GPU gates, not failures.
+reporting around **~470 passed / 0 failed / ~85 skipped** (out of 567 `GDEX_TEST` cases; exact counts grow as tests are added). The skips are the D3D12/GPU gates, not failures.
 
 Land a commit and clean up (see section 9 for the commit step in a real task):
 
@@ -288,7 +285,7 @@ it squashes and generates the message.
 
 After `wt remove`, expect a line like "Branch unmerged; to delete, run wt remove -D <branch>". That is
 not the removal failing: the worktree is already gone. Worktrunk only deletes a branch automatically
-when its content is in the **default branch** (`main`), and work branched from `dspkg-encryption` is not.
+when its content is in the **default branch** (`main`), and work branched from a non-`main` development branch (`<target-branch>`) is not.
 Finish with `wt remove -D <branch>` or `git branch -D <branch>` once the commits are on your target.
 
 Steps 3 and 4 are opt-in. A change that only needs to exist somewhere does not need a commit, and a
@@ -298,8 +295,7 @@ primary checkout, which may be exactly what the user is editing.
 ### Files a worktree cannot see
 
 A worktree is a checkout of a commit, so it contains none of the primary's uncommitted work and none of
-the ignored files. This repository ignores `.agents/skills/audit-pipeline`, `.agents/skills/xmlq`,
-`.agents/skills/godot-specifics` and `.env`, so those never appear in a worktree at all. Editing them is
+the ignored files. This repository ignores `.agents/`, `.projectmem/`, and `.env`, so those never appear in a worktree at all. Editing them is
 a primary-checkout job; a copy placed inside a worktree is an untracked duplicate that no commit can
 carry back to the user's tree.
 
@@ -327,8 +323,7 @@ the guardrails and failure signatures.
 | `.cache/godot-cpp-shared` | one generated tree per godot-cpp commit (`gen-<commit>`) plus the libs exposed as hardlinks | old `gen-<commit>` trees are safe to delete once no worktree's junction points at them; deleting the one in use breaks those junctions |
 | `.cache/buildcache-bin` | optional compiler-cache tool | yes, if unused |
 
-The SCons cache has no size cap and no eviction, so it grows with every target/variant combination;
-prune it when you change target sets. Removing a worktree deletes its links, never the shared store.
+SCons itself does not evict cache entries, so `tools/scons_cache.ps1` enforces soft (`1200 MiB`) and hard (`2000 MiB`) limits, `.vscode/build_remote.ps1` runs `-Action Check` and auto-trims orphans (`-Action TrimOrphans`), and `.config/wt.toml`'s `[[post-remove]]` hook runs `-Action TrimWorktree` on `wt remove` to delete entries exclusive to the removed worktree (handing over landed commits to primary). Removing a worktree deletes its links, never the shared store.
 
 ---
 
@@ -360,7 +355,7 @@ prune it when you change target sets. Removing a worktree deletes its links, nev
 | Worktree creation prints "Cloning into …" | the primary has no module store for that submodule, or it is the nested `extern/godot-cpp`, which is always cloned | expected; needs the network, and a public upstream needs no credential |
 | Worktree creation fails with "repository not found" (HTTP 404) on `thirdparty/libdeflate` | the fork is private and the shell's active GitHub credential cannot see it — GitHub answers 404, not 401, so it reads like a wrong URL | check `gh auth status`: the active account's token decides. The hook normally seeds this from the primary's `.git/modules`, so a 404 here means the seeding path was bypassed or the primary has no module store |
 | `wt switch`, `git` or the hooks print red `NativeCommandError` text in PowerShell | PowerShell reports a native command's stderr that way; the commands still succeed | check `$LASTEXITCODE` (0) rather than the colour |
-| `wt remove` prints "Branch unmerged; to delete, run wt remove -D …" | branch deletion is judged against the default branch (`main`), and the work sits on `dspkg-encryption` | the worktree is already removed; finish with `wt remove -D <branch>` or `git branch -D <branch>` once the commits are on your branch |
+| `wt remove` prints "Branch unmerged; to delete, run wt remove -D …" | branch deletion is judged against the default branch (`main`), and the work sits on a non-`main` development branch (`<target-branch>`) | the worktree is already removed; finish with `wt remove -D <branch>` or `git branch -D <branch>` once the commits are on your branch |
 | `[BUILD FAILED] GDScript Verification`, `Identifier "DSPkg" not declared` | the checkout has no `.godot/extension_list.cfg`, so `--check-only` resolves no GDExtension classes | a verified build now imports the project itself; if it still fails, run `tools/ensure_project_imported.ps1`, confirm the cfg appears, then rebuild |
 | `godot --headless --path project --quit` never returns | `--quit` only ends the main loop after one iteration; it does not import | use `--headless --editor --quit-after 4 --path project` for the one-shot warm-up |
 | Deployment audit reports `dsgd_64.dll` missing | only `template_debug` was built, and the extension manifest declares both the debug and release libraries | expected for a single-target build; build `template_release` as well if the audit must be clean |
@@ -382,14 +377,14 @@ prune it when you change target sets. Removing a worktree deletes its links, nev
 
 ---
 
-## 14. Notes for agents (and their operators)
+## 14. Notes
 
-1. Worktrees must stay inside the repository. If you place them elsewhere, add the parent directory to
-   `.agents/PATH_ALLOWLIST.md`; the sandbox otherwise refuses to read or write them.
-2. Add `wt` (and `sccache`, if used) to `.agents/PATH_ALLOWLIST.md`, or agents cannot execute them.
-3. Commit the worktree tooling — `SConstruct`, `.config/wt.toml`, `tools/wt_bootstrap_env.ps1`,
-   `tools/wt_share_godot_cpp.ps1`, `.worktreeinclude`, `.gitignore`, `codegraph.json` — before asking an
-   agent to create a worktree. Otherwise the bootstrap correctly degrades to a local godot-cpp build and
-   the agent gets a 1 GB, 6-minute build instead of a 140 MB, 40-second one.
-4. Never `git clean -xdf` in a worktree (kills `.env`) or in the primary (deletes `.cache` and leaves
+1. Commit the worktree tooling (`SConstruct`, `.config/wt.toml`, `tools/wt_base.ps1`,
+   `tools/wt_bootstrap_env.ps1`, `tools/wt_share_godot_cpp.ps1`, `tools/wt_bootstrap_submodules.ps1`,
+   `tools/wt_bootstrap_directstorage.ps1`, `tools/wt_bootstrap_gut.ps1`, `tools/scons_cache.ps1`,
+   `.worktreeinclude`, and `.gitignore`) before creating a worktree. If `.config/wt.toml` is
+   missing from the branch, none of the `pre-start` hooks run; if `SConstruct` predates
+   `GODOT_CPP_PREBUILT`, the bootstrap degrades to a local godot-cpp build and the worktree gets
+   a ~1 GB, ~6-minute build instead of a ~140 MB, ~40-second one.
+2. Never `git clean -xdf` in a worktree (kills `.env`) or in the primary (deletes `.cache` and leaves
    every shared worktree with a dangling `godot-cpp/gen` junction).

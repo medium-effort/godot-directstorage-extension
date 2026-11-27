@@ -125,7 +125,7 @@ alive for salvage.
 The three decisions themselves are pure functions in
 [ds_export_policy.gd](../../project/addons/directstorage_accelerator/scripts/ds_export_policy.gd)
 (`resolve_bundle_effective`, `resolve_file_action`, `resolve_failure_action`). The plugin only applies
-their result, which lets `project/headless_tests/test_export_policy.gd` assert the whole table without
+their result, which lets `project/tests/unit/test_export_policy.gd` assert the whole table without
 an extension or an export run. Change the rules there, not inline.
 
 `_export_end()` then applies one rule:
@@ -173,6 +173,18 @@ that the archive contains every texture the build expects, or anything about the
 
 Because both the key and the id rotate per export, **the PCK and the archive ship as a pair**. Any
 patch that rebuilds the pack must redistribute the archive with it.
+
+### 5.1 Programmatic `DSPkg` builder options
+
+Custom build tools and benchmark generators instantiate `DSPkg` directly (`create()` -> `add_texture()` -> `finalize()`). `create()` resets all builder options to their defaults, so configure them after `create()` and before `finalize()`:
+
+| Setter | Default | Effect |
+|---|---|---|
+| `set_payload_alignment(bytes)` | `512` | Aligns payload offsets (`STEAMPIPE_1MB_ALIGNMENT = 1048576` for SteamPipe delta patching). |
+| `set_bin_packing_enabled(bool)` | `false` | Enables bin-packed payload layout. |
+| `set_payload_dedup_enabled(bool)` | `false` | Deduplicates identical payloads across staged entries (for example logical `.png` and `.dstex` alias entries pointing to the same source). |
+| `set_consume_sources_enabled(bool)` | `false` | Opt-in: unlinks each source `.dstex` after streaming it during `finalize()`, keeping peak disk usage around 1.0x instead of 2.0x. On a failed `finalize()`, the partial archive is removed, but already-consumed sources are **not** restored - enable only for regeneratable build/benchmark outputs. |
+| `set_repack_uncompressed(bool)` | `false` | Repacks GDeflate payloads uncompressed (`NONE`, forces a v5 archive). |
 
 ---
 
@@ -238,13 +250,13 @@ $env:DSPKG_NO_ALERT = "1"
 ```
 
 Require exactly one `DSPKG_BOOT status=ok mode=protected entries=<n> key_id=<16 hex>`. Absence is a
-failure; the exit code is supporting only, because `_fail_boot()` calls `quit(1)` without stopping the
-tree and a later `quit(0)` can override it. Then scan the pack (§6.5). A build counts as protected only
-after both checks pass.
+failure; the sentinel line is the primary verdict contract, while `_fail_boot()` records `_boot_failure_code`
+and re-applies it in `_exit_tree()` so a later `quit(0)` from the game cannot erase the non-zero exit code.
+Then scan the pack (§6.5). A build counts as protected only after both checks pass.
 
-Why the exit code cannot be the verdict: `_fail_boot()` is diagnostic. It prints, optionally alerts,
-and quits with the code; it never pauses the tree or frees siblings, so later autoloads and the main
-scene still run.
+Why the sentinel (not just the exit code) is the verdict: `_fail_boot()` is diagnostic. It prints,
+optionally alerts, and quits with the code; it never pauses the tree or frees siblings, so later autoloads
+and the main scene still run.
 
 ### 6.4 The ordering limitation (measured)
 
@@ -277,7 +289,7 @@ bootstrap scene that loads the real scene after the autoload verdict).
 godot --headless --path project --script res://addons/directstorage_accelerator/tools/dspkg_pack_scan.gd -- --pack "<export-dir>/game.pck"
 ```
 
-The same scan runs from **Project > Tools > Verify exported pack (DSPkg)** in the editor; both faces use
+The same scan runs from **Project > Tools > dsgd Tools... (DirectStorage) > Verify exported pack (DSPkg)...** in the editor; both faces use
 one engine, so the verdict line is identical.
 
 Verdict grammar:
@@ -314,11 +326,6 @@ exercise them.
 
 These are open, not design intent.
 
-- **Disk-full during `finalize()` is silent (issue #0157).** `DSPkg::finalize()` ignores every
-  `store_buffer` return value, so a short write produces a truncated archive and returns `OK`. The
-  plugin then renames and reports success. The reader does reject it (`ERR_FILE_CORRUPT`, "Entry
-  payload extends past archive length"), and the runtime treats that as fatal, but the export itself
-  still reports success.
 - **Salvage depends on file order.** If a corrupt texture is processed before any good one, nothing
   is archived and the build falls back entirely to the PCK (`bundle=false`). If a good one comes
   first, a partial archive is deployed (`bundle=true`). Both are safe; the artefact differs.
@@ -336,9 +343,9 @@ Run these after touching the exporter, the runtime, or the archive reader.
 
 | Harness | Command | Proves |
 |---|---|---|
-| Policy unit test | `godot --headless --path project --script headless_tests/test_export_policy.gd` | the whole decision table above, in seconds, with no extension or export (17 checks) |
-| Export-contract gate | `powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/run_export_contract.ps1` (2.5 min, measured peak ~230 MB of scratch, nothing left after a pass) | protected/unprotected/bundling-off exports, the three fail-closed presets, subset modes, stale-archive deletion, partial salvage, corrupted TOC, the boot grammar, the pack scan and the key-scan positive control |
-| Gate self-test | `powershell -ExecutionPolicy Bypass -File project/headless_tests/export_contract/self_test.ps1` (about 1.5 min; needs no keyed template) | the gate's own verdicts: a skipped or unstarted case fails instead of reporting PASS, `-AllowPartial` labels such a run PARTIAL, and an empty selection always fails |
+| Policy unit test | `python tools/run_gut.py -gselect=test_export_policy.gd` (`project/tests/unit/test_export_policy.gd`) | the whole decision table above, in seconds, with no extension or export (17 assertions) |
+| Export-contract gate | `powershell -ExecutionPolicy Bypass -File project/tests/gates/export_contract/run_export_contract.ps1` (2.5 min, measured peak ~230 MB of scratch, nothing left after a pass) | protected/unprotected/bundling-off exports, the three fail-closed presets, subset modes, stale-archive deletion, partial salvage, corrupted TOC, the boot grammar, the pack scan and the key-scan positive control |
+| Gate self-test | `powershell -ExecutionPolicy Bypass -File project/tests/gates/export_contract/self_test.ps1` (about 1.5 min; needs no keyed template) | the gate's own verdicts: a skipped or unstarted case fails instead of reporting PASS, `-AllowPartial` labels such a run PARTIAL, and an empty selection always fails |
 | Pack scan | `godot --headless --path project --script res://addons/directstorage_accelerator/tools/dspkg_pack_scan.gd -- --pack <pck>` | pack validity and key-magic absence for one file |
 
 The gate is run manually before exporting a release; nothing runs it automatically, so a change to the

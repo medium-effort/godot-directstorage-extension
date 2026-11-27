@@ -2,183 +2,194 @@
 
 This addon exposes DirectStorage-backed texture streaming and asynchronous I/O request APIs to Godot 4.
 
-## Editor Workflow
+This document covers the **Installation Quick Start**, **DSTexture Import Settings**, **Project Settings**, and **Export Preset Options** that Godot's editor UI does not display in hover tooltips for addons, along with **Trademarks and Attribution**. For editor workflow, runtime installation, GPU decompression details, runtime API, and building from source, see the [repository README](https://github.com/medium-effort/godot-directstorage-extension/blob/main/README.md).
 
-Enable the `dsgd` plugin (`dsgd - Unofficial DirectStorage binding` in **Project Settings > Plugins**). It registers the `DSRuntime` autoload, the `DirectStorage Texture` importer, and the `DirectStorageExporter` export plugin.
+## Contents
 
-The autoload entry is written to `project.godot` when the plugin is enabled and removed only when you disable the plugin again — commit it with the rest of your project settings. Closing the editor keeps it, because standalone and exported builds need that node to drive the asynchronous prewarm queue.
+- [Installation & Quick Start](#installation--quick-start)
+- [DSTexture Import Settings](#dstexture-import-settings)
+- [Project Settings](#project-settings)
+  - [Notes on Queue Capacity and Timeouts](#notes-on-queue-capacity-and-timeouts)
+  - [Integrated GPUs and Auto-Tune (What UMA Means)](#integrated-gpus-and-auto-tune-what-uma-means)
+- [Export Preset Options](#export-preset-options)
+  - [What the Encryption tab contributes](#what-the-encryption-tab-contributes)
+  - [Outcomes](#outcomes)
+  - [Engine controls that do not affect the archive](#engine-controls-that-do-not-affect-the-archive)
+- [Trademarks and Attribution](#trademarks-and-attribution)
+  - [License](#license)
+  - [Trademarks and Notices](#trademarks-and-notices)
 
-The importer converts `.png`, `.jpg`, `.jpeg`, and `.webp` sources into `.dstex` (version 2, or version 3 when the source is not a multiple of 4 pixels or a mip is split into chunks) resources with D3D12-aligned footprints (256-byte row pitch alignment and 512-byte mip placement alignment) for direct hardware decompression. Non-multiple-of-4 sources keep their authoring dimensions as the logical size in the v3 header while the payload stores the 4-pixel-aligned footprint; the loader applies a size override so the texture reports and renders at its logical size on the CPU/`ImageTexture` path. GPU-decoded textures wrap the padded storage footprint in `Texture2DRD`, which has no size setter and therefore reports the storage size (for example 100x52); enable `compatibility/as_image_texture` when the authoring size must be reported. Its Import dock options control source compression mode (S3TC, BPTC/BC7, or uncompressed), color space, normal-map processing, channel packing, mipmap generation, a source size limit, channel remapping, alpha-border/premultiply processing, and GDeflate compression level.
+## Installation & Quick Start
 
-Three presets are provided: **3D (Streaming)** (the default), **CPU / ImageTexture (2D, UI, Decals)** (uncompressed, no mipmaps, CPU-loaded), and **Project Default**, which follows `dsgd_extension/default_import_profile`. Existing `.import` files keep their stored values on reimport; the project setting only affects new imports. A pure 2D project should normally use Godot's own Texture2D importer instead of this addon.
+1. **Switch to D3D12 (Windows)**: If your project is not already using Direct3D 12, set **Project Settings > General > Rendering > Rendering Device > Driver.windows** (`rendering/rendering_device/driver.windows`) to `d3d12` and restart the editor.
+2. **Install the Addon**: Place `directstorage_accelerator/` in your project's `addons/` directory and enable **dsgd - Unofficial DirectStorage binding** in **Project Settings > Plugins** (this registers the `DSRuntime` autoload).
+3. **Install DirectStorage Runtime (Windows)**: Open **Project > Tools > dsgd Tools... (DirectStorage) > Manage DirectStorage Runtime...** to download, review Microsoft's license, and install `dstorage.dll` and `dstoragecore.dll` (the dialog opens automatically on Windows when you enable the plugin if `dstoragecore.dll` is not installed yet). The plugin also checks `.gdextension` manifest health on startup and warns in the Output panel if the native library is missing, duplicated, or loaded from an unexpected path. The runtime DLLs are not bundled in this repository and must be installed before exporting on Windows.
+4. **Import & Export**: Newly imported textures use the `.dstex` importer (`3D (Streaming)` preset by default) and load transparently through `ResourceLoader.load()`. On export, the `dsgd` export plugin (`dsgd Extension`) packs them into `textures.dspkg` automatically.
 
-### GDeflate compression level
 
-`compression/gdeflate_level` (1-12) trades importer time for a smaller `.dstex`. The level is applied at import only: it changes the stored bytes, not the runtime decompression cost, which is per-byte identical at every level. On the default path the payload is already block-compressed (S3TC/BC1), so the gains flatten quickly. Measured on 8 logical cores, mip 0 of a 4096x4096 albedo (8 MiB S3TC payload) with the addon's own compressor:
+## DSTexture Import Settings
 
-| Level | `.dstex` payload | vs level 1 | Compression time |
-| --- | --- | --- | --- |
-| 1 | 3,240,912 B | - | 187 ms |
-| 3 (3D default) | 3,187,260 B | -1.7% | 193 ms |
-| 6 | 3,083,248 B | -4.9% | 238 ms |
-| 9 | 2,975,292 B | -8.2% | 1126 ms |
-| 12 | 2,959,824 B | -8.7% | 2526 ms |
+The **DirectStorage Texture** importer converts `.png`, `.jpg`, `.jpeg`, `.webp`, `.tga`, and `.dds` images into `.dstex` compressed texture resources for DirectStorage-accelerated streaming.
 
-The same sweep on two other map types from a production 3D project (8 MiB S3TC payloads, 4096x4096), to show how the gain depends on entropy:
+Three presets are provided in the Import dock:
 
-| Level | ORM payload | vs level 1 | Normal payload | vs level 1 |
-| --- | --- | --- | --- | --- |
-| 1 | 5,912,908 B | - | 5,208,268 B | - |
-| 3 | 5,869,528 B | -0.7% | 5,118,716 B | -1.7% |
-| 6 | 5,679,348 B | -4.0% | 5,018,660 B | -3.6% |
-| 9 | 5,535,556 B | -6.4% | 4,833,756 B | -7.2% |
+- **3D (Streaming)** - the product default (VRAM compressed, mipmaps enabled, GDeflate level 3).
+- **CPU / ImageTexture (2D, UI, Decals)** - uncompressed, no mipmaps, `fix_alpha_border` enabled, CPU-loaded. A pure 2D project should normally use Godot's built-in `Texture2D` importer instead.
+- **Project Default** (shown in the Import dock as `Project Default (3D)` or `Project Default (2D)`) - follows `dsgd_extension/default_import_profile` in Project Settings. Existing `.import` files keep their stored values on reimport; changing the project setting only affects new imports.
 
-Albedo gains most, low-entropy ORM masks least.
+- **`compression/disk_compression`** (`int`, default: `1`)
 
-Stylized/hand-painted art gains considerably more at the same levels, because its flat color regions leave more redundancy than photographic albedo. Measured the same way (S3TC payloads, 8 logical cores), on a second 3D project whose assets are imported by Godot's own importer, so these model what this addon would produce for the same art:
+  Selects the on-disk / DirectStorage stream compression codec applied to the GPU-ready payload in `.dstex`: **None (`0`)** stores the raw 256-byte-pitch-aligned footprint verbatim (`DSCompressionFormat::NONE`, v3 header) with zero runtime decompression cost; **GDeflate (`1`)** compresses each mip or chunk with Microsoft GDeflate for smaller disk footprints and hardware-accelerated GPU decompression on DirectStorage-capable Windows systems.
 
-| Asset | S3TC payload | L1 | L3 | L6 | L9 |
-| --- | --- | --- | --- | --- | --- |
-| moss albedo 2048x2048 | 2,097,152 B | 470,496 B | -14.5% | -24.7% | -31.3% |
-| moss normal 2048x2048 | 2,097,152 B | 553,096 B | -7.5% | -13.6% | -19.6% |
-| grass albedo 1024x1024 | 524,288 B | 222,828 B | -3.2% | -6.9% | -13.2% |
-| leaves ORM 1024x1024 | 524,288 B | 347,636 B | -0.8% | -3.1% | -5.8% |
-| menu background 1920x1080 | 1,036,800 B | 515,632 B | -2.2% | -4.7% | -9.7% |
+- **`compression/gdeflate_level`** (`int`, default: `3`)
 
-Encode time at level 3 stays within a few percent there (moss albedo 34.9 to 36.0 ms, moss normal 34.8 to 35.3 ms), while level 6 roughly doubles it (66.8 and 54.5 ms) and level 9 is 10-12x. So the ordering holds across both projects — albedo gains most, ORM least — but the absolute payoff of level 3 depends on how stylized the art is: around 1-2% on photographic block-compressed albedo, up to 14.5% on flat-shaded stylized albedo.
+  Microsoft GDeflate compression level (`1`–`12`). Defaults to `3`, which is close to free in encode time and captures a meaningful share of the reduction (~1–2% on block-compressed payloads, ~6–27% on uncompressed payloads). Higher values shrink files at the cost of slower import times, steeply so from `9` upward. Runtime decompression cost is per-byte identical at every level.
 
-Uncompressed payloads (the CPU / ImageTexture path, `compression/mode=1`) behave differently: there is much more redundancy left for GDeflate to find, so the same levels can buy more. Two sets of base-level RGBA8 payloads, because they answer different questions.
+- **`compression/chunk_size_kb`** (`int`, default: `8192`)
 
-What this project actually ships on that path — the only two `mode=1` assets, both tiny, and the one `as_image_texture` asset (which is block-compressed, not uncompressed):
+  Splits each mip into independent GDeflate chunks of at most this many uncompressed KiB (`0` keeps one stream per mip). Chunks bound the largest DirectStorage request so large textures do not force the staging buffer to hold a whole mip. Block-compressed formats keep every chunk boundary on a 4-row block boundary.
 
-| Asset | Payload | L1 | L3 | L6 |
-| --- | --- | --- | --- | --- |
-| icon 128x128 (`mode=1`) | 65,536 B | 44,016 B | 43,996 B (-0.05%) | 43,316 B (-1.6%) |
-| crosshair 32x32 (`mode=1`) | 4,096 B | 392 B | 292 B (-25.5%) | 280 B (-28.6%) |
-| spotlight 256x256 (`as_image_texture`, S3TC) | 32,768 B | 16,724 B | 16,568 B (-0.9%) | 16,256 B (-2.8%) |
+- **`compression/color_space`** (`int`, default: `1`)
 
-Those assets total about 68 KiB of raw payload, so the level is worth bytes, not kilobytes, on them: the icon is 67% entropy and barely moves, and the crosshair's 100-byte saving is noise at any level.
+  Selects the color space stored in the `.dstex` header: **Linear (`0`)** for normal maps, roughness, metallic, masks, or lookup tables (creates a linear UNORM GPU format); **sRGB (`1`)** for standard color textures such as albedo/diffuse maps (creates the sRGB counterpart GPU format so hardware sampling decodes to linear). Independent from channel packing.
 
-Large uncompressed textures are the case where the level pays. These rows are 2D-profile *models*: production 3D sources re-read as RGBA8 (they are block-compressed in that project), so treat them as what a film, lightmap, or photo-backed UI texture would cost, not as shipped 2D art:
+- **`compress/normal_map`** (`int`, default: `0`)
 
-| Asset | Raw RGBA8 | L1 | L3 | L6 | L9 |
-| --- | --- | --- | --- | --- | --- |
-| floor 512x512 (model) | 1,048,576 B | 43,872 B | -27.0% | -33.0% | -32.0% |
-| particle 512x512 (model) | 1,048,576 B | 66,972 B | -15.9% | -23.4% | -24.7% |
-| splash 1024x233 (model) | 954,368 B | 17,136 B | +0.4% | -7.4% | -7.9% |
-| albedo 4096x4096 (model) | 67,108,864 B | 12,263,368 B | -6.1% | -8.8% | -18.7% |
-| ORM 4096x4096 (model) | 67,108,864 B | 23,040,224 B | -6.2% | -11.8% | -16.7% |
+  Normal-map processing: **Disabled (`0`)** treats the image as ordinary color/data; **Enabled (`1`)** normalizes the base level, renormalizes mip levels, and prioritizes red/green channels during block compression. Produces BC7 when `compression/high_quality` is enabled, or BC5/BC3 when disabled. Usage-based auto-detection is not available to a custom importer, so enable this explicitly for normal maps.
 
-Encode time on that path: levels 1-6 are within noise for the small assets (7.5 / 7.0 / 6.7 ms for the 512x512 model, 4.1 / 5.5 / 4.1 ms for the icon) and +15% / +43% for the 64 MiB ones (1.04 / 1.20 / 1.49 s); level 9 is 10x (`10.2 s`).
+- **`compress/channel_pack`** (`int`, default: `0`)
 
-Both paths therefore default to level `3`. It is the last point that is close to free, and it is the point where further levels start costing two to four times the extra time for two to four times the saved bytes. On block-compressed art that is a small but free win; on uncompressed art it is either noise (small sprites) or a real 6-12% (large textures). Levels 9-12 are the libdeflate cliff in both cases: raise the level beyond 3 only when distribution size is worth more to you than reimport time.
+  Channel packing during block compression (applies only when `compression/mode` is **VRAM Compressed**): **sRGB Friendly (`0`)** detects used channels as sRGB color, avoiding packing that would shift values when sampled as sRGB; **Optimized (`1`)** detects used channels as generic data for more aggressive packing (smaller files, not safe for sRGB-sampled color textures).
 
-### Chunked payloads
+- **`compression/high_quality`** (`bool`, default: `false`)
 
-`compression/chunk_size_kb` (default `8192`) splits each mip into independent GDeflate chunks of at most that many uncompressed KiB; `0` restores the legacy one-stream-per-mip layout, which forces the Windows backend to split each mip at load time and to size the staging buffer for a whole mip. DirectStorage requires every request to fit the staging buffer, so one stream per mip forced `staging_buffer_size_mb` to grow with the largest mip (a 4096x4096 RGBA8 mip is 64 MiB, an 8192x8192 mip is 256 MiB). Chunks decouple the two: the staging floor becomes the largest chunk (8 MiB by default), and the importer warns with the exact number when an asset still exceeds the configured staging size. Chunk count also spends the queue budget: each chunk is one request, and each submitted batch appends one signal and one set-event, so at most `queue_capacity - 2` requests fit in a batch; the loader falls back to CPU decompression above that and warns. Chunked textures are stored in v3 `.dstex` files and v5 `.dspkg` archives; the GPU path uploads each chunk as a row-range texture request and the CPU path reassembles the per-chunk streams. Prewarm supports chunked payloads on both paths: the System RAM path expands one request per chunk, and direct-to-VRAM GPU prewarm emits per-chunk row-range requests in the same shape (GDeflate and NONE raw slices; textures whose fan-out exceeds the queue budget (capacity minus the batch signal and event) stay on the System RAM path).
+  When `compression/mode` is **VRAM Compressed**, uses BPTC/BC7 instead of S3TC. Preserves alpha and normal-map detail better, but takes twice the VRAM of BC1 and encodes on the CPU during import. With BPTC, `compress/normal_map` produces BC7 rather than BC5; disable this option if BC5 normal maps are preferred.
 
-End to end for the same asset (decode, 13 mip levels, BC1, `.dstex` write), level 6 costs +11% import time for a 4.7% smaller file, and level 12 costs 6.1x for 8.4%. Levels 9-12 are the libdeflate cliff: avoid them for interactive or CI reimports.
+- **`compression/mode`** (`int`, default: `0`)
 
-During export, imported `.dstex` files are bundled into `res://textures.dspkg` (version 3 or version 4 with encrypted TOC) along with per-entry GPU mip metadata and entry flags. The runtime resource loader resolves texture paths directly from that archive without requiring individual `.dstex` files in the exported PCK.
+  **VRAM Compressed (`0`)**: compresses mipmaps using S3TC (BC1/BC3/BC4/BC5) or, with `compression/high_quality`, BPTC (BC7) prior to GDeflate compression. Reduces VRAM consumption and optimizes streaming bandwidth (recommended for 3D textures). **VRAM Uncompressed (`1`)**: retains raw pixel data (e.g. RGBA8) with mipmaps, compressed only on disk with lossless GDeflate. Preserves pixel fidelity with zero block artifacts (pixel art, crisp UI, LUTs) at higher runtime memory cost.
 
-### Native library reload (GDExtension)
+- **`mipmaps/generate`** (`bool`, default: `true`)
 
-The native half (`bin/dsgd_64*.dll`) is a GDExtension library, so it can be reloaded without restarting the editor. In Godot 4.7 open **Project Settings > GDExtension** and press the reload button on the `directstorage_accelerator.gdextension` row. The editor also reloads it automatically when you return to the window after rebuilding, and only then - saving the file is not enough.
+  Generates a full mip chain when `true`. Disable for 2D/UI textures always sampled at 1:1 to write a single-mip `.dstex` and save roughly one third of payload and memory.
 
-A reload unloads and reopens the library, so the addon's native singletons (`DSContext`, `DSErrorHandler`, `DSProfiler`, `DSTextureCache`) are rebuilt from scratch; the editor plugin re-initializes the DirectStorage backend as soon as that happens.
+- **`process/size_limit`** (`int`, default: `0`)
 
-- On Windows the editor runs the library from a hidden copy beside it (`bin/~dsgd_64.debug.dll`), which is why rebuilding over a running editor works. The DirectStorage runtime DLLs (`dstorage.dll`, `dstoragecore.dll`) are not copied, so switching runtime versions still needs the staged restart described under **Runtime Install & License**.
-- A failed reload (half-written build, missing dependency) leaves the extension unloaded until the next successful reload or an editor restart. The button ignores the result, so check the Output panel. An extension that never loaded at editor start is not listed in that tab at all.
-- A reload cannot re-initialize an extension whose minimum initialization level is below the scene level; this addon initializes at scene level, so it reloads cleanly.
-- Two copies of the library in the same project cannot both own the DirectStorage classes. The plugin warns at startup with both paths when it detects that, and with the expected manifest when the native half is missing altogether.
+  If `> 0`, resizes the image so its longer edge is at most this many pixels before mip generation and compression. `0` applies only the 16384-pixel container cap. Useful for mobile targets (`4096`/`8192`) and avoiding oversized staging buffers.
 
-## Runtime Install & License
+- **`process/channel_remap/red`** (`int`, default: `0`)
 
-The DirectStorage runtime (`dstorage.dll`, `dstoragecore.dll`) is not bundled with this addon. Enable the plugin, then open **Tools > DSGD Tools... > Manage DirectStorage Runtime...** to download a pinned official Microsoft package, review its license, and choose the active version.
+  Source for the red output channel: Red, Green, Blue, Alpha, Inverted Red/Green/Blue/Alpha, Unused, Zero, or One. Use with the green/blue/alpha siblings to pack PBR masks or flip a normal map's green channel. Applied before normalization and mip generation via `DSTex.remap_channels`.
 
-- The license shown is the exact `LICENSE.txt` from the verified package (SHA-512 checked against Microsoft's published hash). Nothing is installed until you accept it.
-- Installation is editor-only and staged: the new DLL pair is applied on the next editor or game start. Windows locks loaded modules, and one process cannot mix two DirectStorage versions.
-- Only the 1.3 stable runtime is offered by default. Runtimes newer than 1.3 (including the 1.4 preview) stay hidden until you tick **Show preview runtimes** in the manager; the choice is saved in `dsgd_extension/show_preview_runtimes`. A version that is already installed, staged or downloaded is always listed, so turning the option off never makes the active runtime unselectable. Those are development runtimes: the preview license grants no redistribution rights, so do not commit or ship their DLLs.
-- Runtime DLLs must be installed before exporting; the export dependencies reference them.
+- **`process/channel_remap/green`** (`int`, default: `1`)
 
-The runtime is Microsoft-licensed and is not bundled or re-licensed by this addon. When you ship `dstorage.dll` / `dstoragecore.dll` with a game, you are responsible for complying with Microsoft's EULA and for including its `LICENSE.txt` and `NOTICES.txt`. The installer extracts both into `bin/.versions/<version>/`, and the export option `dsgd_extension/include_directstorage_license_file` can copy them next to the exported binaries.
+  Source for the green output channel. See `process/channel_remap/red`.
 
-## Direct GPU Decompression & Fallback
+- **`process/channel_remap/blue`** (`int`, default: `2`)
 
-When running on Windows with a Direct3D 12 `RenderingDevice` (`--rendering-driver d3d12`), DirectStorage decompresses GDeflate mip streams directly into GPU VRAM as `Texture2DRD` resources via compute shaders. If GPU decompression is disabled, unsupported, or if legacy version 1 assets are loaded, the system automatically falls back to multi-threaded CPU software decompression (`ImageTexture`).
+  Source for the blue output channel. See `process/channel_remap/red`.
 
-Destination state caveat: DirectStorage requires destination textures to be in the `COMMON` state, but Godot only creates a fresh texture in `COMMON` when Enhanced Barriers are available (or cross-family relaxed casting applies). On adapters without either, a freshly created texture starts in `COPY_DEST` instead, and GPU destination behavior is unverified there; use a memory destination on those adapters when strict compliance matters. This is a documented hardware precondition, not a runtime check — see `DSRequest.set_destination_resource()` and `DSContext.create_destination_texture()`.
+- **`process/channel_remap/alpha`** (`int`, default: `3`)
 
-That GPU path requires the render thread. Under the default `rendering/driver/threads/thread_model` (`Safe`) the main thread *is* the render thread, so a `ResourceLoader.load()` on the main thread uploads straight to VRAM. Background loads (`load_threaded_request()`, `use_sub_threads`) always run on a worker thread and decompress on the CPU, and under the experimental `Separate` model every load does. Neither is silent any more: `DSContext.get_capability_report()` carries `loader_gpu_loads`, `loader_cache_hits` and `loader_cpu_fallbacks` (per-reason counts), and the first thread-affinity fallback logs one warning per session naming the two ways to reach the GPU path — a main-thread load, or `DSPreloader.prewarm_gpu_async()`. A texture that was prewarmed is served from `DSTextureCache` on the next `ResourceLoader` load, so a worker-thread load of a prewarmed asset is a cache hit and pays no CPU decompression.
+  Source for the alpha output channel. See `process/channel_remap/red`.
 
-*Custom Godot Engine builds:* Direct GPU decompression requires Godot compiled with the D3D12 driver enabled (`d3d12=yes`). If you build Godot from source or strip modules for size, see the custom engine build guide (`docs/custom-godot-builds.md`) for required SCons flags and module guardrails.
+- **`process/fix_alpha_border`** (`bool`, default: `false`)
 
-The file I/O mode is chosen from the volume that holds the assets. NTFS volumes on NVMe, SATA, or ATA buses use DirectStorage's default unbuffered path (BypassIO when the OS and drivers allow it). Rotational volumes automatically switch to buffered file I/O with `ForceFileBuffering` and BypassIO disabled, so the Windows cache and read-ahead are used; this is the supported configuration for hard drives. The choice is process-wide and is taken from the volume passed to `initialize_ds_for_path()`, or from `res://` for default startup. Initialize DirectStorage before querying capabilities; a capability probe that runs first fixes the I/O mode from `res://`.
+  Bleeds surrounding color into the transparent border of RGBA8 images before compression, reducing bilinear-filter halos. Enabled by the CPU/ImageTexture (2D) preset.
 
-### Frame cost on low-end GPUs (measured)
+- **`process/premult_alpha`** (`bool`, default: `false`)
 
-Compression buys disk bandwidth and spends GPU time. On a GTX 1050 Ti at 1920x1080, streaming 32 uncompressed 1024x1024 textures added about 0.02 ms to the median frame, while the same textures as GDeflate added about 0.36 ms at idle and about 1.06 ms while a synthetic GPU load was running; the 95th-percentile frame was 12-15 ms worse during the compressed stream. Throughput moves the other way: the compressed set delivered 2.06 GB/s of logical bytes versus 1.70 GB/s uncompressed at idle, and the two converged (about 1.4-1.5 GB/s) under load.
+  Premultiplies RGB by alpha before compression. Requires materials configured for premultiplied alpha.
 
-If you are frame-bound on a low-end or integrated GPU rather than bandwidth-bound, set `dsgd_extension/disable_gpu_decompression` so decoding happens on the CPU, and budget for the tail. The writer's uncompressed fallback only covers textures GDeflate cannot shrink, so it is not a general substitute for compressible art. Reproduce with `project/benchmark/bench_gpu_contention.gd`; these numbers are machine-specific and only comparable within one run set.
+- **`compatibility/as_image_texture`** (`bool`, default: `false`)
 
-## Runtime API
+  Forces the texture to load into CPU memory as an `ImageTexture` even when GPU streaming prewarm (`DSPreloader.prewarm_gpu_async`) is active. Standard `ResourceLoader` loads and CPU prewarm (`DSPreloader.prewarm_async`) already create `ImageTexture`s automatically. Enable this when using D3D12 GPU prewarm on assets that need CPU pixel access (`Light3D.light_projector`, `Decal` textures, `Texture2D.get_image()`), or when `Texture2D.get_width()` must report the exact authoring size for non-multiple-of-4 sources (the GPU path wraps the 4-pixel-aligned padded size in `Texture2DRD`). Note: uncompressed and float formats (`R8`, `RG8`, `RGB8`, `R16*`, float formats, `BC6H`) always prewarm into `ImageTexture` regardless; color formats with sRGB counterparts (`BC1`, `BC2`, `BC3`, `BC7`, `RGBA8`/`BGRA8`) and linear block formats (`BC4`, `BC5`) use the GPU path.
 
-The native classes are documented in Godot's Editor Help and support Ctrl-click navigation from GDScript. The main entry points are:
-
-- `DSContext`: initialize DirectStorage hardware queues and staging buffers, enqueue `DSRequest` objects, execute synchronous (`flush_batch`) or asynchronous (`flush_batch_async`) batches, handle completion signals (`batch_completed`, `batch_failed`), and query drive/GPU capabilities.
-- `DSRequest`: configure source file paths, byte ranges, compression format (`COMPRESSION_NONE`, `COMPRESSION_GDEFLATE`), destination target (`DESTINATION_MEMORY`, `DESTINATION_GPU_BUFFER`, `DESTINATION_GPU_TEXTURE`), subresource ranges, request priorities (`PRIORITY_LOW`, `PRIORITY_NORMAL`, `PRIORITY_HIGH`), and query execution status.
-- `DSTex`: create or inspect `.dstex` (v1 and v2) files and retrieve per-mip footprint metadata (`mip_offsets`, `mip_sizes`, `mip_uncompressed_sizes`, `mip_row_pitches`).
-- `DSPkg`: build or read bundled `.dspkg` archives (v1, v2, v3, and v4) with per-entry GPU mip tables, flags, and optional TOC encryption.
-- `GDeflateCompressor` and `GDeflateDecompressor`: encode and decode GDeflate tile-compressed payloads with configurable thread pools.
-- `DSTextureCache`: inspect or manage the runtime texture LRU cache.
-- `DSErrorHandler` and `DSProfiler`: monitor asynchronous DirectStorage kernel errors, measure physical storage throughput, and inspect logical decompression metrics.
-
-The extension registers `DSContext`, `DSErrorHandler`, `DSProfiler`, and `DSTextureCache` as Engine singletons. Access them via `Engine.get_singleton("DSContext")` or the corresponding singleton name.
-
-## Async Prewarm: Who Owns What
-
-`DSPreloader` drives the streaming queue and reports its state; it deliberately does not make policy decisions for the game.
-
-- **Residency is intentional.** `DSTextureCache` keeps prewarmed textures resident after a scene swap, so memory staying high (roughly one level's worth of textures) is the cache working, not a leak. Resident entries load again with no disk read.
-- **Releasing a level's GPU resources is the game's job.** Drop the references the scene held, then call `DSTextureCache.clear_unused()`; entries that still have a live reference are kept. Judge the result by whether you are still hitting your session's own best throughput, not by a fixed millisecond budget — the same byte count is cheap with memory headroom and slow when the system is paging.
-- **The addon will not warn you about scene teardown.** A slow quit is the engine freeing the scene graph plus the driver releasing memory; `DSPreloader` does not watch for it and emits nothing. Do not wait for a warning that will never come.
-- **Eviction granularity is per call, not per microsecond.** There is no `clear_unused_budget()`, and none is planned: the call itself is not where the time goes. To spread the cost, release references in stages and call `clear_unused()` after each stage.
-
-Diagnostics, so a wedged load is one call instead of three pollers:
-
-```gdscript
-# Returns false (and cancels the tag) instead of polling forever.
-var ok: bool = await DSPreloader.await_prewarm_finished(tag, on_progress, 8000, on_stall)
-if not ok:
-    # {"progress": Vector2i, "complete": bool, "pending": int, "unbuilt": int,
-    #  "unbuilt_cpu": int, "unbuilt_gpu": int}
-    push_warning("prewarm wedged: %s" % DSPreloader.get_prewarm_state(tag))
-    # fall back to the synchronous load path here
-```
-
-`stall_timeout_msec = 0` keeps the historical "poll until done" behaviour, so existing callers need no change. The stall check watches progress *and* the pending/unbuilt counters, because a batch can finish every request and still be building textures.
+> **Automatic Scene Compatibility Check**: When you open a scene in the Godot editor, the plugin scans `Light3D.light_projector` and `Decal` nodes and prints a yellow Output warning naming any textures bound to `Texture2DRD` that should be re-imported with `compatibility/as_image_texture`.
 
 ## Project Settings
 
 The addon exposes configurable project settings under the `dsgd_extension/` namespace in Godot's Project Settings (`Project -> Project Settings... -> General -> Dsgd Extension`):
 
-| Setting | Type | Default | Description |
-| :--- | :---: | :---: | :--- |
-| `dsgd_extension/staging_buffer_size_mb` | `int` | `32` | Staging buffer size in megabytes allocated by DirectStorage for unbuffered DMA transfers (clamped range: `1`-`2048` MiB). Chunked textures bound a request at one chunk (8 MiB by default), so the default is sized for that; raise it only for legacy un-chunked assets whose mip exceeds the buffer. |
-| `dsgd_extension/disable_gpu_decompression` | `bool` | `false` | When `true`, disables D3D12 GPU compute decompression and forces fallback to multi-threaded CPU software decompression. Useful for debugging, compatibility testing, or profiling. |
-| `dsgd_extension/disable_gpu_decompression_metacommand` | `bool` | `false` | When `true`, keeps GPU decompression enabled but forces the reference implementation instead of the driver's optimized metacommand. Independent of `disable_gpu_decompression`, so the two GPU paths can be compared on the same machine; use it when the optimized path misbehaves or measures slower. Applies to the next DirectStorage initialization. |
-| `dsgd_extension/force_software_fallback` | `bool` | `false` | **Advanced.** When `true`, skips `Win32Backend` and uses `SoftwareFallback` (CPU GDeflate via libdeflate, `ImageTexture` upload) even on a DirectStorage-capable Windows D3D12 host. Useful for troubleshooting buggy storage drivers, reproducing fallback behavior in exported builds, and benchmarking both CPU GDeflate paths under the same rendering driver. Discards all DirectStorage acceleration. Applies on the next `initialize_ds()`; when present, this project setting overrides `DSContext.set_force_software_fallback()`. |
-| `dsgd_extension/allow_directstorage_without_bypassio` | `bool` | `true` | **Advanced.** When `true`, `Win32Backend` initializes on any local Windows volume (USB/SD/exFAT/RAID/virtual disks), disabling BypassIO where unavailable and using buffered I/O only on rotational media. This keeps D3D12 GPU GDeflate instead of forcing CPU decompression on those volumes. Set `false` to restore the older NVMe/SATA/ATA + NTFS restriction (useful as a rollback or for A/B testing). UNC network shares are always excluded. |
-| `dsgd_extension/max_cpu_threads` | `int` | `0` | Maximum CPU threads used by DirectStorage work. `0` (default) means auto: logical processor count capped at 16, and never above Godot's `threading/worker_pool/max_threads` when set. An explicit value (`1`-`32`) caps DirectStorage's built-in CPU decompression pool, the fallback backend's workers, GDeflate tile decompression, and preloader CPU offload batches. Replaces `cpu_decompression_threads`; an old value in `project.godot` is migrated automatically. Changing it requires a restart, because the budget and the DirectStorage configuration are resolved once at initialization. |
-| `dsgd_extension/debug_break_on_error` | `bool` | `false` | Adds `DSTORAGE_DEBUG_BREAK_ON_ERROR` in debug/dev builds only, so a bad read breaks into the debugger at the failing enqueue instead of being attributed to the following batch boundary. Requires a debugger attached: `DebugBreak()` without one terminates the process. Has no effect in release builds. Applies to the next initialization. |
-| `dsgd_extension/queue_capacity` | `int` | `512` | Maximum request capacity allocated for the hardware DirectStorage queue (clamped range: `128`–`8192`). Dictates the upper bound of simultaneous in-flight storage requests. |
-| `dsgd_extension/auto_tune_for_integrated_gpu` | `bool` | `true` | When `true`, automatically lowers the effective staging buffer (64 MiB), queue (256), and `texture_cache_max_entries` (128) on PCs whose GPU shares system memory (see below), and routes GPU prewarms to System RAM. Only ever lowers values, never raises them. Set to `false` to use your configured values exactly as written. |
-| `dsgd_extension/auto_tune_for_low_vram_gpu` | `bool` | `true` | Player-hardware VRAM guardrail for discrete GPUs (see below). When `true`, caps `texture_cache_max_entries` (`128` under 4 GiB, `256` on 4–8 GiB) and clamps any project-raised `staging_buffer_size_mb` (`32` MiB under 2 GiB, `64` MiB under 8 GiB; 8 GiB and above are untouched). Only ever lowers values, never raises them. Set to `false` to use your configured values exactly. |
-| `dsgd_extension/texture_cache_enabled` | `bool` | `true` | LRU residency cache (`DSTextureCache`). `true`: `REUSE` loads hit the cache and become engine-resident, so post-prewarm scene loads bind pointer-identical textures with no disk read, and prewarm works. `false`: every load re-reads and re-decompresses and the texture dies with its last reference — GPU decompression still works, but async prewarm refuses to start and existing entries are cleared. Prefer lowering `texture_cache_max_entries` over disabling. |
-| `dsgd_extension/texture_cache_max_entries` | `int` | `512` | Maximum number of texture entries held in the LRU cache (range: `16`–`2048`). Auto-tune reduces it to `128` on integrated GPUs and discrete GPUs under 4 GiB, and to `256` on 4–8 GiB discrete GPUs; 8 GiB and above keep the full value. When the limit is reached, oldest unreferenced textures are evicted to reclaim VRAM; evicting a prewarmed entry before its batch finishes emits a one-time warning. A prewarm batch may temporarily hold up to 25% more entries (at least one) so it does not evict its own waiting textures; beyond that bounded cap the oldest unconsumed prewarm entry is evicted instead of growing further, and the over-capacity warning is emitted once. |
-| `dsgd_extension/shutdown_drain_timeout_ms` | `int` | `10000` | Maximum time in milliseconds (clamped to a minimum of `100` ms) to wait during application exit or module shutdown for active NVMe DMA and GPU requests to drain before fail-safe cleanup, preventing device-removed crashes or driver hangs. |
-| `dsgd_extension/sync_flush_timeout_ms` | `int` | `3000` | Maximum timeout in milliseconds (clamped range: `500`–`10000` ms) for synchronous batch flushes (`submit_batch` / `flush_batch`). Dictates the timeout budget for hardware queue execution and fence completion, with up to half (`sync_timeout_ms / 2`) allocated for draining prior in-flight batches beforehand. Synchronous flushes should never be called inside gameplay process loops (`_process`). |
-| `dsgd_extension/show_preview_runtimes` | `bool` | `false` | Editor-tool preference, not a runtime setting: when `true`, the Manage DirectStorage Runtime dialog lists runtime versions newer than 1.3 (for example the 1.4 preview). The dialog's **Show preview runtimes** checkbox is the normal way to set it. Versions already installed, staged or downloaded are listed regardless of this value. |
+- **`dsgd_extension/default_import_profile`** (`int`, default: `0`)
+
+  Default profile used by the **Project Default** importer preset for newly imported images (`0` = 3D Streaming, `1` = CPU / ImageTexture). Existing `.import` files keep their stored values.
+
+- **`dsgd_extension/staging_buffer_size_mb`** (`int`, default: `32`)
+
+  Staging buffer size in megabytes allocated by DirectStorage for unbuffered DMA transfers (editor slider range: `16`–`2048` MiB in steps of `16`; runtime clamped range: `1`–`2048` MiB). Chunked textures bound a request at one chunk (8 MiB by default), so the default is sized for that; raise it only for legacy un-chunked assets whose mip exceeds the buffer.
+
+- **`dsgd_extension/disable_gpu_decompression`** (`bool`, default: `false`)
+
+  When `true`, disables D3D12 GPU compute decompression and forces fallback to multi-threaded CPU software decompression. Useful for debugging, compatibility testing, or profiling.
+
+- **`dsgd_extension/disable_gpu_decompression_metacommand`** (`bool`, default: `false`)
+
+  When `true`, keeps GPU decompression enabled but forces the reference implementation instead of the driver's optimized metacommand. Independent of `disable_gpu_decompression`, so the two GPU paths can be compared on the same machine; use it when the optimized path misbehaves or measures slower. Applies to the next DirectStorage initialization.
+
+- **`dsgd_extension/force_disable_bypass_io`** (`bool`, default: `false`)
+
+  Disables Windows BypassIO in `DSTORAGE_CONFIGURATION` while keeping DirectStorage active (uses standard Win32 I/O and retains GPU GDeflate decompression). Applies on the next `initialize_ds()`.
+
+- **`dsgd_extension/force_software_fallback`** (`bool`, default: `false`)
+
+  **Advanced.** When `true`, skips `Win32Backend` and uses `SoftwareFallback` (CPU GDeflate via libdeflate, `ImageTexture` upload) even on a DirectStorage-capable Windows D3D12 host. Useful for troubleshooting buggy storage drivers, reproducing fallback behavior in exported builds, and benchmarking both CPU GDeflate paths under the same rendering driver. Discards all DirectStorage acceleration. Applies on the next `initialize_ds()`; when present, this project setting overrides `DSContext.set_force_software_fallback()`.
+
+- **`dsgd_extension/allow_directstorage_without_bypassio`** (`bool`, default: `true`)
+
+  **Advanced.** When `true`, `Win32Backend` initializes on any local Windows volume (USB/SD/exFAT/RAID/virtual disks), disabling BypassIO where unavailable and using buffered I/O only on rotational media. This keeps D3D12 GPU GDeflate instead of forcing CPU decompression on those volumes. Set `false` to restore the older NVMe/SATA/ATA + NTFS restriction (useful as a rollback or for A/B testing). UNC network shares are always excluded.
+
+- **`dsgd_extension/max_cpu_threads`** (`int`, default: `0`)
+
+  Maximum CPU threads used by DirectStorage work. `0` (default) means auto: logical processor count capped at 16, and never above Godot's `threading/worker_pool/max_threads` when set. An explicit value (`1`–`32`) caps DirectStorage's built-in CPU decompression pool, the fallback backend's workers, GDeflate tile decompression, and preloader CPU offload batches. Replaces `cpu_decompression_threads`; an old value in `project.godot` is migrated automatically. Changing it requires a restart, because the budget and the DirectStorage configuration are resolved once at initialization.
+
+- **`dsgd_extension/debug_break_on_error`** (`bool`, default: `false`)
+
+  Adds `DSTORAGE_DEBUG_BREAK_ON_ERROR` in debug/dev builds only, so a bad read breaks into the debugger at the failing enqueue instead of being attributed to the following batch boundary. Requires a debugger attached: `DebugBreak()` without one terminates the process. Has no effect in release builds. Applies to the next initialization.
+
+- **`dsgd_extension/queue_capacity`** (`int`, default: `512`)
+
+  Maximum request capacity allocated for the hardware DirectStorage queue (clamped range: `128`–`8192`). Dictates the upper bound of simultaneous in-flight storage requests.
+
+- **`dsgd_extension/auto_tune_for_integrated_gpu`** (`bool`, default: `true`)
+
+  When `true`, automatically lowers the effective staging buffer (64 MiB), queue (256), and `texture_cache_max_entries` (128) on PCs whose GPU shares system memory (see below), and routes GPU prewarms to System RAM. Only ever lowers values, never raises them. Set to `false` to use your configured values exactly as written.
+
+- **`dsgd_extension/auto_tune_for_low_vram_gpu`** (`bool`, default: `true`)
+
+  Player-hardware VRAM guardrail for discrete GPUs (see below). When `true`, caps `texture_cache_max_entries` (`128` under `3584` MiB, `256` on `3584`–`7167` MiB; `7168` MiB and above are untouched) and clamps any project-raised `staging_buffer_size_mb` (`32` MiB under `2048` MiB, `64` MiB on `2048`–`7167` MiB; `7168` MiB and above are untouched). Only ever lowers values, never raises them. Set to `false` to use your configured values exactly as written.
+
+- **`dsgd_extension/texture_cache_enabled`** (`bool`, default: `true`)
+
+  LRU residency cache (`DSTextureCache`). `true`: `REUSE` loads hit the cache and become engine-resident, so post-prewarm scene loads bind pointer-identical textures with no disk read, and prewarm works. `false`: every load re-reads and re-decompresses and the texture dies with its last reference - GPU decompression still works, but async prewarm refuses to start and existing entries are cleared. Prefer lowering `texture_cache_max_entries` over disabling.
+
+- **`dsgd_extension/texture_cache_max_entries`** (`int`, default: `512`)
+
+  Maximum number of texture entries held in the LRU cache (range: `16`–`2048`). Auto-tune reduces it to `128` on integrated GPUs and discrete GPUs under `3584` MiB, and to `256` on `3584`–`7167` MiB discrete GPUs; `7168` MiB and above keep the full value. When the limit is reached, oldest unreferenced textures are evicted to reclaim VRAM; evicting a prewarmed entry before its batch finishes emits a one-time warning. A prewarm batch may temporarily hold up to 25% more entries (at least one) so it does not evict its own waiting textures; beyond that bounded cap the oldest unconsumed prewarm entry is evicted instead of growing further, and the over-capacity warning is emitted once.
+
+- **`dsgd_extension/shutdown_drain_timeout_ms`** (`int`, default: `10000`)
+
+  Maximum time in milliseconds (clamped to a minimum of `100` ms) to wait during application exit or module shutdown for active NVMe DMA and GPU requests to drain before fail-safe cleanup, preventing device-removed crashes or driver hangs. Read at runtime if set in `project.godot` / `ProjectSettings`, but not registered in the Project Settings UI by default.
+
+- **`dsgd_extension/sync_flush_timeout_ms`** (`int`, default: `3000`)
+
+  Maximum timeout in milliseconds (clamped range: `500`–`10000` ms) for synchronous batch flushes (`submit_batch` / `flush_batch`). Dictates the timeout budget for hardware queue execution and fence completion, with up to half (`sync_timeout_ms / 2`) allocated for draining prior in-flight batches beforehand. Synchronous flushes should never be called inside gameplay process loops (`_process`). Read at runtime if set in `project.godot` / `ProjectSettings`, but not registered in the Project Settings UI by default.
+
+- **`dsgd_extension/show_preview_runtimes`** (`bool`, default: `false`)
+
+  Editor-tool preference, not a runtime setting: when `true`, the Manage DirectStorage Runtime dialog lists runtime versions newer than 1.3 (for example the 1.4 preview). The dialog's **Show preview runtimes** checkbox is the normal way to set it. Versions already installed, staged or downloaded are listed regardless of this value.
+
+- **`dsgd_extension/archive_name`** (`String`, default: `"textures.dspkg"`)
+
+  Overrides the `.dspkg` archive filename looked up at runtime. Export writes it as an internal setting; test and benchmark harnesses can also set it via `ProjectSettings` to switch between archives (for example `textures.dspkg` vs. `textures_raw.dspkg`). Read at runtime, not registered in the Project Settings UI by default.
+
+- **`dsgd_extension/force_archive_resolution`** (`bool`, default: `false`)
+
+  Allows editor/dev runs (`OS.has_feature("editor")`) to resolve a `.dspkg` archive instead of crawling loose `.dstex` files, for testing or benchmarking archives without exporting. Read at runtime, not registered in the Project Settings UI by default.
+
+- **`dsgd_extension/skip_archive_import_check`** (`bool`, default: `false`)
+
+  Skips per-entry `.import` / TOC `as_image_texture` exclusion checks during `DSPreloader.collect_scene_textures()` archive scans. Read at runtime, not registered in the Project Settings UI by default.
 
 ### Notes on Queue Capacity and Timeouts
 
@@ -192,30 +203,52 @@ Most gaming desktops have a **discrete GPU**: a separate graphics card with its 
 Why that matters for DirectStorage settings:
 
 - The **staging buffer** (`32` MiB by default; up to four internal buffers at that size) is scratch memory DirectStorage uses while moving data. On a discrete GPU it lives in VRAM where there is plenty of room. On an integrated GPU it comes out of the same shared RAM the game, the OS, and the prewarmed textures all compete for, so a big staging buffer adds memory pressure for no speed gain.
-- **GPU decompression still works** on integrated GPUs (the log will say `enabled (GPU-optimized/fallback)`), but "direct to VRAM" really means "direct to a shared-memory allocation" — there is no separate VRAM to be direct *to*.
+- **GPU decompression still works** on integrated GPUs (the log will say `enabled (GPU-optimized/fallback)`), but "direct to VRAM" really means "direct to a shared-memory allocation" - there is no separate VRAM to be direct *to*.
 - **Prewarm auto-routing**: `prewarm_gpu_async()` calls automatically route to System RAM prewarm (`prewarm_async()`) on integrated GPUs when auto-tune is enabled. This prevents 3D/Copy-queue render contention and hard freezes during animated loading screens while preserving direct-to-VRAM DMA on discrete graphics cards.
 
 `dsgd_extension/auto_tune_for_integrated_gpu` (default `true`) handles this automatically: when the extension detects an integrated/UMA adapter (queried directly via Direct3D 12 hardware UMA architecture, or under 1 GiB of dedicated VRAM reported by Windows), it quietly caps the *effective* staging buffer to 64 MiB, the queue to 256, and `texture_cache_max_entries` to 128 at startup, routes GPU prewarms to System RAM, and logs any staging/queue clamp once (`auto-tune clamped staging ...->64 MiB, queue 512->256`). It only ever lowers, never raises - if you already set smaller values, they pass through untouched, and your saved settings are never rewritten. Discrete-GPU PCs are completely unaffected. Turn it off (`false`) if you want full manual control, e.g. when benchmarking exact configured values.
 
-`dsgd_extension/auto_tune_for_low_vram_gpu` (default `true`) is a separate player-hardware guardrail for discrete GPUs. It does two things:
-- **Texture cache residency**: caps `texture_cache_max_entries` (default `512`) to `128` under 4 GiB and `256` on 4–8 GiB cards so the larger default does not cause VRAM pressure on small cards.
-- **Staging buffer safety net**: the DirectStorage factory can hold up to four staging buffers at the configured size (~4x residency). At the `32` MiB default this cap is a no-op, but if a project raises `staging_buffer_size_mb` for higher-VRAM target specs (for example `128` MiB = ~512 MiB residency), this clamps it on players' smaller discrete GPUs (`64` MiB on 2–8 GiB cards, `32` MiB under 2 GiB, untouched at 8 GiB and above) and logs the before/after values once.
+`dsgd_extension/auto_tune_for_low_vram_gpu` (default `true`) is a separate player-hardware guardrail for discrete GPUs (using DXGI-safe boundaries so nominal 4 GiB / 8 GiB cards reporting ~4004 / ~7900 MiB stay in their intended tiers). It does two things:
+- **Texture cache residency**: caps `texture_cache_max_entries` (default `512`) to `128` under `3584` MiB and `256` on `3584`–`7167` MiB cards (`7168` MiB and above are untouched) so the larger default does not cause VRAM pressure on small cards.
+- **Staging buffer safety net**: the DirectStorage factory can hold up to four staging buffers at the configured size (~4x residency). At the `32` MiB default this cap is a no-op, but if a project raises `staging_buffer_size_mb` for higher-VRAM target specs (for example `128` MiB = ~512 MiB residency), this clamps it on players' smaller discrete GPUs (`64` MiB on `2048`–`7167` MiB cards, `32` MiB under `2048` MiB, untouched at `7168` MiB and above) and logs the before/after values once.
 
 It never changes the queue, never raises a value, and leaves lower configured settings alone. Set it to `false` to keep your configured values verbatim on every GPU.
 
 ## Export Preset Options
 
-The exporter adds seven options to every Windows Desktop preset, on the **Options** tab (`Project -> Export... -> Windows Desktop -> Options`):
+The exporter supports **Windows, Linux, and macOS** desktop presets, adding **eight** options on Windows Desktop and **six** on Linux/macOS (omitting the two Windows DirectStorage runtime license options) on the **Options** tab (`Project -> Export... -> <Desktop Preset> -> Options`):
 
-| Export Option | Type | Default | Description |
-| :--- | :---: | :---: | :--- |
-| `dsgd_extension/bundle_textures_dspkg` | `bool` | `true` | Bundles exported textures into `textures.dspkg` for unbuffered DirectStorage DMA loading. |
-| `dsgd_extension/verify_pack_on_export` | `bool` | `true` | Scans a protected standalone `.pck` after export to verify its header, non-empty directory, and absence of plaintext key-file magic (`PACK_VERIFY status=ok`). Embedded PCKs print `status=unverified`; turning this off prints `status=skipped` with a warning and leaves the build unverified. |
-| `dsgd_extension/enforce_archive_pairing` | `bool` | `true` | Publishes a random 64-bit archive id per export and compares it, in full, when the runtime opens the archive. Set to `false` only for local tooling: it publishes `0`, which skips the check in that build, and writes an archive carrying id `0` that any build expecting a real id rejects. |
-| `dsgd_extension/steampipe_1mb_alignment` | `bool` | `false` | Aligns texture payloads to 1 MiB chunks for SteamPipe differential patching efficiency. |
-| `dsgd_extension/include_dsgd_license_file` | `bool` | `true` | Writes `dsgd_LICENSE.txt` next to the exported binaries, containing the project license and the third-party components of `dsgd_64.dll`. Disable when you carry those attributions in-game instead; the source texts stay in the addon folder. |
-| `dsgd_extension/include_directstorage_license_file` | `bool` | `true` | Writes Microsoft's DirectStorage runtime `LICENSE.txt` and `NOTICES.txt` for the active runtime version as `DIRECTSTORAGE_LICENSE.txt`. |
-| `dsgd_extension/merge_license_files` | `bool` | `true` | When both license files are included, appends the DirectStorage runtime texts to `dsgd_LICENSE.txt` and skips the separate runtime file. No effect when fewer than two files are included. |
+- **`dsgd_extension/bundle_textures_dspkg`** (`bool`, default: `true`)
+
+  Bundles exported textures into `textures.dspkg` for unbuffered DirectStorage DMA loading.
+
+- **`dsgd_extension/verify_pack_on_export`** (`bool`, default: `true`)
+
+  Scans a protected standalone `.pck` after export to verify its header, non-empty directory, and absence of plaintext key-file magic (`PACK_VERIFY status=ok`). Embedded PCKs print `status=unverified`; turning this off prints `status=skipped` with a warning and leaves the build unverified.
+
+- **`dsgd_extension/enforce_archive_pairing`** (`bool`, default: `true`)
+
+  Publishes a random 64-bit archive id per export and compares it, in full, when the runtime opens the archive. Set to `false` only for local tooling: it publishes `0`, which skips the check in that build, and writes an archive carrying id `0` that any build expecting a real id rejects.
+
+- **`dsgd_extension/steampipe_1mb_alignment`** (`bool`, default: `false`)
+
+  Aligns texture payloads to 1 MiB chunks for SteamPipe differential patching efficiency.
+
+- **`dsgd_extension/store_uncompressed_textures`** (`bool`, default: `false` on Windows / `true` on Linux, macOS)
+
+  Repacks GDeflate `.dstex` payloads uncompressed (`NONE`) into `textures.dspkg` (v5) or into the PCK when bundling is disabled, avoiding CPU GDeflate decompression overhead on non-DirectStorage platforms.
+
+- **`dsgd_extension/include_dsgd_license_file`** (`bool`, default: `true`)
+
+  Writes `dsgd_LICENSE.txt` next to the exported binaries, containing the project license and the third-party components of `dsgd_64.dll`. Disable when you carry those attributions in-game instead; the source texts stay in the addon folder.
+
+- **`dsgd_extension/include_directstorage_license_file`** (`bool`, default: `true`)
+
+  *(Windows only)* Writes Microsoft's DirectStorage runtime `LICENSE.txt` and `NOTICES.txt` for the active runtime version as `DIRECTSTORAGE_LICENSE.txt`.
+
+- **`dsgd_extension/merge_license_files`** (`bool`, default: `true`)
+
+  *(Windows only)* When both license files are included, appends the DirectStorage runtime texts to `dsgd_LICENSE.txt` and skips the separate runtime file. No effect when fewer than two files are included.
 
 Encryption is not one of those options. It comes entirely from the same preset's **Encryption** tab (`Project -> Export... -> Windows Desktop -> Encryption`), next to Options. The add-on keeps no encryption toggle and no key field of its own, and caches nothing from the preset, because one plugin instance serves every preset of an "Export All" run.
 
@@ -254,24 +287,6 @@ Two more controls sit on that tab and are never read by the exporter:
 - **Encrypt Index (File Names and Info)** changes how the PCK index is stored, not how the archive is built.
 - **Initialization vector seed** only makes encrypted files byte-stable across exports: the AES-256-CFB IV is derived from the file content plus the seed instead of being random. It cannot make a DirectStorage build reproducible, because the archive key and the archive id are regenerated on every export.
 
-### Encryption architecture and key provisioning
-
-- **Prerequisite**: the Godot export templates must be built with the same PCK key. Stock Godot cannot mount a custom-key pack, so plan the template build with your PCK key before enabling encryption.
-- **TOC encryption and authentication**: the archive's table of contents (TOC: entry names, dimensions, offsets) is encrypted and authenticated with AEAD (BLAKE2b key-id derivation, XChaCha20, Poly1305 MAC via Monocypher).
-- **Payload blocks stay unencrypted** so DirectStorage can hand the compressed GDeflate streams straight to the GPU decompressor. The payload bytes are therefore not secret: they are recoverable from the archive without any key.
-- **Key delivery**: the archive key is random per export, is not compiled into published binaries, and reaches the game only as the `res://.dspkg/toc.key` entry inside the encrypted PCK. `DSPkg.open()` reads that entry, checks the 16-byte magic, and installs the key only after it reproduces the archive header's key id and decrypts the TOC. Shipped games do not need to call `DSPkg.set_global_encryption_key()`.
-- **Verification**: a build counts as protected only after the exported player prints one `DSPKG_BOOT status=ok mode=protected … key_id=<16 hex>` line and the add-on's pack scanner (`tools/dspkg_pack_scan.gd`, also available as **Project > Tools > Verify exported pack (DSPkg)**) reports `DSPKG_SCAN status=ok` on the shipped pack.
-  - Boot check: `<export-dir>\game.exe --headless -- --dspkg-validate=protected`. A normal successful boot prints nothing; the switch is what turns the line on. A failed boot prints `DSPKG_BOOT status=fail reason=<code>` every time, and `key_id=none` means no key was committed.
-  - Reference: [`docs/verifying-an-exported-build.md`](../../../docs/verifying-an-exported-build.md) covers the fields, the five failure reasons and the CI shape. That file lives in this repository next to the add-on; a project that only copied `addons/` does not have it, and the editor scan above needs nothing else.
-
-### Legacy: baking the key into the DLL
-
-A source build can compile the archive key into the extension binary (`DSPKG_ENCRYPTION_KEY_FILE`). This is not the delivery path described above and is not used by published builds; it exists for experiments and for source builds that have no encrypted PCK to carry a key.
-
-- **Weaker**: the key ships inside the binary, so anyone holding the DLL holds the key, and every copy of the game shares one archive key. A PCK-delivered key is unique per export.
-- **Precedence**: a valid `res://.dspkg/toc.key` wins; the baked key is used only when no readable key entry exists.
-- **Distribution**: published binaries carry no key in the DLL (`dspkg-key-id=none`); the build audit treats a binary that carries a key, or one with no tag, as a violation for distributed targets.
-
 ## Trademarks and Attribution
 
 ### License
@@ -283,9 +298,6 @@ A source build can compile the archive key into the extension binary (`DSPKG_ENC
 
 ### Trademarks and Notices
 
-This addon/extension (DSGD) is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft. Microsoft and DirectStorage are trademarks of the Microsoft group of companies. The DirectStorage runtime is installed under Microsoft's license and is not bundled with this addon/extension; see Runtime Install & License.
+This addon/extension (DSGD) is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft. Microsoft and DirectStorage are trademarks of the Microsoft group of companies. The DirectStorage runtime is installed under Microsoft's license and is not bundled with this addon/extension; see the [repository README](../../../README.md#installation--quick-start).
 
 Third-party license texts and attributions are in `THIRD_PARTY_NOTICES.txt`; the project's own licenses are in `LICENSE` (MPL-2.0) and `LICENSE-MIT` (MIT). They ship with the addon and are copied next to exported binaries as `dsgd_LICENSE.txt` (with the DirectStorage runtime texts appended when merging is enabled) or as a separate `DIRECTSTORAGE_LICENSE.txt`. The exporter removes and rewrites those files on every export, so the directory always matches the preset.
-
-
-

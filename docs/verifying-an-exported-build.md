@@ -35,7 +35,7 @@ Require:
 DSPKG_SCAN status=ok entries=<n> file=<path>
 ```
 
-The same scan runs from the editor as **Project > Tools > Verify exported pack (DSPkg)**. It needs
+The same scan runs from the editor as **Project > Tools > dsgd Tools... (DirectStorage) > Verify exported pack (DSPkg)...**. It needs
 neither the extension binary nor a key: it only reads the pack you point it at.
 
 ---
@@ -159,9 +159,7 @@ path when the pack lives elsewhere.
 
 ## Using this in CI
 
-The verdict is the **presence of exactly one success line**, not the exit code. The exit code is
-supporting only: the failure path quits with 1 without stopping the tree, so a later quit from the
-game can override it.
+The verdict is the **presence of exactly one success line**, not the exit code alone: the sentinel line is the primary contract (naming the mode, key id, and failure reason), while `_fail_boot()` records and re-applies its non-zero exit code in `_exit_tree()` so a later `quit(0)` from the game cannot erase it.
 
 ```powershell
 $env:DSPKG_VALIDATE_OUT = "boot-verdict.log"
