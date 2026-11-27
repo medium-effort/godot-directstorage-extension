@@ -436,3 +436,213 @@ func _stage_v5_fixtures() -> void:
 	_write_bytes(V4_ARTIFACT, artifact_bytes)
 	_write_text(V5_IMPORT, _v5_import_text())
 	_write_text(V4_IMPORT, _v4_import_text())
+
+
+func _make_dds_2d_rgba8_bytes(width: int = 4, height: int = 4, caps2: int = 0) -> PackedByteArray:
+	var header := PackedByteArray()
+	header.resize(128)
+	header.fill(0)
+	header.encode_u32(0, 0x20534444) # "DDS "
+	header.encode_u32(4, 124)        # dwSize
+	header.encode_u32(8, 0x00001007) # CAPS | HEIGHT | WIDTH | PIXELFORMAT
+	header.encode_u32(12, height)
+	header.encode_u32(16, width)
+	header.encode_u32(20, width * 4) # pitch
+	header.encode_u32(76, 32)        # pf.dwSize
+	header.encode_u32(80, 0x41)      # DDPF_RGB | DDPF_ALPHAPIXELS
+	header.encode_u32(88, 32)        # bitcount
+	header.encode_u32(92, 0x00FF0000)
+	header.encode_u32(96, 0x0000FF00)
+	header.encode_u32(100, 0x000000FF)
+	header.encode_u32(104, 0xFF000000)
+	header.encode_u32(108, 0x1000)   # DDSCAPS_TEXTURE
+	header.encode_u32(112, caps2)
+	var pixels := PackedByteArray()
+	pixels.resize(width * height * 4)
+	pixels.fill(255)
+	return header + pixels
+
+
+func test_tga_and_dds_scan_compatibility() -> void:
+	# 1. TGA image with Godot's standard texture importer -> eligible (adopt)
+	var tga_path := TEST_DIR + "/albedo.tga"
+	var tga_imp := tga_path + ".import"
+	_write_bytes(tga_path, PackedByteArray([0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 4, 0, 32, 8]))
+	_write_text(tga_imp, (
+		"[remap]\n\nimporter=\"texture\"\nimporter_version=5\ntype=\"CompressedTexture2D\"\n"
+		+ "uid=\"uid://ds_tga_test_uid\"\npath=\"%s\"\n\n" % TEST_CTEX
+		+ "[deps]\n\nsource_file=\"%s\"\ndest_files=[\"%s\"]\n\n" % [tga_path, TEST_CTEX]
+		+ "[params]\n\ncompress/mode=2\n"
+	))
+
+	# 2. Compatible 2D DDS with Godot's dds importer -> eligible (adopt)
+	var dds_2d_path := TEST_DIR + "/valid_2d.dds"
+	var dds_2d_imp := dds_2d_path + ".import"
+	_write_bytes(dds_2d_path, _make_dds_2d_rgba8_bytes(4, 4, 0))
+	_write_text(dds_2d_imp, (
+		"[remap]\n\nimporter=\"dds\"\nimporter_version=1\ntype=\"CompressedTexture2D\"\n"
+		+ "uid=\"uid://ds_dds2d_test_uid\"\npath=\"%s\"\n\n" % TEST_CTEX
+		+ "[deps]\n\nsource_file=\"%s\"\ndest_files=[\"%s\"]\n\n" % [dds_2d_path, TEST_CTEX]
+		+ "[params]\n\nmipmaps/generate=true\n"
+	))
+
+	# 3. Incompatible DDS cubemap -> skipped, kept on Godot's importer
+	var dds_cube_path := TEST_DIR + "/skybox_cube.dds"
+	var dds_cube_imp := dds_cube_path + ".import"
+	_write_bytes(dds_cube_path, _make_dds_2d_rgba8_bytes(4, 4, 0x200))
+	_write_text(dds_cube_imp, (
+		"[remap]\n\nimporter=\"dds\"\nimporter_version=1\ntype=\"CompressedCubemap\"\n"
+		+ "uid=\"uid://ds_ddscube_test_uid\"\npath=\"%s\"\n\n" % TEST_CTEX
+		+ "[deps]\n\nsource_file=\"%s\"\ndest_files=[\"%s\"]\n\n" % [dds_cube_path, TEST_CTEX]
+		+ "[params]\n\n"
+	))
+
+	var plan: Array[Dictionary] = CORE.scan()
+
+	var tga_entry := _find_entry(plan, tga_path)
+	assert_false(tga_entry.is_empty())
+	assert_eq(str(tga_entry.get("mode", "")), "adopt")
+	assert_true(bool(tga_entry.get("eligible", false)))
+
+	var dds_2d_entry := _find_entry(plan, dds_2d_path)
+	assert_false(dds_2d_entry.is_empty())
+	assert_eq(str(dds_2d_entry.get("mode", "")), "adopt")
+	assert_true(bool(dds_2d_entry.get("eligible", false)))
+
+	var dds_cube_entry := _find_entry(plan, dds_cube_path)
+	assert_false(dds_cube_entry.is_empty())
+	assert_eq(str(dds_cube_entry.get("mode", "")), "skip")
+	assert_false(bool(dds_cube_entry.get("eligible", true)))
+	assert_true(str(dds_cube_entry.get("reason", "")).contains("kept on Godot's importer"))
+
+
+func _make_dds_dxt1_bytes(width: int = 4, height: int = 4) -> PackedByteArray:
+	var header := PackedByteArray()
+	header.resize(128)
+	header.fill(0)
+	header.encode_u32(0, 0x20534444)   # "DDS "
+	header.encode_u32(4, 124)          # dwSize
+	header.encode_u32(8, 0x00081007)   # CAPS | HEIGHT | WIDTH | PIXELFORMAT | LINEARSIZE
+	header.encode_u32(12, height)
+	header.encode_u32(16, width)
+	header.encode_u32(20, 8)           # 4x4 BC1 block = 8 bytes
+	header.encode_u32(76, 32)          # pf.dwSize
+	header.encode_u32(80, 0x4)         # DDPF_FOURCC
+	header.encode_u32(84, 0x31545844)  # "DXT1"
+	header.encode_u32(108, 0x1000)     # DDSCAPS_TEXTURE
+	var pixels := PackedByteArray()
+	pixels.resize(8)
+	pixels.fill(0)
+	return header + pixels
+
+
+func _make_dds_dx10_bc7_bytes(resource_dimension: int = 3, array_size: int = 1) -> PackedByteArray:
+	var header := PackedByteArray()
+	header.resize(148)
+	header.fill(0)
+	header.encode_u32(0, 0x20534444)   # "DDS "
+	header.encode_u32(4, 124)          # dwSize
+	header.encode_u32(8, 0x00081007)   # CAPS | HEIGHT | WIDTH | PIXELFORMAT | LINEARSIZE
+	header.encode_u32(12, 4)
+	header.encode_u32(16, 4)
+	header.encode_u32(20, 16)          # 4x4 BC7 block = 16 bytes
+	header.encode_u32(76, 32)          # pf.dwSize
+	header.encode_u32(80, 0x4)         # DDPF_FOURCC
+	header.encode_u32(84, 0x30315844)  # "DX10"
+	header.encode_u32(108, 0x1000)     # DDSCAPS_TEXTURE
+	header.encode_u32(128, 98)         # DXGI_FORMAT_BC7_UNORM
+	header.encode_u32(132, resource_dimension)
+	header.encode_u32(140, array_size)
+	var pixels := PackedByteArray()
+	pixels.resize(16)
+	pixels.fill(0)
+	return header + pixels
+
+
+func test_dds_edge_cases_and_lifecycle() -> void:
+	# 1. Compressed S3TC (DXT1) 2D DDS -> adopt with high_quality=false and passthrough reason
+	var dxt1_path := TEST_DIR + "/diffuse_dxt1.dds"
+	var dxt1_imp := dxt1_path + ".import"
+	_write_bytes(dxt1_path, _make_dds_dxt1_bytes())
+	_write_text(dxt1_imp, (
+		"[remap]\n\nimporter=\"dds\"\nimporter_version=1\ntype=\"CompressedTexture2D\"\n"
+		+ "uid=\"uid://ds_dxt1_test_uid\"\npath=\"%s\"\n\n" % TEST_CTEX
+		+ "[deps]\n\nsource_file=\"%s\"\ndest_files=[\"%s\"]\n\n" % [dxt1_path, TEST_CTEX]
+		+ "[params]\n\n"
+	))
+
+	# 2. Compressed BPTC (DX10 BC7) 2D DDS -> adopt with high_quality=true
+	var bc7_path := TEST_DIR + "/detail_bc7.dds"
+	var bc7_imp := bc7_path + ".import"
+	_write_bytes(bc7_path, _make_dds_dx10_bc7_bytes(3, 1))
+	_write_text(bc7_imp, (
+		"[remap]\n\nimporter=\"dds\"\nimporter_version=1\ntype=\"CompressedTexture2D\"\n"
+		+ "uid=\"uid://ds_bc7_test_uid\"\npath=\"%s\"\n\n" % TEST_CTEX
+		+ "[deps]\n\nsource_file=\"%s\"\ndest_files=[\"%s\"]\n\n" % [bc7_path, TEST_CTEX]
+		+ "[params]\n\n"
+	))
+
+	# 3. Volume/3D DDS -> skip
+	var vol_path := TEST_DIR + "/lut_volume.dds"
+	_write_bytes(vol_path, _make_dds_2d_rgba8_bytes(4, 4, 0x200000))
+	_write_text(vol_path + ".import", "[remap]\n\nimporter=\"dds\"\nimporter_version=1\ntype=\"CompressedTexture3D\"\nuid=\"uid://ds_vol_uid\"\n\n[params]\n\n")
+
+	# 4. DX10 Texture2DArray (array_size=2) -> skip
+	var arr_path := TEST_DIR + "/layers_array.dds"
+	_write_bytes(arr_path, _make_dds_dx10_bc7_bytes(3, 2))
+	_write_text(arr_path + ".import", "[remap]\n\nimporter=\"dds\"\nimporter_version=1\ntype=\"CompressedTexture2DArray\"\nuid=\"uid://ds_arr_uid\"\n\n[params]\n\n")
+
+	# 5. Truncated/corrupt DDS -> skip
+	var bad_path := TEST_DIR + "/corrupt.dds"
+	_write_bytes(bad_path, PackedByteArray([1, 2, 3, 4]))
+	_write_text(bad_path + ".import", "[remap]\n\nimporter=\"dds\"\nimporter_version=1\ntype=\"CompressedTexture2D\"\nuid=\"uid://ds_bad_uid\"\n\n[params]\n\n")
+
+	# 6. Incompatible DDS already assigned to directstorage_texture -> skip with Import dock hint
+	var misassigned_path := TEST_DIR + "/misassigned_cube.dds"
+	_write_bytes(misassigned_path, _make_dds_2d_rgba8_bytes(4, 4, 0x200))
+	_write_text(misassigned_path + ".import", "[remap]\n\nimporter=\"directstorage_texture\"\nimporter_version=5\ntype=\"Texture2D\"\nuid=\"uid://ds_mis_uid\"\n\n[params]\n\n")
+
+	var plan: Array[Dictionary] = CORE.scan()
+
+	var dxt1_entry := _find_entry(plan, dxt1_path)
+	assert_eq(str(dxt1_entry.get("mode", "")), "adopt")
+	assert_true(bool(dxt1_entry.get("eligible", false)))
+	assert_eq(str(dxt1_entry.get("mapped_params", {}).get("compression/high_quality", "")), "false")
+	assert_true(str(dxt1_entry.get("reason", "")).contains("passthrough"))
+
+	var bc7_entry := _find_entry(plan, bc7_path)
+	assert_eq(str(bc7_entry.get("mode", "")), "adopt")
+	assert_true(bool(bc7_entry.get("eligible", false)))
+	assert_eq(str(bc7_entry.get("mapped_params", {}).get("compression/high_quality", "")), "true")
+
+	for skip_path in [vol_path, arr_path, bad_path]:
+		var e := _find_entry(plan, skip_path)
+		assert_eq(str(e.get("mode", "")), "skip")
+		assert_false(bool(e.get("eligible", true)))
+
+	var mis_entry := _find_entry(plan, misassigned_path)
+	assert_eq(str(mis_entry.get("mode", "")), "skip")
+	assert_false(bool(mis_entry.get("eligible", true)))
+	assert_true(str(mis_entry.get("reason", "")).contains("Import dock"))
+
+	# 7. Backup -> Apply -> Restore lifecycle on compatible DDS entries
+	var backup_res := CORE.create_zip_backup([dxt1_entry, bc7_entry])
+	assert_true(bool(backup_res.get("ok", false)))
+	_zip_to_clean = str(backup_res.get("zip_res_path", ""))
+
+	var apply_res := CORE.apply_migration([dxt1_entry, bc7_entry])
+	assert_true(bool(apply_res.get("ok", false)))
+
+	var post_cp := ConfigFile.new()
+	assert_eq(post_cp.load(dxt1_imp), OK)
+	assert_eq(str(post_cp.get_value("remap", "importer", "")), CORE.TARGET_IMPORTER)
+	assert_eq(str(post_cp.get_value("remap", "uid", "")), "uid://ds_dxt1_test_uid")
+
+	var restore_res := CORE.restore_from_zip(_zip_to_clean)
+	assert_true(bool(restore_res.get("ok", false)))
+
+	var restored_cp := ConfigFile.new()
+	assert_eq(restored_cp.load(dxt1_imp), OK)
+	assert_eq(str(restored_cp.get_value("remap", "importer", "")), "dds")
+	assert_eq(str(restored_cp.get_value("remap", "type", "")), "CompressedTexture2D")
+	assert_eq(str(restored_cp.get_value("remap", "uid", "")), "uid://ds_dxt1_test_uid")

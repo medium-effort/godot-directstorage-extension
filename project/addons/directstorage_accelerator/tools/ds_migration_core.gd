@@ -11,7 +11,7 @@ extends RefCounted
 
 ## Core logic for migrating Godot projects to the DirectStorage texture importer.
 ##
-## Scans source images (png, jpg, jpeg, webp), inspects their .import sidecars,
+## Scans source images (png, jpg, jpeg, webp, tga, dds), inspects their .import sidecars,
 ## maps parameters for maximum parity, backs up original .import files into a ZIP
 ## archive inside the dsgd addon folder, rewrites .import files with UID preservation,
 ## and provides verified rollback from the ZIP backup.
@@ -23,7 +23,7 @@ const IMPORTER = preload("res://addons/directstorage_accelerator/scripts/ds_impo
 const TARGET_IMPORTER := "directstorage_texture"
 const TARGET_VERSION := IMPORTER.FORMAT_VERSION
 const SCHEMA := 1
-const SUPPORTED_EXTS := ["png", "jpg", "jpeg", "webp"]
+const SUPPORTED_EXTS := ["png", "jpg", "jpeg", "webp", "tga", "dds"]
 const SKIP_DIRS := [".godot", ".git", ".migration_backup"]
 const ADDON_TREE := "addons/directstorage_accelerator"
 const DEFAULT_BACKUP_DIR := "res://addons/directstorage_accelerator/.migration_backup"
@@ -314,6 +314,70 @@ static func map_texture_params(params: Dictionary) -> Array:
 	return [mapped, "Default DirectStorage parameters applied", true]
 
 
+## Checks whether a .dds file is a 2D texture in a pixel format supported by DirectStorage Texture.
+## Rejects cubemaps, volume textures, DX10 texture arrays, and unsupported formats without spamming
+## push_error() during project scans so incompatible assets stay on Godot's built-in DDS importer.
+static func check_dds_compatibility(src_res: String) -> Dictionary:
+	var bytes := _read_bytes(src_res)
+	if bytes.size() < 128 or bytes.decode_u32(0) != IMPORTER.DDS_MAGIC:
+		return {"compatible": false, "compressed": false, "high_quality": false, "reason": "Invalid or unreadable DDS header — kept on Godot's importer"}
+
+	var caps2: int = bytes.decode_u32(112)
+	if (caps2 & (IMPORTER.DDS_CAPS2_CUBEMAP | IMPORTER.DDS_CAPS2_VOLUME)) != 0:
+		return {"compatible": false, "compressed": false, "high_quality": false, "reason": "DDS cubemap or volume texture — kept on Godot's importer"}
+
+	var fourcc: int = bytes.decode_u32(84)
+	if fourcc == IMPORTER.DDS_FOURCC_DX10:
+		if bytes.size() < 148:
+			return {"compatible": false, "compressed": false, "high_quality": false, "reason": "Truncated DX10 DDS header — kept on Godot's importer"}
+		var resource_dimension: int = bytes.decode_u32(132)
+		var array_size: int = bytes.decode_u32(140)
+		if resource_dimension != IMPORTER.DDS_DIMENSION_TEXTURE2D or array_size > 1:
+			return {"compatible": false, "compressed": false, "high_quality": false, "reason": "DDS DX10 non-2D or texture array — kept on Godot's importer"}
+
+	var img := Image.new()
+	var err := img.load_dds_from_buffer(bytes)
+	if err != OK or img.is_empty():
+		return {"compatible": false, "compressed": false, "high_quality": false, "reason": "Unsupported or unreadable DDS payload — kept on Godot's importer"}
+
+	var fmt := img.get_format()
+	if img.is_compressed():
+		if not IMPORTER.DDS_SUPPORTED_COMPRESSED_FORMATS.has(fmt):
+			return {"compatible": false, "compressed": true, "high_quality": false, "reason": "Unsupported compressed DDS format — kept on Godot's importer"}
+		var is_bptc := fmt in [Image.FORMAT_BPTC_RGBA, Image.FORMAT_BPTC_RGBF, Image.FORMAT_BPTC_RGBFU]
+		return {"compatible": true, "compressed": true, "high_quality": is_bptc, "reason": ""}
+
+	if fmt in [Image.FORMAT_R16I, Image.FORMAT_RG16I, Image.FORMAT_RGBA16I, Image.FORMAT_RGBE9995]:
+		return {"compatible": false, "compressed": false, "high_quality": false, "reason": "Unsupported uncompressed DDS pixel format — kept on Godot's importer"}
+
+	return {"compatible": true, "compressed": false, "high_quality": false, "reason": ""}
+
+
+## Maps a compatible 2D DDS sidecar's parameters to DirectStorage parameters.
+static func map_dds_params(params: Dictionary, compat: Dictionary) -> Array:
+	var mapped := DS_DEFAULTS.duplicate()
+	var src_normal := str(params.get("compress/normal_map", "0")).strip_edges()
+	var src_channel := str(params.get("compress/channel_pack", "0")).strip_edges()
+	mapped.merge(_color_options(src_normal == "1", src_channel == "1"), true)
+
+	if bool(compat.get("compressed", false)):
+		mapped["compression/mode"] = "0"
+		mapped["compression/high_quality"] = "true" if bool(compat.get("high_quality", false)) else "false"
+		var codec := "BPTC" if bool(compat.get("high_quality", false)) else "S3TC"
+		return [mapped, "Compatible 2D DDS (%s) -> DirectStorage VRAM Compressed (passthrough)" % codec, true]
+
+	# Uncompressed DDS: keep VRAM Uncompressed if the Godot DDS sidecar requested it, else VRAM Compressed.
+	var dds_mode := str(params.get("compress/mode", "0")).strip_edges()
+	if dds_mode == "2":
+		mapped["compression/mode"] = "1"
+		mapped["compression/high_quality"] = "false"
+		return [mapped, "Compatible 2D DDS (Uncompressed) -> DirectStorage Uncompressed", true]
+
+	mapped["compression/mode"] = "0"
+	mapped["compression/high_quality"] = "false"
+	return [mapped, "Compatible 2D DDS -> DirectStorage VRAM Compressed", true]
+
+
 ## Import parameters one migration action actually decides. A delta, not a full preset: the adopt
 ## path merges it over DS_DEFAULTS itself, while the upgrade path rewrites only these keys and keeps
 ## every other [params] line (gdeflate_level, as_image_texture, mipmaps/*, process/*) intact.
@@ -426,7 +490,17 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 			if cp.has_section("params"):
 				for k in cp.get_section_keys("params"):
 					params[k] = str(cp.get_value("params", k, ""))
-			var mapped_res: Array = map_texture_params(params)
+
+			var mapped_res: Array
+			if ext == "dds":
+				var compat := check_dds_compatibility(src_res)
+				if not bool(compat.get("compatible", false)):
+					mapped_res = [null, str(compat.get("reason", "Incompatible DDS — kept on Godot's importer")), false]
+				else:
+					mapped_res = map_dds_params(params, compat)
+			else:
+				mapped_res = map_texture_params(params)
+
 			var mapped_dict = mapped_res[0]
 			var reason_str: String = mapped_res[1]
 			var is_eligible: bool = mapped_res[2]
@@ -457,6 +531,20 @@ static func _walk_dir(dir_res: String, excludes: Array, plan: Array[Dictionary])
 					"old_dests": old_dests,
 					"mapped_params": mapped_dict if mapped_dict is Dictionary else DS_DEFAULTS.duplicate(),
 				})
+		elif ext == "dds" and not bool(check_dds_compatibility(src_res).get("compatible", false)):
+			var dds_compat := check_dds_compatibility(src_res)
+			plan.append({
+				"source": src_res,
+				"mode": "skip",
+				"base_mode": "skip",
+				"eligible": false,
+				"reason": str(dds_compat.get("reason", "Incompatible DDS")) + " (switch Import As to DDS in Import dock)",
+				"importer": importer,
+				"importer_version": iver,
+				"uid": uid,
+				"old_dests": old_dests,
+				"mapped_params": {},
+			})
 		elif iver < TARGET_VERSION:
 			# An older sidecar still carries compression/source; translate it so the dialog lists
 			# the real action (a legacy normal map is not "VRAM Compressed"). Its own mode is part
