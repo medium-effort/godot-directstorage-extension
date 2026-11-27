@@ -629,8 +629,8 @@ GDEX_TEST_T(dspkg, entry_sorting_is_deterministic, TAG_INTEGRATION) {
 	godot::Array entries = reader->get_entries();
 	GDEX_EXPECT_EQ(entries.size(), 2);
 	// Must be sorted lexicographically
-	GDEX_EXPECT_TRUE(entries[0] == godot::String(virtual_a));
-	GDEX_EXPECT_TRUE(entries[1] == godot::String(virtual_z));
+	GDEX_EXPECT_TRUE(godot::String(entries[0]) == godot::String(virtual_a));
+	GDEX_EXPECT_TRUE(godot::String(entries[1]) == godot::String(virtual_z));
 
 	// On-disk payload offsets must reflect lexicographical sort order (virtual_a before virtual_z).
 	int64_t offset_a = reader->get_entry_info(godot::String(virtual_a)).get("data_offset", 0);

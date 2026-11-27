@@ -3331,10 +3331,15 @@ Array DSPkg::get_entries() const {
 	if (!is_opened) {
 		return result;
 	}
+	std::vector<String> keys;
+	keys.reserve(entries_by_path.size());
 	for (const KeyValue<String, DSPkgEntry> &E : entries_by_path) {
-		result.append(E.key);
+		keys.push_back(E.key);
 	}
-	result.sort();
+	std::sort(keys.begin(), keys.end());
+	for (const String &key : keys) {
+		result.append(key);
+	}
 	return result;
 }
 

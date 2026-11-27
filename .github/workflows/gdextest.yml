@@ -418,7 +418,7 @@ jobs:
           parts = re.split(r"(?m)(?=^### (?:gdextest|GUT) )", text)
           out = []
           for part in parts:
-              if not re.match(r"^### (?:gdextest|GUT) ", part) or "<details" in part:
+              if not re.match(r"^### (?:gdextest|GUT) ", part):
                   out.append(part)
                   continue
               lines = part.splitlines()
@@ -433,7 +433,7 @@ jobs:
               else:
                   body_lines = rest
               body = "\n".join(body_lines).strip()
-              if not body:
+              if not body or body.startswith("<details"):
                   out.append(part)
                   continue
               m = re.search(r"(\d+)\s+failed", part)
