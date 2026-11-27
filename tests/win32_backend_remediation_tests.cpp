@@ -1,17 +1,17 @@
 // tests/win32_backend_remediation_tests.cpp
 //
-// Regression suite covering architectural audit remediations (HIGH-01 through
-// HIGH-08, HIGH-10):
+// Regression suite covering Win32 backend thread safety, resource lifetimes,
+// queue/slot handling, and error attribution:
 //
-// - HIGH-01/02/03: D3D12 device & queue ComPtr thread safety under concurrent
-//   access and invalidate_d3d12_device(), non-blocking queries without unbounded waits.
-// - HIGH-04: BatchSlot two-path freeze (closing flag + active_batch_slot diversion).
-// - HIGH-05: Barrier transition failure cleanly aborts submit without unsubmitted
+// - D3D12 device & queue ComPtr thread safety under concurrent access and
+//   invalidate_d3d12_device(), non-blocking queries without unbounded waits.
+// - BatchSlot two-path freeze (closing flag + active_batch_slot diversion).
+// - Barrier transition failure cleanly aborts submit without unsubmitted
 //   DirectStorage requests.
-// - HIGH-06: Command allocator bounded fence wait tolerates transient GPU busy states.
-// - HIGH-07: GPUTargetTransition resource ComPtr independent lifetime.
-// - HIGH-08: Synchronous timeout retains resources in zombie_slots until fence retirement.
-// - HIGH-10: Multi-queue wait_for_completion iterates all queues (0 to QUEUE_COUNT - 1).
+// - Command allocator bounded fence wait tolerates transient GPU busy states.
+// - GPUTargetTransition resource ComPtr independent lifetime.
+// - Synchronous timeout retains resources in zombie_slots until fence retirement.
+// - Multi-queue wait_for_completion iterates all queues (0 to QUEUE_COUNT - 1).
 // - Lane-scoped completion wait: a wait that names a priority lane must not pay
 //   for another lane's batch, while the all-lane form keeps covering every lane.
 //
@@ -106,7 +106,7 @@ std::string normalized_path(const godot::String &p_path) {
     return path;
 }
 
-// HIGH-01 fixtures: a 2048^2 incompressible RGBA8 payload keeps the DMA +
+// In-flight fixtures: a 2048^2 incompressible RGBA8 payload keeps the DMA +
 // GDeflate decode window at tens of milliseconds (the shape gpu_drain_tests.cpp
 // already relies on), so "still in flight" is observable instead of a
 // theoretical race.
@@ -419,7 +419,7 @@ GDEX_TEST_T(win32_remediation, drive_info_reports_bypassio_state, TAG_UNIT) {
 
 GDEX_TEST_T(win32_remediation, multi_queue_wait_for_completion_bounded_timeout, TAG_INTEGRATION) {
 #ifdef _WIN32
-    // HIGH-10: wait_for_completion() must inspect all priority queues up to
+    // wait_for_completion() must inspect all priority queues up to
     // QUEUE_COUNT and accurately bound wait times without premature true returns.
     godot::Win32Backend *backend = memnew(godot::Win32Backend);
     ctx.add_teardown([backend]() { memdelete(backend); });
@@ -457,7 +457,7 @@ GDEX_TEST_T(win32_remediation, multi_queue_wait_for_completion_bounded_timeout, 
 
 GDEX_TEST_T(win32_remediation, tag_cancellation_and_poll_drain_safe, TAG_INTEGRATION) {
 #ifdef _WIN32
-    // HIGH-08: cancel_requests_with_tag() and poll_batch_status() must safely
+    // cancel_requests_with_tag() and poll_batch_status() must safely
     // inspect queues and zombie_slots without crashes or dangling resource access.
     godot::Win32Backend *backend = memnew(godot::Win32Backend);
     ctx.add_teardown([backend]() { memdelete(backend); });
@@ -511,7 +511,7 @@ GDEX_TEST_T(win32_remediation, tag_cancellation_and_poll_drain_safe, TAG_INTEGRA
 
 GDEX_TEST_T(win32_remediation, slot_divert_and_closing_state, TAG_INTEGRATION) {
 #ifdef _WIN32
-    // HIGH-04: BatchSlot closing flag and active_batch_slot diversion.
+    // BatchSlot closing flag and active_batch_slot diversion.
     godot::Win32Backend *backend = memnew(godot::Win32Backend);
     ctx.add_teardown([backend]() { memdelete(backend); });
 
@@ -540,7 +540,7 @@ GDEX_TEST_T(win32_remediation, slot_divert_and_closing_state, TAG_INTEGRATION) {
 
 GDEX_TEST(win32_remediation, med05_staging_and_queue_capacity_clamping) {
     (void)ctx;
-    // MED-05: Staging buffer size and queue capacity bounds clamping.
+    // Staging buffer size and queue capacity bounds clamping.
     GDEX_EXPECT_EQ(godot::DSContext::clamp_staging_buffer_size_mb(0), 1u);
     GDEX_EXPECT_EQ(godot::DSContext::clamp_staging_buffer_size_mb(128), 128u);
     GDEX_EXPECT_EQ(godot::DSContext::clamp_staging_buffer_size_mb(5000), 2048u);
@@ -552,7 +552,7 @@ GDEX_TEST(win32_remediation, med05_staging_and_queue_capacity_clamping) {
 
 GDEX_TEST_T(win32_remediation, med07_submit_batch_sync_bounded_wait, TAG_INTEGRATION) {
 #ifdef _WIN32
-    // MED-07: Synchronous submit_batch bounded wait without indefinite stall.
+    // Synchronous submit_batch bounded wait without indefinite stall.
     godot::Win32Backend *backend = memnew(godot::Win32Backend);
     ctx.add_teardown([backend]() { memdelete(backend); });
 
@@ -612,7 +612,7 @@ GDEX_TEST_T(win32_remediation, med07_submit_batch_sync_bounded_wait, TAG_INTEGRA
 
 GDEX_TEST(win32_remediation, med01_chunk_range_overflow_validation) {
 #ifdef _WIN32
-    // MED-01: Fuzzing and integer overflow in .dstex chunk range validation.
+    // Fuzzing and integer overflow in .dstex chunk range validation.
     uint64_t resolved = 0;
 
     // 1. Normal valid relative range
@@ -642,7 +642,7 @@ GDEX_TEST(win32_remediation, med01_chunk_range_overflow_validation) {
 
 GDEX_TEST_T(win32_remediation, med03_atomic_child_staging_no_orphans, TAG_INTEGRATION) {
 #ifdef _WIN32
-    // MED-03: True partial-enqueue failure handling and rollback.
+    // True partial-enqueue failure handling and rollback.
     // When intermediate child fails (index c), all previously enqueued children (0..c-1)
     // are rolled back: removed from slot.requests, slot.request_names, and slot.request_name_map,
     // resource guards released, child statuses marked STATUS_FAILED, and parent marked STATUS_FAILED.
@@ -735,7 +735,7 @@ GDEX_TEST_T(win32_remediation, med03_atomic_child_staging_no_orphans, TAG_INTEGR
 
 GDEX_TEST(win32_remediation, med06_exact_error_attribution_and_abortion_message) {
 #ifdef _WIN32
-    // MED-06: Error attribution distinguishes primary failed request from aborted batch siblings
+    // Error attribution distinguishes primary failed request from aborted batch siblings
     // using production Win32Backend::attribute_batch_error_records.
     godot::Vector<godot::Ref<godot::DSRequest>> requests;
     std::unordered_map<std::string, godot::Ref<godot::DSRequest>> name_map;
@@ -840,7 +840,7 @@ GDEX_TEST(win32_remediation, med06_exact_error_attribution_and_abortion_message)
 
 GDEX_TEST_T(win32_remediation, med08_single_mip_parsed_values_preserved, TAG_INTEGRATION) {
 #ifdef _WIN32
-    // MED-08: Real .dstex fixture verification.
+    // Real .dstex fixture verification.
     // Single-mip requests must parse actual on-disk mip table entries, populating
     // the child request with exact data offset past file header, while preserving
     // parent request immutability (offset 0 and initial parameters untouched).
@@ -1009,7 +1009,7 @@ GDEX_TEST_T(win32_remediation, staged_request_reports_resource_in_flight, TAG_IN
 GDEX_TEST_T(win32_remediation, zombie_slot_reports_resource_in_flight, TAG_INTEGRATION) {
 #ifdef _WIN32
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
-    // HIGH-01: when a synchronous flush times out, the batch's requests leave the
+    // When a synchronous flush times out, the batch's requests leave the
     // slot for zombie_slots while the hardware keeps writing. Both in-flight queries
     // must still see them - otherwise a release frees the destination under live DMA
     // and a second enqueue is admitted against a resource nobody can barrier.
@@ -4353,7 +4353,7 @@ GDEX_TEST_T(win32_remediation, large_dispatch_mismatched_codec_16mib, TAG_INTEGR
 #endif
 }
 
-// R1 / issue #0266: the GPU destination-resolution handoff used to be a single
+// Issue #0266: the GPU destination-resolution handoff used to be a single
 // slot. Two threads that resolved different destination RIDs before the render
 // thread ran overwrote each other; the callback serviced only the newer context,
 // the older caller burned its full 250 ms wait, and its perfectly valid request
@@ -4412,7 +4412,7 @@ GDEX_TEST_ASYNC_T(win32_remediation, concurrent_gpu_destination_enqueues_all_acc
         requests[i]->set_destination_resource(rids[i]);
     }
 
-    // R1 residual: both submits come from worker threads, so both must take the
+    // Both submits come from worker threads, so both must take the
     // render-thread handoff. Record a baseline because the telemetry is process-wide.
     const godot::Dictionary handoff_before = backend->get_backend_diagnostics();
     const int64_t handoffs_before = static_cast<int64_t>(handoff_before.get("handoffs", 0));

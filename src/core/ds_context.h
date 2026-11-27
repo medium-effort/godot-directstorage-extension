@@ -47,7 +47,7 @@ public:
 	};
 
 	// Reasons DSResourceFormatLoader::_load_texture_payload() takes the CPU path
-	// instead of DirectStorage GPU decompression (review item R3). Declared here,
+	// instead of DirectStorage GPU decompression. Declared here,
 	// before the counters that index by it, because a data member's array bound is
 	// parsed in declaration order.
 	enum LoaderFallback {
@@ -307,7 +307,7 @@ public:
 	// reports UMA == TRUE (shared system memory architecture).
 	bool is_uma() const;
 	Dictionary get_capability_report() const;
-	// Resource-loader load-outcome counters (review item R3). The loader records
+	// Resource-loader load-outcome counters. The loader records
 	// every texture load so the capability report can distinguish "the GPU path is
 	// configured" from "the GPU path is configured but this load took the CPU
 	// fallback". Process-lifetime atomics with no reset API: read deltas around a

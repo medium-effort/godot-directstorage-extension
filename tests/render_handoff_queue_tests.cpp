@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <memory>
 
-// R1 regression guard (audit report architecture_and_best_practices_review_151126).
+// Render-thread handoff regression guard.
 //
 // The Win32 destination-resource handoff used to be a single slot. Two submits
 // that resolved different destination RIDs before the render thread ran

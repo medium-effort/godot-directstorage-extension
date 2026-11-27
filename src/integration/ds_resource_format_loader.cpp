@@ -489,7 +489,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	RenderingDevice *rd = rs ? rs->get_rendering_device() : nullptr;
 	bool gpu_active = ds_ctx ? ds_ctx->is_gpu_decompression_enabled() : false;
 
-	// Thread-affinity gate for GPU DirectStorage decompression (C2).
+	// Thread-affinity gate for GPU DirectStorage decompression.
 	// Direct GPU decompression requires the render thread because
 	// RenderingDevice::get_driver_resource() and free_rid() assert
 	// is_on_render_thread() and will fail or spam errors on workers.
@@ -524,7 +524,7 @@ Variant DSResourceFormatLoader::_load_texture_payload(
 	// set_enabled(false).
 
 	bool can_attempt_gpu = false;
-	// Every outcome is recorded (review item R3). The availability flags in
+	// Every outcome is recorded. The availability flags in
 	// get_capability_report() cannot tell "GPU path configured" from "GPU path
 	// taken", and a threaded load falls back with print_verbose only.
 	auto note_fallback = [ds_ctx, &p_cache_key, &p_original_cache_key](DSContext::LoaderFallback p_reason) {

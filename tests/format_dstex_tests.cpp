@@ -61,7 +61,7 @@ GDEX_TEST(dstex, mip_layout_zero_extent_is_empty) {
     GDEX_EXPECT_EQ(layout.source_size, 0ULL);
 }
 
-// FMT-01: hostile header caps are pure integer checks — no texture file is
+// Hostile header caps are pure integer checks — no texture file is
 // allocated. A 64x64 RGBA8 mip chain is ~16 KiB; the "2 GiB claim" below is
 // just a uint64 passed to the validator, costing zero storage.
 GDEX_TEST(dstex, sane_sizes_accept_small_texture) {

@@ -1107,7 +1107,7 @@ static bool ds_win32_query_guard_resource_on_render_thread(bool p_is_buffer_requ
 // to the render thread when called from main/worker threads.
 // Managed via std::shared_ptr so that if the calling thread times out after 250ms,
 // any late-arriving render-thread callback safely references a live heap object
-// rather than a destroyed stack frame (HIGH-01).
+// rather than a destroyed stack frame.
 struct DSGPUDestinationContext {
 	std::mutex mutex;
 	std::condition_variable cv;
@@ -1119,7 +1119,7 @@ struct DSGPUDestinationContext {
 	uint64_t native_format = 0;
 	bool rd_available = false;
 };
-// One parked context per in-flight query, never a single slot (R1). With one
+// One parked context per in-flight query, never a single slot. With one
 // slot, two threads resolving different destination RIDs before the render thread
 // runs overwrite each other: the callback services the newer context, and the
 // older caller spends its whole 250 ms budget waiting for a completion that can
@@ -1129,7 +1129,7 @@ struct DSGPUDestinationContext {
 // during DLL_PROCESS_DETACH and touch D3D12 under the loader lock.
 static DSRenderHandoffQueue<DSGPUDestinationContext> &s_gpu_dest_query_queue = *new DSRenderHandoffQueue<DSGPUDestinationContext>();
 
-// R1 residual telemetry. The overwrite race is closed by the queue above, but an
+// Render-thread handoff telemetry. The overwrite race is closed by the queue above, but an
 // off-render-thread enqueue still parks its caller on a bounded 250 ms CV wait.
 // These counters make that second half measurable instead of assumed: they are
 // merged into DSContext.get_capability_report()["destination_handoff"] so a
@@ -1171,7 +1171,7 @@ static void ds_win32_fetch_destination_resource_on_render_thread() {
 		ctx->native_format = native_format;
 		ctx->rd_available = rd_available;
 		ctx->completed = true;
-		ctx->cv.notify_one(); // HIGH-01: Notify while holding mutex
+		ctx->cv.notify_one(); // Notify while holding mutex
 	}
 }
 
@@ -1233,7 +1233,7 @@ static bool ds_win32_query_destination_resource_on_render_thread(
 				previous_max, waited_us, std::memory_order_relaxed)) {
 		}
 		if (!signaled) {
-			// HIGH-02: Bounded timeout with no secondary unbounded wait. Drop this
+			// Bounded timeout with no secondary unbounded wait. Drop this
 			// query from the handoff so a late callback cannot service a caller that
 			// already returned.
 			s_gpu_dest_handoff_timeouts.fetch_add(1, std::memory_order_relaxed);
@@ -1268,7 +1268,7 @@ bool Win32Backend::validate_resource_guard(const Ref<DSRequest> &p_request, Stri
 		return false;
 	}
 
-	// Split validation contract (MED-12):
+	// Split validation contract:
 	// - Off-render-thread (completion thread): Calling RenderingDevice queries (texture_is_valid,
 	//   get_driver_resource) violates thread affinity and asserts (Q02). Validation is conservative:
 	//   the COM ID3D12Resource AddRef retention invariant guarantees the GPU allocation remains
@@ -2590,7 +2590,7 @@ static void ds_win32_fetch_d3d12_device_on_render_thread() {
 	s_device_acquire_cv.notify_all(); // notify while holding the protecting mutex
 }
 
-// D3D12-02 / HIGH-03: release owned COM references and clear the cache. Safe from any
+// Release owned COM references and clear the cache. Safe from any
 // thread; COM Release is thread-safe. Called on shutdown and on
 // device-removed detection so a stale pointer can never be returned.
 void ds_win32_invalidate_d3d12_device() {
@@ -2600,7 +2600,7 @@ void ds_win32_invalidate_d3d12_device() {
 }
 
 Microsoft::WRL::ComPtr<ID3D12Device> ds_win32_get_d3d12_device() {
-	// D3D12-02 / HIGH-03: validate cached device against device-removed (TDR / driver update).
+	// Validate cached device against device-removed (TDR / driver update).
 	Microsoft::WRL::ComPtr<ID3D12Device> cached;
 	{
 		std::lock_guard<std::mutex> lock(s_device_mutex);
@@ -5911,7 +5911,7 @@ int Win32Backend::_debug_cached_source_file_count() const {
 
 void Win32Backend::_debug_set_queue_fence_counters_for_testing(int p_queue_index, uint64_t p_completion_value, uint64_t p_completed_value) {
 #ifdef _WIN32
-	// Test-only seam. HIGH-02 is about two priority queues holding different
+	// Test-only seam. Covers two priority queues holding different
 	// counter values while one of them still has DMA in flight; producing that for
 	// real would need two live queues whose transfers retire at different speeds.
 	// Pinning the counters directly leaves the fence objects alone, so

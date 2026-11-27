@@ -650,7 +650,7 @@ GDEX_TEST_T(loader, cache_mode_reuse_returns_same_ref, TAG_INTEGRATION) {
 	remove_user_file(dstex_path);
 }
 
-// --- Load-outcome counters: GPU vs cache vs CPU fallback (R3) ---------------------
+// --- Load-outcome counters: GPU vs cache vs CPU fallback --------------------------
 
 GDEX_TEST_T(loader, load_outcome_counters_track_each_load, TAG_INTEGRATION) {
 	godot::DSContext *ds = godot::DSContext::get_singleton();

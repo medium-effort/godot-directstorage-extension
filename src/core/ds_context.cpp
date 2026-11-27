@@ -759,13 +759,13 @@ Dictionary DSContext::get_capability_report() const {
 	report["integrated_gpu_guess"] = adapter.get("integrated_gpu_guess", false);
 	report["active_backend"] = get_active_backend_name();
 	report["supported_destination_types"] = supported_destinations;
-	// R3: "gpu_decompression_enabled" says the GPU path is available, not that any
+	// "gpu_decompression_enabled" says the GPU path is available, not that any
 	// load used it. These counters answer the second question.
 	Dictionary loader_stats = get_loader_stats();
 	report["loader_gpu_loads"] = loader_stats["loader_gpu_loads"];
 	report["loader_cache_hits"] = loader_stats["loader_cache_hits"];
 	report["loader_cpu_fallbacks"] = loader_stats["loader_cpu_fallbacks"];
-	// R1: expose the backend's render-thread handoff telemetry when it has any.
+	// Expose the backend's render-thread handoff telemetry when it has any.
 	// A backend without rendezvous (fallback, or Win32 on a single-thread model)
 	// returns an empty Dictionary and the key is left out entirely.
 	{

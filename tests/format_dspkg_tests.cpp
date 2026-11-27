@@ -1868,7 +1868,7 @@ GDEX_TEST_T(dspkg, toc_key_commit_on_open, TAG_INTEGRATION) {
 }
 
 GDEX_TEST_T(dspkg, med09_corrupt_entry_caps_rejected, TAG_INTEGRATION) {
-	// MED-09: Packages with mip_count > DSTEX_MAX_MIP_COUNT or insane dimensions
+	// Packages with mip_count > DSTEX_MAX_MIP_COUNT or insane dimensions
 	// must be rejected with ERR_FILE_CORRUPT.
 	const char *dstex_path = "user://temp_med09_test.dstex";
 	const char *dspkg_path = "user://temp_med09_test.dspkg";

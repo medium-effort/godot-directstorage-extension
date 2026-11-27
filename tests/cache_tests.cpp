@@ -99,7 +99,7 @@ GDEX_TEST_T(cache, binding_store_keeps_documented_four_arg_api, TAG_INTEGRATION)
     // 2- and 4-argument forms. Binding the 5-parameter C++ overload directly
     // advertised 5 args while D_METHOD named 4, so Object::call with 2-4 args
     // raised "Invalid call error argument index" (and callv with 3/4 args
-    // crashed the process). That is what made the MED-03 reload probe spin.
+    // crashed the process). That is what made the reload probe spin.
     auto r2 = cache->call("store", godot::String("res://gdextest_store_bind_2"), make_test_texture(1.0f));
     GDEX_EXPECT_TRUE(static_cast<bool>(r2));
 
@@ -574,7 +574,7 @@ GDEX_TEST_T(cache, clear_unused_all_held_or_empty, TAG_INTEGRATION) {
 }
 
 GDEX_TEST_T(cache, evict_and_clear_preserves_externally_held_refs, TAG_INTEGRATION) {
-    // MED-10: evict() and clear() must remove entries from cache lookups
+    // evict() and clear() must remove entries from cache lookups
     // without destroying GPU resources of externally held textures.
     godot::DSTextureCache *cache = new_enabled_cache(ctx);
 
@@ -599,7 +599,7 @@ GDEX_TEST_T(cache, evict_and_clear_preserves_externally_held_refs, TAG_INTEGRATI
 }
 
 GDEX_TEST_T(cache, med10_in_flight_gpu_resource_query, TAG_INTEGRATION) {
-    // MED-10: In-flight GPU resources must be safely queried via DSContext and PlatformBackend.
+    // In-flight GPU resources must be safely queried via DSContext and PlatformBackend.
     godot::DSContext *ds_ctx = godot::DSContext::get_singleton();
     if (!ds_ctx) {
         GDEX_SKIP("DSContext singleton unavailable.");

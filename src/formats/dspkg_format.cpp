@@ -30,7 +30,7 @@ extern const char *const dspkg_baked_key_id_tag = DSPKG_KEY_ID_TAG;
 namespace {
 
 constexpr uint64_t DSPKG_MAX_PAYLOAD_SIZE = static_cast<uint64_t>(INT32_MAX);
-// FMT-01: per-entry sane cap matching DSTEX_MAX_TOTAL_BYTES (512 MiB) so a
+// Per-entry sane cap matching DSTEX_MAX_TOTAL_BYTES (512 MiB) so a
 // hostile archive entry cannot force a huge transient allocation.
 constexpr uint64_t DSPKG_MAX_ENTRY_BYTES = 512ULL * 1024ULL * 1024ULL;
 constexpr uint32_t D3D12_TEXTURE_DATA_PITCH_ALIGNMENT = 256;
@@ -743,7 +743,7 @@ String DSPkg::get_global_encryption_key_id() {
 	std::lock_guard<std::mutex> lock(s_key_mutex);
 	// Volatile pointer qualification and dereference guarantees an observable load under MSVC /O2,
 	// preventing /OPT:REF from dead-stripping the anchor tag in release builds for both keyed
-	// and keyless ("dspkg-key-id=none") binaries (R7-04, R8-11, R8-15).
+	// and keyless ("dspkg-key-id=none") binaries.
 	const char *volatile p_tag = dspkg_baked_key_id_tag;
 	(void)*p_tag;
 
