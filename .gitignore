@@ -103,6 +103,8 @@ src/cppcheck_result.xml
 # ==============================================================================
 /.cache
 **/__pycache__
+# Packaged addon release archives (tools/pack_addon.py)
+/dist/
 
 # ==============================================================================
 # DirectStorage Encryption Keys & Secrets

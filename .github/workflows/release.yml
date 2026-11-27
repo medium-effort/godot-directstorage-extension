@@ -1,0 +1,198 @@
+# Cross-platform release build and addon packaging workflow.
+# Produces keyless binaries for Windows (x86_64), Linux (x86_64), and
+# macOS (Universal x86_64 + arm64), verifies licensing and doc_classes,
+# and packs dsgd-<version>.zip + .sha256 via tools/pack_addon.py.
+
+name: Release Addon
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional version tag to validate against plugin.cfg (e.g. v1.0.0)'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Build and pack artifacts only without creating a GitHub Release'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Run Tests
+    uses: ./.github/workflows/gdextest.yml
+    secrets: inherit
+
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: bin-windows
+            bin_debug: project/addons/directstorage_accelerator/bin/dsgd_64.debug.dll
+            bin_release: project/addons/directstorage_accelerator/bin/dsgd_64.dll
+            scons_extra: ''
+          - os: ubuntu-22.04
+            artifact_name: bin-linux
+            bin_debug: project/addons/directstorage_accelerator/bin/libdsgd_64.debug.so
+            bin_release: project/addons/directstorage_accelerator/bin/libdsgd_64.so
+            scons_extra: ''
+          - os: macos-latest
+            artifact_name: bin-macos
+            bin_debug: project/addons/directstorage_accelerator/bin/libdsgd_64.debug.dylib
+            bin_release: project/addons/directstorage_accelerator/bin/libdsgd_64.dylib
+            scons_extra: 'arch=universal'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout submodules
+        shell: bash
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.SUBMODULES_TOKEN }}@github.com/medium-effort/".insteadOf "https://github.com/medium-effort/"
+          git submodule update --init --recursive
+
+      - name: Configure C++ compiler (Linux/Ubuntu)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make python3-pip
+
+      - name: Configure Python and SCons
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip setuptools wheel scons
+
+      - name: Fetch DirectStorage SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./tools/fetch_directstorage.ps1 -Version 1.3.0 -Decision Accept
+
+      - name: Restore SCons cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.scons-cache
+          key: scons-release-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}
+          restore-keys: |
+            scons-release-${{ matrix.os }}-${{ github.ref_name }}-
+            scons-release-${{ matrix.os }}-
+
+      - name: Build template_debug and template_release (keyless)
+        shell: bash
+        env:
+          SCONS_CACHE: ${{ github.workspace }}/.scons-cache
+        run: |
+          set -euo pipefail
+          NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+          scons -j "$NPROC" target=template_debug debug_symbols=no ${{ matrix.scons_extra }}
+          scons -j "$NPROC" target=template_release debug_symbols=no ${{ matrix.scons_extra }}
+
+      - name: Save SCons cache
+        uses: actions/cache/save@v4
+        if: '!cancelled()'
+        with:
+          path: ${{ github.workspace }}/.scons-cache
+          key: scons-release-${{ matrix.os }}-${{ github.ref_name }}-${{ hashFiles('godot-cpp/**', 'SConstruct', 'src/**') }}-run-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify macOS universal slices
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dylib in "${{ matrix.bin_debug }}" "${{ matrix.bin_release }}"; do
+            INFO=$(lipo -info "$dylib")
+            echo "$INFO"
+            echo "$INFO" | grep -q "x86_64"
+            echo "$INFO" | grep -q "arm64"
+          done
+
+      - name: Upload canonical platform binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.bin_debug }}
+            ${{ matrix.bin_release }}
+          if-no-files-found: error
+
+  pack:
+    name: Pack & Publish
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run license verification
+        shell: bash
+        run: python3 tools/check_license.py
+
+      - name: Run doc_classes verification
+        shell: bash
+        run: python3 tools/check_doc_classes.py
+
+      - name: Download platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: staging/bin
+          merge-multiple: true
+
+      - name: List staged binaries
+        shell: bash
+        run: ls -la staging/bin
+
+      - name: Pack addon archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(--binaries-dir staging/bin --write-sha256)
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            ARGS+=(--version "${{ github.ref_name }}")
+          elif [ -n "${{ inputs.tag }}" ]; then
+            ARGS+=(--version "${{ inputs.tag }}")
+          fi
+          python3 tools/pack_addon.py "${ARGS[@]}"
+          ls -la dist/
+
+      - name: Upload packaged addon artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsgd-addon-release
+          path: |
+            dist/dsgd-*.zip
+            dist/dsgd-*.zip.sha256
+          if-no-files-found: error
+
+      - name: Create Draft GitHub Release
+        if: github.ref_type == 'tag' && inputs.dry_run != true
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/dsgd-*.zip
+            dist/dsgd-*.zip.sha256
